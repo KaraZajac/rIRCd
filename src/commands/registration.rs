@@ -1312,11 +1312,14 @@ pub async fn handle_register(
             return Ok(());
         }
         let account_param = msg.params.get(0).map(|s| s.as_str()).unwrap_or("*");
-        let account = if account_param == "*" { nick.clone() } else {
+        // Accept "*" (use current nick) or the nick itself; anything else is rejected.
+        let account = if account_param == "*" || account_param.eq_ignore_ascii_case(&nick) {
+            nick.clone()
+        } else {
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["REGISTER".into(), "ACCOUNT_NAME_MUST_BE_NICK".into(), account_param.into(), " :Account name must match your nick".into()])
+                Message::new("FAIL", vec!["REGISTER".into(), "ACCOUNT_NAME_MUST_BE_NICK".into(), account_param.into(), " :Account name must match your current nick".into()])
                     .with_prefix(&cfg.server.name),
                 label,
             )
@@ -1369,7 +1372,8 @@ pub async fn handle_register(
             )
             .await;
         }
-        Err(RegisterError::Io(_)) => {
+        Err(RegisterError::Io(e)) => {
+            tracing::error!(client_id, account = %account, error = %e, "REGISTER: database error");
             reply_to_client(
                 &senders,
                 client_id,
