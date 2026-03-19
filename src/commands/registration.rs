@@ -289,7 +289,14 @@ pub async fn handle_cap(
     match subcmd {
         "LS" => {
             conn.cap_negotiating = true;
-            let caps = build_cap_list(&std::collections::HashSet::new(), version_302);
+            let tls_port: Option<u16> = if cfg.tls_enabled() {
+                cfg.server.listen_tls.first()
+                    .and_then(|addr| addr.rsplit(':').next())
+                    .and_then(|p| p.parse().ok())
+            } else {
+                None
+            };
+            let caps = build_cap_list(version_302, tls_port);
             for (i, cap_line) in caps.iter().enumerate() {
                 let last = if caps.len() > 1 && i == caps.len() - 1 {
                     "*"

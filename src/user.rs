@@ -1,4 +1,5 @@
 use crate::channel::ChannelMembership;
+use crate::protocol::Message;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -204,11 +205,39 @@ impl MsgIdStore {
     }
 }
 
+/// Glob matching: `*` matches any sequence of chars, `?` matches any single char.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (pl, tl) = (p.len(), t.len());
+    let mut dp = vec![vec![false; tl + 1]; pl + 1];
+    dp[0][0] = true;
+    for i in 1..=pl {
+        if p[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=pl {
+        for j in 1..=tl {
+            dp[i][j] = if p[i - 1] == '*' {
+                dp[i - 1][j] || dp[i][j - 1]
+            } else if p[i - 1] == '?' || p[i - 1] == t[j - 1] {
+                dp[i - 1][j - 1]
+            } else {
+                false
+            };
+        }
+    }
+    dp[pl][tl]
+}
+
 /// Reverse index: nick (lowercase) -> set of client_ids that have this nick in their monitor list.
 /// Used to send 730/731 only to watchers.
 #[derive(Debug, Default)]
 pub struct MonitorWatchers {
     pub by_nick: HashMap<String, std::collections::HashSet<String>>,
+    /// extended-monitor: glob pattern -> set of client_ids watching that pattern.
+    pub by_pattern: HashMap<String, std::collections::HashSet<String>>,
 }
 
 impl MonitorWatchers {
@@ -223,14 +252,43 @@ impl MonitorWatchers {
             }
         }
     }
+    /// extended-monitor: add a glob pattern watcher.
+    pub fn add_pattern(&mut self, pattern: String, client_id: String) {
+        self.by_pattern.entry(pattern).or_default().insert(client_id);
+    }
+    /// extended-monitor: remove a glob pattern watcher.
+    pub fn remove_pattern(&mut self, pattern: &str, client_id: &str) {
+        if let Some(set) = self.by_pattern.get_mut(pattern) {
+            set.remove(client_id);
+            if set.is_empty() {
+                self.by_pattern.remove(pattern);
+            }
+        }
+    }
     /// Remove client_id from all nicks' watcher sets (e.g. on QUIT).
     pub fn remove_client(&mut self, client_id: &str, nicks: &std::collections::HashSet<String>) {
         for nick in nicks {
             self.remove(nick, client_id);
         }
     }
+    /// Remove client_id from all pattern watcher sets (e.g. on QUIT).
+    pub fn remove_client_patterns(&mut self, client_id: &str, patterns: &std::collections::HashSet<String>) {
+        for pat in patterns {
+            self.remove_pattern(pat, client_id);
+        }
+    }
     pub fn watchers(&self, nick_lower: &str) -> Option<&std::collections::HashSet<String>> {
         self.by_nick.get(nick_lower)
+    }
+    /// Return all client_ids whose patterns match `source_lower` (nick!user@host lowercase).
+    pub fn pattern_watchers_for(&self, source_lower: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        for (pat, clients) in &self.by_pattern {
+            if glob_match(pat, source_lower) {
+                result.extend(clients.iter().cloned());
+            }
+        }
+        result
     }
 }
 
@@ -248,6 +306,8 @@ pub struct ServerState {
     pub metadata: HashMap<String, HashMap<String, String>>,
     /// draft/multiline: client_id -> in-flight batch (ref, target, command, lines)
     pub pending_multiline: HashMap<String, PendingMultilineBatch>,
+    /// draft/client-batch: client_id -> in-flight generic client batch
+    pub pending_client_batches: HashMap<String, PendingClientBatch>,
     /// WHOWAS history: nick_lower -> recent entries
     pub whowas: HashMap<String, VecDeque<WhowasEntry>>,
     /// Server start time (Unix timestamp)
@@ -261,6 +321,15 @@ pub struct PendingMultilineBatch {
     pub target: String,
     pub command: String,
     pub lines: Vec<(bool, String)>,
+}
+
+/// In-flight draft/client-batch for one client
+#[derive(Debug)]
+pub struct PendingClientBatch {
+    pub ref_tag: String,
+    pub batch_type: String,
+    pub target: String,
+    pub messages: Vec<Message>,
 }
 
 impl ServerState {

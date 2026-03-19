@@ -11,7 +11,7 @@ pub use reply::reply_to_client;
 use crate::channel::ChannelStore;
 use crate::config::Config;
 use crate::protocol::Message;
-use crate::user::{PendingMultilineBatch, ServerState};
+use crate::user::{PendingClientBatch, PendingMultilineBatch, ServerState};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -45,6 +45,20 @@ pub async fn handle_message(
                     },
                 );
                 return Ok(());
+            } else if !batch_type.is_empty() {
+                // draft/client-batch: any other batch type is collected and delivered
+                let target = msg.params.get(2).map(|s| s.to_string()).unwrap_or_default();
+                let mut state_w = state.write().await;
+                state_w.pending_client_batches.insert(
+                    client_id.clone(),
+                    PendingClientBatch {
+                        ref_tag,
+                        batch_type: batch_type.to_string(),
+                        target,
+                        messages: Vec::new(),
+                    },
+                );
+                return Ok(());
             }
         } else if first.starts_with('-') {
             let ref_tag = first[1..].to_string();
@@ -67,16 +81,34 @@ pub async fn handle_message(
                 )
                 .await;
             }
+            let client_batch = {
+                let mut state_w = state.write().await;
+                state_w.pending_client_batches.remove(&client_id)
+            };
+            if let Some(batch) = client_batch {
+                if batch.ref_tag == ref_tag {
+                    return messaging::deliver_client_batch(
+                        &client_id,
+                        batch,
+                        state,
+                        channels,
+                        senders,
+                        cfg,
+                        label.as_deref(),
+                    )
+                    .await;
+                }
+            }
         }
     }
 
     // draft/multiline: PRIVMSG/NOTICE with batch=ref appends to pending batch
     if msg.command == "PRIVMSG" || msg.command == "NOTICE" {
-        let batch_ref = msg.tags.get("batch").and_then(|v| v.as_ref());
+        let batch_ref = msg.tags.get("batch").and_then(|v| v.as_ref()).cloned();
         if let Some(ref ref_val) = batch_ref {
             let mut state_w = state.write().await;
             if let Some(pending) = state_w.pending_multiline.get_mut(&client_id) {
-                if &pending.ref_tag == *ref_val {
+                if pending.ref_tag == *ref_val {
                     let line_target = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
                     if line_target != pending.target {
                         let (batch_target, line_target_owned) = (pending.target.clone(), line_target.to_string());
@@ -133,6 +165,29 @@ pub async fn handle_message(
                     pending.lines.push((concat, text));
                     return Ok(());
                 }
+            }
+        }
+    }
+
+    // draft/client-batch: PRIVMSG/NOTICE/TAGMSG with batch=ref appends to pending client batch
+    if msg.command == "PRIVMSG" || msg.command == "NOTICE" || msg.command == "TAGMSG" {
+        let batch_ref = msg.tags.get("batch").and_then(|v| v.as_ref()).cloned();
+        if let Some(ref ref_val) = batch_ref {
+            let appended = {
+                let mut state_w = state.write().await;
+                if let Some(pending) = state_w.pending_client_batches.get_mut(&client_id) {
+                    if pending.ref_tag == *ref_val {
+                        pending.messages.push(msg.clone());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if appended {
+                return Ok(());
             }
         }
     }

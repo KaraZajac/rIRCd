@@ -28,6 +28,7 @@ pub const CAPS: &[&str] = &[
     "message-redaction",
     "account-extban",
     "monitor",
+    "extended-monitor",
     "draft/channel-rename",
     "draft/chathistory",
     "draft/read-marker",
@@ -36,30 +37,31 @@ pub const CAPS: &[&str] = &[
     "draft/multiline",
     "draft/pre-away",
     "draft/message-edit",
-    "draft/reactions",
-    "draft/typing",
+    "draft/react",
+    "typing",
+    "reply",
+    "draft/channel-context",
+    "draft/client-batch",
+    "sts",
 ];
 
 /// Capabilities that depend on message-tags
 pub const TAGS_DEPENDENT: &[&str] = &["server-time", "batch", "account-tag"];
 
-/// Capability value for CAP LS (e.g. draft/multiline=max-bytes=4096,max-lines=20)
-fn cap_ls_value(cap: &str) -> &str {
-    match cap {
-        "sasl"            => "sasl=PLAIN,SCRAM-SHA-256",
-        "draft/multiline" => "draft/multiline=max-bytes=4096,max-lines=20",
-        _ => cap,
-    }
-}
-
-/// Build CAP LS reply value (space-separated list)
-pub fn build_cap_list(_enabled: &HashSet<String>, version_302: bool) -> Vec<String> {
+/// Build CAP LS reply value (space-separated list).
+/// `tls_port` is required to advertise `sts`; omit it when TLS is not configured.
+pub fn build_cap_list(version_302: bool, tls_port: Option<u16>) -> Vec<String> {
     let caps: Vec<String> = CAPS
         .iter()
         .copied()
         .filter(|c| *c != "capability-negotiation")
-        .map(cap_ls_value)
-        .map(String::from)
+        .filter(|c| *c != "sts" || tls_port.is_some())
+        .map(|c| match c {
+            "sasl"            => "sasl=PLAIN,SCRAM-SHA-256".to_string(),
+            "draft/multiline" => "draft/multiline=max-bytes=4096,max-lines=20".to_string(),
+            "sts"             => format!("sts=port={},duration=2592000", tls_port.unwrap_or(6697)),
+            _                 => c.to_string(),
+        })
         .collect();
 
     if version_302 {

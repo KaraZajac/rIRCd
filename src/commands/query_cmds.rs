@@ -344,13 +344,15 @@ pub async fn handle_monitor(
 
     match param0 {
         "+" => {
+            let has_extended_monitor = client.read().await.has_cap("extended-monitor");
             let mut state_w = state.write().await;
             let client_arc = match state_w.clients.get(client_id) {
                 Some(c) => c.clone(),
                 None => return Ok(()),
             };
             let mut current_list = client_arc.read().await.monitor_list.clone();
-            let mut added = Vec::new();
+            let mut added_nicks: Vec<String> = Vec::new();
+            let mut added_patterns: Vec<String> = Vec::new();
             let mut failed = Vec::new();
             for t in &targets {
                 let n = t.to_lowercase();
@@ -362,14 +364,22 @@ pub async fn handle_monitor(
                     continue;
                 }
                 current_list.insert(n.clone());
-                added.push(n);
+                // extended-monitor: targets with '!' or '@' are glob patterns
+                if has_extended_monitor && (n.contains('!') || n.contains('@')) {
+                    added_patterns.push(n);
+                } else {
+                    added_nicks.push(n);
+                }
             }
             {
                 let mut guard = client_arc.write().await;
                 guard.monitor_list = current_list;
             }
-            for n in &added {
+            for n in &added_nicks {
                 state_w.monitor_watchers.add(n.clone(), client_id.to_string());
+            }
+            for p in &added_patterns {
+                state_w.monitor_watchers.add_pattern(p.clone(), client_id.to_string());
             }
             if !failed.is_empty() {
                 let fail_msg = Message::new("734", vec![nick.clone(), MONITOR_LIMIT.to_string(), failed.join(","), "Monitor list is full.".to_string()])
@@ -377,13 +387,13 @@ pub async fn handle_monitor(
                 reply_to_client(&senders, client_id, fail_msg, label).await;
             }
             drop(state_w);
-            if added.is_empty() {
-                tracing::info!(client_id = %client_id, "MONITOR +: no new nicks added (empty list or all already in list)");
-            }
+
             let state_r = state.read().await;
             let mut online_list = Vec::new();
             let mut offline_list = Vec::new();
-            for n in &added {
+
+            // Nick-based online/offline check
+            for n in &added_nicks {
                 if let Some(id) = state_r.nick_to_id.get(&n.to_uppercase()) {
                     if let Some(c) = state_r.clients.get(id) {
                         let src = c.read().await.source().unwrap_or_else(|| n.clone());
@@ -395,21 +405,28 @@ pub async fn handle_monitor(
                     offline_list.push(n.clone());
                 }
             }
+            // Pattern-based online check (extended-monitor)
+            for pat in &added_patterns {
+                let mut matched = false;
+                for c in state_r.clients.values() {
+                    let g = c.read().await;
+                    if let Some(src) = g.source() {
+                        if crate::user::glob_match(pat, &src.to_lowercase()) {
+                            online_list.push(src);
+                            matched = true;
+                        }
+                    }
+                }
+                if !matched {
+                    offline_list.push(pat.clone());
+                }
+            }
+
             if !online_list.is_empty() {
-                tracing::info!(
-                    client_id = %client_id,
-                    online_count = online_list.len(),
-                    "Monitor: MONITOR + response, sending 730 (targets now online)"
-                );
                 let m = Message::new("730", vec![nick.clone(), format!(":{}", online_list.join(","))]).with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
             if !offline_list.is_empty() {
-                tracing::info!(
-                    client_id = %client_id,
-                    offline_count = offline_list.len(),
-                    "Monitor: MONITOR + response, sending 731 (targets offline)"
-                );
                 let m = Message::new("731", vec![nick.clone(), format!(":{}", offline_list.join(","))]).with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
@@ -422,7 +439,11 @@ pub async fn handle_monitor(
                 for t in &targets {
                     let n = t.to_lowercase();
                     if guard.monitor_list.remove(&n) {
-                        state_w.monitor_watchers.remove(&n, client_id);
+                        if n.contains('!') || n.contains('@') {
+                            state_w.monitor_watchers.remove_pattern(&n, client_id);
+                        } else {
+                            state_w.monitor_watchers.remove(&n, client_id);
+                        }
                     }
                 }
             }
@@ -433,7 +454,11 @@ pub async fn handle_monitor(
             if let Some(c) = client_arc {
                 let list = c.write().await.monitor_list.drain().collect::<Vec<_>>();
                 for n in &list {
-                    state_w.monitor_watchers.remove(n, client_id);
+                    if n.contains('!') || n.contains('@') {
+                        state_w.monitor_watchers.remove_pattern(n, client_id);
+                    } else {
+                        state_w.monitor_watchers.remove(n, client_id);
+                    }
                 }
             }
         }
@@ -469,16 +494,35 @@ pub async fn handle_monitor(
             let mut online = Vec::new();
             let mut offline = Vec::new();
             for n in &list {
-                let state_r = state.read().await;
-                let id_opt = state_r.nick_to_id.get(&n.to_uppercase()).cloned();
-                let client_arc = id_opt.and_then(|id| state_r.clients.get(&id).cloned());
-                drop(state_r);
-                match client_arc {
-                    Some(c) => {
-                        let src = c.read().await.source().unwrap_or_else(|| n.clone());
-                        online.push(src);
+                if n.contains('!') || n.contains('@') {
+                    // Pattern-based check
+                    let state_r = state.read().await;
+                    let mut matched = false;
+                    for c in state_r.clients.values() {
+                        let g = c.read().await;
+                        if let Some(src) = g.source() {
+                            if crate::user::glob_match(n, &src.to_lowercase()) {
+                                online.push(src);
+                                matched = true;
+                            }
+                        }
                     }
-                    None => offline.push(n.clone()),
+                    if !matched {
+                        offline.push(n.clone());
+                    }
+                } else {
+                    // Nick-based check
+                    let state_r = state.read().await;
+                    let id_opt = state_r.nick_to_id.get(&n.to_uppercase()).cloned();
+                    let client_arc = id_opt.and_then(|id| state_r.clients.get(&id).cloned());
+                    drop(state_r);
+                    match client_arc {
+                        Some(c) => {
+                            let src = c.read().await.source().unwrap_or_else(|| n.clone());
+                            online.push(src);
+                        }
+                        None => offline.push(n.clone()),
+                    }
                 }
             }
             if !online.is_empty() {
