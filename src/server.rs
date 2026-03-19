@@ -44,9 +44,9 @@ pub async fn run(cfg: Config, pidfile: Option<&Path>) -> anyhow::Result<()> {
 
     let state = ServerState::new();
     let channels = ChannelStore::new();
-    // Load channels.toml: pre-create channels with topic and persisted operators/voice
-    if let Some(ref config_dir) = cfg.config_dir {
-        let entries = crate::persist::load_channels(config_dir);
+    // Load channels from the database: pre-create channels with topic and persisted operators/voice
+    if let Some(ref pool) = cfg.db {
+        let entries = crate::persist::load_channels(pool).await;
         let mut store = channels.write().await;
         for e in entries {
             let ch = store

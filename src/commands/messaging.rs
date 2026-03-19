@@ -121,8 +121,8 @@ pub async fn handle_privmsg(
                 };
                 send_to_client_with_caps(&senders, mid, base_msg.clone(), &recipient_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref()).await;
             }
-            if let Some(ref config_dir) = cfg.config_dir {
-                let _ = persist::append_channel_history(config_dir, &ch_key, &source, &text, Some(&msgid));
+            if let Some(ref pool) = cfg.db {
+                let _ = persist::append_channel_history(pool, &ch_key, &source, &text, Some(&msgid)).await;
             }
         } else {
             reply_to_client(
@@ -228,8 +228,8 @@ pub async fn handle_notice(
                     send_to_client_with_caps(&senders, mid, base_msg.clone(), &recipient_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref()).await;
                 }
             }
-            if let Some(ref config_dir) = cfg.config_dir {
-                let _ = persist::append_channel_history(config_dir, &ch_key, &source, &text, Some(&msgid));
+            if let Some(ref pool) = cfg.db {
+                let _ = persist::append_channel_history(pool, &ch_key, &source, &text, Some(&msgid)).await;
             }
         }
     } else {
@@ -456,10 +456,11 @@ pub async fn deliver_multiline_batch(
         }
     }
 
-    if (batch.target.starts_with('#') || batch.target.starts_with('&')) && cfg.config_dir.is_some() {
-        let config_dir = cfg.config_dir.as_ref().unwrap();
-        for (_, text) in &batch.lines {
-            let _ = persist::append_channel_history(config_dir, &batch.target, &source, text, Some(&msgid));
+    if let Some(ref pool) = cfg.db {
+        if batch.target.starts_with('#') || batch.target.starts_with('&') {
+            for (_, text) in &batch.lines {
+                let _ = persist::append_channel_history(pool, &batch.target, &source, text, Some(&msgid)).await;
+            }
         }
     }
 
@@ -607,10 +608,11 @@ pub async fn handle_redact(
     let allowed = if client_id == sender_id {
         true
     } else if target.starts_with('#') || target.starts_with('&') {
+        // Only channel ops may redact others' messages
         let ch_key = canonical_channel_key(&target);
         let ch_store = channels.read().await;
         match ch_store.channels.get(&ch_key) {
-            Some(ch) => ch.read().await.members.contains_key(client_id),
+            Some(ch) => ch.read().await.members.get(client_id).map(|m| m.modes.op).unwrap_or(false),
             None => false,
         }
     } else {
@@ -666,8 +668,8 @@ pub async fn handle_chathistory(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let config_dir = match &cfg.config_dir {
-        Some(d) => d.clone(),
+    let pool = match cfg.db.as_ref() {
+        Some(p) => p,
         None => return Ok(()),
     };
     let params = &msg.params;
@@ -729,7 +731,7 @@ pub async fn handle_chathistory(
         return Ok(());
     }
 
-    let entries = persist::read_channel_history(&config_dir, target, limit);
+    let entries = persist::read_channel_history(pool, target, limit).await;
     let caps = {
         let state_r = state.read().await;
         match state_r.clients.get(client_id) {

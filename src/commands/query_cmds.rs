@@ -134,19 +134,19 @@ pub async fn handle_who(
                         let msg = Message::new("354", params).with_prefix(&cfg.server.name);
                         reply_to_client(&senders, client_id, msg, label).await;
                     } else {
-                        let nick_with_prefix = format!("{}{}", prefix_str, c.nick_or_id());
-                        let who_line = format!(
-                            "{} {} {} {} {} {} H{} :{}",
-                            target,
-                            c.display_user(),
-                            c.display_host(),
-                            cfg.server.name,
-                            nick_with_prefix,
-                            flags,
-                            hopcount,
-                            realname
-                        );
-                        let msg = Message::new("352", vec![nick.clone(), who_line]).with_prefix(&cfg.server.name);
+                        // RPL_WHOREPLY: channel user host server nick flags :hopcount realname
+                        let oper_flag = if c.oper { "*" } else { "" };
+                        let flags_field = format!("{}{}{}", flags, oper_flag, prefix_str);
+                        let msg = Message::new("352", vec![
+                            nick.clone(),
+                            target.to_string(),
+                            c.display_user().to_string(),
+                            c.display_host().to_string(),
+                            cfg.server.name.clone(),
+                            c.nick_or_id().to_string(),
+                            flags_field,
+                            format!(":{} {}", hopcount, realname),
+                        ]).with_prefix(&cfg.server.name);
                         reply_to_client(&senders, client_id, msg, label).await;
                     }
                 }
@@ -181,16 +181,19 @@ pub async fn handle_who(
                     let msg = Message::new("354", params).with_prefix(&cfg.server.name);
                     reply_to_client(&senders, client_id, msg, label).await;
                 } else {
-                    let who_line = format!(
-                        "* {} {} {} {} * H{} :{}",
-                        c.display_user(),
-                        c.display_host(),
-                        cfg.server.name,
-                        c.nick_or_id(),
-                        hopcount,
-                        realname
-                    );
-                    let msg = Message::new("352", vec![nick.clone(), who_line]).with_prefix(&cfg.server.name);
+                    // RPL_WHOREPLY: * user host server nick flags :hopcount realname
+                    let oper_flag = if c.oper { "*" } else { "" };
+                    let flags_field = format!("{}{}", flags, oper_flag);
+                    let msg = Message::new("352", vec![
+                        nick.clone(),
+                        "*".to_string(),
+                        c.display_user().to_string(),
+                        c.display_host().to_string(),
+                        cfg.server.name.clone(),
+                        c.nick_or_id().to_string(),
+                        flags_field,
+                        format!(":{} {}", hopcount, realname),
+                    ]).with_prefix(&cfg.server.name);
                     reply_to_client(&senders, client_id, msg, label).await;
                 }
             }

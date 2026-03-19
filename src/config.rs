@@ -6,6 +6,8 @@ use bcrypt::{hash, DEFAULT_COST};
 
 pub const DEFAULT_CONFIG_DIR: &str = "/etc/rIRCd";
 
+// ─── Top-level Config ─────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
@@ -20,14 +22,60 @@ pub struct Config {
     pub opers: Vec<OperConfig>,
     #[serde(default)]
     pub webirc: Option<WebircConfig>,
-    /// Set by load() from config file path; used for users.toml, channels.toml, history/
+    /// MariaDB connection settings.
+    #[serde(default)]
+    pub database: DatabaseConfig,
+    /// Live connection pool — populated after `load()`, not serialised.
     #[serde(skip)]
-    pub config_dir: Option<PathBuf>,
+    pub db: Option<sqlx::MySqlPool>,
 }
+
+// ─── Database ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DatabaseConfig {
+    #[serde(default = "default_db_host")]
+    pub host: String,
+    #[serde(default = "default_db_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_db_name")]
+    pub database: String,
+}
+
+fn default_db_host() -> String { "localhost".into() }
+fn default_db_port() -> u16 { 3306 }
+fn default_db_name() -> String { "rircdb".into() }
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            host: default_db_host(),
+            port: default_db_port(),
+            user: String::new(),
+            password: String::new(),
+            database: default_db_name(),
+        }
+    }
+}
+
+impl DatabaseConfig {
+    pub fn connection_url(&self) -> String {
+        format!(
+            "mysql://{}:{}@{}:{}/{}",
+            self.user, self.password, self.host, self.port, self.database
+        )
+    }
+}
+
+// ─── Server ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WebircConfig {
-    /// Password gateways must send to use WEBIRC (enables real IP/host from gateway).
+    /// Password gateways must send to use WEBIRC.
     pub password: String,
 }
 
@@ -39,6 +87,7 @@ pub struct ServerConfig {
     pub listen: Vec<String>,
     #[serde(default)]
     pub listen_tls: Vec<String>,
+    /// MOTD text displayed to clients on connect (inline, not a file path).
     #[serde(default = "default_motd")]
     pub motd: String,
     #[serde(default = "default_registration_timeout")]
@@ -47,29 +96,17 @@ pub struct ServerConfig {
     pub ping_timeout_secs: u64,
     #[serde(default = "default_disconnect_timeout")]
     pub disconnect_timeout_secs: u64,
-    /// If set, 005 CLIENTTAGDENY=... and relay drops these client-only tags (e.g. ["+typing"] or ["*"]).
+    /// If set, 005 CLIENTTAGDENY=... and relay drops these client-only tags.
     #[serde(default)]
     pub client_tag_deny: Option<Vec<String>>,
 }
 
-fn default_server_name() -> String {
-    "rIRCd.local".into()
-}
-fn default_listen() -> Vec<String> {
-    vec![":6667".into()]
-}
-fn default_motd() -> String {
-    "/etc/rIRCd/motd".into()
-}
-fn default_registration_timeout() -> u64 {
-    60
-}
-fn default_ping_timeout() -> u64 {
-    90
-}
-fn default_disconnect_timeout() -> u64 {
-    150
-}
+fn default_server_name() -> String { "rIRCd.local".into() }
+fn default_listen() -> Vec<String> { vec![":6667".into()] }
+fn default_motd() -> String { "Welcome to rIRCd!".into() }
+fn default_registration_timeout() -> u64 { 60 }
+fn default_ping_timeout() -> u64 { 90 }
+fn default_disconnect_timeout() -> u64 { 150 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -86,23 +123,21 @@ impl Default for ServerConfig {
     }
 }
 
+// ─── Network ──────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NetworkConfig {
     #[serde(default = "default_network_name")]
     pub name: String,
 }
 
-fn default_network_name() -> String {
-    "rIRCd".into()
-}
+fn default_network_name() -> String { "rIRCd".into() }
 
 impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            name: default_network_name(),
-        }
-    }
+    fn default() -> Self { Self { name: default_network_name() } }
 }
+
+// ─── TLS ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsConfig {
@@ -111,13 +146,10 @@ pub struct TlsConfig {
 }
 
 impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            cert: None,
-            key: None,
-        }
-    }
+    fn default() -> Self { Self { cert: None, key: None } }
 }
+
+// ─── Limits ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LimitsConfig {
@@ -127,12 +159,8 @@ pub struct LimitsConfig {
     pub max_line_length: usize,
 }
 
-fn default_max_channels() -> usize {
-    50
-}
-fn default_max_line_length() -> usize {
-    8191
-}
+fn default_max_channels() -> usize { 50 }
+fn default_max_line_length() -> usize { 8191 }
 
 impl Default for LimitsConfig {
     fn default() -> Self {
@@ -143,6 +171,8 @@ impl Default for LimitsConfig {
     }
 }
 
+// ─── Opers ────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OperConfig {
     pub name: String,
@@ -150,20 +180,23 @@ pub struct OperConfig {
     pub password_hash: String,
 }
 
+// ─── Methods ──────────────────────────────────────────────────────────────────
+
 impl Config {
     pub fn tls_enabled(&self) -> bool {
         self.tls.cert.is_some() && self.tls.key.is_some()
     }
 }
 
+// ─── Load / init ──────────────────────────────────────────────────────────────
+
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     let content = fs::read_to_string(path)?;
-    let mut config: Config = toml::from_str(&content)?;
-    config.config_dir = path.parent().map(PathBuf::from);
+    let config: Config = toml::from_str(&content)?;
     Ok(config)
 }
 
-/// Path to the PID file for a given config path (e.g. /etc/rIRCd/config.toml -> /etc/rIRCd/rircd.pid).
+/// Path to the PID file for a given config path.
 pub fn pidfile_path(config_path: &Path) -> PathBuf {
     config_path
         .parent()
@@ -171,6 +204,8 @@ pub fn pidfile_path(config_path: &Path) -> PathBuf {
         .join("rircd.pid")
 }
 
+/// Initialise /etc/rIRCd with a default config.toml.
+/// Users, channels, and history are stored in the database — no extra files needed.
 pub fn init_config_dir(dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(dir)?;
 
@@ -183,58 +218,9 @@ pub fn init_config_dir(dir: &Path) -> anyhow::Result<()> {
         println!("{} already exists, skipping", config_path.display());
     }
 
-    let users_toml = r#"# Registered user accounts for SASL
-# Use: rircd genpasswd to generate password hashes
-
-[[user]]
-nick = "nick"
-password = "$2a$12$..."
-email = "user@example.com"
-public_key = ""
-
-"#;
-    let users_path = dir.join("users.toml");
-    if !users_path.exists() {
-        fs::write(&users_path, users_toml)?;
-        println!("Created {}", users_path.display());
-    } else {
-        println!("{} already exists, skipping", users_path.display());
-    }
-
-    let channels_toml = r##"# Persistent channel config: topic and roles (op/voice) applied on join
-# name = channel name; topic = channel topic; operators/voice = nicks or account names
-
-[[channel]]
-name = "#general"
-topic = "Welcome"
-operators = ["alice", "bob"]
-voice = ["charlie"]
-
-"##;
-    let channels_path = dir.join("channels.toml");
-    if !channels_path.exists() {
-        fs::write(&channels_path, channels_toml)?;
-        println!("Created {}", channels_path.display());
-    } else {
-        println!("{} already exists, skipping", channels_path.display());
-    }
-
-    let history_dir = dir.join("history");
-    if !history_dir.exists() {
-        fs::create_dir_all(&history_dir)?;
-        println!("Created {}", history_dir.display());
-    }
-
-    let motd = include_str!("../default-motd.txt");
-    let motd_path = dir.join("motd");
-    if !motd_path.exists() {
-        fs::write(&motd_path, motd)?;
-        println!("Created {}", motd_path.display());
-    } else {
-        println!("{} already exists, skipping", motd_path.display());
-    }
-
-    println!("\nSetup complete. Edit {} and run: rircd run", config_path.display());
+    println!("\nSetup complete.");
+    println!("Edit {} then run: rircd run", config_path.display());
+    println!("The database schema is created automatically on first startup.");
     Ok(())
 }
 
@@ -252,17 +238,15 @@ pub fn genpasswd() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read PID from pidfile. Returns None if file missing or invalid.
+// ─── Process management ───────────────────────────────────────────────────────
+
 fn read_pidfile(pidfile: &Path) -> Option<nix::unistd::Pid> {
     let s = fs::read_to_string(pidfile).ok()?;
     let pid: i32 = s.trim().parse().ok()?;
-    if pid <= 0 {
-        return None;
-    }
+    if pid <= 0 { return None; }
     Some(nix::unistd::Pid::from_raw(pid))
 }
 
-/// Stop the running rIRCd server (sends SIGTERM to the process in the pidfile).
 pub fn stop_cmd(config_path: &Path) -> anyhow::Result<()> {
     let pidfile = pidfile_path(config_path);
     let pid = read_pidfile(&pidfile)
@@ -283,7 +267,6 @@ pub fn stop_cmd(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print whether the server is running (based on pidfile and process existence).
 pub fn status_cmd(config_path: &Path) -> anyhow::Result<()> {
     let pidfile = pidfile_path(config_path);
     let pid = match read_pidfile(&pidfile) {
