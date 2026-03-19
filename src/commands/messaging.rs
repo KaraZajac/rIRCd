@@ -120,11 +120,13 @@ pub async fn handle_privmsg(
 
     // draft/message-edit: if the client sends +draft/edit=<original-msgid>, verify ownership
     // before accepting the message. Only the original sender may edit their own message.
-    if let Some(Some(edit_msgid)) = msg.tags.get("+draft/edit") {
-        let edit_msgid = edit_msgid.clone();
+    let pending_edit_msgid: Option<String> = msg.tags.get("+draft/edit")
+        .and_then(|v| v.as_ref())
+        .cloned();
+    if let Some(ref edit_msgid) = pending_edit_msgid {
         let is_owner = {
             let state_r = state.read().await;
-            state_r.msgid_store.get(&edit_msgid)
+            state_r.msgid_store.get(edit_msgid.as_str())
                 .map(|(_, sid)| sid == client_id)
                 .unwrap_or(false)
         };
@@ -161,6 +163,12 @@ pub async fn handle_privmsg(
     {
         let mut state_w = state.write().await;
         state_w.record_msgid(msgid.clone(), target.to_string(), client_id.to_string());
+    }
+    // If this is an edit, update the channel history entry in the DB.
+    if let Some(ref orig_msgid) = pending_edit_msgid {
+        if let Some(ref pool) = cfg.db {
+            persist::update_channel_history_message(pool, orig_msgid, &text, &msgid).await;
+        }
     }
     let state_guard = state.read().await;
 
@@ -790,10 +798,13 @@ pub async fn handle_redact(
         return Ok(());
     }
 
-    // Remove from the store now that we've authorised the redaction.
+    // Remove from the in-memory store and delete from channel history.
     {
         let mut state_w = state.write().await;
         state_w.msgid_store.take(msgid);
+    }
+    if let Some(ref pool) = cfg.db {
+        persist::delete_channel_history_by_msgid(pool, msgid).await;
     }
 
     // Get sender's nick!user@host for the relay prefix.
