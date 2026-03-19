@@ -304,9 +304,15 @@ Channels, topics, operator lists, voice lists, and message history are all store
 | **whox** | Full | WHO with %fields; 354 RPL_WHOSPCRPL |
 | **bot** | Full | Umode +B; RPL_WHOISBOT (335) in WHOIS |
 | **message-redaction** | Full | REDACT command; msgid store; broadcast to channel/DM recipients |
+| **draft/message-edit** | Full | PRIVMSG with `+draft/edit=<msgid>` tag; sender ownership validated |
+| **draft/react** | Full | TAGMSG with `+draft/react=<emoji>`; forwarded via client-only tag relay |
+| **typing** | Full | TAGMSG with `+typing=active/paused/done`; forwarded via client-only tag relay |
+| **reply** | Full | Messages with `+reply=<msgid>` tag forwarded as-is |
 | **account-extban** | Full | MODE +b ~a:account; JOIN 474 when banned by account |
 | **sasl** | Full | AUTHENTICATE PLAIN and SCRAM-SHA-256; 903/904; advertised as `sasl=PLAIN,SCRAM-SHA-256` |
 | **monitor** | Full | MONITOR +/−/C/L/S; 730/731/732/733/734; on join/quit/nick |
+| **extended-monitor** | Full | MONITOR patterns with `nick!user@host` globs (`*`/`?` wildcards) |
+| **sts** | Full | Strict Transport Security; advertised in CAP LS only when TLS is configured; `duration=2592000` |
 | **draft/channel-rename** | Full | RENAME old new [reason]; op-only; fallback PART+JOIN for clients without cap |
 | **draft/chathistory** | Full | CHATHISTORY LATEST/BEFORE/AFTER; BATCH chathistory; DB-backed; limit 200 |
 | **draft/read-marker** | Full | MARKREAD target [timestamp]; per-account in-memory store |
@@ -314,6 +320,8 @@ Channels, topics, operator lists, voice lists, and message history are all store
 | **draft/account-registration** | Full | REGISTER \* [email] password; VERIFY returns INVALID_CODE (no email verification) |
 | **draft/multiline** | Full | BATCH draft/multiline; max-bytes=4096, max-lines=20; fallback for non-multiline clients |
 | **draft/pre-away** | Full | AWAY during registration; applied after NICK/USER complete |
+| **draft/channel-context** | Full | `+draft/channel-context` tag forwarded to channel members |
+| **draft/client-batch** | Full | Client-originated BATCH types collected and relayed to recipients |
 | **CLIENTTAGDENY** | Full | Optional 005 token; config `server.client_tag_deny` |
 | **WebIRC** | Full | WEBIRC password gateway hostname ip; config `[webirc]` |
 

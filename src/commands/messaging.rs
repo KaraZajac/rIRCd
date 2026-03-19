@@ -3,7 +3,7 @@ use crate::commands::reply_to_client;
 use crate::config::Config;
 use crate::persist;
 use crate::protocol::{add_tags_for_recipient, generate_msgid, Message};
-use crate::user::{PendingMultilineBatch, ServerState};
+use crate::user::{PendingClientBatch, PendingMultilineBatch, ServerState};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -995,5 +995,97 @@ pub async fn handle_markread(
         let m = Message::new("MARKREAD", vec![target.into(), ts_param]).with_prefix(&cfg.server.name);
         reply_to_client(&senders, client_id, m, label).await;
     }
+    Ok(())
+}
+
+/// Deliver a draft/client-batch to the target channel or user.
+/// Clients with the `batch` cap receive the batch wrapped in BATCH open/close with a server-assigned ref.
+/// Clients without the `batch` cap receive each message individually.
+pub async fn deliver_client_batch(
+    client_id: &str,
+    batch: PendingClientBatch,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
+    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    cfg: &Config,
+    _label: Option<&str>,
+) -> anyhow::Result<()> {
+    if batch.messages.is_empty() {
+        return Ok(());
+    }
+
+    let (source, sender_account) = {
+        let state_r = state.read().await;
+        let client = match state_r.clients.get(client_id) {
+            Some(c) => c.clone(),
+            None => return Ok(()),
+        };
+        let g = client.read().await;
+        let source = g.source().unwrap_or_else(|| client_id.to_string());
+        let account = g.account.clone();
+        (source, account)
+    };
+
+    let state_r = state.read().await;
+    let recipient_ids: Vec<String> = if batch.target.starts_with('#') || batch.target.starts_with('&') {
+        let ch_key = canonical_channel_key(&batch.target);
+        let ch_store = channels.read().await;
+        match ch_store.channels.get(&ch_key) {
+            Some(ch) => {
+                let ch = ch.read().await;
+                if !ch.is_member(client_id) {
+                    return Ok(());
+                }
+                ch.members.keys().cloned().collect()
+            }
+            None => return Ok(()),
+        }
+    } else {
+        match state_r.nick_to_id.get(&batch.target.to_uppercase()) {
+            Some(tid) => vec![tid.clone()],
+            None => return Ok(()),
+        }
+    };
+    drop(state_r);
+
+    // Generate a server-side batch ref for each recipient (they can't share the client's ref tag)
+    let server_ref = generate_msgid();
+
+    for mid in &recipient_ids {
+        let caps = {
+            let state_r = state.read().await;
+            match state_r.clients.get(mid).cloned() {
+                Some(c) => c.read().await.capabilities.clone(),
+                None => Default::default(),
+            }
+        };
+        let has_batch = caps.contains("batch") && caps.contains("draft/client-batch");
+
+        if has_batch {
+            let batch_start = Message::new(
+                "BATCH",
+                vec![format!("+{}", server_ref), batch.batch_type.clone(), batch.target.clone()],
+            )
+            .with_prefix(&source);
+            send_to_client(&senders, mid, batch_start).await;
+            for mut inner in batch.messages.clone() {
+                // Rewrite source prefix and strip the original batch tag
+                inner.prefix = Some(source.clone());
+                inner.tags.insert("batch".to_string(), Some(server_ref.clone()));
+                let tagged = add_tags_for_recipient(inner, &caps, sender_account.as_deref(), None, None, cfg.server.client_tag_deny.as_deref());
+                send_to_client(&senders, mid, tagged).await;
+            }
+            let batch_end = Message::new("BATCH", vec![format!("-{}", server_ref)]).with_prefix(&source);
+            send_to_client(&senders, mid, batch_end).await;
+        } else {
+            for mut inner in batch.messages.clone() {
+                inner.prefix = Some(source.clone());
+                inner.tags.remove("batch");
+                let tagged = add_tags_for_recipient(inner, &caps, sender_account.as_deref(), None, None, cfg.server.client_tag_deny.as_deref());
+                send_to_client(&senders, mid, tagged).await;
+            }
+        }
+    }
+
     Ok(())
 }
