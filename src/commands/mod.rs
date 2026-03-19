@@ -238,6 +238,10 @@ pub async fn handle_message(
         "WHOWAS" => server_cmds::handle_whowas(&client_id, msg, state, senders, cfg, label.as_deref()).await,
         "HELP" => server_cmds::handle_help(&client_id, msg, state, senders, cfg, label.as_deref()).await,
         "KNOCK" => server_cmds::handle_knock(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
+        "KILL" => server_cmds::handle_kill(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
+        "WALLOPS" => server_cmds::handle_wallops(&client_id, msg, state, senders, cfg, label.as_deref()).await,
+        "ISON" => query_cmds::handle_ison(&client_id, msg, state, senders, cfg, label.as_deref()).await,
+        "USERHOST" => query_cmds::handle_userhost(&client_id, msg, state, senders, cfg, label.as_deref()).await,
         _ => {
             let target = {
                 let state = state.read().await;

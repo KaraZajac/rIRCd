@@ -56,6 +56,10 @@ pub struct Client {
     pub vhost: Option<String>,
     /// Virtual username shown to others; used in source() when set
     pub vuser: Option<String>,
+    /// User mode +i: invisible (hidden from WHO unless sharing a channel)
+    pub invisible: bool,
+    /// User mode +w: receives WALLOPS broadcasts
+    pub wallops: bool,
 }
 
 impl Client {
@@ -76,6 +80,8 @@ impl Client {
             oper: false,
             vhost: None,
             vuser: None,
+            invisible: false,
+            wallops: false,
         }
     }
 
@@ -355,6 +361,33 @@ impl ServerState {
             timestamp: Utc::now().timestamp(),
         };
         self.push_whowas(entry);
+    }
+
+    /// Record WHOWAS for a killed client by client_id (used by KILL handler).
+    pub fn record_whowas_for_kill(&mut self, client_id: &str, server_name: &str) {
+        let entry_opt = if let Some(c) = self.clients.get(client_id) {
+            if let Ok(g) = c.try_read() {
+                if let Some(ref nick) = g.nick {
+                    Some(WhowasEntry {
+                        nick: nick.clone(),
+                        user: g.user.as_deref().unwrap_or("*").to_string(),
+                        host: g.host.clone(),
+                        realname: g.realname.as_deref().unwrap_or("").to_string(),
+                        server: server_name.to_string(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(entry) = entry_opt {
+            self.push_whowas(entry);
+        }
     }
 
     /// Push an already-built WhowasEntry (useful when the client borrow conflicts with &mut self).

@@ -289,6 +289,23 @@ pub async fn handle_whois(
                 )
                 .await;
             }
+            // 379 RPL_WHOISMODES — user modes
+            {
+                let mut modes = String::from("+");
+                if c.invisible { modes.push('i'); }
+                if c.oper { modes.push('o'); }
+                if c.account.is_some() { modes.push('r'); }
+                if c.wallops { modes.push('w'); }
+                if c.bot { modes.push('B'); }
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("379", vec![nick.clone(), target_nick.into(), format!("is using modes {}", modes)])
+                        .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+            }
         }
     }
 
@@ -537,5 +554,70 @@ pub async fn handle_monitor(
         _ => {}
     }
 
+    Ok(())
+}
+
+/// ISON nick1 [nick2 ...] — check which nicks are currently online (303 RPL_ISON).
+pub async fn handle_ison(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let state_r = state.read().await;
+    let nick = match state_r.clients.get(client_id) {
+        Some(c) => c.read().await.nick_or_id().to_string(),
+        None => return Ok(()),
+    };
+
+    // Nicks may be space-separated across multiple params or in trailing
+    let all: Vec<String> = msg.params.iter()
+        .flat_map(|p| p.split_whitespace().map(String::from))
+        .collect();
+
+    let mut online: Vec<String> = Vec::new();
+    for n in &all {
+        if state_r.nick_to_id.contains_key(&n.to_uppercase()) {
+            online.push(n.clone());
+        }
+    }
+
+    let m = Message::new("303", vec![nick, format!(":{}", online.join(" "))]).with_prefix(&cfg.server.name);
+    reply_to_client(&senders, client_id, m, label).await;
+    Ok(())
+}
+
+/// USERHOST nick1 [nick2 ...] — return host info for up to 5 nicks (302 RPL_USERHOST).
+pub async fn handle_userhost(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let state_r = state.read().await;
+    let nick = match state_r.clients.get(client_id) {
+        Some(c) => c.read().await.nick_or_id().to_string(),
+        None => return Ok(()),
+    };
+
+    let mut results: Vec<String> = Vec::new();
+    for target_nick in msg.params.iter().take(5) {
+        if let Some(tid) = state_r.nick_to_id.get(&target_nick.to_uppercase()) {
+            if let Some(c) = state_r.clients.get(tid) {
+                let g = c.read().await;
+                let oper_star = if g.oper { "*" } else { "" };
+                let away_sign = if g.away_message.is_some() { "-" } else { "+" };
+                results.push(format!("{}{}={}{}@{}",
+                    g.nick_or_id(), oper_star, away_sign, g.display_user(), g.display_host()));
+            }
+        }
+    }
+
+    let m = Message::new("302", vec![nick, format!(":{}", results.join(" "))]).with_prefix(&cfg.server.name);
+    reply_to_client(&senders, client_id, m, label).await;
     Ok(())
 }

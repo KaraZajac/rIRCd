@@ -47,7 +47,7 @@ async fn send_to_client(
 
 /// ISUPPORT (005) token list; used at registration and for extended-isupport.
 fn isupport_tokens(cfg: &Config) -> String {
-    let base = "CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 MODES=4 CASEMAPPING=ascii PREFIX=(ohv)@%+ UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp";
+    let base = "CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp";
     let deny = cfg
         .server
         .client_tag_deny
@@ -135,7 +135,7 @@ pub async fn complete_registration(
     reply_to_client(
         &senders,
         client_id,
-        Message::new("004", vec![nick_str.clone(), server.clone(), "rIRCd-0.1".into(), "iow".into()])
+        Message::new("004", vec![nick_str.clone(), server.clone(), "rIRCd-0.1".into(), "BiorRw".into(), "beIqklimntspRcC".into()])
             .with_prefix(server),
         label,
     )
