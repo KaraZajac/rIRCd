@@ -696,3 +696,29 @@ pub async fn list_history_targets(
         .map(|r| (r.get::<String, _>("channel"), r.get::<String, _>("latest_ts")))
         .collect()
 }
+
+/// Delete a single message from channel history by its msgid (used by REDACT).
+pub async fn delete_channel_history_by_msgid(pool: &sqlx::MySqlPool, msgid: &str) {
+    let _ = sqlx::query("DELETE FROM channel_history WHERE msgid = ?")
+        .bind(msgid)
+        .execute(pool)
+        .await;
+}
+
+/// Update the text (and replace the msgid) of a channel history entry identified by the original
+/// msgid. Used when a client edits a previously-sent message via `+draft/edit`.
+pub async fn update_channel_history_message(
+    pool: &sqlx::MySqlPool,
+    original_msgid: &str,
+    new_text: &str,
+    new_msgid: &str,
+) {
+    let _ = sqlx::query(
+        "UPDATE channel_history SET text = ?, msgid = ? WHERE msgid = ?",
+    )
+    .bind(new_text)
+    .bind(new_msgid)
+    .bind(original_msgid)
+    .execute(pool)
+    .await;
+}
