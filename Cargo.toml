@@ -13,7 +13,7 @@ toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rustls = "0.22"
+rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 bcrypt = "0.17"
