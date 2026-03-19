@@ -593,19 +593,16 @@ pub async fn read_channel_history(
     }
 }
 
-/// Read messages centered around a reference point (`msgid=xxx` or `timestamp=xxx`), oldest-first.
-pub async fn read_channel_history_around(
+/// Resolve a CHATHISTORY cursor (`msgid=xxx` or `timestamp=xxx`) to a row id.
+/// For msgid cursors, returns the id of that exact row.
+/// For timestamp cursors, returns the id of the last row at or before that timestamp.
+async fn resolve_cursor(
     pool: &sqlx::MySqlPool,
     channel_name: &str,
     cursor: &str,
-    limit: usize,
-) -> Vec<HistoryEntry> {
+) -> Option<i64> {
     use sqlx::Row;
-
-    let half = ((limit + 1) / 2).max(1) as i64;
-
-    // Resolve the pivot row ID from the cursor.
-    let pivot_id: Option<i64> = if let Some(msgid) = cursor.strip_prefix("msgid=") {
+    if let Some(msgid) = cursor.strip_prefix("msgid=") {
         sqlx::query(
             "SELECT id FROM channel_history WHERE channel = ? AND msgid = ? LIMIT 1",
         )
@@ -629,9 +626,94 @@ pub async fn read_channel_history_around(
         .map(|r: sqlx::mysql::MySqlRow| r.get::<i64, _>("id"))
     } else {
         None
-    };
+    }
+}
 
-    let pivot_id = match pivot_id {
+/// Read up to `limit` messages strictly BEFORE the cursor, returned oldest-first.
+pub async fn read_channel_history_before(
+    pool: &sqlx::MySqlPool,
+    channel_name: &str,
+    cursor: &str,
+    limit: usize,
+) -> Vec<HistoryEntry> {
+    use sqlx::Row;
+    let pivot = match resolve_cursor(pool, channel_name, cursor).await {
+        Some(id) => id,
+        None => return Vec::new(),
+    };
+    let rows = sqlx::query(
+        "SELECT ts, source, text, msgid
+         FROM (
+             SELECT id, ts, source, text, msgid
+             FROM channel_history
+             WHERE channel = ? AND id < ?
+             ORDER BY id DESC
+             LIMIT ?
+         ) AS sub
+         ORDER BY id ASC",
+    )
+    .bind(channel_name)
+    .bind(pivot)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|r| HistoryEntry {
+            ts: r.get("ts"),
+            source: r.get("source"),
+            text: r.get("text"),
+            msgid: r.get("msgid"),
+        })
+        .collect()
+}
+
+/// Read up to `limit` messages strictly AFTER the cursor, returned oldest-first.
+pub async fn read_channel_history_after(
+    pool: &sqlx::MySqlPool,
+    channel_name: &str,
+    cursor: &str,
+    limit: usize,
+) -> Vec<HistoryEntry> {
+    use sqlx::Row;
+    let pivot = match resolve_cursor(pool, channel_name, cursor).await {
+        Some(id) => id,
+        None => return Vec::new(),
+    };
+    let rows = sqlx::query(
+        "SELECT id, ts, source, text, msgid
+         FROM channel_history
+         WHERE channel = ? AND id > ?
+         ORDER BY id ASC
+         LIMIT ?",
+    )
+    .bind(channel_name)
+    .bind(pivot)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|r| HistoryEntry {
+            ts: r.get("ts"),
+            source: r.get("source"),
+            text: r.get("text"),
+            msgid: r.get("msgid"),
+        })
+        .collect()
+}
+
+/// Read messages centered around a reference point (`msgid=xxx` or `timestamp=xxx`), oldest-first.
+pub async fn read_channel_history_around(
+    pool: &sqlx::MySqlPool,
+    channel_name: &str,
+    cursor: &str,
+    limit: usize,
+) -> Vec<HistoryEntry> {
+    use sqlx::Row;
+
+    let half = ((limit + 1) / 2).max(1) as i64;
+    let pivot_id = match resolve_cursor(pool, channel_name, cursor).await {
         Some(id) => id,
         None => return Vec::new(),
     };

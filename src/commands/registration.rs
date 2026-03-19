@@ -283,19 +283,19 @@ pub async fn handle_cap(
             } else {
                 None
             };
+            // CAP LS 302 multi-line format per IRCv3 spec:
+            //   continuation lines: CAP * LS * :cap1 cap2 ...
+            //   final line:         CAP * LS :cap1 cap2 ...
+            // Without 302 (or single-line): CAP * LS :cap1 cap2 ...
             let caps = build_cap_list(version_302, tls_port);
+            let total = caps.len();
             for (i, cap_line) in caps.iter().enumerate() {
-                let last = if caps.len() > 1 && i == caps.len() - 1 {
-                    "*"
-                } else if version_302 && caps.len() == 1 {
-                    "302"
+                let is_last = i == total - 1;
+                let params = if !is_last {
+                    // Continuation: the asterisk is a separate third parameter.
+                    vec!["*".into(), "LS".into(), "*".into(), cap_line.clone()]
                 } else {
-                    "*"
-                };
-                let params = if caps.len() > 1 {
-                    vec!["*".into(), "LS".into(), format!("{} {}", cap_line, last)]
-                } else {
-                    vec!["*".into(), "LS".into(), format!("{} {}", cap_line, last)]
+                    vec!["*".into(), "LS".into(), cap_line.clone()]
                 };
                 let mut reply = Message::new("CAP", params);
                 reply.prefix = Some(cfg.server.name.clone());
@@ -323,21 +323,8 @@ pub async fn handle_cap(
                 let mut reply = Message::new("CAP", vec!["*".into(), "ACK".into(), ack.join(" ")]);
                 reply.prefix = Some(cfg.server.name.clone());
                 reply_to_client(&senders, client_id, reply, label).await;
-                if conn.capabilities.contains("cap-notify") {
-                    let list = crate::capability::CAPS
-                        .iter()
-                        .copied()
-                        .filter(|c| *c != "capability-negotiation")
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    reply_to_client(
-                        &senders,
-                        client_id,
-                        Message::new("CAP", vec!["*".into(), "NOTIFY".into(), list]).with_prefix(&cfg.server.name),
-                        label,
-                    )
-                    .await;
-                }
+                // cap-notify: no action needed here; CAP NEW/DEL would be sent if
+                // the server's capability list changed at runtime (it doesn't).
             } else {
                 let mut reply = Message::new("CAP", vec!["*".into(), "NAK".into(), nak.join(" ")]);
                 reply.prefix = Some(cfg.server.name.clone());
@@ -346,21 +333,6 @@ pub async fn handle_cap(
         }
         "END" => {
             conn.cap_ended = true;
-            if conn.capabilities.contains("cap-notify") {
-                let list = crate::capability::CAPS
-                    .iter()
-                    .copied()
-                    .filter(|c| *c != "capability-negotiation")
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    Message::new("CAP", vec!["*".into(), "NOTIFY".into(), list]).with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
-            }
         }
         _ => {}
     }

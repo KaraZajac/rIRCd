@@ -329,10 +329,10 @@ pub async fn handle_notice(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let target = msg.params.first().map(|s| s.as_str()).unwrap_or("");
+    let raw_target = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let text = msg.trailing().unwrap_or("").to_string();
 
-    if target.is_empty() || text.is_empty() {
+    if raw_target.is_empty() || text.is_empty() {
         return Ok(());
     }
 
@@ -348,6 +348,16 @@ pub async fn handle_notice(
     drop(sender_data);
     drop(state_guard);
 
+    // STATUSMSG: @#channel (ops+halfops) or +#channel (voiced+ops+halfops)
+    let (statusmsg_prefix, target) = if (raw_target.starts_with('@') || raw_target.starts_with('+'))
+        && raw_target.len() > 1
+        && (raw_target[1..].starts_with('#') || raw_target[1..].starts_with('&'))
+    {
+        (Some(raw_target.chars().next().unwrap()), &raw_target[1..])
+    } else {
+        (None, raw_target)
+    };
+
     let msgid = generate_msgid();
     {
         let mut state_w = state.write().await;
@@ -355,35 +365,64 @@ pub async fn handle_notice(
     }
     let state_guard = state.read().await;
 
-    let base_msg = Message::new("NOTICE", vec![target.into(), text.clone()]).with_prefix(&source);
+    let display_target = if let Some(pfx) = statusmsg_prefix {
+        format!("{}{}", pfx, target)
+    } else {
+        target.to_string()
+    };
+    let base_msg = Message::new("NOTICE", vec![display_target, text.clone()]).with_prefix(&source);
 
     if target.starts_with('#') || target.starts_with('&') {
         let ch_key = canonical_channel_key(&target);
         let ch_store = channels.read().await;
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
-            if ch.is_member(client_id) {
-                for (mid, _) in &ch.members {
-                    if *mid == client_id {
-                        if echo_message {
-                            let caps = match state_guard.clients.get(mid) {
-                                Some(c) => c.read().await.capabilities.clone(),
-                                None => Default::default(),
-                            };
-                            let tagged = add_tags_for_recipient(base_msg.clone(), &caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref());
-                            reply_to_client(&senders, client_id, tagged, label).await;
-                        }
-                        continue;
-                    }
-                    let recipient_caps = match state_guard.clients.get(mid) {
-                        Some(c) => c.read().await.capabilities.clone(),
-                        None => Default::default(),
-                    };
-                    send_to_client_with_caps(&senders, mid, base_msg.clone(), &recipient_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref()).await;
-                }
+            if !ch.is_member(client_id) {
+                return Ok(());
             }
-            if let Some(ref pool) = cfg.db {
-                let _ = persist::append_channel_history(pool, &ch_key, &source, &text, Some(&msgid)).await;
+            // +m: only voiced/op may send
+            if ch.modes.moderated && !ch.members.get(client_id).map(|m| m.modes.voice || m.modes.halfop || m.modes.op).unwrap_or(false) {
+                return Ok(()); // NOTICE silently drops per RFC
+            }
+            // +R: registered-only channel
+            if ch.modes.registered_only && sender_account.is_none() {
+                return Ok(());
+            }
+            // +q: sender is quieted
+            if ch.is_quieted(sender_account.as_deref(), &source) {
+                return Ok(());
+            }
+            for (mid, memb) in &ch.members {
+                // STATUSMSG filter
+                if let Some(pfx) = statusmsg_prefix {
+                    let passes = match pfx {
+                        '@' => memb.modes.op || memb.modes.halfop,
+                        '+' => memb.modes.voice || memb.modes.halfop || memb.modes.op,
+                        _ => true,
+                    };
+                    if !passes { continue; }
+                }
+                if *mid == client_id {
+                    if echo_message {
+                        let caps = match state_guard.clients.get(mid) {
+                            Some(c) => c.read().await.capabilities.clone(),
+                            None => Default::default(),
+                        };
+                        let tagged = add_tags_for_recipient(base_msg.clone(), &caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref());
+                        reply_to_client(&senders, client_id, tagged, label).await;
+                    }
+                    continue;
+                }
+                let recipient_caps = match state_guard.clients.get(mid) {
+                    Some(c) => c.read().await.capabilities.clone(),
+                    None => Default::default(),
+                };
+                send_to_client_with_caps(&senders, mid, base_msg.clone(), &recipient_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref()).await;
+            }
+            if statusmsg_prefix.is_none() {
+                if let Some(ref pool) = cfg.db {
+                    let _ = persist::append_channel_history(pool, &ch_key, &source, &text, Some(&msgid)).await;
+                }
             }
         }
     } else {
@@ -987,10 +1026,11 @@ pub async fn handle_chathistory(
         return Ok(());
     }
 
-    let entries = if subcommand == "AROUND" && cursor != "*" {
-        persist::read_channel_history_around(pool, target, cursor, limit).await
-    } else {
-        persist::read_channel_history(pool, target, limit).await
+    let entries = match (subcommand.as_str(), cursor) {
+        ("AROUND", c) if c != "*" => persist::read_channel_history_around(pool, target, c, limit).await,
+        ("BEFORE", c) if c != "*" => persist::read_channel_history_before(pool, target, c, limit).await,
+        ("AFTER",  c) if c != "*" => persist::read_channel_history_after(pool, target, c, limit).await,
+        _ => persist::read_channel_history(pool, target, limit).await,
     };
     let caps = {
         let state_r = state.read().await;
