@@ -204,23 +204,167 @@ pub fn pidfile_path(config_path: &Path) -> PathBuf {
         .join("rircd.pid")
 }
 
-/// Initialise /etc/rIRCd with a default config.toml.
+// ─── Interactive init helpers ─────────────────────────────────────────────────
+
+fn prompt(label: &str, default: &str) -> String {
+    if default.is_empty() {
+        print!("  {}: ", label);
+    } else {
+        print!("  {} [{}]: ", label, default);
+    }
+    io::stdout().flush().unwrap();
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).unwrap();
+    let s = s.trim().to_string();
+    if s.is_empty() { default.to_string() } else { s }
+}
+
+fn prompt_bool(label: &str, default: bool) -> bool {
+    let hint = if default { "Y/n" } else { "y/N" };
+    print!("  {} [{}]: ", label, hint);
+    io::stdout().flush().unwrap();
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).unwrap();
+    let s = s.trim().to_lowercase();
+    if s.is_empty() { default } else { s.starts_with('y') }
+}
+
+fn prompt_password_twice(label: &str) -> String {
+    loop {
+        let p1 = rpassword::prompt_password(format!("  {}: ", label)).unwrap_or_default();
+        let p2 = rpassword::prompt_password(format!("  {} (confirm): ", label)).unwrap_or_default();
+        if p1 == p2 {
+            return p1;
+        }
+        println!("  Passwords do not match, try again.");
+    }
+}
+
+/// Initialise /etc/rIRCd with an interactively generated config.toml.
 /// Users, channels, and history are stored in the database — no extra files needed.
 pub fn init_config_dir(dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(dir)?;
-
-    let config_toml = include_str!("../default-config.toml");
     let config_path = dir.join("config.toml");
-    if !config_path.exists() {
-        fs::write(&config_path, config_toml)?;
-        println!("Created {}", config_path.display());
-    } else {
-        println!("{} already exists, skipping", config_path.display());
+
+    if config_path.exists() {
+        println!("{} already exists.", config_path.display());
+        print!("  Overwrite it? [y/N]: ");
+        io::stdout().flush().unwrap();
+        let mut s = String::new();
+        std::io::stdin().read_line(&mut s).unwrap();
+        if !s.trim().to_lowercase().starts_with('y') {
+            println!("Keeping existing config. Run: rircd run");
+            return Ok(());
+        }
     }
 
-    println!("\nSetup complete.");
-    println!("Edit {} then run: rircd run", config_path.display());
+    println!("\nrIRCd interactive setup");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Press Enter to accept the [default] value.\n");
+
+    // ── Server ────────────────────────────────────────────────────────────────
+    println!("[Server]");
+    let server_name = prompt("Server hostname", "irc.example.com");
+    let network_name = prompt("Network name", "rIRCd");
+    let plain_port = prompt("Plain-text IRC port", "6667");
+    let motd_line = prompt("Message of the day", "Welcome to rIRCd!");
+
+    // ── TLS ───────────────────────────────────────────────────────────────────
+    println!("\n[TLS]");
+    let want_tls = prompt_bool("Enable TLS listener?", false);
+    let (tls_port, tls_cert, tls_key) = if want_tls {
+        let port = prompt("TLS port", "6697");
+        let cert = prompt("Path to certificate (PEM)", "/etc/rIRCd/cert.pem");
+        let key  = prompt("Path to private key (PEM)", "/etc/rIRCd/key.pem");
+        (Some(port), Some(cert), Some(key))
+    } else {
+        (None, None, None)
+    };
+
+    // ── Database ──────────────────────────────────────────────────────────────
+    println!("\n[Database]");
+    println!("  (rIRCd requires MariaDB/MySQL for user accounts and channel history.)");
+    let db_host = prompt("Database host", "localhost");
+    let db_port = prompt("Database port", "3306");
+    let db_name = prompt("Database name", "rircdb");
+    let db_user = prompt("Database user", "rirc");
+    let db_pass = rpassword::prompt_password("  Database password: ").unwrap_or_default();
+
+    // ── IRC Operator ──────────────────────────────────────────────────────────
+    println!("\n[IRC Operator]");
+    let want_oper = prompt_bool("Create an IRC operator account?", true);
+    let oper_block = if want_oper {
+        let oper_name = prompt("Operator name", "admin");
+        let oper_pass = prompt_password_twice("Operator password");
+        if oper_pass.is_empty() {
+            println!("  Empty password, skipping operator creation.");
+            String::new()
+        } else {
+            match hash(&oper_pass, DEFAULT_COST) {
+                Ok(h) => format!(
+                    "\n[[opers]]\nname = \"{}\"\nhostmask = \"*\"\npassword_hash = \"{}\"\n",
+                    oper_name, h
+                ),
+                Err(e) => {
+                    println!("  Failed to hash password ({}), skipping oper.", e);
+                    String::new()
+                }
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    // ── Assemble config ───────────────────────────────────────────────────────
+    let listen_tls_line = match &tls_port {
+        Some(p) => format!("\nlisten_tls = [\":{}\"]", p),
+        None => String::new(),
+    };
+    let tls_block = match (&tls_cert, &tls_key) {
+        (Some(cert), Some(key)) => format!(
+            "\n[tls]\ncert = \"{}\"\nkey  = \"{}\"\n",
+            cert, key
+        ),
+        _ => String::new(),
+    };
+
+    let config_content = format!(
+        r#"# rIRCd configuration — generated by `rircd init`
+# https://github.com/KaraZajac/rIRCd
+
+[server]
+name = "{server_name}"
+listen = [":{plain_port}"]{listen_tls_line}
+motd = """
+{motd_line}
+"""
+
+registration_timeout_secs = 60
+ping_timeout_secs = 90
+disconnect_timeout_secs = 150
+
+[network]
+name = "{network_name}"
+
+[database]
+host = "{db_host}"
+port = {db_port}
+user = "{db_user}"
+password = "{db_pass}"
+database = "{db_name}"
+{tls_block}
+[limits]
+max_channels_per_client = 50
+max_line_length = 8191
+{oper_block}"#
+    );
+
+    fs::write(&config_path, &config_content)?;
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Config written to {}", config_path.display());
     println!("The database schema is created automatically on first startup.");
+    println!("\nStart the server with:  rircd run");
     Ok(())
 }
 

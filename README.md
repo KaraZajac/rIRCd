@@ -29,34 +29,65 @@ cargo build --release
 sudo cp target/release/rircd /usr/local/bin/
 ```
 
-### 3. Initialise the config directory
+### 3. Run the interactive setup
 
 ```bash
 sudo rircd init
-# Creates /etc/rIRCd/config.toml with defaults
 ```
 
-### 4. Edit the config
+This starts an interactive prompt that asks for:
 
-```bash
-sudo nano /etc/rIRCd/config.toml
+- **Server hostname** and **network name**
+- **Plain-text port** (default: 6667) and optionally a **TLS port** with cert/key paths
+- **Database credentials** (host, port, name, user, password)
+- **Message of the day**
+- Optionally, an **IRC operator** account (password is bcrypt-hashed automatically)
+
+A `config.toml` is written to `/etc/rIRCd/` with all your answers filled in. If the file already exists you are asked before overwriting.
+
+Example session:
+
+```
+rIRCd interactive setup
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Press Enter to accept the [default] value.
+
+[Server]
+  Server hostname [irc.example.com]: irc.mynetwork.org
+  Network name [rIRCd]: MyNet
+  Plain-text IRC port [6667]:
+  Message of the day [Welcome to rIRCd!]: Welcome to MyNet!
+
+[TLS]
+  Enable TLS listener? [y/N]: y
+  TLS port [6697]:
+  Path to certificate (PEM) [/etc/rIRCd/cert.pem]:
+  Path to private key (PEM) [/etc/rIRCd/key.pem]:
+
+[Database]
+  (rIRCd requires MariaDB/MySQL for user accounts and channel history.)
+  Database host [localhost]:
+  Database port [3306]:
+  Database name [rircdb]:
+  Database user [rirc]:
+  Database password:
+
+[IRC Operator]
+  Create an IRC operator account? [Y/n]:
+  Operator name [admin]:
+  Operator password:
+  Operator password (confirm):
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Config written to /etc/rIRCd/config.toml
+The database schema is created automatically on first startup.
+
+Start the server with:  rircd run
 ```
 
-At minimum, set your database credentials and server name:
+You can always hand-edit `/etc/rIRCd/config.toml` afterwards — see [Configuration Reference](#configuration-reference) below.
 
-```toml
-[server]
-name = "irc.example.com"
-
-[database]
-host = "localhost"
-port = 3306
-user = "rirc"
-password = "your-password"
-database = "rircdb"
-```
-
-### 5. Start the server
+### 4. Start the server
 
 ```bash
 sudo rircd run
