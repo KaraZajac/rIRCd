@@ -115,6 +115,35 @@ pub async fn handle_privmsg(
     drop(sender_data);
     drop(state_guard);
 
+    // draft/message-edit: if the client sends +draft/edit=<original-msgid>, verify ownership
+    // before accepting the message. Only the original sender may edit their own message.
+    if let Some(Some(edit_msgid)) = msg.tags.get("+draft/edit") {
+        let edit_msgid = edit_msgid.clone();
+        let is_owner = {
+            let state_r = state.read().await;
+            state_r.msgid_store.get(&edit_msgid)
+                .map(|(_, sid)| sid == client_id)
+                .unwrap_or(false)
+        };
+        if !is_owner {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("FAIL", vec![
+                    "EDIT".into(),
+                    "CANNOT_EDIT".into(),
+                    target.to_string(),
+                    edit_msgid.clone(),
+                    "Message not found or you are not the original sender".into(),
+                ])
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
     let msgid = generate_msgid();
     {
         let mut state_w = state.write().await;
@@ -645,12 +674,21 @@ pub async fn handle_redact(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let msgid = msg.params.first().map(|s| s.as_str()).unwrap_or("");
-    if msgid.is_empty() {
+    // Per IRCv3 message-redaction spec: REDACT <target> <msgid> [:<reason>]
+    let target_param = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
+    let msgid = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
+    // Reason is the trailing param (index 2) if provided.
+    let reason = if msg.params.len() > 2 {
+        msg.params.get(2).map(|s| s.as_str()).unwrap_or("message redacted")
+    } else {
+        "message redacted"
+    };
+
+    if target_param.is_empty() || msgid.is_empty() {
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec!["REDACT".into(), "NEED_MORE_PARAMS".into(), "Message ID required".into()])
+            Message::new("FAIL", vec!["REDACT".into(), "NEED_MORE_PARAMS".into(), "Target and message ID required".into()])
                 .with_prefix(&cfg.server.name),
             label,
         )
@@ -658,13 +696,15 @@ pub async fn handle_redact(
         return Ok(());
     }
 
+    // Look up the original message to get target and original sender.
+    // Use the server-recorded target (not the one the client provided, to prevent spoofing).
     let entry = {
-        let mut state_w = state.write().await;
-        state_w.msgid_store.take(msgid)
+        let state_r = state.read().await;
+        state_r.msgid_store.get(msgid).map(|(t, s)| (t.to_string(), s.to_string()))
     };
 
     let (target, sender_id) = match entry {
-        Some((t, s)) => (t, s),
+        Some(e) => e,
         None => {
             reply_to_client(
                 &senders,
@@ -681,7 +721,7 @@ pub async fn handle_redact(
     let allowed = if client_id == sender_id {
         true
     } else if target.starts_with('#') || target.starts_with('&') {
-        // Only channel ops may redact others' messages
+        // Channel ops may redact others' messages
         let ch_key = canonical_channel_key(&target);
         let ch_store = channels.read().await;
         match ch_store.channels.get(&ch_key) {
@@ -689,6 +729,7 @@ pub async fn handle_redact(
             None => false,
         }
     } else {
+        // DM: only the message target may redact (i.e. the recipient of a DM can remove it from their view)
         let state_r = state.read().await;
         state_r.nick_to_id.get(&target.to_uppercase()).map_or(false, |tid| *tid == client_id)
     };
@@ -705,24 +746,63 @@ pub async fn handle_redact(
         return Ok(());
     }
 
-    let redact_msg = Message::new("REDACT", vec![msgid.into(), format!(":{}", target)]).with_prefix(&cfg.server.name);
+    // Remove from the store now that we've authorised the redaction.
+    {
+        let mut state_w = state.write().await;
+        state_w.msgid_store.take(msgid);
+    }
 
+    // Get sender's nick!user@host for the relay prefix.
+    let source = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => c.read().await.source().unwrap_or_else(|| client_id.to_string()),
+            None => client_id.to_string(),
+        }
+    };
+
+    // Per spec: :<nick!user@host> REDACT <target> <msgid> :<reason>
+    let redact_relay = Message::new("REDACT", vec![target.clone(), msgid.to_string(), reason.to_string()])
+        .with_prefix(&source);
+
+    // Deliver only to clients that have negotiated the message-redaction capability.
     if target.starts_with('#') || target.starts_with('&') {
         let ch_key = canonical_channel_key(&target);
         let ch_store = channels.read().await;
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let member_ids: Vec<String> = ch.read().await.members.keys().cloned().collect();
             drop(ch_store);
+            let state_r = state.read().await;
             for mid in &member_ids {
-                send_to_client(&senders, mid, redact_msg.clone()).await;
+                let has_cap = match state_r.clients.get(mid) {
+                    Some(c) => c.read().await.capabilities.contains("message-redaction"),
+                    None => false,
+                };
+                if has_cap {
+                    send_to_client(&senders, mid, redact_relay.clone()).await;
+                }
             }
         }
     } else {
-        let tid_opt = state.read().await.nick_to_id.get(&target.to_uppercase()).cloned();
-        if let Some(tid) = tid_opt {
-            send_to_client(&senders, &tid, redact_msg.clone()).await;
+        // DM: send to original sender and recipient if they have the cap.
+        let state_r = state.read().await;
+        let tid_opt = state_r.nick_to_id.get(&target.to_uppercase()).cloned();
+        let sender_has_cap = state_r.clients.get(client_id)
+            .map(|c| c.try_read().map(|g| g.capabilities.contains("message-redaction")).unwrap_or(false))
+            .unwrap_or(false);
+        let recipient_has_cap = tid_opt.as_deref().and_then(|tid| state_r.clients.get(tid))
+            .map(|c| c.try_read().map(|g| g.capabilities.contains("message-redaction")).unwrap_or(false))
+            .unwrap_or(false);
+        drop(state_r);
+
+        if sender_has_cap {
+            send_to_client(&senders, client_id, redact_relay.clone()).await;
         }
-        send_to_client(&senders, &sender_id, redact_msg).await;
+        if let Some(ref tid) = tid_opt {
+            if tid != client_id && recipient_has_cap {
+                send_to_client(&senders, tid, redact_relay.clone()).await;
+            }
+        }
     }
 
     Ok(())
