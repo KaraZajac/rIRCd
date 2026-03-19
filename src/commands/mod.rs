@@ -223,6 +223,7 @@ pub async fn handle_message(
         "SETUSER" => registration::handle_setuser(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
         "SETNAME" => registration::handle_setname(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
         "ISUPPORT" => registration::handle_isupport(&client_id, state, senders, cfg, label.as_deref()).await,
+        "MOTD" => registration::handle_motd(&client_id, state, senders, cfg, label.as_deref()).await,
         "REDACT" => messaging::handle_redact(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
         "CHATHISTORY" => messaging::handle_chathistory(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
         "MONITOR" => query_cmds::handle_monitor(&client_id, msg, state, senders, cfg, label.as_deref()).await,

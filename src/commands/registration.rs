@@ -47,7 +47,7 @@ async fn send_to_client(
 
 /// ISUPPORT (005) token list; used at registration and for extended-isupport.
 fn isupport_tokens(cfg: &Config) -> String {
-    let base = "CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp";
+    let base = "CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp";
     let deny = cfg
         .server
         .client_tag_deny
@@ -158,27 +158,7 @@ pub async fn complete_registration(
     )
     .await;
 
-    for line in cfg.server.motd.lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new("372", vec![nick_str.clone(), format!("- {}", line)])
-                    .with_prefix(server),
-                label,
-            )
-            .await;
-        }
-    }
-    reply_to_client(
-        &senders,
-        client_id,
-        Message::new("376", vec![nick_str.clone(), "End of /MOTD command.".into()])
-            .with_prefix(server),
-        label,
-    )
-    .await;
+    send_motd(nick_str, server, &senders, cfg, label, client_id).await;
 
     // monitor: notify clients monitoring this nick that they came online (730)
     let source = client.read().await.source().unwrap_or_else(|| nick_str.clone());
@@ -624,6 +604,64 @@ pub async fn handle_pass(
         let conn = state.get_or_create_pending(client_id, "unknown");
         conn.pass = Some(p.to_string());
     }
+    Ok(())
+}
+
+/// Send MOTD lines (375 / 372... / 376) to a client.
+async fn send_motd(
+    nick: &str,
+    server: &str,
+    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    cfg: &Config,
+    label: Option<&str>,
+    client_id: &str,
+) {
+    reply_to_client(
+        senders,
+        client_id,
+        Message::new("375", vec![nick.to_string(), format!("- {} Message of the day -", server)])
+            .with_prefix(server),
+        label,
+    )
+    .await;
+    for line in cfg.server.motd.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            reply_to_client(
+                senders,
+                client_id,
+                Message::new("372", vec![nick.to_string(), format!("- {}", line)])
+                    .with_prefix(server),
+                label,
+            )
+            .await;
+        }
+    }
+    reply_to_client(
+        senders,
+        client_id,
+        Message::new("376", vec![nick.to_string(), "End of /MOTD command.".into()])
+            .with_prefix(server),
+        label,
+    )
+    .await;
+}
+
+pub async fn handle_motd(
+    client_id: &str,
+    state: Arc<RwLock<ServerState>>,
+    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let state_r = state.read().await;
+    let client = match state_r.clients.get(client_id) {
+        Some(c) => c.clone(),
+        None => return Ok(()),
+    };
+    let nick = client.read().await.nick_or_id().to_string();
+    drop(state_r);
+    send_motd(&nick, &cfg.server.name, &senders, cfg, label, client_id).await;
     Ok(())
 }
 

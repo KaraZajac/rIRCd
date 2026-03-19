@@ -147,6 +147,16 @@ pub async fn handle_privmsg(
         }
     }
 
+    // STATUSMSG: @#channel (ops+halfops) or +#channel (voiced+ops+halfops)
+    let (statusmsg_prefix, target) = if (target.starts_with('@') || target.starts_with('+'))
+        && target.len() > 1
+        && (target[1..].starts_with('#') || target[1..].starts_with('&'))
+    {
+        (Some(target.chars().next().unwrap()), &target[1..])
+    } else {
+        (None, target)
+    };
+
     let msgid = generate_msgid();
     {
         let mut state_w = state.write().await;
@@ -207,8 +217,23 @@ pub async fn handle_privmsg(
                 None => return Ok(()),
             };
 
-            let base_msg = Message::new("PRIVMSG", vec![target.into(), text.clone()]).with_prefix(&source);
-            for (mid, _) in &ch.members {
+            // For STATUSMSG, the target shown to recipients includes the status prefix
+            let display_target = if let Some(pfx) = statusmsg_prefix {
+                format!("{}{}", pfx, target)
+            } else {
+                target.to_string()
+            };
+            let base_msg = Message::new("PRIVMSG", vec![display_target, text.clone()]).with_prefix(&source);
+            for (mid, memb) in &ch.members {
+                // STATUSMSG filter: @ → ops/halfops only; + → voiced/halfop/op only
+                if let Some(pfx) = statusmsg_prefix {
+                    let passes = match pfx {
+                        '@' => memb.modes.op || memb.modes.halfop,
+                        '+' => memb.modes.voice || memb.modes.halfop || memb.modes.op,
+                        _ => true,
+                    };
+                    if !passes { continue; }
+                }
                 if *mid == client_id {
                     if echo_message {
                         let caps = match state_guard.clients.get(mid) {
@@ -845,30 +870,78 @@ pub async fn handle_chathistory(
         None => return Ok(()),
     };
     let params = &msg.params;
-    let (target, limit) = if params.get(0).map(|s| s.as_str()) == Some("LATEST")
-        || params.get(0).map(|s| s.as_str()) == Some("BEFORE")
-        || params.get(0).map(|s| s.as_str()) == Some("AFTER")
-    {
-        let subcommand = params.get(0).map(|s| s.as_str()).unwrap_or("");
-        let target = params.get(1).map(|s| s.as_str()).unwrap_or("");
-        let _cursor = params.get(2).map(|s| s.as_str()).unwrap_or("*");
-        let limit_param = params.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
-        if target.is_empty() {
+    let subcommand = params.get(0).map(|s| s.to_uppercase()).unwrap_or_default();
+
+    // TARGETS is a special subcommand that returns a list of conversations, not messages.
+    if subcommand == "TARGETS" {
+        let from_ts = params.get(1).map(|s| s.as_str()).unwrap_or("");
+        let to_ts = params.get(2).map(|s| s.as_str()).unwrap_or("");
+        let limit = params.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(50).min(CHATHISTORY_LIMIT);
+        // Strip "timestamp=" prefix if present.
+        let from_ts = from_ts.strip_prefix("timestamp=").unwrap_or(from_ts);
+        let to_ts = to_ts.strip_prefix("timestamp=").unwrap_or(to_ts);
+        if from_ts.is_empty() || to_ts.is_empty() {
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["CHATHISTORY".into(), "INVALID_PARAMS".into(), subcommand.into(), "Insufficient parameters".into()])
+                Message::new("FAIL", vec!["CHATHISTORY".into(), "INVALID_PARAMS".into(), "TARGETS".into(), "Insufficient parameters".into()])
                     .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
             return Ok(());
         }
-        (target, limit_param.min(CHATHISTORY_LIMIT))
+        let targets = persist::list_history_targets(pool, from_ts, to_ts, limit).await;
+        let caps = {
+            let state_r = state.read().await;
+            match state_r.clients.get(client_id) {
+                Some(c) => c.read().await.capabilities.clone(),
+                None => std::collections::HashSet::new(),
+            }
+        };
+        let use_batch = caps.contains("batch") && caps.contains("message-tags");
+        let batch_ref = if use_batch { Some(crate::protocol::generate_msgid()) } else { None };
+        if let Some(ref ref_id) = batch_ref {
+            let batch_start = Message::new("BATCH", vec![format!("+{}", ref_id), "chathistory".into(), "targets".into()]).with_prefix(&cfg.server.name);
+            send_to_client(&senders, client_id, batch_start).await;
+        }
+        for (chan, latest_ts) in &targets {
+            let mut m = Message::new("CHATHISTORY", vec!["TARGETS".into(), chan.clone(), format!("timestamp={}", latest_ts)]);
+            m.prefix = Some(cfg.server.name.clone());
+            if let Some(ref ref_id) = batch_ref {
+                m.tags.insert("batch".to_string(), Some(ref_id.clone()));
+            }
+            send_to_client(&senders, client_id, m).await;
+        }
+        if let Some(ref ref_id) = batch_ref {
+            let batch_end = Message::new("BATCH", vec![format!("-{}", ref_id)]).with_prefix(&cfg.server.name);
+            send_to_client(&senders, client_id, batch_end).await;
+        }
+        return Ok(());
+    }
+
+    // Parse target, cursor, and limit for LATEST/BEFORE/AFTER/AROUND and legacy forms.
+    let (target, cursor, limit) = if matches!(subcommand.as_str(), "LATEST" | "BEFORE" | "AFTER" | "AROUND") {
+        let target = params.get(1).map(|s| s.as_str()).unwrap_or("");
+        let cursor = params.get(2).map(|s| s.as_str()).unwrap_or("*");
+        let limit_param = params.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
+        if target.is_empty() {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("FAIL", vec!["CHATHISTORY".into(), "INVALID_PARAMS".into(), subcommand.as_str().into(), "Insufficient parameters".into()])
+                    .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+        (target, cursor, limit_param.min(CHATHISTORY_LIMIT))
     } else {
+        // Legacy: CHATHISTORY #channel [count]
         let target = params.get(0).map(|s| s.as_str()).unwrap_or("");
         let limit_param = params.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
-        (target, limit_param.min(CHATHISTORY_LIMIT))
+        (target, "*", limit_param.min(CHATHISTORY_LIMIT))
     };
 
     if target.is_empty() || (!target.starts_with('#') && !target.starts_with('&')) {
@@ -903,7 +976,11 @@ pub async fn handle_chathistory(
         return Ok(());
     }
 
-    let entries = persist::read_channel_history(pool, target, limit).await;
+    let entries = if subcommand == "AROUND" && cursor != "*" {
+        persist::read_channel_history_around(pool, target, cursor, limit).await
+    } else {
+        persist::read_channel_history(pool, target, limit).await
+    };
     let caps = {
         let state_r = state.read().await;
         match state_r.clients.get(client_id) {
@@ -992,15 +1069,20 @@ pub async fn handle_markread(
         } else {
             ts.to_string()
         };
-        let mut state_w = state.write().await;
-        let entry = state_w.read_markers.entry(key.clone()).or_default();
-        let current = entry.get(target).cloned();
-        if current.as_ref().map(|c| c.as_str()) < Some(ts.as_str()) {
-            entry.insert(target.to_string(), ts.clone());
+        let updated_ts = {
+            let mut state_w = state.write().await;
+            let entry = state_w.read_markers.entry(key.clone()).or_default();
+            let current = entry.get(target).cloned();
+            if current.as_ref().map(|c| c.as_str()) < Some(ts.as_str()) {
+                entry.insert(target.to_string(), ts.clone());
+            }
+            entry.get(target).cloned().unwrap_or_else(|| ts)
+        };
+        // Persist to database
+        if let Some(ref pool) = cfg.db {
+            persist::save_read_marker(pool, &key, target, &updated_ts).await;
         }
-        let reply_ts = entry.get(target).cloned().unwrap_or_else(|| ts);
-        drop(state_w);
-        let m = Message::new("MARKREAD", vec![target.into(), format!("timestamp={}", reply_ts)]).with_prefix(&cfg.server.name);
+        let m = Message::new("MARKREAD", vec![target.into(), format!("timestamp={}", updated_ts)]).with_prefix(&cfg.server.name);
         reply_to_client(&senders, client_id, m, label).await;
     } else {
         let state_r = state.read().await;
