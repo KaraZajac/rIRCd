@@ -343,6 +343,22 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `WHOWAS` | 314/312/369 | Historical nick info; up to 5 entries per nick, in-memory |
 | `HELP` | 704/705/706 | Per-command help text |
 | `KNOCK` | 710/711 | Request invite to an invite-only channel; notifies ops |
+| `KILL` | — | Oper-only: forcibly disconnect a user; broadcasts QUIT to their channels |
+| `WALLOPS` | — | Oper-only: broadcast a message to all users with `+w` |
+| `ISON` | 303 | Check which nicks in a list are currently online |
+| `USERHOST` | 302 | Return `nick=+user@host` info for up to 5 nicks |
+
+---
+
+## User Modes
+
+| Mode | Set by | Description |
+|------|--------|-------------|
+| `+B` | User | Bot mode — shown in WHOIS as a bot (RPL_WHOISBOT 335) |
+| `+i` | User | Invisible — hidden from WHO unless sharing a channel |
+| `+o` | Server | IRC operator — set by successful OPER command |
+| `+r` | Server | Registered — set automatically on SASL login |
+| `+w` | User | Receives WALLOPS broadcasts from opers |
 
 ---
 
@@ -353,7 +369,9 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+o` | Channel operator |
 | `+v` | Voice (+) |
 | `+h` | Half-op (%) |
-| `+b` | Ban list (supports `~a:account` extban) |
+| `+b` | Ban list (supports `~a:account` extban and glob masks) |
+| `+e` | Ban exception list — exempt users bypass `+b` bans |
+| `+I` | Invite exception list — matching users bypass `+i` without explicit INVITE |
 | `+q` | Quiet list — silences matching users without kicking |
 | `+i` | Invite-only |
 | `+m` | Moderated — only `+v`/`+h`/`+o` may speak |

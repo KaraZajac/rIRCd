@@ -58,6 +58,10 @@ pub struct Channel {
     pub bans: Vec<String>,
     /// Quiet list (+q masks): user can join but not speak
     pub quiet_list: Vec<String>,
+    /// Ban exceptions (+e masks): users matching these are exempt from bans
+    pub ban_exceptions: Vec<String>,
+    /// Invite exceptions (+I masks): users matching these can join invite-only channels
+    pub invite_exceptions: Vec<String>,
     /// From channels.toml: nicks/accounts that get @ when they join
     pub persisted_operators: Vec<String>,
     /// From channels.toml: nicks/accounts that get + when they join
@@ -91,6 +95,8 @@ impl Channel {
             invite_list: HashSet::new(),
             bans: Vec::new(),
             quiet_list: Vec::new(),
+            ban_exceptions: Vec::new(),
+            invite_exceptions: Vec::new(),
             persisted_operators: Vec::new(),
             persisted_voice: Vec::new(),
         }
@@ -127,6 +133,34 @@ impl Channel {
                     return true;
                 }
             } else if ban == source {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if source/account matches a ban exception (+e).
+    pub fn is_ban_exempt(&self, account: Option<&str>, source: &str) -> bool {
+        for exc in &self.ban_exceptions {
+            if let Some(acc) = exc.strip_prefix("~a:") {
+                if account.map(|a| a.eq_ignore_ascii_case(acc)).unwrap_or(false) {
+                    return true;
+                }
+            } else if crate::user::glob_match(exc, source) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if source/account matches an invite exception (+I).
+    pub fn is_invite_exempt(&self, account: Option<&str>, source: &str) -> bool {
+        for exc in &self.invite_exceptions {
+            if let Some(acc) = exc.strip_prefix("~a:") {
+                if account.map(|a| a.eq_ignore_ascii_case(acc)).unwrap_or(false) {
+                    return true;
+                }
+            } else if crate::user::glob_match(exc, source) {
                 return true;
             }
         }

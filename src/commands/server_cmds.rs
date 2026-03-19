@@ -1,6 +1,6 @@
 //! Standard IRC server information commands: LUSERS, VERSION, TIME, INFO, LINKS, STATS, WHOWAS, HELP, KNOCK.
 
-use crate::channel::ChannelStore;
+use crate::channel::{canonical_channel_key, ChannelStore};
 use crate::commands::reply_to_client;
 use crate::config::Config;
 use crate::protocol::Message;
@@ -41,9 +41,13 @@ pub async fn handle_lusers(
 
     let total_users = state.clients.len();
     let mut ops = 0usize;
+    let mut invisible_users = 0usize;
     for c in state.clients.values() {
-        if c.read().await.oper { ops += 1; }
+        let g = c.read().await;
+        if g.oper { ops += 1; }
+        if g.invisible { invisible_users += 1; }
     }
+    let visible_users = total_users.saturating_sub(invisible_users);
     let channels_count = channels.read().await.channels.len();
 
     // 251 RPL_LUSERCLIENT
@@ -51,7 +55,7 @@ pub async fn handle_lusers(
         &senders, client_id,
         Message::new("251", vec![
             nick.clone(),
-            format!("There are {} users and 0 invisible on 1 servers", total_users),
+            format!("There are {} users and {} invisible on 1 servers", visible_users, invisible_users),
         ]).with_prefix(s),
         label,
     ).await;
@@ -591,6 +595,181 @@ pub async fn handle_knock(
         Message::new("711", vec![nick, ch_name.to_string(), "Your KNOCK has been delivered".into()]).with_prefix(s),
         label,
     ).await;
+
+    Ok(())
+}
+
+// ─── KILL ─────────────────────────────────────────────────────────────────────
+
+/// KILL <nick> <reason> — forcibly disconnect a user (oper only).
+pub async fn handle_kill(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
+    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let s = &cfg.server.name;
+
+    let (is_oper, killer_nick, killer_source) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.oper, g.nick_or_id().to_string(), g.source().unwrap_or_else(|| g.nick_or_id().to_string()))
+            }
+            None => return Ok(()),
+        }
+    };
+
+    if !is_oper {
+        reply_to_client(&senders, client_id,
+            Message::new("481", vec![killer_nick, "Permission Denied- You're not an IRC operator".into()])
+                .with_prefix(s), label).await;
+        return Ok(());
+    }
+
+    let target_nick = msg.params.first().map(|s| s.as_str()).unwrap_or("");
+    let reason = msg.trailing().or_else(|| msg.params.get(1).map(|s| s.as_str())).unwrap_or("No reason").to_string();
+
+    if target_nick.is_empty() {
+        reply_to_client(&senders, client_id,
+            Message::new("461", vec![killer_nick, "KILL".into(), "Not enough parameters".into()])
+                .with_prefix(s), label).await;
+        return Ok(());
+    }
+
+    let target_id = {
+        let state_r = state.read().await;
+        state_r.nick_to_id.get(&target_nick.to_uppercase()).cloned()
+    };
+
+    let tid = match target_id {
+        Some(id) => id,
+        None => {
+            reply_to_client(&senders, client_id,
+                Message::new("401", vec![killer_nick, target_nick.into(), "No such nick/channel".into()])
+                    .with_prefix(s), label).await;
+            return Ok(());
+        }
+    };
+
+    let (target_source, target_channels, target_nick_upper) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(&tid) {
+            Some(c) => {
+                let g = c.read().await;
+                let source = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
+                let chans: Vec<String> = g.channels.keys().cloned().collect();
+                let nick_upper = g.nick.as_deref().unwrap_or("").to_uppercase();
+                (source, chans, nick_upper)
+            }
+            None => return Ok(()),
+        }
+    };
+
+    // Send ERROR to target
+    let error_msg = Message::new("ERROR", vec![format!("Killed ({} ({}))", killer_source, reason)]);
+    send_to_client(&senders, &tid, error_msg).await;
+
+    // Remove from senders (causes write task to close the connection)
+    senders.write().await.remove(&tid);
+
+    // Broadcast QUIT to channel members
+    let quit_msg = Message::new("QUIT", vec![format!("Killed by {} ({})", killer_nick, reason)])
+        .with_prefix(&target_source);
+    for ch_name in &target_channels {
+        let ch_key = canonical_channel_key(ch_name);
+        let mut ch_store = channels.write().await;
+        let mut should_remove = false;
+        if let Some(ch_rw) = ch_store.channels.get_mut(&ch_key) {
+            let mut ch = ch_rw.write().await;
+            let member_ids: Vec<String> = ch.members.keys().filter(|id| id.as_str() != tid).cloned().collect();
+            ch.members.remove(&tid);
+            should_remove = ch.members.is_empty();
+            drop(ch);
+            for mid in &member_ids {
+                send_to_client(&senders, mid, quit_msg.clone()).await;
+            }
+        }
+        if should_remove {
+            ch_store.channels.remove(&ch_key);
+        }
+    }
+
+    // Remove from server state
+    {
+        let mut state_w = state.write().await;
+        state_w.record_whowas_for_kill(&tid, s);
+        state_w.clients.remove(&tid);
+        state_w.nick_to_id.remove(&target_nick_upper);
+    }
+
+    // Notify the killer
+    reply_to_client(&senders, client_id,
+        Message::new("NOTICE", vec![killer_nick, format!("Killed {}: {}", target_nick, reason)])
+            .with_prefix(s), label).await;
+
+    Ok(())
+}
+
+// ─── WALLOPS ──────────────────────────────────────────────────────────────────
+
+/// WALLOPS <text> — broadcast to all users with +w (oper only).
+pub async fn handle_wallops(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let s = &cfg.server.name;
+
+    let (is_oper, source, nick) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                let src = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
+                let n = g.nick_or_id().to_string();
+                (g.oper, src, n)
+            }
+            None => return Ok(()),
+        }
+    };
+
+    if !is_oper {
+        reply_to_client(&senders, client_id,
+            Message::new("481", vec![nick, "Permission Denied- You're not an IRC operator".into()])
+                .with_prefix(s), label).await;
+        return Ok(());
+    }
+
+    let text = msg.trailing().unwrap_or("").to_string();
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let wallops_msg = Message::new("WALLOPS", vec![format!(":{}", text)]).with_prefix(&source);
+
+    // Collect all clients with +w
+    let wallops_ids: Vec<String> = {
+        let state_r = state.read().await;
+        let mut ids = Vec::new();
+        for (id, c) in &state_r.clients {
+            if c.read().await.wallops {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    };
+
+    for tid in &wallops_ids {
+        send_to_client(&senders, tid, wallops_msg.clone()).await;
+    }
 
     Ok(())
 }

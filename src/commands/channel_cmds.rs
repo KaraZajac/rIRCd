@@ -103,7 +103,7 @@ pub async fn handle_join(
             continue;
         }
 
-        if ch.is_banned(account.as_deref(), &source) {
+        if ch.is_banned(account.as_deref(), &source) && !ch.is_ban_exempt(account.as_deref(), &source) {
             reply_to_client(
                 &senders,
                 client_id,
@@ -127,7 +127,7 @@ pub async fn handle_join(
             continue;
         }
 
-        if ch.modes.invite_only && !ch.invite_list.contains(&client_id.to_string()) {
+        if ch.modes.invite_only && !ch.invite_list.contains(&client_id.to_string()) && !ch.is_invite_exempt(account.as_deref(), &source) {
             reply_to_client(
                 &senders,
                 client_id,
@@ -463,20 +463,21 @@ pub async fn handle_mode(
 
             if msg.params.len() == 1 {
                 let mut modes = String::new();
-                if ch.modes.secret { modes.push('s'); }
-                if ch.modes.private { modes.push('p'); }
                 if ch.modes.invite_only { modes.push('i'); }
-                if ch.modes.topic_protect { modes.push('t'); }
-                if ch.modes.no_external { modes.push('n'); }
                 if ch.modes.moderated { modes.push('m'); }
+                if ch.modes.no_external { modes.push('n'); }
+                if ch.modes.secret { modes.push('s'); }
+                if ch.modes.topic_protect { modes.push('t'); }
                 if ch.modes.registered_only { modes.push('R'); }
                 if ch.modes.no_colors { modes.push('c'); }
                 if ch.modes.no_ctcp { modes.push('C'); }
-                if !ch.bans.is_empty() { modes.push('b'); }
-                if !ch.quiet_list.is_empty() { modes.push('q'); }
-                let mode_str = if modes.is_empty() { "" } else { &modes };
-                let msg = Message::new("324", vec![nick.clone(), target.into(), format!("+{}", mode_str), "".to_string()])
-                    .with_prefix(&cfg.server.name);
+                if ch.modes.private { modes.push('p'); }
+                if ch.key.is_some() { modes.push('k'); }
+                if ch.modes.user_limit.is_some() { modes.push('l'); }
+                let mut reply_params = vec![nick.clone(), target.into(), format!("+{}", modes)];
+                if let Some(ref key) = ch.key { reply_params.push(key.clone()); }
+                if let Some(limit) = ch.modes.user_limit { reply_params.push(limit.to_string()); }
+                let msg = Message::new("324", reply_params).with_prefix(&cfg.server.name);
                 reply_to_client(&senders, client_id, msg, label).await;
                 return Ok(());
             }
@@ -574,6 +575,82 @@ pub async fn handle_mode(
                             return Ok(());
                         }
                     }
+                    'v' => {
+                        if let Some(target_nick) = msg.params.get(param_idx) {
+                            if let Some(target_id) = state.nick_to_id.get(&target_nick.to_uppercase()) {
+                                if let Some(memb) = ch.members.get_mut(target_id) {
+                                    memb.modes.voice = plus;
+                                }
+                            }
+                            param_idx += 1;
+                        }
+                    }
+                    'h' => {
+                        if let Some(target_nick) = msg.params.get(param_idx) {
+                            if let Some(target_id) = state.nick_to_id.get(&target_nick.to_uppercase()) {
+                                if let Some(memb) = ch.members.get_mut(target_id) {
+                                    memb.modes.halfop = plus;
+                                }
+                            }
+                            param_idx += 1;
+                        }
+                    }
+                    'l' => {
+                        if plus {
+                            if let Some(limit_str) = msg.params.get(param_idx) {
+                                ch.modes.user_limit = limit_str.parse().ok();
+                                param_idx += 1;
+                            }
+                        } else {
+                            ch.modes.user_limit = None;
+                        }
+                    }
+                    'e' => {
+                        if let Some(mask) = msg.params.get(param_idx) {
+                            if plus {
+                                if !ch.ban_exceptions.contains(mask) {
+                                    ch.ban_exceptions.push(mask.clone());
+                                }
+                            } else {
+                                ch.ban_exceptions.retain(|b| b != mask);
+                            }
+                            param_idx += 1;
+                        } else {
+                            // No param: list ban exceptions (348/349)
+                            let exceptions = ch.ban_exceptions.clone();
+                            drop(ch); drop(ch_store);
+                            for exc in &exceptions {
+                                reply_to_client(&senders, client_id,
+                                    Message::new("348", vec![nick.clone(), target.into(), exc.clone()]).with_prefix(&cfg.server.name), label).await;
+                            }
+                            reply_to_client(&senders, client_id,
+                                Message::new("349", vec![nick, target.into(), "End of channel exception list".into()]).with_prefix(&cfg.server.name), label).await;
+                            return Ok(());
+                        }
+                    }
+                    'I' => {
+                        if let Some(mask) = msg.params.get(param_idx) {
+                            if plus {
+                                if !ch.invite_exceptions.contains(mask) {
+                                    ch.invite_exceptions.push(mask.clone());
+                                }
+                            } else {
+                                ch.invite_exceptions.retain(|b| b != mask);
+                            }
+                            param_idx += 1;
+                        } else {
+                            // No param: list invite exceptions (346/347)
+                            let invexes = ch.invite_exceptions.clone();
+                            drop(ch); drop(ch_store);
+                            for exc in &invexes {
+                                reply_to_client(&senders, client_id,
+                                    Message::new("346", vec![nick.clone(), target.into(), exc.clone()]).with_prefix(&cfg.server.name), label).await;
+                            }
+                            reply_to_client(&senders, client_id,
+                                Message::new("347", vec![nick, target.into(), "End of channel invite list".into()]).with_prefix(&cfg.server.name), label).await;
+                            return Ok(());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -586,8 +663,24 @@ pub async fn handle_mode(
             }
         }
     } else if target.eq_ignore_ascii_case(&nick) {
-        // User mode: MODE <own_nick> +B / -B (bot)
         let mode_str = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
+
+        if mode_str.is_empty() {
+            // MODE query: return current user modes (221 RPL_UMODEIS)
+            if let Some(client_ref) = state.clients.get(client_id) {
+                let g = client_ref.read().await;
+                let mut modes = String::from("+");
+                if g.invisible { modes.push('i'); }
+                if g.oper { modes.push('o'); }
+                if g.account.is_some() { modes.push('r'); }
+                if g.wallops { modes.push('w'); }
+                if g.bot { modes.push('B'); }
+                let m = Message::new("221", vec![nick.clone(), modes]).with_prefix(&cfg.server.name);
+                reply_to_client(&senders, client_id, m, label).await;
+            }
+            return Ok(());
+        }
+
         let mut plus = true;
         for c in mode_str.chars() {
             match c {
@@ -597,9 +690,25 @@ pub async fn handle_mode(
                     if let Some(client_ref) = state.clients.get(client_id) {
                         client_ref.write().await.bot = plus;
                     }
-                    let mode_msg = Message::new("MODE", vec![nick.clone(), format!("{}{}", if plus { "+" } else { "-" }, "B")])
+                    let m = Message::new("MODE", vec![nick.clone(), format!("{}B", if plus { "+" } else { "-" })])
                         .with_prefix(&nick);
-                    reply_to_client(&senders, client_id, mode_msg, label).await;
+                    reply_to_client(&senders, client_id, m, label).await;
+                }
+                'i' => {
+                    if let Some(client_ref) = state.clients.get(client_id) {
+                        client_ref.write().await.invisible = plus;
+                    }
+                    let m = Message::new("MODE", vec![nick.clone(), format!("{}i", if plus { "+" } else { "-" })])
+                        .with_prefix(&nick);
+                    reply_to_client(&senders, client_id, m, label).await;
+                }
+                'w' => {
+                    if let Some(client_ref) = state.clients.get(client_id) {
+                        client_ref.write().await.wallops = plus;
+                    }
+                    let m = Message::new("MODE", vec![nick.clone(), format!("{}w", if plus { "+" } else { "-" })])
+                        .with_prefix(&nick);
+                    reply_to_client(&senders, client_id, m, label).await;
                 }
                 _ => {}
             }
