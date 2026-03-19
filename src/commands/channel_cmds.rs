@@ -59,17 +59,6 @@ pub async fn handle_join(
     let source = client_data.source().unwrap_or_else(|| client_data.nick_or_id().to_string());
     let nick = client_data.nick_or_id().to_string();
 
-    if client_data.channels.len() >= cfg.limits.max_channels_per_client {
-        reply_to_client(
-            &senders,
-            client_id,
-            Message::new("405", vec![nick.clone(), "You have joined too many channels".into()])
-                .with_prefix(&cfg.server.name),
-            label,
-        )
-        .await;
-        return Ok(());
-    }
     let client_caps = client_data.capabilities.clone();
     let account = client_data.account.clone();
     drop(client_data);
@@ -79,6 +68,28 @@ pub async fn handle_join(
         if ch_name.is_empty() || !ch_name.starts_with('#'){
             continue;
         }
+
+        // Check per-channel so joining multiple channels in one command can't bypass the limit
+        let current_channel_count = match state.clients.get(client_id) {
+            Some(c) => c.read().await.channels.len(),
+            None => return Ok(()),
+        };
+        if current_channel_count >= cfg.limits.max_channels_per_client {
+            let nick = match state.clients.get(client_id) {
+                Some(c) => c.read().await.nick_or_id().to_string(),
+                None => return Ok(()),
+            };
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("405", vec![nick, ch_name.to_string(), "You have joined too many channels".into()])
+                    .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            continue;
+        }
+
         let ch_key = canonical_channel_key(ch_name);
 
         let mut ch_store = channels.write().await;
@@ -218,8 +229,8 @@ pub async fn handle_part(
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
     senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
-    _cfg: &Config,
-    _label: Option<&str>,
+    cfg: &Config,
+    label: Option<&str>,
 ) -> anyhow::Result<()> {
     let state = state.read().await;
     let client = match state.clients.get(client_id) {
@@ -243,6 +254,21 @@ pub async fn handle_part(
         let mut should_remove = false;
         if let Some(ch_rw) = ch_store.channels.get_mut(&ch_key) {
             let mut ch = ch_rw.write().await;
+            if !ch.is_member(client_id) {
+                // Not in channel — send 442 ERR_NOTONCHANNEL and skip
+                let nick = client.read().await.nick_or_id().to_string();
+                drop(ch);
+                drop(ch_store);
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("442", vec![nick, ch_name.to_string(), "You're not on that channel".into()])
+                        .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                continue;
+            }
             for (mid, _) in &ch.members.clone() {
                 if let Some(tx) = senders.read().await.get(mid) {
                     let _ = tx.send(part_msg.clone()).await;
@@ -452,6 +478,8 @@ pub async fn handle_mode(
             }
 
             let mut plus = true;
+            // param_idx starts at 2: params[0]=target, params[1]=mode_str, params[2+]=mode args
+            let mut param_idx: usize = 2;
             for c in mode_str.chars() {
                 match c {
                     '+' => plus = true,
@@ -463,22 +491,24 @@ pub async fn handle_mode(
                     'n' => ch.modes.no_external = plus,
                     'k' => {
                         if plus {
-                            ch.key = msg.params.get(2).cloned();
+                            ch.key = msg.params.get(param_idx).cloned();
                         } else {
                             ch.key = None;
                         }
+                        param_idx += 1;
                     }
                     'o' => {
-                        if let Some(target_nick) = msg.params.get(2) {
+                        if let Some(target_nick) = msg.params.get(param_idx) {
                             if let Some(target_id) = state.nick_to_id.get(&target_nick.to_uppercase()) {
                                 if let Some(memb) = ch.members.get_mut(target_id) {
                                     memb.modes.op = plus;
                                 }
                             }
+                            param_idx += 1;
                         }
                     }
                     'b' => {
-                        if let Some(mask) = msg.params.get(2) {
+                        if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
                                 if !ch.bans.contains(mask) {
                                     ch.bans.push(mask.clone());
@@ -486,6 +516,7 @@ pub async fn handle_mode(
                             } else {
                                 ch.bans.retain(|b| b != mask);
                             }
+                            param_idx += 1;
                         }
                     }
                     _ => {}

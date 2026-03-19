@@ -139,7 +139,7 @@ pub async fn handle_message(
     match msg.command.as_str() {
         "WEBIRC" => registration::handle_webirc(&client_id, &host, msg, state, senders, cfg, label.as_deref()).await,
         "CAP" => registration::handle_cap(&client_id, &host, msg, state, senders, cfg, label.as_deref()).await,
-        "NICK" => registration::handle_nick(&client_id, &host, msg, state, senders, cfg, label.as_deref()).await,
+        "NICK" => registration::handle_nick(&client_id, &host, msg, state, channels, senders, cfg, label.as_deref()).await,
         "USER" => registration::handle_user(&client_id, &host, msg, state, senders, cfg, label.as_deref()).await,
         "PASS" => registration::handle_pass(&client_id, msg, state, senders, label.as_deref()).await,
         "PING" => registration::handle_ping(&client_id, msg, state, senders, cfg, label.as_deref()).await,

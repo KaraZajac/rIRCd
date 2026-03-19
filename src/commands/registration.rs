@@ -6,7 +6,6 @@ use crate::persist::{self, RegisterError};
 use crate::protocol::Message;
 use crate::user::{Client, ServerState};
 use std::collections::HashMap;
-use std::fs;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -130,38 +129,27 @@ pub async fn complete_registration(
     )
     .await;
 
-    if let Ok(content) = fs::read_to_string(&cfg.server.motd) {
-        for line in content.lines() {
-            let line = line.trim();
-            if !line.is_empty() {
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    Message::new("372", vec![nick_str.clone(), format!("- {}", line)])
-                        .with_prefix(server),
-                    label,
-                )
-                .await;
-            }
+    for line in cfg.server.motd.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("372", vec![nick_str.clone(), format!("- {}", line)])
+                    .with_prefix(server),
+                label,
+            )
+            .await;
         }
-        reply_to_client(
-            &senders,
-            client_id,
-            Message::new("376", vec![nick_str.clone(), "End of /MOTD command.".into()])
-                .with_prefix(server),
-            label,
-        )
-        .await;
-    } else {
-        reply_to_client(
-            &senders,
-            client_id,
-            Message::new("422", vec![nick_str.clone(), "MOTD File is missing".into()])
-                .with_prefix(server),
-            label,
-        )
-        .await;
     }
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new("376", vec![nick_str.clone(), "End of /MOTD command.".into()])
+            .with_prefix(server),
+        label,
+    )
+    .await;
 
     // monitor: notify clients monitoring this nick that they came online (730)
     let source = client.read().await.source().unwrap_or_else(|| nick_str.clone());
@@ -376,6 +364,7 @@ pub async fn handle_nick(
     host: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
     senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
     cfg: &Config,
     label: Option<&str>,
@@ -412,6 +401,7 @@ pub async fn handle_nick(
                 return Ok(());
             }
             let old_nick = client_guard.nick.clone();
+            let old_source = client_guard.source().unwrap_or_else(|| client_guard.nick_or_id().to_string());
             drop(client_guard);
             if let Some(ref o) = old_nick {
                 state_guard.nick_to_id.remove(&o.to_uppercase());
@@ -464,6 +454,30 @@ pub async fn handle_nick(
                 let m = Message::new("730", vec![recv_nick, format!(":{}", new_source)]).with_prefix(server);
                 send_to_client(&senders, w, m).await;
             }
+
+            // Broadcast NICK change to channel members (and self)
+            let nick_msg = Message::new("NICK", vec![nick.clone()]).with_prefix(&old_source);
+            send_to_client(&senders, client_id, nick_msg.clone()).await;
+            let channel_names: Vec<String> = match state.read().await.clients.get(client_id) {
+                Some(c) => c.read().await.channels.keys().cloned().collect(),
+                None => Vec::new(),
+            };
+            let mut notified = std::collections::HashSet::new();
+            notified.insert(client_id.to_string());
+            for ch_name in &channel_names {
+                let ch_store = channels.read().await;
+                let member_ids: Vec<String> = match ch_store.channels.get(ch_name.as_str()) {
+                    Some(ch) => ch.read().await.members.keys().cloned().collect(),
+                    None => Vec::new(),
+                };
+                drop(ch_store);
+                for mid in member_ids {
+                    if notified.insert(mid.clone()) {
+                        send_to_client(&senders, &mid, nick_msg.clone()).await;
+                    }
+                }
+            }
+
             return Ok(());
         }
     }
@@ -1050,7 +1064,11 @@ pub async fn handle_authenticate(
         return Ok(());
     }
 
-    if !verify_account(cfg, authcid, passwd) {
+    let verified = match cfg.db.as_ref() {
+        Some(pool) => persist::verify_user(pool, authcid, passwd).await,
+        None => false,
+    };
+    if !verified {
         tracing::info!(client_id = %client_id, authcid = %authcid, "SASL AUTHENTICATE: invalid credentials, sending 904");
         sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
         return Ok(());
@@ -1174,14 +1192,6 @@ fn base64_decode(s: &str) -> anyhow::Result<String> {
     String::from_utf8(decoded).map_err(|e| anyhow::anyhow!("SASL PLAIN message must be valid UTF-8: {}", e))
 }
 
-fn verify_account(cfg: &Config, account: &str, password: &str) -> bool {
-    let config_dir = cfg
-        .config_dir
-        .as_deref()
-        .unwrap_or_else(|| std::path::Path::new(persist::DEFAULT_CONFIG_DIR));
-    persist::verify_user(config_dir, account, password)
-}
-
 pub async fn handle_oper(
     client_id: &str,
     msg: Message,
@@ -1253,8 +1263,8 @@ pub async fn handle_register(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let config_dir = match &cfg.config_dir {
-        Some(d) => d.clone(),
+    let pool = match cfg.db.as_ref() {
+        Some(p) => p,
         None => {
             reply_to_client(
                 &senders,
@@ -1328,7 +1338,7 @@ pub async fn handle_register(
         .await;
         return Ok(());
     }
-    match persist::register_user(&config_dir, &account, password, email) {
+    match persist::register_user(pool, &account, password, email).await {
         Ok(()) => {
             reply_to_client(
                 &senders,
@@ -1417,8 +1427,8 @@ pub async fn handle_away(
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<crate::channel::ChannelStore>>,
     senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
-    _cfg: &Config,
-    _label: Option<&str>,
+    cfg: &Config,
+    label: Option<&str>,
 ) -> anyhow::Result<()> {
     let away_msg = msg.trailing().map(String::from);
     let (source, channel_list) = {
@@ -1436,6 +1446,20 @@ pub async fn handle_away(
         let channel_list: Vec<String> = client_guard.channels.keys().cloned().collect();
         (source, channel_list)
     };
+
+    // Send 306 RPL_NOWAWAY or 305 RPL_UNAWAY to the client
+    let (reply_code, reply_text) = if away_msg.is_some() {
+        ("306", "You have been marked as being away")
+    } else {
+        ("305", "You are no longer marked as being away")
+    };
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(reply_code, vec!["*".into(), reply_text.into()]).with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
 
     // away-notify: tell channel peers that have the cap
     for ch_name in &channel_list {
