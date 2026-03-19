@@ -1,0 +1,30 @@
+# rIRCd - Bleeding-edge IRC Server
+# https://ircv3.net/irc/
+
+[server]
+name = "rIRCd.local"
+listen = [":6667"]
+# For TLS, add ports to listen_tls and configure [tls] cert/key:
+# listen_tls = [":6697"]
+motd = "/etc/rIRCd/motd"
+registration_timeout_secs = 60
+ping_timeout_secs = 90
+disconnect_timeout_secs = 150
+
+[network]
+name = "rIRCd"
+
+[tls]
+# Uncomment and set paths to enable TLS on port 6697
+# cert = "/etc/rIRCd/cert.pem"
+# key = "/etc/rIRCd/key.pem"
+
+[limits]
+max_channels_per_client = 50
+max_line_length = 8191
+
+# [opers]
+# [[opers]]
+# name = "admin"
+# hostmask = "*"
+# password_hash = "$2a$..."  # Use: rircd genpasswd

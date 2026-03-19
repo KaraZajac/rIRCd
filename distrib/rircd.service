@@ -1,0 +1,24 @@
+[Unit]
+Description=rIRCd - Bleeding-edge IRC server
+Documentation=https://ircv3.net/irc/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rircd run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+User=rircd
+Group=rircd
+RuntimeDirectory=rIRCd
+ConfigurationDirectory=rIRCd
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/rIRCd
+
+[Install]
+WantedBy=multi-user.target

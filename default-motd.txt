@@ -1,0 +1,3 @@
+Welcome to rIRCd!
+A bleeding-edge IRC server following IRCv3 specifications.
+https://ircv3.net/
