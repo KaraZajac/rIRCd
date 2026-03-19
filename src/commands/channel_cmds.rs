@@ -63,6 +63,39 @@ pub async fn handle_join(
     let account = client_data.account.clone();
     drop(client_data);
 
+    // JOIN 0: part all channels the client is currently in
+    if ch_names.trim() == "0" {
+        let client_arc = match state.clients.get(client_id) {
+            Some(c) => c.clone(),
+            None => return Ok(()),
+        };
+        let joined_channels: Vec<String> = client_arc.read().await.channels.keys().cloned().collect();
+        drop(state); // release ServerState read guard
+        for ch_key in &joined_channels {
+            let part_msg = Message::new("PART", vec![ch_key.clone(), "Leaving all channels".into()])
+                .with_prefix(&source);
+            let member_ids: Vec<String> = {
+                let ch_store = channels.write().await;
+                if let Some(ch_lock) = ch_store.channels.get(ch_key) {
+                    let mut ch = ch_lock.write().await;
+                    let ids: Vec<String> = ch.members.keys().cloned().collect();
+                    ch.members.remove(client_id);
+                    ch.invite_list.remove(client_id);
+                    ids
+                } else {
+                    vec![]
+                }
+            };
+            for mid in &member_ids {
+                if let Some(tx) = senders.read().await.get(mid) {
+                    let _ = tx.send(part_msg.clone()).await;
+                }
+            }
+        }
+        client_arc.write().await.channels.clear();
+        return Ok(());
+    }
+
     for ch_name in ch_names.split(',') {
         let ch_name = ch_name.trim();
         if ch_name.is_empty() || !ch_name.starts_with('#'){
@@ -198,6 +231,23 @@ pub async fn handle_join(
         let topic_setter = ch.topic_setter.clone();
         let topic_time = ch.topic_time;
         let created_at = ch.created_at;
+        // Build mode string for 324 RPL_CHANNELMODE sent after NAMES
+        let join_mode_str = {
+            let mut flags = String::from("+");
+            if ch.modes.invite_only { flags.push('i'); }
+            if ch.modes.moderated { flags.push('m'); }
+            if ch.modes.no_external { flags.push('n'); }
+            if ch.modes.secret { flags.push('s'); }
+            if ch.modes.topic_protect { flags.push('t'); }
+            if ch.modes.registered_only { flags.push('R'); }
+            if ch.modes.no_colors { flags.push('c'); }
+            if ch.modes.no_ctcp { flags.push('C'); }
+            if ch.key.is_some() { flags.push('k'); }
+            if ch.modes.user_limit.is_some() { flags.push('l'); }
+            flags
+        };
+        let join_mode_key = ch.key.clone();
+        let join_mode_limit = ch.modes.user_limit;
         drop(ch);
         for mid in &member_ids {
             let caps = match state.clients.get(mid) {
@@ -250,6 +300,13 @@ pub async fn handle_join(
             if let Some(ch_ref) = ch_store.channels.get(&ch_key) {
                 send_names_for_channel(ch_ref, &ch_key, &nick, &state, &senders, client_id, &cfg.server.name, &client_caps, label).await;
             }
+        }
+        // 324 RPL_CHANNELMODE: send current channel modes after NAMES burst
+        {
+            let mut rp = vec![nick.clone(), ch_key.clone(), join_mode_str.clone()];
+            if let Some(ref k) = join_mode_key { rp.push(k.clone()); }
+            if let Some(lim) = join_mode_limit { rp.push(lim.to_string()); }
+            reply_to_client(&senders, client_id, Message::new("324", rp).with_prefix(&cfg.server.name), label).await;
         }
         // draft/read-marker: send MARKREAD for channel (before ENDOFNAMES per spec; we send after NAMES)
         if client_caps.contains("draft/read-marker") {
@@ -439,13 +496,24 @@ async fn send_names_for_channel(
 
 pub async fn handle_list(
     client_id: &str,
-    _msg: Message,
+    msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
     senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Parse optional filter: LIST [<filter>]
+    // Filter can be: ">N" (more than N users), "<N" (fewer than N), or a channel name mask
+    let filter = msg.params.first().map(|s| s.as_str()).unwrap_or("");
+    let min_users: Option<usize> = if filter.starts_with('>') { filter[1..].parse().ok() } else { None };
+    let max_users: Option<usize> = if filter.starts_with('<') { filter[1..].parse().ok() } else { None };
+    let name_mask: Option<&str> = if !filter.is_empty() && !filter.starts_with('>') && !filter.starts_with('<') {
+        Some(filter)
+    } else {
+        None
+    };
+
     let state = state.read().await;
     let client = match state.clients.get(client_id) {
         Some(c) => c.clone(),
@@ -460,11 +528,20 @@ pub async fn handle_list(
         if ch.modes.secret && !ch.is_member(client_id) {
             continue;
         }
-        let topic = ch.topic.as_deref().unwrap_or("");
         let count = ch.member_count();
-        let msg = Message::new("322", vec![nick.clone(), ch_name.clone(), count.to_string(), topic.to_string()])
+        // Apply filters
+        if let Some(min) = min_users { if count <= min { continue; } }
+        if let Some(max) = max_users { if count >= max { continue; } }
+        if let Some(mask) = name_mask {
+            let mask_lower = mask.to_lowercase();
+            if !crate::user::glob_match(&mask_lower, &ch_name.to_lowercase()) {
+                continue;
+            }
+        }
+        let topic = ch.topic.as_deref().unwrap_or("");
+        let m = Message::new("322", vec![nick.clone(), ch_name.clone(), count.to_string(), topic.to_string()])
             .with_prefix(&cfg.server.name);
-        reply_to_client(&senders, client_id, msg, label).await;
+        reply_to_client(&senders, client_id, m, label).await;
     }
 
     let end_msg = Message::new("323", vec![nick, "End of /LIST".into()]).with_prefix(&cfg.server.name);

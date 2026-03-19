@@ -141,6 +141,28 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS read_markers (
+            account   VARCHAR(64)  NOT NULL,
+            target    VARCHAR(128) NOT NULL,
+            timestamp VARCHAR(64)  NOT NULL,
+            PRIMARY KEY (account, target)
+        ) CHARACTER SET utf8mb4",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS metadata (
+            target    VARCHAR(128) NOT NULL,
+            meta_key  VARCHAR(128) NOT NULL,
+            value     TEXT         NOT NULL,
+            PRIMARY KEY (target, meta_key)
+        ) CHARACTER SET utf8mb4",
+    )
+    .execute(pool)
+    .await?;
+
     tracing::info!("Database schema ready");
     Ok(())
 }
@@ -231,6 +253,87 @@ pub async fn save_channel_modes(
     .bind(mode_limit)
     .execute(pool)
     .await;
+}
+
+// ─── Read markers ─────────────────────────────────────────────────────────────
+
+/// Upsert a read marker timestamp for an account+target.
+pub async fn save_read_marker(pool: &sqlx::MySqlPool, account: &str, target: &str, timestamp: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO read_markers (account, target, timestamp) VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE timestamp = VALUES(timestamp)",
+    )
+    .bind(account)
+    .bind(target)
+    .bind(timestamp)
+    .execute(pool)
+    .await;
+}
+
+/// Load all read markers from the database into a nested HashMap.
+pub async fn load_read_markers(pool: &sqlx::MySqlPool) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    use sqlx::Row;
+    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, String>> = Default::default();
+    let rows = sqlx::query("SELECT account, target, timestamp FROM read_markers")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    for row in rows {
+        let account: String = row.get("account");
+        let target: String = row.get("target");
+        let timestamp: String = row.get("timestamp");
+        out.entry(account).or_default().insert(target, timestamp);
+    }
+    out
+}
+
+// ─── Metadata ─────────────────────────────────────────────────────────────────
+
+/// Upsert a metadata key-value for a target.
+pub async fn save_metadata(pool: &sqlx::MySqlPool, target: &str, key: &str, value: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO metadata (target, meta_key, value) VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE value = VALUES(value)",
+    )
+    .bind(target)
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await;
+}
+
+/// Delete a metadata key for a target.
+pub async fn delete_metadata(pool: &sqlx::MySqlPool, target: &str, key: &str) {
+    let _ = sqlx::query("DELETE FROM metadata WHERE target = ? AND meta_key = ?")
+        .bind(target)
+        .bind(key)
+        .execute(pool)
+        .await;
+}
+
+/// Delete all metadata for a target.
+pub async fn clear_metadata(pool: &sqlx::MySqlPool, target: &str) {
+    let _ = sqlx::query("DELETE FROM metadata WHERE target = ?")
+        .bind(target)
+        .execute(pool)
+        .await;
+}
+
+/// Load all metadata from the database.
+pub async fn load_all_metadata(pool: &sqlx::MySqlPool) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    use sqlx::Row;
+    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, String>> = Default::default();
+    let rows = sqlx::query("SELECT target, meta_key, value FROM metadata")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    for row in rows {
+        let target: String = row.get("target");
+        let key: String = row.get("meta_key");
+        let value: String = row.get("value");
+        out.entry(target).or_default().insert(key, value);
+    }
+    out
 }
 
 // ─── SCRAM-SHA-256 helpers ────────────────────────────────────────────────────
@@ -488,4 +591,108 @@ pub async fn read_channel_history(
             Vec::new()
         }
     }
+}
+
+/// Read messages centered around a reference point (`msgid=xxx` or `timestamp=xxx`), oldest-first.
+pub async fn read_channel_history_around(
+    pool: &sqlx::MySqlPool,
+    channel_name: &str,
+    cursor: &str,
+    limit: usize,
+) -> Vec<HistoryEntry> {
+    use sqlx::Row;
+
+    let half = ((limit + 1) / 2).max(1) as i64;
+
+    // Resolve the pivot row ID from the cursor.
+    let pivot_id: Option<i64> = if let Some(msgid) = cursor.strip_prefix("msgid=") {
+        sqlx::query(
+            "SELECT id FROM channel_history WHERE channel = ? AND msgid = ? LIMIT 1",
+        )
+        .bind(channel_name)
+        .bind(msgid)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|r: sqlx::mysql::MySqlRow| r.get::<i64, _>("id"))
+    } else if let Some(ts) = cursor.strip_prefix("timestamp=") {
+        sqlx::query(
+            "SELECT id FROM channel_history WHERE channel = ? AND ts <= ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(channel_name)
+        .bind(ts)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|r: sqlx::mysql::MySqlRow| r.get::<i64, _>("id"))
+    } else {
+        None
+    };
+
+    let pivot_id = match pivot_id {
+        Some(id) => id,
+        None => return Vec::new(),
+    };
+
+    // Rows at or before pivot, newest-first.
+    let before = sqlx::query(
+        "SELECT id, ts, source, text, msgid FROM channel_history WHERE channel = ? AND id <= ? ORDER BY id DESC LIMIT ?",
+    )
+    .bind(channel_name)
+    .bind(pivot_id)
+    .bind(half)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    // Rows after pivot, oldest-first.
+    let after = sqlx::query(
+        "SELECT id, ts, source, text, msgid FROM channel_history WHERE channel = ? AND id > ? ORDER BY id ASC LIMIT ?",
+    )
+    .bind(channel_name)
+    .bind(pivot_id)
+    .bind(half)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    // Reverse before (to restore chronological order) then append after.
+    before
+        .into_iter()
+        .rev()
+        .chain(after)
+        .map(|r| HistoryEntry {
+            ts: r.get("ts"),
+            source: r.get("source"),
+            text: r.get("text"),
+            msgid: r.get("msgid"),
+        })
+        .collect()
+}
+
+/// List channels that have history between two timestamps, paired with their latest message timestamp.
+/// Returns at most `limit` results, ordered by most-recently-active first.
+pub async fn list_history_targets(
+    pool: &sqlx::MySqlPool,
+    from_ts: &str,
+    to_ts: &str,
+    limit: usize,
+) -> Vec<(String, String)> {
+    use sqlx::Row;
+
+    let rows = sqlx::query(
+        "SELECT channel, MAX(ts) AS latest_ts FROM channel_history WHERE ts >= ? AND ts <= ? GROUP BY channel ORDER BY latest_ts DESC LIMIT ?",
+    )
+    .bind(from_ts)
+    .bind(to_ts)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.into_iter()
+        .map(|r| (r.get::<String, _>("channel"), r.get::<String, _>("latest_ts")))
+        .collect()
 }

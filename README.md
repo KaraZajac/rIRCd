@@ -273,7 +273,9 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 - **Topic** — persisted whenever a channel topic is set; 333 RPL_TOPICWHOTIME and 329 RPL_CREATIONTIME sent on JOIN.
 - **Channel modes** — mode flags (`+imnstRcC`), key (`+k`), and user limit (`+l`) are saved to the database on every MODE change and restored on startup.
 - **Operators / Voice** — stored per channel; users in these lists receive `@`/`+` automatically when they join.
-- **Message history** — PRIVMSG and NOTICE to channels are appended (up to 1,000 messages per channel, oldest pruned). Clients with `draft/chathistory` can request history via `CHATHISTORY LATEST #channel * <limit>`.
+- **Message history** — PRIVMSG and NOTICE to channels are appended (up to 1,000 messages per channel, oldest pruned). Clients with `draft/chathistory` can request history via `CHATHISTORY LATEST/BEFORE/AFTER/AROUND #channel <cursor> <limit>` or list active conversations with `CHATHISTORY TARGETS timestamp=<from> timestamp=<to> <limit>`.
+- **Read markers** — `MARKREAD` timestamps are persisted per account in MariaDB and survive server restarts.
+- **Metadata** — `METADATA` key-value entries set on users and channels are persisted in MariaDB.
 
 ---
 
@@ -316,9 +318,10 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **extended-monitor** | Full | MONITOR patterns with `nick!user@host` globs (`*`/`?` wildcards) |
 | **sts** | Full | Strict Transport Security; advertised in CAP LS only when TLS is configured; `duration=2592000` |
 | **draft/channel-rename** | Full | RENAME old new [reason]; op-only; fallback PART+JOIN for clients without cap |
-| **draft/chathistory** | Full | CHATHISTORY LATEST/BEFORE/AFTER; BATCH chathistory; DB-backed; limit 200 |
-| **draft/read-marker** | Full | MARKREAD target [timestamp]; per-account in-memory store |
-| **draft/metadata-2** | Full | METADATA GET/LIST/SET/CLEAR; in-memory key-value per user/channel |
+| **draft/chathistory** | Full | CHATHISTORY LATEST/BEFORE/AFTER/AROUND/TARGETS; BATCH chathistory; DB-backed; limit 200 |
+| **draft/read-marker** | Full | MARKREAD target [timestamp]; per-account, persisted in MariaDB |
+| **draft/metadata-2** | Full | METADATA GET/LIST/SET/CLEAR; key-value per user/channel, persisted in MariaDB |
+| **STATUSMSG** | Full | PRIVMSG/NOTICE to `@#channel` (ops+) or `+#channel` (voiced+); advertised in 005 `STATUSMSG=@+` |
 | **draft/account-registration** | Full | REGISTER \* [email] password; VERIFY returns INVALID_CODE (no email verification) |
 | **draft/multiline** | Full | BATCH draft/multiline; max-bytes=4096, max-lines=20; fallback for non-multiline clients |
 | **draft/pre-away** | Full | AWAY during registration; applied after NICK/USER complete |
@@ -335,6 +338,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 
 | Command | Numerics | Description |
 |---------|----------|-------------|
+| `LIST` | 321/322/323 | List channels; supports `>N`/`<N` (user count filter) and glob name masks |
 | `LUSERS` | 251/252/254/255/265/266 | Server user/channel statistics |
 | `VERSION` | 351 | Server version string |
 | `TIME` | 391 | Server local time |
@@ -348,6 +352,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `KNOCK` | 710/711 | Request invite to an invite-only channel; notifies ops |
 | `KILL` | — | Oper-only: forcibly disconnect a user; broadcasts QUIT to their channels |
 | `WALLOPS` | — | Oper-only: broadcast a message to all users with `+w` |
+| `MOTD` | 375/372/376 | Send the message of the day |
 | `ISON` | 303 | Check which nicks in a list are currently online |
 | `USERHOST` | 302 | Return `nick=+user@host` info for up to 5 nicks |
 

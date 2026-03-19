@@ -79,6 +79,12 @@ pub async fn run(cfg: Config, pidfile: Option<&Path>) -> anyhow::Result<()> {
                 ch_guard.created_at = e.created_at;
             }
         }
+        // Load read markers and metadata into server state
+        let markers = crate::persist::load_read_markers(pool).await;
+        let meta = crate::persist::load_all_metadata(pool).await;
+        let mut state_w = state.write().await;
+        state_w.read_markers = markers;
+        state_w.metadata = meta;
     }
     let senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>> =
         Arc::new(RwLock::new(HashMap::new()));

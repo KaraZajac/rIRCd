@@ -203,6 +203,14 @@ pub async fn handle_metadata(
                 }
                 value.clone()
             };
+            // Persist to database
+            if let Some(ref pool) = cfg.db {
+                if let Some(ref v) = new_value {
+                    crate::persist::save_metadata(pool, &target, key, v).await;
+                } else {
+                    crate::persist::delete_metadata(pool, &target, key).await;
+                }
+            }
             if let Some(v) = new_value {
                 reply_to_client(
                     &senders,
@@ -254,6 +262,10 @@ pub async fn handle_metadata(
                 let kvs: Vec<_> = entry.drain().collect();
                 kvs
             };
+            // Persist to database
+            if let Some(ref pool) = cfg.db {
+                crate::persist::clear_metadata(pool, &target).await;
+            }
             for (k, v) in cleared {
                 reply_to_client(
                     &senders,
