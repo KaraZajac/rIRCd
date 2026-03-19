@@ -99,6 +99,9 @@ pub struct ServerConfig {
     /// If set, 005 CLIENTTAGDENY=... and relay drops these client-only tags.
     #[serde(default)]
     pub client_tag_deny: Option<Vec<String>>,
+    /// If set, connecting clients receive an HMAC-SHA256-based virtual host cloak.
+    #[serde(default)]
+    pub cloak_key: Option<String>,
 }
 
 fn default_server_name() -> String { "rIRCd.local".into() }
@@ -119,6 +122,7 @@ impl Default for ServerConfig {
             ping_timeout_secs: default_ping_timeout(),
             disconnect_timeout_secs: default_disconnect_timeout(),
             client_tag_deny: None,
+            cloak_key: None,
         }
     }
 }

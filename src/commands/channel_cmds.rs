@@ -153,6 +153,20 @@ pub async fn handle_join(
             }
         }
 
+        if let Some(limit) = ch.modes.user_limit {
+            if ch.member_count() >= limit as usize {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("471", vec![nick.clone(), ch_name.to_string(), "Cannot join channel (+l)".into()])
+                        .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                continue;
+            }
+        }
+
         let is_first = ch.members.is_empty();
         let (persisted_op, persisted_voice) = ch.persisted_modes_for(&nick, account.as_deref());
         let mut modes = ChannelMemberModeSet::default();
@@ -181,6 +195,9 @@ pub async fn handle_join(
         };
         let member_ids: Vec<String> = ch.members.keys().cloned().collect();
         let topic = ch.topic.clone();
+        let topic_setter = ch.topic_setter.clone();
+        let topic_time = ch.topic_time;
+        let created_at = ch.created_at;
         drop(ch);
         for mid in &member_ids {
             let caps = match state.clients.get(mid) {
@@ -206,7 +223,27 @@ pub async fn handle_join(
                 label,
             )
             .await;
+            // 333 RPL_TOPICWHOTIME
+            let setter = topic_setter.as_deref().unwrap_or("*");
+            let time_str = topic_time.unwrap_or(0).to_string();
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("333", vec![nick.clone(), ch_key.clone(), setter.to_string(), time_str])
+                    .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
         }
+        // 329 RPL_CREATIONTIME
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("329", vec![nick.clone(), ch_key.clone(), created_at.to_string()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
 
         // no-implicit-names: send NAMES to joining user unless they have the cap
         if !client_caps.contains("no-implicit-names") {
@@ -419,6 +456,10 @@ pub async fn handle_list(
     let ch_store = channels.read().await;
     for (ch_name, ch) in &ch_store.channels {
         let ch = ch.read().await;
+        // +s: secret channels are not shown to non-members
+        if ch.modes.secret && !ch.is_member(client_id) {
+            continue;
+        }
         let topic = ch.topic.as_deref().unwrap_or("");
         let count = ch.member_count();
         let msg = Message::new("322", vec![nick.clone(), ch_name.clone(), count.to_string(), topic.to_string()])
@@ -655,11 +696,33 @@ pub async fn handle_mode(
                 }
             }
 
+            // Collect data needed after dropping ch
+            let mode_flags_str = {
+                let mut flags = String::new();
+                if ch.modes.invite_only { flags.push('i'); }
+                if ch.modes.moderated { flags.push('m'); }
+                if ch.modes.no_external { flags.push('n'); }
+                if ch.modes.secret { flags.push('s'); }
+                if ch.modes.topic_protect { flags.push('t'); }
+                if ch.modes.registered_only { flags.push('R'); }
+                if ch.modes.no_colors { flags.push('c'); }
+                if ch.modes.no_ctcp { flags.push('C'); }
+                flags
+            };
+            let mode_key_val = ch.key.clone();
+            let mode_limit_val = ch.modes.user_limit;
+            let member_ids_mode: Vec<String> = ch.members.keys().cloned().collect();
             let mode_msg = Message::new("MODE", msg.params.clone()).with_prefix(nick.as_str());
-            for (mid, _) in &ch.members.clone() {
+            drop(ch);
+            drop(ch_store);
+            for mid in &member_ids_mode {
                 if let Some(tx) = senders.read().await.get(mid) {
                     let _ = tx.send(mode_msg.clone()).await;
                 }
+            }
+            // Persist channel modes to database
+            if let Some(ref pool) = cfg.db {
+                crate::persist::save_channel_modes(pool, &ch_key, &mode_flags_str, mode_key_val.as_deref(), mode_limit_val).await;
             }
         }
     } else if target.eq_ignore_ascii_case(&nick) {
@@ -779,20 +842,32 @@ pub async fn handle_topic(
             return Ok(());
         }
 
+        let topic_time_ts = chrono::Utc::now().timestamp();
         ch.topic = new_topic.clone();
         ch.topic_setter = Some(source.clone());
-        ch.topic_time = Some(chrono::Utc::now().timestamp());
+        ch.topic_time = Some(topic_time_ts);
 
         let topic_msg = Message::new(
             "TOPIC",
             vec![ch_name.into(), new_topic.unwrap_or_default()],
         )
         .with_prefix(&source);
-        for (mid, _) in &ch.members.clone() {
+        let member_ids_for_topic: Vec<String> = ch.members.keys().cloned().collect();
+        drop(ch);
+        for mid in &member_ids_for_topic {
             if let Some(tx) = senders.read().await.get(mid) {
                 let _ = tx.send(topic_msg.clone()).await;
             }
         }
+        // 333 RPL_TOPICWHOTIME to the setter
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("333", vec![nick.clone(), ch_name.into(), source.clone(), topic_time_ts.to_string()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
     } else {
         reply_to_client(
             &senders,

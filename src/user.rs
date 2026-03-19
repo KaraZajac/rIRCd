@@ -60,6 +60,10 @@ pub struct Client {
     pub invisible: bool,
     /// User mode +w: receives WALLOPS broadcasts
     pub wallops: bool,
+    /// Unix timestamp when the client completed registration (for WHOIS 317)
+    pub signon_at: i64,
+    /// Unix timestamp of the last message received from this client (for WHOIS 317 idle)
+    pub last_active: i64,
 }
 
 impl Client {
@@ -82,6 +86,8 @@ impl Client {
             vuser: None,
             invisible: false,
             wallops: false,
+            signon_at: Utc::now().timestamp(),
+            last_active: Utc::now().timestamp(),
         }
     }
 

@@ -58,6 +58,14 @@ async fn handle_client_stream<S>(
         }
     });
 
+    // Flood control: classic IRC token bucket
+    // Capacity: 10 tokens. Each message costs 1 token. Tokens refill at 1/second.
+    // When empty, messages are dropped and client receives an error.
+    const FLOOD_CAPACITY: f64 = 10.0;
+    const FLOOD_REFILL_RATE: f64 = 1.0; // tokens per second
+    let mut flood_tokens: f64 = FLOOD_CAPACITY;
+    let mut flood_last_refill = tokio::time::Instant::now();
+
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -89,6 +97,24 @@ async fn handle_client_stream<S>(
                 match parse_message(line) {
                     Ok(msg) => {
                         debug!(client = %client_id, command = %msg.command, "received");
+
+                        // Flood control: refill tokens based on elapsed time, then consume one
+                        let now = tokio::time::Instant::now();
+                        let elapsed = now.duration_since(flood_last_refill).as_secs_f64();
+                        flood_tokens = (flood_tokens + elapsed * FLOOD_REFILL_RATE).min(FLOOD_CAPACITY);
+                        flood_last_refill = now;
+
+                        // Bypass flood control for PONG (keeps connection alive)
+                        if msg.command != "PONG" {
+                            if flood_tokens < 1.0 {
+                                let reply = Message::new("NOTICE", vec!["*".into(), "Flood control: you are sending messages too fast".into()])
+                                    .with_prefix(&server_name);
+                                let _ = send_tx.send(reply).await;
+                                continue;
+                            }
+                            flood_tokens -= 1.0;
+                        }
+
                         if tx_clone
                             .send(ClientMessage {
                                 client_id: client_id.clone(),

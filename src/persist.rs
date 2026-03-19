@@ -29,6 +29,14 @@ pub struct ChannelEntry {
     pub operators: Vec<String>,
     /// Nicks or account names that get + (voice) on join.
     pub voice: Vec<String>,
+    /// Persisted mode flags string (e.g. "imns")
+    pub mode_flags: String,
+    /// Persisted channel key (+k)
+    pub mode_key: Option<String>,
+    /// Persisted user limit (+l)
+    pub mode_limit: Option<u32>,
+    /// Channel creation Unix timestamp
+    pub created_at: i64,
 }
 
 /// One line of channel history from the database.
@@ -76,14 +84,26 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS channels (
-            id    BIGINT AUTO_INCREMENT PRIMARY KEY,
-            name  VARCHAR(64) NOT NULL UNIQUE,
-            topic TEXT        NOT NULL DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+            name        VARCHAR(64)  NOT NULL UNIQUE,
+            topic       TEXT         NOT NULL DEFAULT '',
+            mode_flags  VARCHAR(32)  NOT NULL DEFAULT '',
+            mode_key    VARCHAR(64)  NULL,
+            mode_limit  INT UNSIGNED NULL,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) CHARACTER SET utf8mb4",
     )
     .execute(pool)
     .await?;
+
+    // Migrate existing channels table
+    for col_def in &[
+        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_flags VARCHAR(32) NOT NULL DEFAULT ''",
+        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_key VARCHAR(64) NULL",
+        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_limit INT UNSIGNED NULL",
+    ] {
+        let _ = sqlx::query(col_def).execute(pool).await;
+    }
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS channel_operators (
@@ -131,9 +151,11 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
 pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
     use sqlx::Row;
 
-    let rows = match sqlx::query("SELECT id, name, topic FROM channels")
-        .fetch_all(pool)
-        .await
+    let rows = match sqlx::query(
+        "SELECT id, name, topic, mode_flags, mode_key, mode_limit, UNIX_TIMESTAMP(created_at) AS created_ts FROM channels",
+    )
+    .fetch_all(pool)
+    .await
     {
         Ok(r) => r,
         Err(e) => {
@@ -147,6 +169,10 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
         let id: i64 = row.get("id");
         let name: String = row.get("name");
         let topic: String = row.get("topic");
+        let mode_flags: String = row.try_get("mode_flags").unwrap_or_default();
+        let mode_key: Option<String> = row.try_get("mode_key").unwrap_or(None);
+        let mode_limit: Option<u32> = row.try_get("mode_limit").unwrap_or(None);
+        let created_at: i64 = row.try_get("created_ts").unwrap_or(0);
 
         let ops: Vec<String> = sqlx::query(
             "SELECT nick_or_account FROM channel_operators WHERE channel_id = ?",
@@ -175,9 +201,36 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
             topic,
             operators: ops,
             voice,
+            mode_flags,
+            mode_key,
+            mode_limit,
+            created_at,
         });
     }
     entries
+}
+
+// ─── Channel mode persistence ─────────────────────────────────────────────────
+
+/// Upsert the mode_flags, mode_key, and mode_limit for a channel by name.
+pub async fn save_channel_modes(
+    pool: &sqlx::MySqlPool,
+    channel_name: &str,
+    mode_flags: &str,
+    mode_key: Option<&str>,
+    mode_limit: Option<u32>,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO channels (name, mode_flags, mode_key, mode_limit)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE mode_flags = VALUES(mode_flags), mode_key = VALUES(mode_key), mode_limit = VALUES(mode_limit)",
+    )
+    .bind(channel_name)
+    .bind(mode_flags)
+    .bind(mode_key)
+    .bind(mode_limit)
+    .execute(pool)
+    .await;
 }
 
 // ─── SCRAM-SHA-256 helpers ────────────────────────────────────────────────────

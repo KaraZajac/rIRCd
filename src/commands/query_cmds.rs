@@ -153,9 +153,51 @@ pub async fn handle_who(
             }
         }
     } else {
-        if let Some(target_id) = state.nick_to_id.get(&target.to_uppercase()) {
+        // Determine which clients share a channel with the requester (for invisible filtering)
+        let requester_channels: std::collections::HashSet<String> = match state.clients.get(client_id) {
+            Some(c) => c.read().await.channels.keys().cloned().collect(),
+            None => Default::default(),
+        };
+        let has_wildcards = target.contains('*') || target.contains('?');
+        let target_upper = target.to_uppercase();
+
+        // Collect matching client IDs
+        let matching_ids: Vec<String> = if !has_wildcards && target != "*" {
+            // Exact nick lookup
+            state.nick_to_id.get(&target_upper).cloned().into_iter().collect()
+        } else {
+            // Glob or wildcard: iterate all clients
+            let target_lower = target.to_lowercase();
+            state.clients.keys()
+                .filter(|id| {
+                    if let Some(c) = state.clients.get(*id) {
+                        if let Ok(g) = c.try_read() {
+                            let match_str = format!(
+                                "{}!{}@{}",
+                                g.nick_or_id().to_lowercase(),
+                                g.display_user().to_lowercase(),
+                                g.display_host().to_lowercase()
+                            );
+                            return crate::user::glob_match(&target_lower, &match_str)
+                                || crate::user::glob_match(&target_lower, g.nick_or_id());
+                        }
+                    }
+                    false
+                })
+                .cloned()
+                .collect()
+        };
+
+        for target_id in &matching_ids {
             if let Some(c) = state.clients.get(target_id) {
                 let c = c.read().await;
+                // +i invisible: skip unless requester shares a channel or is the same user
+                if c.invisible && target_id != client_id {
+                    let shares_channel = c.channels.keys().any(|ch| requester_channels.contains(ch));
+                    if !shares_channel {
+                        continue;
+                    }
+                }
                 let hopcount = "0";
                 let realname = c.realname.as_deref().unwrap_or("");
                 let flags = if c.away_message.is_some() { "G" } else { "H" };
@@ -181,7 +223,6 @@ pub async fn handle_who(
                     let msg = Message::new("354", params).with_prefix(&cfg.server.name);
                     reply_to_client(&senders, client_id, msg, label).await;
                 } else {
-                    // RPL_WHOREPLY: * user host server nick flags :hopcount realname
                     let oper_flag = if c.oper { "*" } else { "" };
                     let flags_field = format!("{}{}", flags, oper_flag);
                     let msg = Message::new("352", vec![
@@ -264,6 +305,38 @@ pub async fn handle_whois(
                     &senders,
                     client_id,
                     Message::new("319", vec![nick.clone(), target_nick.into(), ch_str])
+                        .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+            }
+            // 312 RPL_WHOISSERVER
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("312", vec![nick.clone(), target_nick.into(), cfg.server.name.clone(), "rIRCd server".into()])
+                    .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            // 317 RPL_WHOISIDLE: seconds idle, signon time
+            {
+                let idle_secs = chrono::Utc::now().timestamp().saturating_sub(c.last_active);
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("317", vec![nick.clone(), target_nick.into(), idle_secs.to_string(), c.signon_at.to_string(), "seconds idle, signon time".into()])
+                        .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+            }
+            // 301 RPL_AWAY if target is away
+            if let Some(ref away_msg) = c.away_message {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("301", vec![nick.clone(), target_nick.into(), away_msg.clone()])
                         .with_prefix(&cfg.server.name),
                     label,
                 )
