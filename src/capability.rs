@@ -35,6 +35,9 @@ pub const CAPS: &[&str] = &[
     "draft/account-registration",
     "draft/multiline",
     "draft/pre-away",
+    "draft/message-edit",
+    "draft/reactions",
+    "draft/typing",
 ];
 
 /// Capabilities that depend on message-tags
