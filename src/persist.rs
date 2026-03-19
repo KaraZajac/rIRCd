@@ -3,7 +3,13 @@
 //! All tables are created automatically on first startup via `init_schema`.
 //! The pool is held in `Config::db` and passed to every function here.
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use hmac::{Hmac, Mac};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Error from `register_user`.
 #[derive(Debug)]
@@ -43,16 +49,30 @@ const MAX_HISTORY_ENTRIES: i64 = 1000;
 pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS users (
-            id       BIGINT AUTO_INCREMENT PRIMARY KEY,
-            nick     VARCHAR(64)  NOT NULL,
-            nick_lower VARCHAR(64) NOT NULL UNIQUE,
-            password VARCHAR(255) NOT NULL,
-            email    VARCHAR(255) NOT NULL DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+            nick            VARCHAR(64)  NOT NULL,
+            nick_lower      VARCHAR(64)  NOT NULL UNIQUE,
+            password        VARCHAR(255) NOT NULL,
+            email           VARCHAR(255) NOT NULL DEFAULT '',
+            scram_salt      VARCHAR(64)  NOT NULL DEFAULT '',
+            scram_iterations INT UNSIGNED NOT NULL DEFAULT 4096,
+            scram_stored_key VARCHAR(64) NOT NULL DEFAULT '',
+            scram_server_key VARCHAR(64) NOT NULL DEFAULT '',
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) CHARACTER SET utf8mb4",
     )
     .execute(pool)
     .await?;
+
+    // Migrate existing tables that were created before SCRAM columns were added
+    for col_def in &[
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS scram_salt VARCHAR(64) NOT NULL DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS scram_iterations INT UNSIGNED NOT NULL DEFAULT 4096",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS scram_stored_key VARCHAR(64) NOT NULL DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS scram_server_key VARCHAR(64) NOT NULL DEFAULT ''",
+    ] {
+        let _ = sqlx::query(col_def).execute(pool).await;
+    }
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS channels (
@@ -160,6 +180,80 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
     entries
 }
 
+// ─── SCRAM-SHA-256 helpers ────────────────────────────────────────────────────
+
+const SCRAM_ITERATIONS: u32 = 4096;
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data).into()
+}
+
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut out);
+    out
+}
+
+/// Compute SCRAM-SHA-256 (StoredKey, ServerKey) from a cleartext password.
+pub fn scram_compute(password: &str, salt: &[u8], iterations: u32) -> ([u8; 32], [u8; 32]) {
+    let salted = pbkdf2_sha256(password.as_bytes(), salt, iterations);
+    let client_key = hmac_sha256(&salted, b"Client Key");
+    let stored_key = sha256(&client_key);
+    let server_key = hmac_sha256(&salted, b"Server Key");
+    (stored_key, server_key)
+}
+
+/// SCRAM credentials retrieved from the database.
+pub struct ScramCredentials {
+    pub salt_b64: String,
+    pub iterations: u32,
+    pub stored_key: [u8; 32],
+    pub server_key: [u8; 32],
+}
+
+/// Retrieve SCRAM-SHA-256 credentials for an account. Returns None if account not found or not enrolled.
+pub async fn get_scram_credentials(
+    pool: &sqlx::MySqlPool,
+    account: &str,
+) -> Option<ScramCredentials> {
+    use sqlx::Row;
+
+    let account_lower = account.to_lowercase();
+    let row = sqlx::query(
+        "SELECT scram_salt, scram_iterations, scram_stored_key, scram_server_key
+         FROM users WHERE nick_lower = ?",
+    )
+    .bind(&account_lower)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+
+    let salt_b64: String = row.get("scram_salt");
+    let iterations: u32 = row.get("scram_iterations");
+    let stored_b64: String = row.get("scram_stored_key");
+    let server_b64: String = row.get("scram_server_key");
+
+    if salt_b64.is_empty() || stored_b64.is_empty() {
+        return None; // Not SCRAM-enrolled (registered before this feature)
+    }
+
+    let stored_key: [u8; 32] = B64.decode(&stored_b64).ok()?.try_into().ok()?;
+    let server_key: [u8; 32] = B64.decode(&server_b64).ok()?.try_into().ok()?;
+
+    Some(ScramCredentials {
+        salt_b64,
+        iterations,
+        stored_key,
+        server_key,
+    })
+}
+
 // ─── Users ────────────────────────────────────────────────────────────────────
 
 /// Register a new account. Fails if nick already exists or password is too short.
@@ -190,13 +284,25 @@ pub async fn register_user(
     let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
         .map_err(|e| RegisterError::Io(e.to_string()))?;
 
+    // Compute SCRAM-SHA-256 credentials at registration time
+    let salt: [u8; 16] = rand::thread_rng().gen();
+    let (stored_key, server_key) = scram_compute(password, &salt, SCRAM_ITERATIONS);
+    let salt_b64 = B64.encode(salt);
+    let stored_b64 = B64.encode(stored_key);
+    let server_b64 = B64.encode(server_key);
+
     sqlx::query(
-        "INSERT INTO users (nick, nick_lower, password, email) VALUES (?, ?, ?, ?)",
+        "INSERT INTO users (nick, nick_lower, password, email, scram_salt, scram_iterations, scram_stored_key, scram_server_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(nick)
     .bind(&nick_lower)
     .bind(&hash)
     .bind(email.unwrap_or(""))
+    .bind(&salt_b64)
+    .bind(SCRAM_ITERATIONS)
+    .bind(&stored_b64)
+    .bind(&server_b64)
     .execute(pool)
     .await
     .map_err(|e| RegisterError::Io(e.to_string()))?;

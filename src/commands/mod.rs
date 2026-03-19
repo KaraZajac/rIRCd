@@ -4,6 +4,7 @@ mod messaging;
 mod query_cmds;
 mod registration;
 mod reply;
+mod server_cmds;
 
 pub use reply::reply_to_client;
 
@@ -173,6 +174,15 @@ pub async fn handle_message(
         "RENAME" => channel_cmds::handle_rename(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
         "MARKREAD" => messaging::handle_markread(&client_id, msg, state, senders, cfg, label.as_deref()).await,
         "METADATA" => metadata::handle_metadata(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
+        "LUSERS" => server_cmds::handle_lusers(&client_id, state, channels.clone(), senders, cfg, label.as_deref()).await,
+        "VERSION" => server_cmds::handle_version(&client_id, state, senders, cfg, label.as_deref()).await,
+        "TIME" => server_cmds::handle_time(&client_id, state, senders, cfg, label.as_deref()).await,
+        "INFO" => server_cmds::handle_info(&client_id, state, senders, cfg, label.as_deref()).await,
+        "LINKS" => server_cmds::handle_links(&client_id, state, senders, cfg, label.as_deref()).await,
+        "STATS" => server_cmds::handle_stats(&client_id, msg, state, senders, cfg, label.as_deref()).await,
+        "WHOWAS" => server_cmds::handle_whowas(&client_id, msg, state, senders, cfg, label.as_deref()).await,
+        "HELP" => server_cmds::handle_help(&client_id, msg, state, senders, cfg, label.as_deref()).await,
+        "KNOCK" => server_cmds::handle_knock(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
         _ => {
             let target = {
                 let state = state.read().await;

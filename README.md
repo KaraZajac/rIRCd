@@ -240,15 +240,26 @@ User registration is handled via the IRC `REGISTER` command (draft/account-regis
 REGISTER * [email|*] <password>
 ```
 
-This stores a bcrypt hash of the password in MariaDB. Passwords must be at least 6 characters.
+This stores a bcrypt hash of the password (for SASL PLAIN) and full SCRAM credentials (for SASL SCRAM-SHA-256) in MariaDB. Passwords must be at least 6 characters.
 
-Authentication uses SASL PLAIN:
+Authentication is supported via two SASL mechanisms:
 
+**SASL PLAIN:**
 ```
 CAP REQ :sasl
 AUTHENTICATE PLAIN
 AUTHENTICATE <base64-encoded NUL-separated authzid NUL authcid NUL password>
 ```
+
+**SASL SCRAM-SHA-256** (recommended):
+```
+CAP REQ :sasl
+AUTHENTICATE SCRAM-SHA-256
+AUTHENTICATE <base64-encoded client-first-message>
+AUTHENTICATE <base64-encoded client-final-message>
+```
+
+SCRAM-SHA-256 uses PBKDF2 key derivation (4096 iterations) and provides mutual authentication — the server proves it knows your credentials without ever seeing your password in clear text over the protocol exchange.
 
 Accounts are keyed by nick (lowercase). There is no separate admin interface for user management — use direct SQL queries on the `users` table if needed.
 
@@ -287,7 +298,6 @@ Channels, topics, operator lists, voice lists, and message history are all store
 | **standard-replies** | Full | FAIL for SETNAME, REDACT, UTF-8 errors |
 | **no-implicit-names** | Full | No NAMES burst on JOIN when client has cap |
 | **userhost-in-names** | Full | NAMES (353) with full `nick!user@host` when client has cap |
-| **pre-away** | Full | AWAY during registration; applied after NICK/USER complete |
 | **utf8only** | Full | Non-UTF-8 rejected with FAIL when client has standard-replies |
 | **cap-notify** | Full | CAP NOTIFY with current cap list on REQ/ACK and END |
 | **draft/extended-isupport** | Full | ISUPPORT command; 005 before registration |
@@ -295,7 +305,7 @@ Channels, topics, operator lists, voice lists, and message history are all store
 | **bot** | Full | Umode +B; RPL_WHOISBOT (335) in WHOIS |
 | **message-redaction** | Full | REDACT command; msgid store; broadcast to channel/DM recipients |
 | **account-extban** | Full | MODE +b ~a:account; JOIN 474 when banned by account |
-| **sasl** | Full | AUTHENTICATE PLAIN, 903/904 |
+| **sasl** | Full | AUTHENTICATE PLAIN and SCRAM-SHA-256; 903/904; advertised as `sasl=PLAIN,SCRAM-SHA-256` |
 | **monitor** | Full | MONITOR +/−/C/L/S; 730/731/732/733/734; on join/quit/nick |
 | **draft/channel-rename** | Full | RENAME old new [reason]; op-only; fallback PART+JOIN for clients without cap |
 | **draft/chathistory** | Full | CHATHISTORY LATEST/BEFORE/AFTER; BATCH chathistory; DB-backed; limit 200 |
@@ -303,8 +313,50 @@ Channels, topics, operator lists, voice lists, and message history are all store
 | **draft/metadata-2** | Full | METADATA GET/LIST/SET/CLEAR; in-memory key-value per user/channel |
 | **draft/account-registration** | Full | REGISTER \* [email] password; VERIFY returns INVALID_CODE (no email verification) |
 | **draft/multiline** | Full | BATCH draft/multiline; max-bytes=4096, max-lines=20; fallback for non-multiline clients |
+| **draft/pre-away** | Full | AWAY during registration; applied after NICK/USER complete |
 | **CLIENTTAGDENY** | Full | Optional 005 token; config `server.client_tag_deny` |
 | **WebIRC** | Full | WEBIRC password gateway hostname ip; config `[webirc]` |
+
+---
+
+## Standard IRC Commands
+
+In addition to IRCv3 features, rIRCd implements the standard IRC command set:
+
+| Command | Numerics | Description |
+|---------|----------|-------------|
+| `LUSERS` | 251/252/254/255/265/266 | Server user/channel statistics |
+| `VERSION` | 351 | Server version string |
+| `TIME` | 391 | Server local time |
+| `INFO` | 371/374 | Server info and uptime |
+| `LINKS` | 364/365 | Linked servers (single-server: lists self) |
+| `STATS u` | 242/219 | Server uptime |
+| `STATS o` | 243/219 | IRC operator list |
+| `WHOWAS` | 314/312/369 | Historical nick info; up to 5 entries per nick, in-memory |
+| `HELP` | 704/705/706 | Per-command help text |
+| `KNOCK` | 710/711 | Request invite to an invite-only channel; notifies ops |
+
+---
+
+## Channel Modes
+
+| Mode | Description |
+|------|-------------|
+| `+o` | Channel operator |
+| `+v` | Voice (+) |
+| `+h` | Half-op (%) |
+| `+b` | Ban list (supports `~a:account` extban) |
+| `+q` | Quiet list — silences matching users without kicking |
+| `+i` | Invite-only |
+| `+m` | Moderated — only `+v`/`+h`/`+o` may speak |
+| `+n` | No external messages |
+| `+s` | Secret channel |
+| `+t` | Topic restricted to ops |
+| `+k` | Channel key (password) |
+| `+l` | User limit |
+| `+R` | Registered users only — unregistered users cannot join or speak |
+| `+c` | Strip mIRC colour and formatting codes from messages |
+| `+C` | Block CTCP messages (including `/me` actions) |
 
 ---
 

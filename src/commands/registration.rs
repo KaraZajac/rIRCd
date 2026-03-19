@@ -4,10 +4,32 @@ use crate::commands::reply_to_client;
 use crate::config::Config;
 use crate::persist::{self, RegisterError};
 use crate::protocol::Message;
-use crate::user::{Client, ServerState};
+use crate::user::{Client, ScramServerState, ServerState};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use hmac::{Hmac, Mac};
+use rand::Rng;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn hmac_sha256_reg(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key");
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
+fn sha256_reg(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data).into()
+}
+
+fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for i in 0..32 { out[i] = a[i] ^ b[i]; }
+    out
+}
 
 /// Send a message to a client. Returns true if the client was in senders and the send was attempted.
 async fn send_to_client(
@@ -402,7 +424,18 @@ pub async fn handle_nick(
             }
             let old_nick = client_guard.nick.clone();
             let old_source = client_guard.source().unwrap_or_else(|| client_guard.nick_or_id().to_string());
+            // Record old nick in WHOWAS before changing it.
+            // Build the entry while we hold client_guard, then drop it before mutating state_guard.
+            let whowas_entry = old_nick.as_ref().map(|n| crate::user::WhowasEntry {
+                nick: n.clone(),
+                user: client_guard.user.as_deref().unwrap_or("*").to_string(),
+                host: client_guard.host.clone(),
+                realname: client_guard.realname.as_deref().unwrap_or("").to_string(),
+                server: cfg.server.name.clone(),
+                timestamp: chrono::Utc::now().timestamp(),
+            });
             drop(client_guard);
+            if let Some(entry) = whowas_entry { state_guard.push_whowas(entry); }
             if let Some(ref o) = old_nick {
                 state_guard.nick_to_id.remove(&o.to_uppercase());
             }
@@ -632,6 +665,8 @@ pub async fn handle_quit(
             let had_account = c.account.is_some();
             let nick = c.nick.clone().unwrap_or_else(|| client_id.to_string());
             let list = c.monitor_list.clone();
+            // Record WHOWAS before the client is removed
+            state_guard.record_whowas(&c, &cfg.server.name);
             (source, chans, had_account, nick, list)
         } else {
             state_guard.pending.remove(client_id);
@@ -752,6 +787,75 @@ pub async fn handle_authenticate(
     label: Option<&str>,
 ) -> anyhow::Result<()> {
     let mechanism = msg.params.first().map(|s| s.as_str()).unwrap_or("");
+
+    // ── Check stored mechanism for routing ────────────────────────────────────
+    let stored_mechanism = {
+        let sg = state.read().await;
+        sg.pending.get(client_id).and_then(|c| c.sasl_mechanism.clone())
+    };
+
+    // Already-authenticated guard
+    {
+        let sg = state.read().await;
+        if let Some(conn) = sg.pending.get(client_id) {
+            if conn.account.is_some() {
+                let nick = conn.nick.clone().unwrap_or_else(|| "*".to_string());
+                drop(sg);
+                tracing::info!(client_id, "SASL: already authenticated, sending 907");
+                reply_to_client(&senders, client_id,
+                    Message::new("907", vec![nick, "You have already authenticated using SASL".into()]).with_prefix(&cfg.server.name), label).await;
+                return Ok(());
+            }
+            if conn.sasl_failed {
+                return Ok(());
+            }
+        }
+    }
+
+    // Route SCRAM-SHA-256: initial selection or continuation
+    if mechanism == "SCRAM-SHA-256" || stored_mechanism.as_deref() == Some("SCRAM-SHA-256") {
+        if mechanism == "SCRAM-SHA-256" {
+            // Store mechanism and send AUTHENTICATE +
+            {
+                let mut sg = state.write().await;
+                if let Some(conn) = sg.pending.get_mut(client_id) {
+                    conn.sasl_mechanism = Some("SCRAM-SHA-256".to_string());
+                }
+            }
+            // Client may have sent data inline
+            let inline = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
+            if inline.is_empty() || inline == "SCRAM-SHA-256" {
+                reply_to_client(&senders, client_id,
+                    Message::new("AUTHENTICATE", vec!["+".into()]).with_prefix(&cfg.server.name), label).await;
+                return Ok(());
+            }
+            return handle_authenticate_scram_step(client_id, host, inline, state, channels, senders, cfg, label).await;
+        } else {
+            // Continuation
+            return handle_authenticate_scram_step(client_id, host, mechanism, state, channels, senders, cfg, label).await;
+        }
+    }
+
+    // Unknown mechanism (not PLAIN, not SCRAM, not a continuation of either)
+    if mechanism != "PLAIN" && mechanism != "+" && !mechanism.is_empty()
+        && stored_mechanism.is_none()
+    {
+        let nick = state.read().await.pending.get(client_id)
+            .and_then(|c| c.nick.clone()).unwrap_or_else(|| "*".to_string());
+        reply_to_client(&senders, client_id,
+            Message::new("908", vec![nick, "PLAIN,SCRAM-SHA-256".into(), "are available SASL mechanisms".into()])
+                .with_prefix(&cfg.server.name), label).await;
+        return Ok(());
+    }
+
+    // Store PLAIN mechanism on first call
+    if mechanism == "PLAIN" {
+        let mut sg = state.write().await;
+        if let Some(conn) = sg.pending.get_mut(client_id) {
+            conn.sasl_mechanism = Some("PLAIN".to_string());
+        }
+    }
+
     // Token: first message is "AUTHENTICATE PLAIN" [optional first chunk]; continuation is "AUTHENTICATE <chunk>".
     // When client sends only "AUTHENTICATE PLAIN", params = ["PLAIN"] and trailing() returns the last param "PLAIN" —
     // we must not treat the mechanism name as a credential chunk.
@@ -813,26 +917,6 @@ pub async fn handle_authenticate(
     let (to_decode, is_end, explicit_end) = {
         let mut state_guard = state.write().await;
         let conn = state_guard.get_or_create_pending(client_id, host);
-        // Already succeeded or already failed SASL; ignore further AUTHENTICATE.
-        if conn.account.is_some() {
-            let nick = conn.nick.clone().unwrap_or_else(|| "*".to_string());
-            drop(state_guard);
-            tracing::info!(client_id = %client_id, "SASL AUTHENTICATE: already authenticated, sending 907");
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new("907", vec![nick, "You have already authenticated using SASL".into()])
-                    .with_prefix(&cfg.server.name),
-                label,
-            )
-            .await;
-            return Ok(());
-        }
-        if conn.sasl_failed {
-            drop(state_guard);
-            tracing::info!(client_id = %client_id, "SASL AUTHENTICATE: ignored (already failed)");
-            return Ok(());
-        }
         // is_end = true when we have the full response: token is "+" or token.len() < 400.
         let explicit_end = token == "+";
         let chunk_lt_400 = token.len() < 400;
@@ -1187,9 +1271,235 @@ async fn sasl_fail(
 
 /// Decode base64 to UTF-8 string. Fails on invalid UTF-8 per RFC 4616 (PLAIN uses UTF-8).
 fn base64_decode(s: &str) -> anyhow::Result<String> {
-    use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD.decode(s)?;
+    let decoded = B64.decode(s)?;
     String::from_utf8(decoded).map_err(|e| anyhow::anyhow!("SASL PLAIN message must be valid UTF-8: {}", e))
+}
+
+// ─── SASL SCRAM-SHA-256 ───────────────────────────────────────────────────────
+
+/// Handle one AUTHENTICATE step for SCRAM-SHA-256.
+/// Step 1: receive client-first, send server-first.
+/// Step 2: receive client-final, verify proof, send server-final + 903/904.
+async fn handle_authenticate_scram_step(
+    client_id: &str,
+    host: &str,
+    token: &str,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let nick = {
+        let sg = state.read().await;
+        sg.pending.get(client_id).and_then(|c| c.nick.clone()).unwrap_or_else(|| "*".to_string())
+    };
+
+    // Decode the base64 payload
+    let payload = match B64.decode(token) {
+        Ok(b) => match String::from_utf8(b) {
+            Ok(s) => s,
+            Err(_) => {
+                sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: invalid UTF-8").await;
+                return Ok(());
+            }
+        },
+        Err(_) => {
+            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: invalid base64").await;
+            return Ok(());
+        }
+    };
+
+    // Determine which step we're on by checking sasl_scram
+    let has_scram_state = state.read().await.pending.get(client_id)
+        .map(|c| c.sasl_scram.is_some()).unwrap_or(false);
+
+    if !has_scram_state {
+        // ── Step 1: process client-first-message ─────────────────────────────
+        // Format: n,,n=username,r=clientnonce
+        // GS2 header is "n,," for no channel binding
+        let bare = if let Some(b) = payload.strip_prefix("n,,") {
+            b
+        } else {
+            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: invalid GS2 header").await;
+            return Ok(());
+        };
+
+        let mut username = String::new();
+        let mut client_nonce = String::new();
+        for part in bare.split(',') {
+            if let Some(v) = part.strip_prefix("n=") { username = v.to_string(); }
+            if let Some(v) = part.strip_prefix("r=") { client_nonce = v.to_string(); }
+        }
+        if username.is_empty() || client_nonce.is_empty() {
+            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: missing n= or r= in client-first").await;
+            return Ok(());
+        }
+
+        // Look up SCRAM credentials
+        let pool = match cfg.db.as_ref() {
+            Some(p) => p,
+            None => {
+                sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: database unavailable").await;
+                return Ok(());
+            }
+        };
+        let creds = match persist::get_scram_credentials(pool, &username).await {
+            Some(c) => c,
+            None => {
+                // Account not found or not SCRAM-enrolled — still fail with generic message
+                tracing::info!(client_id, account = %username, "SASL SCRAM: account not found or not SCRAM-enrolled");
+                sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+                return Ok(());
+            }
+        };
+
+        // Generate server nonce and build server-first-message
+        let server_nonce: String = rand::thread_rng()
+            .sample_iter(rand::distributions::Alphanumeric)
+            .take(24)
+            .map(char::from)
+            .collect();
+        let full_nonce = format!("{}{}", client_nonce, server_nonce);
+        let server_first = format!("r={},s={},i={}", full_nonce, creds.salt_b64, creds.iterations);
+
+        // Store SCRAM state
+        {
+            let mut sg = state.write().await;
+            let conn = sg.get_or_create_pending(client_id, host);
+            conn.sasl_scram = Some(ScramServerState {
+                username: username.clone(),
+                full_nonce: full_nonce.clone(),
+                client_first_bare: bare.to_string(),
+                server_first: server_first.clone(),
+                stored_key: creds.stored_key,
+                server_key: creds.server_key,
+            });
+        }
+
+        // Send server-first
+        let encoded = B64.encode(server_first.as_bytes());
+        reply_to_client(&senders, client_id,
+            Message::new("AUTHENTICATE", vec![encoded]).with_prefix(&cfg.server.name), label).await;
+    } else {
+        // ── Step 2: process client-final-message ─────────────────────────────
+        // Format: c=biws,r=fullnonce,p=base64(ClientProof)
+        let scram = {
+            let mut sg = state.write().await;
+            sg.pending.get_mut(client_id).and_then(|c| c.sasl_scram.take())
+        };
+        let scram = match scram {
+            Some(s) => s,
+            None => {
+                sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: internal state error").await;
+                return Ok(());
+            }
+        };
+
+        let mut cbind = String::new();
+        let mut recv_nonce = String::new();
+        let mut client_proof_b64 = String::new();
+        // We need client-final-without-proof for auth message
+        let proof_prefix = ",p=";
+        let client_final_without_proof = payload.find(proof_prefix)
+            .map(|i| &payload[..i])
+            .unwrap_or(&payload);
+        for part in payload.split(',') {
+            if let Some(v) = part.strip_prefix("c=") { cbind = v.to_string(); }
+            else if let Some(v) = part.strip_prefix("r=") { recv_nonce = v.to_string(); }
+            else if let Some(v) = part.strip_prefix("p=") { client_proof_b64 = v.to_string(); }
+        }
+
+        // Validate nonce
+        if recv_nonce != scram.full_nonce {
+            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+            return Ok(());
+        }
+        // Validate channel binding header (no channel binding = "biws" = base64("n,,"))
+        if cbind != "biws" {
+            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+            return Ok(());
+        }
+
+        let client_proof = match B64.decode(&client_proof_b64) {
+            Ok(b) if b.len() == 32 => { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); arr }
+            _ => {
+                sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: invalid client proof").await;
+                return Ok(());
+            }
+        };
+
+        // auth_message = client_first_bare + "," + server_first + "," + client_final_without_proof
+        let auth_message = format!("{},{},{}", scram.client_first_bare, scram.server_first, client_final_without_proof);
+
+        // Verify: ClientSignature = HMAC(StoredKey, AuthMessage)
+        //         RecoveredClientKey = ClientProof XOR ClientSignature
+        //         SHA256(RecoveredClientKey) must equal StoredKey
+        let client_signature = hmac_sha256_reg(&scram.stored_key, auth_message.as_bytes());
+        let recovered_client_key = xor32(&client_proof, &client_signature);
+        let recovered_stored_key = sha256_reg(&recovered_client_key);
+
+        if recovered_stored_key != scram.stored_key {
+            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+            return Ok(());
+        }
+
+        // Compute and send server-final: v=base64(ServerSignature)
+        let server_sig = hmac_sha256_reg(&scram.server_key, auth_message.as_bytes());
+        let server_final = format!("v={}", B64.encode(server_sig));
+        reply_to_client(&senders, client_id,
+            Message::new("AUTHENTICATE", vec![B64.encode(server_final.as_bytes())]).with_prefix(&cfg.server.name), label).await;
+
+        let account = scram.username.clone();
+
+        // Set account
+        {
+            let mut sg = state.write().await;
+            if let Some(conn) = sg.pending.get_mut(client_id) {
+                conn.account = Some(account.clone());
+            }
+        }
+
+        tracing::info!(client_id, account = %account, "SASL SCRAM-SHA-256 authentication successful");
+
+        // 900 RPL_LOGGEDIN + 903 RPL_SASLSUCCESS
+        let (channel_list, source, user_ident_host) = {
+            let sg = state.write().await;
+            if let Some(conn) = sg.pending.get(client_id) {
+                let uih = format!("{}!{}@{}", nick, conn.nick.as_deref().unwrap_or("*"), conn.host);
+                (Vec::<String>::new(), uih.clone(), uih)
+            } else {
+                (Vec::new(), nick.clone(), nick.clone())
+            }
+        };
+
+        reply_to_client(&senders, client_id,
+            Message::new("900", vec![nick.to_string(), user_ident_host, account.clone(), format!("You are now logged in as {}", account)])
+                .with_prefix(&cfg.server.name), label).await;
+        reply_to_client(&senders, client_id,
+            Message::new("903", vec![nick.to_string(), "SASL authentication successful".into()])
+                .with_prefix(&cfg.server.name), label).await;
+
+        // account-notify
+        let account_msg = Message::new("ACCOUNT", vec![account.clone()]).with_prefix(&source);
+        for ch_name in &channel_list {
+            let ch_store = channels.read().await;
+            if let Some(ch) = ch_store.channels.get(ch_name) {
+                let member_ids: Vec<String> = ch.read().await.members.keys().cloned().collect();
+                drop(ch_store);
+                let sg = state.read().await;
+                for mid in &member_ids {
+                    if *mid == client_id { continue; }
+                    if let Some(c) = sg.clients.get(mid) {
+                        if c.read().await.has_cap("account-notify") {
+                            send_to_client(&senders, mid, account_msg.clone()).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn handle_oper(
