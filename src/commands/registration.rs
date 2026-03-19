@@ -101,6 +101,13 @@ pub async fn complete_registration(
     client.account = pending.account.clone();
     client.away_message = pending.away_message.take();
 
+    // Auto-cloak: if cloak_key is set, derive a stable vhost from the real IP via HMAC-SHA256
+    if let Some(ref cloak_key) = cfg.server.cloak_key {
+        let hash = hmac_sha256_reg(cloak_key.as_bytes(), client.host.as_bytes());
+        let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+        client.vhost = Some(format!("{}.IP", &hex[..8]));
+    }
+
     let client = state_guard.add_client(client).await;
 
     drop(state_guard);

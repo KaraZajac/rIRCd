@@ -59,6 +59,25 @@ pub async fn run(cfg: Config, pidfile: Option<&Path>) -> anyhow::Result<()> {
             }
             ch_guard.persisted_operators = e.operators;
             ch_guard.persisted_voice = e.voice;
+            // Restore channel modes
+            for c in e.mode_flags.chars() {
+                match c {
+                    'i' => ch_guard.modes.invite_only = true,
+                    'm' => ch_guard.modes.moderated = true,
+                    'n' => ch_guard.modes.no_external = true,
+                    's' => ch_guard.modes.secret = true,
+                    't' => ch_guard.modes.topic_protect = true,
+                    'R' => ch_guard.modes.registered_only = true,
+                    'c' => ch_guard.modes.no_colors = true,
+                    'C' => ch_guard.modes.no_ctcp = true,
+                    _ => {}
+                }
+            }
+            ch_guard.key = e.mode_key;
+            ch_guard.modes.user_limit = e.mode_limit;
+            if e.created_at > 0 {
+                ch_guard.created_at = e.created_at;
+            }
         }
     }
     let senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>> =

@@ -115,6 +115,9 @@ pub async fn handle_privmsg(
     drop(sender_data);
     drop(state_guard);
 
+    // Update last_active for idle tracking (WHOIS 317)
+    client.write().await.last_active = chrono::Utc::now().timestamp();
+
     // draft/message-edit: if the client sends +draft/edit=<original-msgid>, verify ownership
     // before accepting the message. Only the original sender may edit their own message.
     if let Some(Some(edit_msgid)) = msg.tags.get("+draft/edit") {
@@ -245,6 +248,22 @@ pub async fn handle_privmsg(
                 None => Default::default(),
             };
             send_to_client_with_caps(&senders, &tid, privmsg.clone(), &target_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref()).await;
+            // 301 RPL_AWAY if target is away
+            let target_away = match state_guard.clients.get(&tid) {
+                Some(c) => c.read().await.away_message.clone(),
+                None => None,
+            };
+            if let Some(away_msg) = target_away {
+                let sender_nick = source.split('!').next().unwrap_or("*").to_string();
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("301", vec![sender_nick, target.to_string(), away_msg])
+                        .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+            }
             if echo_message {
                 let sender_caps = match state_guard.clients.get(client_id) {
                     Some(c) => c.read().await.capabilities.clone(),

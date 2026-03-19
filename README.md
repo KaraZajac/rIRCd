@@ -113,6 +113,7 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 | `ping_timeout_secs` | `90` | How long to wait for PONG before sending next PING |
 | `disconnect_timeout_secs` | `150` | Time after missed PONG before disconnecting client |
 | `client_tag_deny` | _(unset)_ | List of client-only tags to drop (e.g. `["+typing"]` or `["*"]` to drop all) |
+| `cloak_key` | _(unset)_ | If set, connecting clients receive an HMAC-SHA256-based virtual host cloak (e.g. `"mysecret"`) |
 
 ### `[network]`
 
@@ -267,9 +268,10 @@ Accounts are keyed by nick (lowercase). There is no separate admin interface for
 
 ## Channel Persistence
 
-Channels, topics, operator lists, voice lists, and message history are all stored in MariaDB automatically:
+Channels, topics, modes, operator lists, voice lists, and message history are all stored in MariaDB automatically:
 
-- **Topic** — persisted whenever a channel topic is set.
+- **Topic** — persisted whenever a channel topic is set; 333 RPL_TOPICWHOTIME and 329 RPL_CREATIONTIME sent on JOIN.
+- **Channel modes** — mode flags (`+imnstRcC`), key (`+k`), and user limit (`+l`) are saved to the database on every MODE change and restored on startup.
 - **Operators / Voice** — stored per channel; users in these lists receive `@`/`+` automatically when they join.
 - **Message history** — PRIVMSG and NOTICE to channels are appended (up to 1,000 messages per channel, oldest pruned). Clients with `draft/chathistory` can request history via `CHATHISTORY LATEST #channel * <limit>`.
 
@@ -341,6 +343,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `STATS u` | 242/219 | Server uptime |
 | `STATS o` | 243/219 | IRC operator list |
 | `WHOWAS` | 314/312/369 | Historical nick info; up to 5 entries per nick, in-memory |
+| `WHO` mask | 352/315 | Supports glob masks (`*`, `?`) against nick!user@host; respects +i invisible mode |
 | `HELP` | 704/705/706 | Per-command help text |
 | `KNOCK` | 710/711 | Request invite to an invite-only channel; notifies ops |
 | `KILL` | — | Oper-only: forcibly disconnect a user; broadcasts QUIT to their channels |
