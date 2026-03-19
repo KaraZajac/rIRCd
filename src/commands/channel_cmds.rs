@@ -115,6 +115,18 @@ pub async fn handle_join(
             continue;
         }
 
+        if ch.modes.registered_only && account.is_none() {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("477", vec![nick.clone(), ch_name.to_string(), "Cannot join channel (+R) - you must be registered".into()])
+                    .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            continue;
+        }
+
         if ch.modes.invite_only && !ch.invite_list.contains(&client_id.to_string()) {
             reply_to_client(
                 &senders,
@@ -456,7 +468,12 @@ pub async fn handle_mode(
                 if ch.modes.invite_only { modes.push('i'); }
                 if ch.modes.topic_protect { modes.push('t'); }
                 if ch.modes.no_external { modes.push('n'); }
+                if ch.modes.moderated { modes.push('m'); }
+                if ch.modes.registered_only { modes.push('R'); }
+                if ch.modes.no_colors { modes.push('c'); }
+                if ch.modes.no_ctcp { modes.push('C'); }
                 if !ch.bans.is_empty() { modes.push('b'); }
+                if !ch.quiet_list.is_empty() { modes.push('q'); }
                 let mode_str = if modes.is_empty() { "" } else { &modes };
                 let msg = Message::new("324", vec![nick.clone(), target.into(), format!("+{}", mode_str), "".to_string()])
                     .with_prefix(&cfg.server.name);
@@ -489,6 +506,10 @@ pub async fn handle_mode(
                     's' => ch.modes.secret = plus,
                     'p' => ch.modes.private = plus,
                     'n' => ch.modes.no_external = plus,
+                    'm' => ch.modes.moderated = plus,
+                    'R' => ch.modes.registered_only = plus,
+                    'c' => ch.modes.no_colors = plus,
+                    'C' => ch.modes.no_ctcp = plus,
                     'k' => {
                         if plus {
                             ch.key = msg.params.get(param_idx).cloned();
@@ -517,6 +538,40 @@ pub async fn handle_mode(
                                 ch.bans.retain(|b| b != mask);
                             }
                             param_idx += 1;
+                        } else {
+                            // No param: list bans (367 RPL_BANLIST / 368 RPL_ENDOFBANLIST)
+                            let bans = ch.bans.clone();
+                            drop(ch); drop(ch_store);
+                            for ban in &bans {
+                                reply_to_client(&senders, client_id,
+                                    Message::new("367", vec![nick.clone(), target.into(), ban.clone()]).with_prefix(&cfg.server.name), label).await;
+                            }
+                            reply_to_client(&senders, client_id,
+                                Message::new("368", vec![nick, target.into(), "End of channel ban list".into()]).with_prefix(&cfg.server.name), label).await;
+                            return Ok(());
+                        }
+                    }
+                    'q' => {
+                        if let Some(mask) = msg.params.get(param_idx) {
+                            if plus {
+                                if !ch.quiet_list.contains(mask) {
+                                    ch.quiet_list.push(mask.clone());
+                                }
+                            } else {
+                                ch.quiet_list.retain(|q| q != mask);
+                            }
+                            param_idx += 1;
+                        } else {
+                            // No param: list quiets (728 RPL_QUIETLIST / 729 RPL_ENDOFQUIETLIST)
+                            let quiets = ch.quiet_list.clone();
+                            drop(ch); drop(ch_store);
+                            for q in &quiets {
+                                reply_to_client(&senders, client_id,
+                                    Message::new("728", vec![nick.clone(), target.into(), "q".into(), q.clone(), String::new(), "0".into()]).with_prefix(&cfg.server.name), label).await;
+                            }
+                            reply_to_client(&senders, client_id,
+                                Message::new("729", vec![nick, target.into(), "q".into(), "End of channel quiet list".into()]).with_prefix(&cfg.server.name), label).await;
+                            return Ok(());
                         }
                     }
                     _ => {}

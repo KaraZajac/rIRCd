@@ -2,6 +2,35 @@ use crate::channel::ChannelMembership;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use chrono::Utc;
+
+// ─── WHOWAS ───────────────────────────────────────────────────────────────────
+
+const MAX_WHOWAS: usize = 5;
+
+/// One WHOWAS history entry (recorded on NICK change or QUIT)
+#[derive(Debug, Clone)]
+pub struct WhowasEntry {
+    pub nick: String,
+    pub user: String,
+    pub host: String,
+    pub realname: String,
+    pub server: String,
+    pub timestamp: i64,
+}
+
+// ─── SCRAM server state ───────────────────────────────────────────────────────
+
+/// Intermediate SASL SCRAM-SHA-256 server state (lives between step 1 and step 2)
+#[derive(Debug)]
+pub struct ScramServerState {
+    pub username: String,
+    pub full_nonce: String,
+    pub client_first_bare: String,
+    pub server_first: String,
+    pub stored_key: [u8; 32],
+    pub server_key: [u8; 32],
+}
 
 /// A connected client / user on the server
 #[derive(Debug)]
@@ -103,6 +132,10 @@ pub struct PendingConnection {
     pub sasl_chunk_count: u32,
     /// True after we sent 904 for this connection; ignore further AUTHENTICATE so we don't later "succeed".
     pub sasl_failed: bool,
+    /// Current SASL mechanism ("PLAIN" or "SCRAM-SHA-256"); set on first AUTHENTICATE
+    pub sasl_mechanism: Option<String>,
+    /// SCRAM-SHA-256: intermediate server state (set after step 1, consumed in step 2)
+    pub sasl_scram: Option<ScramServerState>,
 }
 
 impl PendingConnection {
@@ -121,6 +154,8 @@ impl PendingConnection {
             sasl_plain_buffer: String::new(),
             sasl_chunk_count: 0,
             sasl_failed: false,
+            sasl_mechanism: None,
+            sasl_scram: None,
         }
     }
 
@@ -213,6 +248,10 @@ pub struct ServerState {
     pub metadata: HashMap<String, HashMap<String, String>>,
     /// draft/multiline: client_id -> in-flight batch (ref, target, command, lines)
     pub pending_multiline: HashMap<String, PendingMultilineBatch>,
+    /// WHOWAS history: nick_lower -> recent entries
+    pub whowas: HashMap<String, VecDeque<WhowasEntry>>,
+    /// Server start time (Unix timestamp)
+    pub started_at: i64,
 }
 
 /// In-flight draft/multiline batch for one client
@@ -226,7 +265,37 @@ pub struct PendingMultilineBatch {
 
 impl ServerState {
     pub fn new() -> Arc<RwLock<Self>> {
-        Arc::new(RwLock::new(Self::default()))
+        Arc::new(RwLock::new(Self {
+            started_at: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        }))
+    }
+
+    /// Record a WHOWAS entry for the given client (call before removing the client or changing nick).
+    pub fn record_whowas(&mut self, client: &Client, server_name: &str) {
+        let nick = match &client.nick {
+            Some(n) => n.clone(),
+            None => return,
+        };
+        let entry = WhowasEntry {
+            nick: nick.clone(),
+            user: client.user.as_deref().unwrap_or("*").to_string(),
+            host: client.host.clone(),
+            realname: client.realname.as_deref().unwrap_or("").to_string(),
+            server: server_name.to_string(),
+            timestamp: Utc::now().timestamp(),
+        };
+        self.push_whowas(entry);
+    }
+
+    /// Push an already-built WhowasEntry (useful when the client borrow conflicts with &mut self).
+    pub fn push_whowas(&mut self, entry: WhowasEntry) {
+        let key = entry.nick.to_lowercase();
+        let list = self.whowas.entry(key).or_default();
+        list.push_back(entry);
+        while list.len() > MAX_WHOWAS {
+            list.pop_front();
+        }
     }
 
     pub async fn add_client(&mut self, client: Client) -> Arc<RwLock<Client>> {

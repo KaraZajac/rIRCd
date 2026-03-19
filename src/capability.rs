@@ -34,6 +34,7 @@ pub const CAPS: &[&str] = &[
     "draft/metadata-2",
     "draft/account-registration",
     "draft/multiline",
+    "draft/pre-away",
 ];
 
 /// Capabilities that depend on message-tags
@@ -42,6 +43,7 @@ pub const TAGS_DEPENDENT: &[&str] = &["server-time", "batch", "account-tag"];
 /// Capability value for CAP LS (e.g. draft/multiline=max-bytes=4096,max-lines=20)
 fn cap_ls_value(cap: &str) -> &str {
     match cap {
+        "sasl"            => "sasl=PLAIN,SCRAM-SHA-256",
         "draft/multiline" => "draft/multiline=max-bytes=4096,max-lines=20",
         _ => cap,
     }

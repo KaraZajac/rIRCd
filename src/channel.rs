@@ -56,6 +56,8 @@ pub struct Channel {
     pub invite_list: HashSet<String>,
     /// Ban list: hostmasks or ~a:account (account-extban)
     pub bans: Vec<String>,
+    /// Quiet list (+q masks): user can join but not speak
+    pub quiet_list: Vec<String>,
     /// From channels.toml: nicks/accounts that get @ when they join
     pub persisted_operators: Vec<String>,
     /// From channels.toml: nicks/accounts that get + when they join
@@ -64,12 +66,15 @@ pub struct Channel {
 
 #[derive(Debug, Clone, Default)]
 pub struct ChannelModeSet {
-    pub secret: bool,      // +s
-    pub private: bool,     // +p
-    pub invite_only: bool, // +i
-    pub topic_protect: bool, // +t
-    pub no_external: bool, // +n
-    pub moderated: bool,   // +m
+    pub secret: bool,           // +s
+    pub private: bool,          // +p
+    pub invite_only: bool,      // +i
+    pub topic_protect: bool,    // +t
+    pub no_external: bool,      // +n
+    pub moderated: bool,        // +m
+    pub registered_only: bool,  // +R: only authed users may join/speak
+    pub no_colors: bool,        // +c: strip mIRC color codes
+    pub no_ctcp: bool,          // +C: block CTCP to channel
     pub user_limit: Option<u32>,
 }
 
@@ -85,9 +90,24 @@ impl Channel {
             key: None,
             invite_list: HashSet::new(),
             bans: Vec::new(),
+            quiet_list: Vec::new(),
             persisted_operators: Vec::new(),
             persisted_voice: Vec::new(),
         }
+    }
+
+    /// Check if a source (nick!user@host) or account is on the quiet list.
+    pub fn is_quieted(&self, account: Option<&str>, source: &str) -> bool {
+        for mask in &self.quiet_list {
+            if let Some(account_mask) = mask.strip_prefix("~a:") {
+                if account.map(|a| a.eq_ignore_ascii_case(account_mask)).unwrap_or(false) {
+                    return true;
+                }
+            } else if mask == source {
+                return true;
+            }
+        }
+        false
     }
 
     /// Returns (op, voice) for a joining user based on nick/account and persisted lists.

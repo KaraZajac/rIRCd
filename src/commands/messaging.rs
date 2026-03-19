@@ -17,6 +17,43 @@ async fn send_to_client(
     }
 }
 
+/// Strip mIRC/IRC color and formatting codes from a message.
+/// Removes: \x03[n][,m] (colors), \x02 (bold), \x1d (italic), \x1f (underline),
+///          \x1e (strikethrough), \x0f (reset), \x16 (reverse)
+fn strip_colors(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\x03' => {
+                i += 1;
+                // Optional foreground number (1-2 digits)
+                if i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                    if i < chars.len() && chars[i].is_ascii_digit() { i += 1; }
+                    // Optional ,background
+                    if i < chars.len() && chars[i] == ',' {
+                        i += 1;
+                        if i < chars.len() && chars[i].is_ascii_digit() {
+                            i += 1;
+                            if i < chars.len() && chars[i].is_ascii_digit() { i += 1; }
+                        }
+                    }
+                }
+            }
+            '\x02' | '\x0f' | '\x16' | '\x1d' | '\x1e' | '\x1f' => { i += 1; }
+            c => { out.push(c); i += 1; }
+        }
+    }
+    out
+}
+
+/// Returns true if the text is a CTCP message (starts and ends with \x01).
+fn is_ctcp(text: &str) -> bool {
+    text.starts_with('\x01')
+}
+
 /// Send message to a recipient, adding server-time/msgid/account tags and client-only (+prefix) tags.
 async fn send_to_client_with_caps(
     senders: &Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
@@ -85,8 +122,6 @@ pub async fn handle_privmsg(
     }
     let state_guard = state.read().await;
 
-    let base_msg = Message::new("PRIVMSG", vec![target.into(), text.clone()]).with_prefix(&source);
-
     if target.starts_with('#') || target.starts_with('&') {
         let ch_key = canonical_channel_key(&target);
         let ch_store = channels.read().await;
@@ -103,6 +138,44 @@ pub async fn handle_privmsg(
                 .await;
                 return Ok(());
             }
+
+            // +C: block CTCPs (ACTION \x01ACTION...\x01 is also blocked)
+            if ch.modes.no_ctcp && is_ctcp(&text) {
+                reply_to_client(&senders, client_id,
+                    Message::new("404", vec![target.into(), "CTCPs are not allowed in this channel (+C)".into()])
+                        .with_prefix(&cfg.server.name), label).await;
+                return Ok(());
+            }
+
+            // +q: sender is quieted
+            if ch.is_quieted(sender_account.as_deref(), &source) {
+                reply_to_client(&senders, client_id,
+                    Message::new("404", vec![target.into(), "You are quieted in this channel (+q)".into()])
+                        .with_prefix(&cfg.server.name), label).await;
+                return Ok(());
+            }
+
+            // +R: registered users only for speaking
+            if ch.modes.registered_only && sender_account.is_none() {
+                reply_to_client(&senders, client_id,
+                    Message::new("404", vec![target.into(), "You must be registered to speak here (+R)".into()])
+                        .with_prefix(&cfg.server.name), label).await;
+                return Ok(());
+            }
+
+            // +c: strip colors from message text
+            let text = if ch.modes.no_colors { strip_colors(&text) } else { text.clone() };
+            drop(ch);
+            drop(ch_store);
+
+            // Rebuild ch reference and relay
+            let ch_store = channels.read().await;
+            let ch = match ch_store.channels.get(&ch_key) {
+                Some(c) => c.read().await,
+                None => return Ok(()),
+            };
+
+            let base_msg = Message::new("PRIVMSG", vec![target.into(), text.clone()]).with_prefix(&source);
             for (mid, _) in &ch.members {
                 if *mid == client_id {
                     if echo_message {
