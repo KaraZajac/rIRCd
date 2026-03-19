@@ -1,0 +1,33 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock (keep for binaries, remove this line if you want to track it)
+# Cargo.lock
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+
+# Environment / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Config overrides (keep defaults, ignore local overrides)
+local-config.toml
