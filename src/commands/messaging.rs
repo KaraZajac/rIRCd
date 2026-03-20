@@ -6,6 +6,7 @@ use crate::protocol::{add_tags_for_recipient, generate_msgid, Message};
 use crate::user::{PendingClientBatch, PendingMultilineBatch, ServerState};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
+use tracing::debug;
 
 async fn send_to_client(
     senders: &Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
@@ -768,12 +769,9 @@ pub async fn handle_redact(
     // Per IRCv3 message-redaction spec: REDACT <target> <msgid> [:<reason>]
     let target_param = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
     let msgid = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
-    // Reason is the trailing param (index 2) if provided.
-    let reason = if msg.params.len() > 2 {
-        msg.params.get(2).map(|s| s.as_str()).unwrap_or("message redacted")
-    } else {
-        "message redacted"
-    };
+    let reason = msg.trailing().unwrap_or("message redacted").to_string();
+
+    debug!("REDACT from client={} target_param={} msgid={}", client_id, target_param, msgid);
 
     if target_param.is_empty() || msgid.is_empty() {
         reply_to_client(
@@ -787,32 +785,71 @@ pub async fn handle_redact(
         return Ok(());
     }
 
-    // Look up the original message to get target and original sender.
-    // Use the server-recorded target (not the one the client provided, to prevent spoofing).
-    let entry = {
+    // Resolve the original message's target and sender nick.
+    // Try the in-memory msgid store first (messages sent this session), then fall back to the DB
+    // (handles messages sent before a restart — the key fix for cross-restart redaction).
+    let in_mem = {
         let state_r = state.read().await;
         state_r.msgid_store.get(msgid).map(|(t, s)| (t.to_string(), s.to_string()))
     };
 
-    let (target, sender_id) = match entry {
-        Some(e) => e,
-        None => {
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new("FAIL", vec!["REDACT".into(), "UNKNOWN_MSGID".into(), "No such message".into()])
-                    .with_prefix(&cfg.server.name),
-                label,
-            )
-            .await;
-            return Ok(());
+    // (target_channel_or_nick, sender_nick_for_auth)
+    let (target, sender_nick): (String, Option<String>) = if let Some((t, sender_id)) = in_mem {
+        debug!("REDACT: msgid={} found in memory store (target={} sender_id={})", msgid, t, sender_id);
+        let nick = {
+            let state_r = state.read().await;
+            state_r.clients.get(&sender_id).map(|c| {
+                // Use try_read to avoid blocking; fall back to None if contended
+                c.try_read().ok().and_then(|g| g.nick.clone())
+            }).flatten()
+        };
+        (t, nick)
+    } else {
+        debug!("REDACT: msgid={} not in memory, querying DB", msgid);
+        let db_result = match cfg.db {
+            Some(ref pool) => persist::lookup_channel_history_by_msgid(pool, msgid).await,
+            None => None,
+        };
+        match db_result {
+            Some((channel, source)) => {
+                // source is "nick!user@host"; extract just the nick for auth
+                let nick = source.split('!').next().map(|s| s.to_string());
+                debug!("REDACT: msgid={} found in DB (channel={} source={} nick={:?})", msgid, channel, source, nick);
+                (channel, nick)
+            }
+            None => {
+                debug!("REDACT: msgid={} not found in memory or DB", msgid);
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("FAIL", vec!["REDACT".into(), "UNKNOWN_MSGID".into(), "No such message".into()])
+                        .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
         }
     };
 
-    let allowed = if client_id == sender_id {
-        true
-    } else if target.starts_with('#') || target.starts_with('&') {
-        // Channel ops may redact others' messages
+    // Get the current client's nick and oper status for the authorization check
+    let (current_nick, is_oper, source) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.nick_or_id().to_string(), g.oper, g.source().unwrap_or_else(|| g.nick_or_id().to_string()))
+            }
+            None => return Ok(()),
+        }
+    };
+
+    // Authorization: own message (by nick), channel op, or IRC oper
+    let is_own = sender_nick.as_deref()
+        .map(|sn| sn.eq_ignore_ascii_case(&current_nick))
+        .unwrap_or(false);
+
+    let is_op = if target.starts_with('#') || target.starts_with('&') {
         let ch_key = canonical_channel_key(&target);
         let ch_store = channels.read().await;
         match ch_store.channels.get(&ch_key) {
@@ -820,10 +857,12 @@ pub async fn handle_redact(
             None => false,
         }
     } else {
-        // DM: only the message target may redact (i.e. the recipient of a DM can remove it from their view)
-        let state_r = state.read().await;
-        state_r.nick_to_id.get(&target.to_uppercase()).map_or(false, |tid| *tid == client_id)
+        false
     };
+
+    let allowed = is_own || is_op || is_oper;
+    debug!("REDACT: allowed={} (is_own={} is_op={} is_oper={}) current_nick={} sender_nick={:?}",
+        allowed, is_own, is_op, is_oper, current_nick, sender_nick);
 
     if !allowed {
         reply_to_client(
@@ -837,29 +876,23 @@ pub async fn handle_redact(
         return Ok(());
     }
 
-    // Remove from the in-memory store and delete from channel history.
+    // Remove from in-memory store
     {
         let mut state_w = state.write().await;
         state_w.msgid_store.take(msgid);
     }
+
+    // Delete from DB
     if let Some(ref pool) = cfg.db {
-        persist::delete_channel_history_by_msgid(pool, msgid).await;
+        let deleted = persist::delete_channel_history_by_msgid(pool, msgid).await;
+        debug!("REDACT: DB delete rows_affected={} for msgid={}", deleted, msgid);
     }
 
-    // Get sender's nick!user@host for the relay prefix.
-    let source = {
-        let state_r = state.read().await;
-        match state_r.clients.get(client_id) {
-            Some(c) => c.read().await.source().unwrap_or_else(|| client_id.to_string()),
-            None => client_id.to_string(),
-        }
-    };
-
     // Per spec: :<nick!user@host> REDACT <target> <msgid> :<reason>
-    let redact_relay = Message::new("REDACT", vec![target.clone(), msgid.to_string(), reason.to_string()])
+    let redact_relay = Message::new("REDACT", vec![target.clone(), msgid.to_string(), reason])
         .with_prefix(&source);
 
-    // Deliver only to clients that have negotiated the message-redaction capability.
+    // Deliver only to clients that have negotiated the message-redaction capability
     if target.starts_with('#') || target.starts_with('&') {
         let ch_key = canonical_channel_key(&target);
         let ch_store = channels.read().await;
@@ -878,14 +911,17 @@ pub async fn handle_redact(
             }
         }
     } else {
-        // DM: send to original sender and recipient if they have the cap.
+        // DM: send to the redacting client and the other party if they have the cap
         let state_r = state.read().await;
         let tid_opt = state_r.nick_to_id.get(&target.to_uppercase()).cloned();
         let sender_has_cap = state_r.clients.get(client_id)
-            .map(|c| c.try_read().map(|g| g.capabilities.contains("message-redaction")).unwrap_or(false))
+            .and_then(|c| c.try_read().ok())
+            .map(|g| g.capabilities.contains("message-redaction"))
             .unwrap_or(false);
-        let recipient_has_cap = tid_opt.as_deref().and_then(|tid| state_r.clients.get(tid))
-            .map(|c| c.try_read().map(|g| g.capabilities.contains("message-redaction")).unwrap_or(false))
+        let recipient_has_cap = tid_opt.as_deref()
+            .and_then(|tid| state_r.clients.get(tid))
+            .and_then(|c| c.try_read().ok())
+            .map(|g| g.capabilities.contains("message-redaction"))
             .unwrap_or(false);
         drop(state_r);
 
