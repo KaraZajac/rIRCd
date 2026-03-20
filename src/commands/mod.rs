@@ -1,6 +1,6 @@
 mod channel_cmds;
-mod metadata;
 mod messaging;
+mod metadata;
 mod query_cmds;
 mod registration;
 mod reply;
@@ -119,7 +119,8 @@ pub async fn handle_message(
                 if pending.ref_tag == *ref_val {
                     let line_target = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
                     if line_target != pending.target {
-                        let (batch_target, line_target_owned) = (pending.target.clone(), line_target.to_string());
+                        let (batch_target, line_target_owned) =
+                            (pending.target.clone(), line_target.to_string());
                         crate::commands::reply_to_client(
                             &senders,
                             &client_id,
@@ -147,8 +148,16 @@ pub async fn handle_message(
                         crate::commands::reply_to_client(
                             &senders,
                             &client_id,
-                            Message::new("FAIL", vec!["BATCH".into(), "MULTILINE_INVALID".into(), "*".into(), " :Invalid multiline batch".into()])
-                                .with_prefix(&cfg.server.name),
+                            Message::new(
+                                "FAIL",
+                                vec![
+                                    "BATCH".into(),
+                                    "MULTILINE_INVALID".into(),
+                                    "*".into(),
+                                    " :Invalid multiline batch".into(),
+                                ],
+                            )
+                            .with_prefix(&cfg.server.name),
                             label.as_deref(),
                         )
                         .await;
@@ -162,8 +171,16 @@ pub async fn handle_message(
                         crate::commands::reply_to_client(
                             &senders,
                             &client_id,
-                            Message::new("FAIL", vec!["BATCH".into(), "MULTILINE_INVALID".into(), "*".into(), " :Invalid multiline batch with concatenated blank line".into()])
-                                .with_prefix(&cfg.server.name),
+                            Message::new(
+                                "FAIL",
+                                vec![
+                                    "BATCH".into(),
+                                    "MULTILINE_INVALID".into(),
+                                    "*".into(),
+                                    " :Invalid multiline batch with concatenated blank line".into(),
+                                ],
+                            )
+                            .with_prefix(&cfg.server.name),
                             label.as_deref(),
                         )
                         .await;
@@ -201,62 +218,431 @@ pub async fn handle_message(
     }
 
     match msg.command.as_str() {
-        "WEBIRC" => registration::handle_webirc(&client_id, &host, msg, state, senders, cfg, label.as_deref()).await,
-        "CAP" => registration::handle_cap(&client_id, &host, msg, state, senders, cfg, label.as_deref()).await,
-        "NICK" => registration::handle_nick(&client_id, &host, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "USER" => registration::handle_user(&client_id, &host, msg, state, senders, cfg, label.as_deref()).await,
-        "PASS" => registration::handle_pass(&client_id, msg, state, senders, label.as_deref()).await,
-        "PING" => registration::handle_ping(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "PONG" => registration::handle_pong(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "QUIT" => registration::handle_quit(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "JOIN" => channel_cmds::handle_join(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "PART" => channel_cmds::handle_part(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "NAMES" => channel_cmds::handle_names(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "LIST" => channel_cmds::handle_list(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "PRIVMSG" => messaging::handle_privmsg(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "NOTICE" => messaging::handle_notice(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "TAGMSG" => messaging::handle_tagmsg(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "MODE" => channel_cmds::handle_mode(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "TOPIC" => channel_cmds::handle_topic(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "KICK" => channel_cmds::handle_kick(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "INVITE" => channel_cmds::handle_invite(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "WHO" => query_cmds::handle_who(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "WHOIS" => query_cmds::handle_whois(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "AWAY" => registration::handle_away(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "AUTHENTICATE" => registration::handle_authenticate(&client_id, &host, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "OPER" => registration::handle_oper(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "REGISTER" => registration::handle_register(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "VERIFY" => registration::handle_verify(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "SETHOST" => registration::handle_sethost(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "SETUSER" => registration::handle_setuser(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "SETNAME" => registration::handle_setname(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "ISUPPORT" => registration::handle_isupport(&client_id, state, senders, cfg, label.as_deref()).await,
-        "MOTD" => registration::handle_motd(&client_id, state, senders, cfg, label.as_deref()).await,
-        "REDACT" => messaging::handle_redact(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "CHATHISTORY" => messaging::handle_chathistory(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "MONITOR" => query_cmds::handle_monitor(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "RENAME" => channel_cmds::handle_rename(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "MARKREAD" => messaging::handle_markread(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "METADATA" => metadata::handle_metadata(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "LUSERS" => server_cmds::handle_lusers(&client_id, state, channels.clone(), senders, cfg, label.as_deref()).await,
-        "VERSION" => server_cmds::handle_version(&client_id, state, senders, cfg, label.as_deref()).await,
+        "WEBIRC" => {
+            registration::handle_webirc(
+                &client_id,
+                &host,
+                msg,
+                state,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "CAP" => {
+            registration::handle_cap(
+                &client_id,
+                &host,
+                msg,
+                state,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "NICK" => {
+            registration::handle_nick(
+                &client_id,
+                &host,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "USER" => {
+            registration::handle_user(
+                &client_id,
+                &host,
+                msg,
+                state,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "PASS" => {
+            registration::handle_pass(&client_id, msg, state, senders, label.as_deref()).await
+        }
+        "PING" => {
+            registration::handle_ping(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "PONG" => {
+            registration::handle_pong(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "QUIT" => {
+            registration::handle_quit(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "JOIN" => {
+            channel_cmds::handle_join(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "PART" => {
+            channel_cmds::handle_part(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "NAMES" => {
+            channel_cmds::handle_names(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "LIST" => {
+            channel_cmds::handle_list(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "PRIVMSG" => {
+            messaging::handle_privmsg(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "NOTICE" => {
+            messaging::handle_notice(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "TAGMSG" => {
+            messaging::handle_tagmsg(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "MODE" => {
+            channel_cmds::handle_mode(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "TOPIC" => {
+            channel_cmds::handle_topic(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "KICK" => {
+            channel_cmds::handle_kick(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "INVITE" => {
+            channel_cmds::handle_invite(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "WHO" => {
+            query_cmds::handle_who(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "WHOIS" => {
+            query_cmds::handle_whois(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "AWAY" => {
+            registration::handle_away(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "AUTHENTICATE" => {
+            registration::handle_authenticate(
+                &client_id,
+                &host,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "OPER" => {
+            registration::handle_oper(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "REGISTER" => {
+            registration::handle_register(&client_id, msg, state, senders, cfg, label.as_deref())
+                .await
+        }
+        "VERIFY" => {
+            registration::handle_verify(&client_id, msg, state, senders, cfg, label.as_deref())
+                .await
+        }
+        "SETHOST" => {
+            registration::handle_sethost(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "SETUSER" => {
+            registration::handle_setuser(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "SETNAME" => {
+            registration::handle_setname(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "ISUPPORT" => {
+            registration::handle_isupport(&client_id, state, senders, cfg, label.as_deref()).await
+        }
+        "MOTD" => {
+            registration::handle_motd(&client_id, state, senders, cfg, label.as_deref()).await
+        }
+        "REDACT" => {
+            messaging::handle_redact(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "CHATHISTORY" => {
+            messaging::handle_chathistory(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "MONITOR" => {
+            query_cmds::handle_monitor(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "RENAME" => {
+            channel_cmds::handle_rename(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "MARKREAD" => {
+            messaging::handle_markread(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "METADATA" => {
+            metadata::handle_metadata(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "LUSERS" => {
+            server_cmds::handle_lusers(
+                &client_id,
+                state,
+                channels.clone(),
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "VERSION" => {
+            server_cmds::handle_version(&client_id, state, senders, cfg, label.as_deref()).await
+        }
         "TIME" => server_cmds::handle_time(&client_id, state, senders, cfg, label.as_deref()).await,
         "INFO" => server_cmds::handle_info(&client_id, state, senders, cfg, label.as_deref()).await,
-        "LINKS" => server_cmds::handle_links(&client_id, state, senders, cfg, label.as_deref()).await,
-        "STATS" => server_cmds::handle_stats(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "WHOWAS" => server_cmds::handle_whowas(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "HELP" => server_cmds::handle_help(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "KNOCK" => server_cmds::handle_knock(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "KILL" => server_cmds::handle_kill(&client_id, msg, state, channels, senders, cfg, label.as_deref()).await,
-        "WALLOPS" => server_cmds::handle_wallops(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "ISON" => query_cmds::handle_ison(&client_id, msg, state, senders, cfg, label.as_deref()).await,
-        "USERHOST" => query_cmds::handle_userhost(&client_id, msg, state, senders, cfg, label.as_deref()).await,
+        "LINKS" => {
+            server_cmds::handle_links(&client_id, state, senders, cfg, label.as_deref()).await
+        }
+        "STATS" => {
+            server_cmds::handle_stats(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "WHOWAS" => {
+            server_cmds::handle_whowas(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "HELP" => {
+            server_cmds::handle_help(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "KNOCK" => {
+            server_cmds::handle_knock(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "KILL" => {
+            server_cmds::handle_kill(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "WALLOPS" => {
+            server_cmds::handle_wallops(&client_id, msg, state, senders, cfg, label.as_deref())
+                .await
+        }
+        "ISON" => {
+            query_cmds::handle_ison(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "USERHOST" => {
+            query_cmds::handle_userhost(&client_id, msg, state, senders, cfg, label.as_deref())
+                .await
+        }
         _ => {
             let target = {
                 let state = state.read().await;
-                state.clients
-                    .get(&client_id)
-                    .cloned()
+                state.clients.get(&client_id).cloned()
             };
             let target = match target {
                 Some(c) => c.read().await.nick_or_id().to_string(),

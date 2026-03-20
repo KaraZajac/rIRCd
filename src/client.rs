@@ -1,4 +1,4 @@
-use crate::protocol::{parse_message, format_message, Message, ParseError};
+use crate::protocol::{format_message, parse_message, Message, ParseError};
 use crate::server::ClientMessage;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -25,7 +25,10 @@ pub async fn handle_client(
     tx: mpsc::Sender<ClientMessage>,
     server_name: String,
 ) {
-    let addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".into());
+    let addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".into());
     info!("Client connected: {} from {}", client_id, addr);
     handle_client_stream(stream, client_id, host, tx, server_name).await;
 }
@@ -49,9 +52,7 @@ async fn handle_client_stream<S>(
     tokio::spawn(async move {
         while let Some(msg) = send_rx.recv().await {
             let line = format_message(&msg);
-            if writer.write_all(line.as_bytes()).await.is_err()
-                || writer.flush().await.is_err()
-            {
+            if writer.write_all(line.as_bytes()).await.is_err() || writer.flush().await.is_err() {
                 error!("Write error for {}", client_id_clone);
                 break;
             }
@@ -85,7 +86,11 @@ async fn handle_client_stream<S>(
                             .send(
                                 Message::new(
                                     "FAIL",
-                                    vec!["*".into(), "INVALID_UTF8".into(), "Message contained invalid UTF-8".into()],
+                                    vec![
+                                        "*".into(),
+                                        "INVALID_UTF8".into(),
+                                        "Message contained invalid UTF-8".into(),
+                                    ],
                                 )
                                 .with_prefix(&server_name),
                             )
@@ -101,19 +106,32 @@ async fn handle_client_stream<S>(
                         // Flood control: refill tokens based on elapsed time, then consume one
                         let now = tokio::time::Instant::now();
                         let elapsed = now.duration_since(flood_last_refill).as_secs_f64();
-                        flood_tokens = (flood_tokens + elapsed * FLOOD_REFILL_RATE).min(FLOOD_CAPACITY);
+                        flood_tokens =
+                            (flood_tokens + elapsed * FLOOD_REFILL_RATE).min(FLOOD_CAPACITY);
                         flood_last_refill = now;
 
                         // Bypass flood control for connection setup and PONG.
                         // CAP/NICK/USER/PASS/AUTHENTICATE are pre-registration commands that
                         // clients send in rapid succession; dropping them silently breaks auth.
                         const FLOOD_EXEMPT: &[&str] = &[
-                            "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PONG", "QUIT",
+                            "CAP",
+                            "NICK",
+                            "USER",
+                            "PASS",
+                            "AUTHENTICATE",
+                            "PONG",
+                            "QUIT",
                         ];
                         if !FLOOD_EXEMPT.contains(&msg.command.as_str()) {
                             if flood_tokens < 1.0 {
-                                let reply = Message::new("NOTICE", vec!["*".into(), "Flood control: you are sending messages too fast".into()])
-                                    .with_prefix(&server_name);
+                                let reply = Message::new(
+                                    "NOTICE",
+                                    vec![
+                                        "*".into(),
+                                        "Flood control: you are sending messages too fast".into(),
+                                    ],
+                                )
+                                .with_prefix(&server_name);
                                 let _ = send_tx.send(reply).await;
                                 continue;
                             }
@@ -134,13 +152,23 @@ async fn handle_client_stream<S>(
                         }
                     }
                     Err(e) => {
-                        let line_preview = if line.len() > 80 { format!("{}...", &line[..80]) } else { line.to_string() };
+                        let line_preview = if line.len() > 80 {
+                            format!("{}...", &line[..80])
+                        } else {
+                            line.to_string()
+                        };
                         warn!(client = %client_id, error = %e, line = %line_preview, "parse failed");
                         let reply = match &e {
-                            ParseError::InputTooLong => Message::new("417", vec!["*".into(), "Input line was too long".into()])
-                                .with_prefix(&server_name),
-                            _ => Message::new("NOTICE", vec!["*".into(), format!("Parse error: {}", e)])
-                                .with_prefix(&server_name),
+                            ParseError::InputTooLong => Message::new(
+                                "417",
+                                vec!["*".into(), "Input line was too long".into()],
+                            )
+                            .with_prefix(&server_name),
+                            _ => Message::new(
+                                "NOTICE",
+                                vec!["*".into(), format!("Parse error: {}", e)],
+                            )
+                            .with_prefix(&server_name),
                         };
                         let _ = send_tx.send(reply).await;
                     }
@@ -154,10 +182,12 @@ async fn handle_client_stream<S>(
     }
 
     info!("Client disconnected: {}", client_id);
-    let _ = tx.send(ClientMessage {
-        client_id: client_id.clone(),
-        host,
-        msg: Message::new("QUIT", vec!["Connection closed".into()]),
-        send_tx,
-    }).await;
+    let _ = tx
+        .send(ClientMessage {
+            client_id: client_id.clone(),
+            host,
+            msg: Message::new("QUIT", vec!["Connection closed".into()]),
+            send_tx,
+        })
+        .await;
 }

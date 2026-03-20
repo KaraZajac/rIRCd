@@ -18,9 +18,19 @@ pub fn init_cmd(dir: &Path) -> anyhow::Result<()> {
 pub async fn run_server(mut cfg: Config, config_path: &Path) -> anyhow::Result<()> {
     // Connect to MariaDB and store the pool in cfg so all handlers can access it.
     let url = cfg.database.connection_url();
-    tracing::info!("Connecting to database at {}:{}/{}", cfg.database.host, cfg.database.port, cfg.database.database);
-    let pool = sqlx::MySqlPool::connect(&url).await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to MariaDB ({}): {}", url.replace(&cfg.database.password, "***"), e))?;
+    tracing::info!(
+        "Connecting to database at {}:{}/{}",
+        cfg.database.host,
+        cfg.database.port,
+        cfg.database.database
+    );
+    let pool = sqlx::MySqlPool::connect(&url).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to connect to MariaDB ({}): {}",
+            url.replace(&cfg.database.password, "***"),
+            e
+        )
+    })?;
     persist::init_schema(&pool).await?;
     cfg.db = Some(pool);
 

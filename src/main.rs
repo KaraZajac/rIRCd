@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
+use rircd::{config, genpasswd_cmd, init_cmd, run_server, status_cmd, stop_cmd};
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use rircd::{config, init_cmd, run_server, genpasswd_cmd, stop_cmd, status_cmd};
 
 #[derive(Parser)]
 #[command(name = "rircd")]
@@ -39,7 +39,9 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to install rustls crypto provider");
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::from_default_env().add_directive("rircd=info".parse()?))
+        .with(
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("rircd=info".parse()?),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 

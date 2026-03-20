@@ -32,19 +32,28 @@ fn strip_colors(text: &str) -> String {
                 // Optional foreground number (1-2 digits)
                 if i < chars.len() && chars[i].is_ascii_digit() {
                     i += 1;
-                    if i < chars.len() && chars[i].is_ascii_digit() { i += 1; }
+                    if i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
                     // Optional ,background
                     if i < chars.len() && chars[i] == ',' {
                         i += 1;
                         if i < chars.len() && chars[i].is_ascii_digit() {
                             i += 1;
-                            if i < chars.len() && chars[i].is_ascii_digit() { i += 1; }
+                            if i < chars.len() && chars[i].is_ascii_digit() {
+                                i += 1;
+                            }
                         }
                     }
                 }
             }
-            '\x02' | '\x0f' | '\x16' | '\x1d' | '\x1e' | '\x1f' => { i += 1; }
-            c => { out.push(c); i += 1; }
+            '\x02' | '\x0f' | '\x16' | '\x1d' | '\x1e' | '\x1f' => {
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
     out
@@ -66,7 +75,14 @@ async fn send_to_client_with_caps(
     client_only_tags: Option<&std::collections::HashMap<String, Option<String>>>,
     client_tag_deny: Option<&[String]>,
 ) {
-    let tagged = add_tags_for_recipient(msg, recipient_caps, sender_account, msgid, client_only_tags, client_tag_deny);
+    let tagged = add_tags_for_recipient(
+        msg,
+        recipient_caps,
+        sender_account,
+        msgid,
+        client_only_tags,
+        client_tag_deny,
+    );
     send_to_client(senders, to_id, tagged).await;
 }
 
@@ -110,7 +126,9 @@ pub async fn handle_privmsg(
         }
     };
     let sender_data = client.read().await;
-    let source = sender_data.source().unwrap_or_else(|| client_id.to_string());
+    let source = sender_data
+        .source()
+        .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
     let echo_message = sender_data.has_cap("echo-message");
     drop(sender_data);
@@ -121,13 +139,17 @@ pub async fn handle_privmsg(
 
     // draft/message-edit: if the client sends +draft/edit=<original-msgid>, verify ownership
     // before accepting the message. Only the original sender may edit their own message.
-    let pending_edit_msgid: Option<String> = msg.tags.get("+draft/edit")
+    let pending_edit_msgid: Option<String> = msg
+        .tags
+        .get("+draft/edit")
         .and_then(|v| v.as_ref())
         .cloned();
     if let Some(ref edit_msgid) = pending_edit_msgid {
         let is_owner = {
             let state_r = state.read().await;
-            state_r.msgid_store.get(edit_msgid.as_str())
+            state_r
+                .msgid_store
+                .get(edit_msgid.as_str())
                 .map(|(_, sid)| sid == client_id)
                 .unwrap_or(false)
         };
@@ -135,13 +157,16 @@ pub async fn handle_privmsg(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec![
-                    "EDIT".into(),
-                    "CANNOT_EDIT".into(),
-                    target.to_string(),
-                    edit_msgid.clone(),
-                    "Message not found or you are not the original sender".into(),
-                ])
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "EDIT".into(),
+                        "CANNOT_EDIT".into(),
+                        target.to_string(),
+                        edit_msgid.clone(),
+                        "Message not found or you are not the original sender".into(),
+                    ],
+                )
                 .with_prefix(&cfg.server.name),
                 label,
             )
@@ -192,30 +217,64 @@ pub async fn handle_privmsg(
 
             // +C: block CTCPs (ACTION \x01ACTION...\x01 is also blocked)
             if ch.modes.no_ctcp && is_ctcp(&text) {
-                reply_to_client(&senders, client_id,
-                    Message::new("404", vec![target.into(), "CTCPs are not allowed in this channel (+C)".into()])
-                        .with_prefix(&cfg.server.name), label).await;
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "404",
+                        vec![
+                            target.into(),
+                            "CTCPs are not allowed in this channel (+C)".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
                 return Ok(());
             }
 
             // +q: sender is quieted
             if ch.is_quieted(sender_account.as_deref(), &source) {
-                reply_to_client(&senders, client_id,
-                    Message::new("404", vec![target.into(), "You are quieted in this channel (+q)".into()])
-                        .with_prefix(&cfg.server.name), label).await;
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "404",
+                        vec![target.into(), "You are quieted in this channel (+q)".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
                 return Ok(());
             }
 
             // +R: registered users only for speaking
             if ch.modes.registered_only && sender_account.is_none() {
-                reply_to_client(&senders, client_id,
-                    Message::new("404", vec![target.into(), "You must be registered to speak here (+R)".into()])
-                        .with_prefix(&cfg.server.name), label).await;
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "404",
+                        vec![
+                            target.into(),
+                            "You must be registered to speak here (+R)".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
                 return Ok(());
             }
 
             // +c: strip colors from message text
-            let text = if ch.modes.no_colors { strip_colors(&text) } else { text.clone() };
+            let text = if ch.modes.no_colors {
+                strip_colors(&text)
+            } else {
+                text.clone()
+            };
             drop(ch);
             drop(ch_store);
 
@@ -232,7 +291,8 @@ pub async fn handle_privmsg(
             } else {
                 target.to_string()
             };
-            let base_msg = Message::new("PRIVMSG", vec![display_target, text.clone()]).with_prefix(&source);
+            let base_msg =
+                Message::new("PRIVMSG", vec![display_target, text.clone()]).with_prefix(&source);
             for (mid, memb) in &ch.members {
                 // STATUSMSG filter: @ → ops/halfops only; + → voiced/halfop/op only
                 if let Some(pfx) = statusmsg_prefix {
@@ -241,7 +301,9 @@ pub async fn handle_privmsg(
                         '+' => memb.modes.voice || memb.modes.halfop || memb.modes.op,
                         _ => true,
                     };
-                    if !passes { continue; }
+                    if !passes {
+                        continue;
+                    }
                 }
                 if *mid == client_id {
                     if echo_message {
@@ -249,7 +311,14 @@ pub async fn handle_privmsg(
                             Some(c) => c.read().await.capabilities.clone(),
                             None => Default::default(),
                         };
-                        let tagged = add_tags_for_recipient(base_msg.clone(), &caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref());
+                        let tagged = add_tags_for_recipient(
+                            base_msg.clone(),
+                            &caps,
+                            sender_account.as_deref(),
+                            Some(&msgid),
+                            Some(&msg.tags),
+                            cfg.server.client_tag_deny.as_deref(),
+                        );
                         reply_to_client(&senders, client_id, tagged, label).await;
                     }
                     continue;
@@ -258,10 +327,22 @@ pub async fn handle_privmsg(
                     Some(c) => c.read().await.capabilities.clone(),
                     None => Default::default(),
                 };
-                send_to_client_with_caps(&senders, mid, base_msg.clone(), &recipient_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref()).await;
+                send_to_client_with_caps(
+                    &senders,
+                    mid,
+                    base_msg.clone(),
+                    &recipient_caps,
+                    sender_account.as_deref(),
+                    Some(&msgid),
+                    Some(&msg.tags),
+                    cfg.server.client_tag_deny.as_deref(),
+                )
+                .await;
             }
             if let Some(ref pool) = cfg.db {
-                let _ = persist::append_channel_history(pool, &ch_key, &source, &text, Some(&msgid)).await;
+                let _ =
+                    persist::append_channel_history(pool, &ch_key, &source, &text, Some(&msgid))
+                        .await;
             }
         } else {
             reply_to_client(
@@ -276,12 +357,23 @@ pub async fn handle_privmsg(
     } else {
         let target_id = state_guard.nick_to_id.get(&target.to_uppercase()).cloned();
         if let Some(tid) = target_id {
-            let privmsg = Message::new("PRIVMSG", vec![target.into(), text.clone()]).with_prefix(&source);
+            let privmsg =
+                Message::new("PRIVMSG", vec![target.into(), text.clone()]).with_prefix(&source);
             let target_caps = match state_guard.clients.get(&tid) {
                 Some(c) => c.read().await.capabilities.clone(),
                 None => Default::default(),
             };
-            send_to_client_with_caps(&senders, &tid, privmsg.clone(), &target_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref()).await;
+            send_to_client_with_caps(
+                &senders,
+                &tid,
+                privmsg.clone(),
+                &target_caps,
+                sender_account.as_deref(),
+                Some(&msgid),
+                Some(&msg.tags),
+                cfg.server.client_tag_deny.as_deref(),
+            )
+            .await;
             // 301 RPL_AWAY if target is away
             let target_away = match state_guard.clients.get(&tid) {
                 Some(c) => c.read().await.away_message.clone(),
@@ -303,7 +395,14 @@ pub async fn handle_privmsg(
                     Some(c) => c.read().await.capabilities.clone(),
                     None => Default::default(),
                 };
-                let tagged = add_tags_for_recipient(privmsg, &sender_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref());
+                let tagged = add_tags_for_recipient(
+                    privmsg,
+                    &sender_caps,
+                    sender_account.as_deref(),
+                    Some(&msgid),
+                    Some(&msg.tags),
+                    cfg.server.client_tag_deny.as_deref(),
+                );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
         } else {
@@ -343,7 +442,9 @@ pub async fn handle_notice(
         None => return Ok(()),
     };
     let sender_data = client.read().await;
-    let source = sender_data.source().unwrap_or_else(|| client_id.to_string());
+    let source = sender_data
+        .source()
+        .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
     let echo_message = sender_data.has_cap("echo-message");
     drop(sender_data);
@@ -382,7 +483,13 @@ pub async fn handle_notice(
                 return Ok(());
             }
             // +m: only voiced/op may send
-            if ch.modes.moderated && !ch.members.get(client_id).map(|m| m.modes.voice || m.modes.halfop || m.modes.op).unwrap_or(false) {
+            if ch.modes.moderated
+                && !ch
+                    .members
+                    .get(client_id)
+                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .unwrap_or(false)
+            {
                 return Ok(()); // NOTICE silently drops per RFC
             }
             // +R: registered-only channel
@@ -401,7 +508,9 @@ pub async fn handle_notice(
                         '+' => memb.modes.voice || memb.modes.halfop || memb.modes.op,
                         _ => true,
                     };
-                    if !passes { continue; }
+                    if !passes {
+                        continue;
+                    }
                 }
                 if *mid == client_id {
                     if echo_message {
@@ -409,7 +518,14 @@ pub async fn handle_notice(
                             Some(c) => c.read().await.capabilities.clone(),
                             None => Default::default(),
                         };
-                        let tagged = add_tags_for_recipient(base_msg.clone(), &caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref());
+                        let tagged = add_tags_for_recipient(
+                            base_msg.clone(),
+                            &caps,
+                            sender_account.as_deref(),
+                            Some(&msgid),
+                            Some(&msg.tags),
+                            cfg.server.client_tag_deny.as_deref(),
+                        );
                         reply_to_client(&senders, client_id, tagged, label).await;
                     }
                     continue;
@@ -418,11 +534,28 @@ pub async fn handle_notice(
                     Some(c) => c.read().await.capabilities.clone(),
                     None => Default::default(),
                 };
-                send_to_client_with_caps(&senders, mid, base_msg.clone(), &recipient_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref()).await;
+                send_to_client_with_caps(
+                    &senders,
+                    mid,
+                    base_msg.clone(),
+                    &recipient_caps,
+                    sender_account.as_deref(),
+                    Some(&msgid),
+                    Some(&msg.tags),
+                    cfg.server.client_tag_deny.as_deref(),
+                )
+                .await;
             }
             if statusmsg_prefix.is_none() {
                 if let Some(ref pool) = cfg.db {
-                    let _ = persist::append_channel_history(pool, &ch_key, &source, &text, Some(&msgid)).await;
+                    let _ = persist::append_channel_history(
+                        pool,
+                        &ch_key,
+                        &source,
+                        &text,
+                        Some(&msgid),
+                    )
+                    .await;
                 }
             }
         }
@@ -433,13 +566,30 @@ pub async fn handle_notice(
                 Some(c) => c.read().await.capabilities.clone(),
                 None => Default::default(),
             };
-            send_to_client_with_caps(&senders, &tid, base_msg.clone(), &target_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref()).await;
+            send_to_client_with_caps(
+                &senders,
+                &tid,
+                base_msg.clone(),
+                &target_caps,
+                sender_account.as_deref(),
+                Some(&msgid),
+                Some(&msg.tags),
+                cfg.server.client_tag_deny.as_deref(),
+            )
+            .await;
             if echo_message {
                 let sender_caps = match state_guard.clients.get(client_id) {
                     Some(c) => c.read().await.capabilities.clone(),
                     None => Default::default(),
                 };
-                let tagged = add_tags_for_recipient(base_msg, &sender_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref());
+                let tagged = add_tags_for_recipient(
+                    base_msg,
+                    &sender_caps,
+                    sender_account.as_deref(),
+                    Some(&msgid),
+                    Some(&msg.tags),
+                    cfg.server.client_tag_deny.as_deref(),
+                );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
         }
@@ -465,8 +615,16 @@ pub async fn deliver_multiline_batch(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec!["BATCH".into(), "MULTILINE_INVALID".into(), "*".into(), " :Invalid multiline batch with blank lines only".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "FAIL",
+                vec![
+                    "BATCH".into(),
+                    "MULTILINE_INVALID".into(),
+                    "*".into(),
+                    " :Invalid multiline batch with blank lines only".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -476,8 +634,16 @@ pub async fn deliver_multiline_batch(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec!["BATCH".into(), "MULTILINE_MAX_LINES".into(), MULTILINE_MAX_LINES.to_string(), " :Multiline batch max-lines exceeded".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "FAIL",
+                vec![
+                    "BATCH".into(),
+                    "MULTILINE_MAX_LINES".into(),
+                    MULTILINE_MAX_LINES.to_string(),
+                    " :Multiline batch max-lines exceeded".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -494,8 +660,16 @@ pub async fn deliver_multiline_batch(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec!["BATCH".into(), "MULTILINE_MAX_BYTES".into(), MULTILINE_MAX_BYTES.to_string(), " :Multiline batch max-bytes exceeded".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "FAIL",
+                vec![
+                    "BATCH".into(),
+                    "MULTILINE_MAX_BYTES".into(),
+                    MULTILINE_MAX_BYTES.to_string(),
+                    " :Multiline batch max-bytes exceeded".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -522,57 +696,68 @@ pub async fn deliver_multiline_batch(
     }
 
     let state_guard = state.read().await;
-    let recipient_ids: Vec<String> = if batch.target.starts_with('#') || batch.target.starts_with('&') {
-        let ch_key = canonical_channel_key(&batch.target);
-        let ch_store = channels.read().await;
-        match ch_store.channels.get(&ch_key) {
-            Some(ch) => {
-                let ch = ch.read().await;
-                if !ch.is_member(client_id) {
+    let recipient_ids: Vec<String> =
+        if batch.target.starts_with('#') || batch.target.starts_with('&') {
+            let ch_key = canonical_channel_key(&batch.target);
+            let ch_store = channels.read().await;
+            match ch_store.channels.get(&ch_key) {
+                Some(ch) => {
+                    let ch = ch.read().await;
+                    if !ch.is_member(client_id) {
+                        reply_to_client(
+                            &senders,
+                            client_id,
+                            Message::new(
+                                "404",
+                                vec![batch.target.clone(), "Cannot send to channel".into()],
+                            )
+                            .with_prefix(&cfg.server.name),
+                            label,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    ch.members.keys().cloned().collect()
+                }
+                None => {
                     reply_to_client(
                         &senders,
                         client_id,
-                        Message::new("404", vec![batch.target.clone(), "Cannot send to channel".into()])
+                        Message::new("403", vec![batch.target.clone(), "No such channel".into()])
                             .with_prefix(&cfg.server.name),
                         label,
                     )
                     .await;
                     return Ok(());
                 }
-                ch.members.keys().cloned().collect()
             }
-            None => {
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    Message::new("403", vec![batch.target.clone(), "No such channel".into()])
+        } else {
+            match state_guard.nick_to_id.get(&batch.target.to_uppercase()) {
+                Some(tid) => vec![tid.clone()],
+                None => {
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        Message::new(
+                            "401",
+                            vec![batch.target.clone(), "No such nick/channel".into()],
+                        )
                         .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
-                return Ok(());
+                        label,
+                    )
+                    .await;
+                    return Ok(());
+                }
             }
-        }
-    } else {
-        match state_guard.nick_to_id.get(&batch.target.to_uppercase()) {
-            Some(tid) => vec![tid.clone()],
-            None => {
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    Message::new("401", vec![batch.target.clone(), "No such nick/channel".into()])
-                        .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
-                return Ok(());
-            }
-        }
-    };
+        };
 
     let batch_start = Message::new(
         "BATCH",
-        vec![format!("+{}", batch.ref_tag), "draft/multiline".into(), batch.target.clone()],
+        vec![
+            format!("+{}", batch.ref_tag),
+            "draft/multiline".into(),
+            batch.target.clone(),
+        ],
     )
     .with_prefix(&cfg.server.name);
 
@@ -593,20 +778,47 @@ pub async fn deliver_multiline_batch(
         if has_multiline {
             send_to_client(&senders, mid, batch_start.clone()).await;
             for (concat, text) in &batch.lines {
-                let mut line_msg = Message::new(batch.command.clone(), vec![batch.target.clone(), format!(":{}", text)]).with_prefix(&source);
-                line_msg.tags.insert("batch".to_string(), Some(batch.ref_tag.clone()));
+                let mut line_msg = Message::new(
+                    batch.command.clone(),
+                    vec![batch.target.clone(), format!(":{}", text)],
+                )
+                .with_prefix(&source);
+                line_msg
+                    .tags
+                    .insert("batch".to_string(), Some(batch.ref_tag.clone()));
                 if *concat {
-                    line_msg.tags.insert("draft/multiline-concat".to_string(), None);
+                    line_msg
+                        .tags
+                        .insert("draft/multiline-concat".to_string(), None);
                 }
-                let tagged = add_tags_for_recipient(line_msg, &caps, sender_account.as_deref(), Some(&msgid), None, cfg.server.client_tag_deny.as_deref());
+                let tagged = add_tags_for_recipient(
+                    line_msg,
+                    &caps,
+                    sender_account.as_deref(),
+                    Some(&msgid),
+                    None,
+                    cfg.server.client_tag_deny.as_deref(),
+                );
                 send_to_client(&senders, mid, tagged).await;
             }
-            let batch_end = Message::new("BATCH", vec![format!("-{}", batch.ref_tag)]).with_prefix(&cfg.server.name);
+            let batch_end = Message::new("BATCH", vec![format!("-{}", batch.ref_tag)])
+                .with_prefix(&cfg.server.name);
             send_to_client(&senders, mid, batch_end).await;
         } else {
             for (_, text) in &batch.lines {
-                let line_msg = Message::new(batch.command.clone(), vec![batch.target.clone(), format!(":{}", text)]).with_prefix(&source);
-                let tagged = add_tags_for_recipient(line_msg, &caps, sender_account.as_deref(), Some(&msgid), None, cfg.server.client_tag_deny.as_deref());
+                let line_msg = Message::new(
+                    batch.command.clone(),
+                    vec![batch.target.clone(), format!(":{}", text)],
+                )
+                .with_prefix(&source);
+                let tagged = add_tags_for_recipient(
+                    line_msg,
+                    &caps,
+                    sender_account.as_deref(),
+                    Some(&msgid),
+                    None,
+                    cfg.server.client_tag_deny.as_deref(),
+                );
                 send_to_client(&senders, mid, tagged).await;
             }
         }
@@ -626,25 +838,56 @@ pub async fn deliver_multiline_batch(
         if has_multiline {
             let echo_batch_start = Message::new(
                 "BATCH",
-                vec![format!("+{}", batch.ref_tag), "draft/multiline".into(), batch.target.clone()],
+                vec![
+                    format!("+{}", batch.ref_tag),
+                    "draft/multiline".into(),
+                    batch.target.clone(),
+                ],
             )
             .with_prefix(&cfg.server.name);
             reply_to_client(&senders, client_id, echo_batch_start, label).await;
             for (concat, text) in &batch.lines {
-                let mut line_msg = Message::new(batch.command.clone(), vec![batch.target.clone(), format!(":{}", text)]).with_prefix(&source);
-                line_msg.tags.insert("batch".to_string(), Some(batch.ref_tag.clone()));
+                let mut line_msg = Message::new(
+                    batch.command.clone(),
+                    vec![batch.target.clone(), format!(":{}", text)],
+                )
+                .with_prefix(&source);
+                line_msg
+                    .tags
+                    .insert("batch".to_string(), Some(batch.ref_tag.clone()));
                 if *concat {
-                    line_msg.tags.insert("draft/multiline-concat".to_string(), None);
+                    line_msg
+                        .tags
+                        .insert("draft/multiline-concat".to_string(), None);
                 }
-                let tagged = add_tags_for_recipient(line_msg, &sender_caps, sender_account.as_deref(), Some(&msgid), None, cfg.server.client_tag_deny.as_deref());
+                let tagged = add_tags_for_recipient(
+                    line_msg,
+                    &sender_caps,
+                    sender_account.as_deref(),
+                    Some(&msgid),
+                    None,
+                    cfg.server.client_tag_deny.as_deref(),
+                );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
-            let batch_end = Message::new("BATCH", vec![format!("-{}", batch.ref_tag)]).with_prefix(&cfg.server.name);
+            let batch_end = Message::new("BATCH", vec![format!("-{}", batch.ref_tag)])
+                .with_prefix(&cfg.server.name);
             reply_to_client(&senders, client_id, batch_end, label).await;
         } else {
             for (_, text) in &batch.lines {
-                let line_msg = Message::new(batch.command.clone(), vec![batch.target.clone(), format!(":{}", text)]).with_prefix(&source);
-                let tagged = add_tags_for_recipient(line_msg, &sender_caps, sender_account.as_deref(), Some(&msgid), None, cfg.server.client_tag_deny.as_deref());
+                let line_msg = Message::new(
+                    batch.command.clone(),
+                    vec![batch.target.clone(), format!(":{}", text)],
+                )
+                .with_prefix(&source);
+                let tagged = add_tags_for_recipient(
+                    line_msg,
+                    &sender_caps,
+                    sender_account.as_deref(),
+                    Some(&msgid),
+                    None,
+                    cfg.server.client_tag_deny.as_deref(),
+                );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
         }
@@ -653,7 +896,14 @@ pub async fn deliver_multiline_batch(
     if let Some(ref pool) = cfg.db {
         if batch.target.starts_with('#') || batch.target.starts_with('&') {
             for (_, text) in &batch.lines {
-                let _ = persist::append_channel_history(pool, &batch.target, &source, text, Some(&msgid)).await;
+                let _ = persist::append_channel_history(
+                    pool,
+                    &batch.target,
+                    &source,
+                    text,
+                    Some(&msgid),
+                )
+                .await;
             }
         }
     }
@@ -690,7 +940,9 @@ pub async fn handle_tagmsg(
         None => return Ok(()),
     };
     let sender_data = client.read().await;
-    let source = sender_data.source().unwrap_or_else(|| client_id.to_string());
+    let source = sender_data
+        .source()
+        .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
     let echo_message = sender_data.has_cap("echo-message");
     drop(sender_data);
@@ -723,11 +975,28 @@ pub async fn handle_tagmsg(
                         if !echo_message {
                             continue;
                         }
-                        let tagged = add_tags_for_recipient(base_msg.clone(), &caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref());
+                        let tagged = add_tags_for_recipient(
+                            base_msg.clone(),
+                            &caps,
+                            sender_account.as_deref(),
+                            Some(&msgid),
+                            Some(&msg.tags),
+                            cfg.server.client_tag_deny.as_deref(),
+                        );
                         reply_to_client(&senders, client_id, tagged, label).await;
                         continue;
                     }
-                    send_to_client_with_caps(&senders, mid, base_msg.clone(), &caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref()).await;
+                    send_to_client_with_caps(
+                        &senders,
+                        mid,
+                        base_msg.clone(),
+                        &caps,
+                        sender_account.as_deref(),
+                        Some(&msgid),
+                        Some(&msg.tags),
+                        cfg.server.client_tag_deny.as_deref(),
+                    )
+                    .await;
                 }
             }
         }
@@ -739,7 +1008,17 @@ pub async fn handle_tagmsg(
                 None => Default::default(),
             };
             if target_caps.contains("message-tags") {
-                send_to_client_with_caps(&senders, &tid, base_msg.clone(), &target_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref()).await;
+                send_to_client_with_caps(
+                    &senders,
+                    &tid,
+                    base_msg.clone(),
+                    &target_caps,
+                    sender_account.as_deref(),
+                    Some(&msgid),
+                    Some(&msg.tags),
+                    cfg.server.client_tag_deny.as_deref(),
+                )
+                .await;
             }
             if echo_message {
                 let sender_caps = match state_guard.clients.get(client_id) {
@@ -747,7 +1026,14 @@ pub async fn handle_tagmsg(
                     None => Default::default(),
                 };
                 if sender_caps.contains("message-tags") {
-                    let tagged = add_tags_for_recipient(base_msg, &sender_caps, sender_account.as_deref(), Some(&msgid), Some(&msg.tags), cfg.server.client_tag_deny.as_deref());
+                    let tagged = add_tags_for_recipient(
+                        base_msg,
+                        &sender_caps,
+                        sender_account.as_deref(),
+                        Some(&msgid),
+                        Some(&msg.tags),
+                        cfg.server.client_tag_deny.as_deref(),
+                    );
                     reply_to_client(&senders, client_id, tagged, label).await;
                 }
             }
@@ -777,8 +1063,15 @@ pub async fn handle_redact(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec!["REDACT".into(), "NEED_MORE_PARAMS".into(), "Target and message ID required".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "FAIL",
+                vec![
+                    "REDACT".into(),
+                    "NEED_MORE_PARAMS".into(),
+                    "Target and message ID required".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -790,12 +1083,18 @@ pub async fn handle_redact(
     // (handles messages sent before a restart — the key fix for cross-restart redaction).
     let in_mem = {
         let state_r = state.read().await;
-        state_r.msgid_store.get(msgid).map(|(t, s)| (t.to_string(), s.to_string()))
+        state_r
+            .msgid_store
+            .get(msgid)
+            .map(|(t, s)| (t.to_string(), s.to_string()))
     };
 
     // (target_channel_or_nick, sender_nick_for_auth)
     let (target, sender_nick): (String, Option<String>) = if let Some((t, sender_id)) = in_mem {
-        debug!("REDACT: msgid={} found in memory store (target={} sender_id={})", msgid, t, sender_id);
+        debug!(
+            "REDACT: msgid={} found in memory store (target={} sender_id={})",
+            msgid, t, sender_id
+        );
         let nick = {
             let c_arc = state.read().await.clients.get(&sender_id).cloned();
             if let Some(c) = c_arc {
@@ -815,7 +1114,10 @@ pub async fn handle_redact(
             Some((channel, source)) => {
                 // source is "nick!user@host"; extract just the nick for auth
                 let nick = source.split('!').next().map(|s| s.to_string());
-                debug!("REDACT: msgid={} found in DB (channel={} source={} nick={:?})", msgid, channel, source, nick);
+                debug!(
+                    "REDACT: msgid={} found in DB (channel={} source={} nick={:?})",
+                    msgid, channel, source, nick
+                );
                 (channel, nick)
             }
             None => {
@@ -823,8 +1125,15 @@ pub async fn handle_redact(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("FAIL", vec!["REDACT".into(), "UNKNOWN_MSGID".into(), "No such message".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "REDACT".into(),
+                            "UNKNOWN_MSGID".into(),
+                            "No such message".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -839,14 +1148,19 @@ pub async fn handle_redact(
         match state_r.clients.get(client_id) {
             Some(c) => {
                 let g = c.read().await;
-                (g.nick_or_id().to_string(), g.oper, g.source().unwrap_or_else(|| g.nick_or_id().to_string()))
+                (
+                    g.nick_or_id().to_string(),
+                    g.oper,
+                    g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
+                )
             }
             None => return Ok(()),
         }
     };
 
     // Authorization: own message (by nick), channel op, or IRC oper
-    let is_own = sender_nick.as_deref()
+    let is_own = sender_nick
+        .as_deref()
         .map(|sn| sn.eq_ignore_ascii_case(&current_nick))
         .unwrap_or(false);
 
@@ -854,7 +1168,13 @@ pub async fn handle_redact(
         let ch_key = canonical_channel_key(&target);
         let ch_store = channels.read().await;
         match ch_store.channels.get(&ch_key) {
-            Some(ch) => ch.read().await.members.get(client_id).map(|m| m.modes.op).unwrap_or(false),
+            Some(ch) => ch
+                .read()
+                .await
+                .members
+                .get(client_id)
+                .map(|m| m.modes.op)
+                .unwrap_or(false),
             None => false,
         }
     } else {
@@ -872,8 +1192,15 @@ pub async fn handle_redact(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec!["REDACT".into(), "REDACT_FORBIDDEN".into(), "You may not redact this message".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "FAIL",
+                vec![
+                    "REDACT".into(),
+                    "REDACT_FORBIDDEN".into(),
+                    "You may not redact this message".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -889,7 +1216,12 @@ pub async fn handle_redact(
     // Delete from DB
     if let Some(ref pool) = cfg.db {
         let deleted = persist::delete_channel_history_by_msgid(pool, msgid).await;
-        tracing::info!(client_id, msgid, rows_affected = deleted, "REDACT DB delete");
+        tracing::info!(
+            client_id,
+            msgid,
+            rows_affected = deleted,
+            "REDACT DB delete"
+        );
     }
 
     // Per spec: :<nick!user@host> REDACT <target> <msgid> :<reason>
@@ -918,11 +1250,14 @@ pub async fn handle_redact(
         // DM: send to the redacting client and the other party if they have the cap
         let state_r = state.read().await;
         let tid_opt = state_r.nick_to_id.get(&target.to_uppercase()).cloned();
-        let sender_has_cap = state_r.clients.get(client_id)
+        let sender_has_cap = state_r
+            .clients
+            .get(client_id)
             .and_then(|c| c.try_read().ok())
             .map(|g| g.capabilities.contains("message-redaction"))
             .unwrap_or(false);
-        let recipient_has_cap = tid_opt.as_deref()
+        let recipient_has_cap = tid_opt
+            .as_deref()
             .and_then(|tid| state_r.clients.get(tid))
             .and_then(|c| c.try_read().ok())
             .map(|g| g.capabilities.contains("message-redaction"))
@@ -966,7 +1301,11 @@ pub async fn handle_chathistory(
     if subcommand == "TARGETS" {
         let from_ts = params.get(1).map(|s| s.as_str()).unwrap_or("");
         let to_ts = params.get(2).map(|s| s.as_str()).unwrap_or("");
-        let limit = params.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(50).min(CHATHISTORY_LIMIT);
+        let limit = params
+            .get(3)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(50)
+            .min(CHATHISTORY_LIMIT);
         // Strip "timestamp=" prefix if present.
         let from_ts = from_ts.strip_prefix("timestamp=").unwrap_or(from_ts);
         let to_ts = to_ts.strip_prefix("timestamp=").unwrap_or(to_ts);
@@ -974,8 +1313,16 @@ pub async fn handle_chathistory(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["CHATHISTORY".into(), "INVALID_PARAMS".into(), "TARGETS".into(), "Insufficient parameters".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "CHATHISTORY".into(),
+                        "INVALID_PARAMS".into(),
+                        "TARGETS".into(),
+                        "Insufficient parameters".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -990,13 +1337,32 @@ pub async fn handle_chathistory(
             }
         };
         let use_batch = caps.contains("batch") && caps.contains("message-tags");
-        let batch_ref = if use_batch { Some(crate::protocol::generate_msgid()) } else { None };
+        let batch_ref = if use_batch {
+            Some(crate::protocol::generate_msgid())
+        } else {
+            None
+        };
         if let Some(ref ref_id) = batch_ref {
-            let batch_start = Message::new("BATCH", vec![format!("+{}", ref_id), "chathistory".into(), "targets".into()]).with_prefix(&cfg.server.name);
+            let batch_start = Message::new(
+                "BATCH",
+                vec![
+                    format!("+{}", ref_id),
+                    "chathistory".into(),
+                    "targets".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name);
             send_to_client(&senders, client_id, batch_start).await;
         }
         for (chan, latest_ts) in &targets {
-            let mut m = Message::new("CHATHISTORY", vec!["TARGETS".into(), chan.clone(), format!("timestamp={}", latest_ts)]);
+            let mut m = Message::new(
+                "CHATHISTORY",
+                vec![
+                    "TARGETS".into(),
+                    chan.clone(),
+                    format!("timestamp={}", latest_ts),
+                ],
+            );
             m.prefix = Some(cfg.server.name.clone());
             if let Some(ref ref_id) = batch_ref {
                 m.tags.insert("batch".to_string(), Some(ref_id.clone()));
@@ -1004,23 +1370,38 @@ pub async fn handle_chathistory(
             send_to_client(&senders, client_id, m).await;
         }
         if let Some(ref ref_id) = batch_ref {
-            let batch_end = Message::new("BATCH", vec![format!("-{}", ref_id)]).with_prefix(&cfg.server.name);
+            let batch_end =
+                Message::new("BATCH", vec![format!("-{}", ref_id)]).with_prefix(&cfg.server.name);
             send_to_client(&senders, client_id, batch_end).await;
         }
         return Ok(());
     }
 
     // Parse target, cursor, and limit for LATEST/BEFORE/AFTER/AROUND and legacy forms.
-    let (target, cursor, limit) = if matches!(subcommand.as_str(), "LATEST" | "BEFORE" | "AFTER" | "AROUND") {
+    let (target, cursor, limit) = if matches!(
+        subcommand.as_str(),
+        "LATEST" | "BEFORE" | "AFTER" | "AROUND"
+    ) {
         let target = params.get(1).map(|s| s.as_str()).unwrap_or("");
         let cursor = params.get(2).map(|s| s.as_str()).unwrap_or("*");
-        let limit_param = params.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
+        let limit_param = params
+            .get(3)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(50);
         if target.is_empty() {
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["CHATHISTORY".into(), "INVALID_PARAMS".into(), subcommand.as_str().into(), "Insufficient parameters".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "CHATHISTORY".into(),
+                        "INVALID_PARAMS".into(),
+                        subcommand.as_str().into(),
+                        "Insufficient parameters".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1030,7 +1411,10 @@ pub async fn handle_chathistory(
     } else {
         // Legacy: CHATHISTORY #channel [count]
         let target = params.get(0).map(|s| s.as_str()).unwrap_or("");
-        let limit_param = params.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
+        let limit_param = params
+            .get(1)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(50);
         (target, "*", limit_param.min(CHATHISTORY_LIMIT))
     };
 
@@ -1038,8 +1422,11 @@ pub async fn handle_chathistory(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("461", vec!["CHATHISTORY".into(), "Channel name required".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "461",
+                vec!["CHATHISTORY".into(), "Channel name required".into()],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1058,8 +1445,17 @@ pub async fn handle_chathistory(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec!["CHATHISTORY".into(), "INVALID_TARGET".into(), "CHATHISTORY".into(), target.into(), "You're not on that channel".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "FAIL",
+                vec![
+                    "CHATHISTORY".into(),
+                    "INVALID_TARGET".into(),
+                    "CHATHISTORY".into(),
+                    target.into(),
+                    "You're not on that channel".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1067,9 +1463,15 @@ pub async fn handle_chathistory(
     }
 
     let entries = match (subcommand.as_str(), cursor) {
-        ("AROUND", c) if c != "*" => persist::read_channel_history_around(pool, target, c, limit).await,
-        ("BEFORE", c) if c != "*" => persist::read_channel_history_before(pool, target, c, limit).await,
-        ("AFTER",  c) if c != "*" => persist::read_channel_history_after(pool, target, c, limit).await,
+        ("AROUND", c) if c != "*" => {
+            persist::read_channel_history_around(pool, target, c, limit).await
+        }
+        ("BEFORE", c) if c != "*" => {
+            persist::read_channel_history_before(pool, target, c, limit).await
+        }
+        ("AFTER", c) if c != "*" => {
+            persist::read_channel_history_after(pool, target, c, limit).await
+        }
         _ => persist::read_channel_history(pool, target, limit).await,
     };
     let caps = {
@@ -1088,7 +1490,11 @@ pub async fn handle_chathistory(
 
     if use_batch {
         if let Some(ref ref_id) = batch_ref {
-            let batch_start = Message::new("BATCH", vec![format!("+{}", ref_id), "chathistory".into(), target.into()]).with_prefix(&cfg.server.name);
+            let batch_start = Message::new(
+                "BATCH",
+                vec![format!("+{}", ref_id), "chathistory".into(), target.into()],
+            )
+            .with_prefix(&cfg.server.name);
             send_to_client(&senders, client_id, batch_start).await;
         }
     }
@@ -1107,7 +1513,14 @@ pub async fn handle_chathistory(
         if let Some(ref ref_id) = batch_ref {
             m.tags.insert("batch".to_string(), Some(ref_id.clone()));
         }
-        let tagged = add_tags_for_recipient(m, &caps, None, e.msgid.as_deref(), None, cfg.server.client_tag_deny.as_deref());
+        let tagged = add_tags_for_recipient(
+            m,
+            &caps,
+            None,
+            e.msgid.as_deref(),
+            None,
+            cfg.server.client_tag_deny.as_deref(),
+        );
         send_to_client(&senders, client_id, tagged).await;
     }
 
@@ -1123,7 +1536,9 @@ pub async fn handle_chathistory(
             )
             .with_prefix(&source);
             if let Some(ref ref_id) = batch_ref {
-                redact_msg.tags.insert("batch".to_string(), Some(ref_id.clone()));
+                redact_msg
+                    .tags
+                    .insert("batch".to_string(), Some(ref_id.clone()));
             }
             send_to_client(&senders, client_id, redact_msg).await;
         }
@@ -1131,7 +1546,8 @@ pub async fn handle_chathistory(
 
     if use_batch {
         if let Some(ref ref_id) = batch_ref {
-            let batch_end = Message::new("BATCH", vec![format!("-{}", ref_id)]).with_prefix(&cfg.server.name);
+            let batch_end =
+                Message::new("BATCH", vec![format!("-{}", ref_id)]).with_prefix(&cfg.server.name);
             send_to_client(&senders, client_id, batch_end).await;
         }
     }
@@ -1153,8 +1569,15 @@ pub async fn handle_markread(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec!["MARKREAD".into(), "NEED_MORE_PARAMS".into(), "Missing parameters".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "FAIL",
+                vec![
+                    "MARKREAD".into(),
+                    "NEED_MORE_PARAMS".into(),
+                    "Missing parameters".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1162,7 +1585,12 @@ pub async fn handle_markread(
     }
     let client_arc = state.read().await.clients.get(client_id).cloned();
     let key = match client_arc {
-        Some(c) => c.read().await.account.clone().unwrap_or_else(|| client_id.to_string()),
+        Some(c) => c
+            .read()
+            .await
+            .account
+            .clone()
+            .unwrap_or_else(|| client_id.to_string()),
         None => client_id.to_string(),
     };
     let timestamp_param = msg.params.get(1).map(|s| s.as_str());
@@ -1172,8 +1600,15 @@ pub async fn handle_markread(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["MARKREAD".into(), "INVALID_PARAMS".into(), "timestamp must not be * for set".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "MARKREAD".into(),
+                        "INVALID_PARAMS".into(),
+                        "timestamp must not be * for set".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1197,7 +1632,11 @@ pub async fn handle_markread(
         if let Some(ref pool) = cfg.db {
             persist::save_read_marker(pool, &key, target, &updated_ts).await;
         }
-        let m = Message::new("MARKREAD", vec![target.into(), format!("timestamp={}", updated_ts)]).with_prefix(&cfg.server.name);
+        let m = Message::new(
+            "MARKREAD",
+            vec![target.into(), format!("timestamp={}", updated_ts)],
+        )
+        .with_prefix(&cfg.server.name);
         reply_to_client(&senders, client_id, m, label).await;
     } else {
         let state_r = state.read().await;
@@ -1207,8 +1646,11 @@ pub async fn handle_markread(
             .and_then(|m| m.get(target))
             .cloned();
         drop(state_r);
-        let ts_param = ts.map(|t| format!("timestamp={}", t)).unwrap_or_else(|| "*".to_string());
-        let m = Message::new("MARKREAD", vec![target.into(), ts_param]).with_prefix(&cfg.server.name);
+        let ts_param = ts
+            .map(|t| format!("timestamp={}", t))
+            .unwrap_or_else(|| "*".to_string());
+        let m =
+            Message::new("MARKREAD", vec![target.into(), ts_param]).with_prefix(&cfg.server.name);
         reply_to_client(&senders, client_id, m, label).await;
     }
     Ok(())
@@ -1243,25 +1685,26 @@ pub async fn deliver_client_batch(
     };
 
     let state_r = state.read().await;
-    let recipient_ids: Vec<String> = if batch.target.starts_with('#') || batch.target.starts_with('&') {
-        let ch_key = canonical_channel_key(&batch.target);
-        let ch_store = channels.read().await;
-        match ch_store.channels.get(&ch_key) {
-            Some(ch) => {
-                let ch = ch.read().await;
-                if !ch.is_member(client_id) {
-                    return Ok(());
+    let recipient_ids: Vec<String> =
+        if batch.target.starts_with('#') || batch.target.starts_with('&') {
+            let ch_key = canonical_channel_key(&batch.target);
+            let ch_store = channels.read().await;
+            match ch_store.channels.get(&ch_key) {
+                Some(ch) => {
+                    let ch = ch.read().await;
+                    if !ch.is_member(client_id) {
+                        return Ok(());
+                    }
+                    ch.members.keys().cloned().collect()
                 }
-                ch.members.keys().cloned().collect()
+                None => return Ok(()),
             }
-            None => return Ok(()),
-        }
-    } else {
-        match state_r.nick_to_id.get(&batch.target.to_uppercase()) {
-            Some(tid) => vec![tid.clone()],
-            None => return Ok(()),
-        }
-    };
+        } else {
+            match state_r.nick_to_id.get(&batch.target.to_uppercase()) {
+                Some(tid) => vec![tid.clone()],
+                None => return Ok(()),
+            }
+        };
     drop(state_r);
 
     // Generate a server-side batch ref for each recipient (they can't share the client's ref tag)
@@ -1280,24 +1723,45 @@ pub async fn deliver_client_batch(
         if has_batch {
             let batch_start = Message::new(
                 "BATCH",
-                vec![format!("+{}", server_ref), batch.batch_type.clone(), batch.target.clone()],
+                vec![
+                    format!("+{}", server_ref),
+                    batch.batch_type.clone(),
+                    batch.target.clone(),
+                ],
             )
             .with_prefix(&source);
             send_to_client(&senders, mid, batch_start).await;
             for mut inner in batch.messages.clone() {
                 // Rewrite source prefix and strip the original batch tag
                 inner.prefix = Some(source.clone());
-                inner.tags.insert("batch".to_string(), Some(server_ref.clone()));
-                let tagged = add_tags_for_recipient(inner, &caps, sender_account.as_deref(), None, None, cfg.server.client_tag_deny.as_deref());
+                inner
+                    .tags
+                    .insert("batch".to_string(), Some(server_ref.clone()));
+                let tagged = add_tags_for_recipient(
+                    inner,
+                    &caps,
+                    sender_account.as_deref(),
+                    None,
+                    None,
+                    cfg.server.client_tag_deny.as_deref(),
+                );
                 send_to_client(&senders, mid, tagged).await;
             }
-            let batch_end = Message::new("BATCH", vec![format!("-{}", server_ref)]).with_prefix(&source);
+            let batch_end =
+                Message::new("BATCH", vec![format!("-{}", server_ref)]).with_prefix(&source);
             send_to_client(&senders, mid, batch_end).await;
         } else {
             for mut inner in batch.messages.clone() {
                 inner.prefix = Some(source.clone());
                 inner.tags.remove("batch");
-                let tagged = add_tags_for_recipient(inner, &caps, sender_account.as_deref(), None, None, cfg.server.client_tag_deny.as_deref());
+                let tagged = add_tags_for_recipient(
+                    inner,
+                    &caps,
+                    sender_account.as_deref(),
+                    None,
+                    None,
+                    cfg.server.client_tag_deny.as_deref(),
+                );
                 send_to_client(&senders, mid, tagged).await;
             }
         }

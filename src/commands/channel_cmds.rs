@@ -1,4 +1,6 @@
-use crate::channel::{canonical_channel_key, Channel, ChannelMembership, ChannelMemberModeSet, ChannelStore};
+use crate::channel::{
+    canonical_channel_key, Channel, ChannelMemberModeSet, ChannelMembership, ChannelStore,
+};
 use crate::commands::reply_to_client;
 use crate::config::Config;
 use crate::protocol::{add_batch_tag, generate_msgid, Message};
@@ -56,7 +58,9 @@ pub async fn handle_join(
     }
 
     let client_data = client.read().await;
-    let source = client_data.source().unwrap_or_else(|| client_data.nick_or_id().to_string());
+    let source = client_data
+        .source()
+        .unwrap_or_else(|| client_data.nick_or_id().to_string());
     let nick = client_data.nick_or_id().to_string();
 
     let client_caps = client_data.capabilities.clone();
@@ -69,11 +73,13 @@ pub async fn handle_join(
             Some(c) => c.clone(),
             None => return Ok(()),
         };
-        let joined_channels: Vec<String> = client_arc.read().await.channels.keys().cloned().collect();
+        let joined_channels: Vec<String> =
+            client_arc.read().await.channels.keys().cloned().collect();
         drop(state); // release ServerState read guard
         for ch_key in &joined_channels {
-            let part_msg = Message::new("PART", vec![ch_key.clone(), "Leaving all channels".into()])
-                .with_prefix(&source);
+            let part_msg =
+                Message::new("PART", vec![ch_key.clone(), "Leaving all channels".into()])
+                    .with_prefix(&source);
             let member_ids: Vec<String> = {
                 let ch_store = channels.write().await;
                 if let Some(ch_lock) = ch_store.channels.get(ch_key) {
@@ -98,7 +104,7 @@ pub async fn handle_join(
 
     for ch_name in ch_names.split(',') {
         let ch_name = ch_name.trim();
-        if ch_name.is_empty() || !ch_name.starts_with('#'){
+        if ch_name.is_empty() || !ch_name.starts_with('#') {
             continue;
         }
 
@@ -115,8 +121,15 @@ pub async fn handle_join(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("405", vec![nick, ch_name.to_string(), "You have joined too many channels".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "405",
+                    vec![
+                        nick,
+                        ch_name.to_string(),
+                        "You have joined too many channels".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -136,12 +149,21 @@ pub async fn handle_join(
             continue;
         }
 
-        if ch.is_banned(account.as_deref(), &source) && !ch.is_ban_exempt(account.as_deref(), &source) {
+        if ch.is_banned(account.as_deref(), &source)
+            && !ch.is_ban_exempt(account.as_deref(), &source)
+        {
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("474", vec![nick.clone(), ch_name.to_string(), "Cannot join channel (+b)".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "474",
+                    vec![
+                        nick.clone(),
+                        ch_name.to_string(),
+                        "Cannot join channel (+b)".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -152,20 +174,37 @@ pub async fn handle_join(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("477", vec![nick.clone(), ch_name.to_string(), "Cannot join channel (+R) - you must be registered".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "477",
+                    vec![
+                        nick.clone(),
+                        ch_name.to_string(),
+                        "Cannot join channel (+R) - you must be registered".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
             continue;
         }
 
-        if ch.modes.invite_only && !ch.invite_list.contains(&client_id.to_string()) && !ch.is_invite_exempt(account.as_deref(), &source) {
+        if ch.modes.invite_only
+            && !ch.invite_list.contains(&client_id.to_string())
+            && !ch.is_invite_exempt(account.as_deref(), &source)
+        {
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("473", vec![nick.clone(), ch_name.to_string(), "Cannot join channel (+i)".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "473",
+                    vec![
+                        nick.clone(),
+                        ch_name.to_string(),
+                        "Cannot join channel (+i)".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -177,8 +216,15 @@ pub async fn handle_join(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("475", vec![nick.clone(), ch_name.to_string(), "Cannot join channel (+k)".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "475",
+                        vec![
+                            nick.clone(),
+                            ch_name.to_string(),
+                            "Cannot join channel (+k)".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -191,8 +237,15 @@ pub async fn handle_join(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("471", vec![nick.clone(), ch_name.to_string(), "Cannot join channel (+l)".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "471",
+                        vec![
+                            nick.clone(),
+                            ch_name.to_string(),
+                            "Cannot join channel (+l)".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -215,15 +268,31 @@ pub async fn handle_join(
 
         if let Some(client) = state.clients.get(client_id) {
             let mut c = client.write().await;
-            c.channels.insert(ch_key.clone(), ChannelMembership { client_id: client_id.to_string(), modes });
+            c.channels.insert(
+                ch_key.clone(),
+                ChannelMembership {
+                    client_id: client_id.to_string(),
+                    modes,
+                },
+            );
         }
 
         let joining_account = match state.clients.get(client_id) {
-            Some(c) => c.read().await.account.clone().unwrap_or_else(|| "*".to_string()),
+            Some(c) => c
+                .read()
+                .await
+                .account
+                .clone()
+                .unwrap_or_else(|| "*".to_string()),
             None => "*".to_string(),
         };
         let joining_realname = match state.clients.get(client_id) {
-            Some(c) => c.read().await.realname.clone().unwrap_or_else(|| "*".to_string()),
+            Some(c) => c
+                .read()
+                .await
+                .realname
+                .clone()
+                .unwrap_or_else(|| "*".to_string()),
             None => "*".to_string(),
         };
         let member_ids: Vec<String> = ch.members.keys().cloned().collect();
@@ -234,16 +303,36 @@ pub async fn handle_join(
         // Build mode string for 324 RPL_CHANNELMODE sent after NAMES
         let join_mode_str = {
             let mut flags = String::from("+");
-            if ch.modes.invite_only { flags.push('i'); }
-            if ch.modes.moderated { flags.push('m'); }
-            if ch.modes.no_external { flags.push('n'); }
-            if ch.modes.secret { flags.push('s'); }
-            if ch.modes.topic_protect { flags.push('t'); }
-            if ch.modes.registered_only { flags.push('R'); }
-            if ch.modes.no_colors { flags.push('c'); }
-            if ch.modes.no_ctcp { flags.push('C'); }
-            if ch.key.is_some() { flags.push('k'); }
-            if ch.modes.user_limit.is_some() { flags.push('l'); }
+            if ch.modes.invite_only {
+                flags.push('i');
+            }
+            if ch.modes.moderated {
+                flags.push('m');
+            }
+            if ch.modes.no_external {
+                flags.push('n');
+            }
+            if ch.modes.secret {
+                flags.push('s');
+            }
+            if ch.modes.topic_protect {
+                flags.push('t');
+            }
+            if ch.modes.registered_only {
+                flags.push('R');
+            }
+            if ch.modes.no_colors {
+                flags.push('c');
+            }
+            if ch.modes.no_ctcp {
+                flags.push('C');
+            }
+            if ch.key.is_some() {
+                flags.push('k');
+            }
+            if ch.modes.user_limit.is_some() {
+                flags.push('l');
+            }
             flags
         };
         let join_mode_key = ch.key.clone();
@@ -255,7 +344,15 @@ pub async fn handle_join(
                 None => Default::default(),
             };
             let join_msg = if caps.contains("extended-join") {
-                Message::new("JOIN", vec![ch_key.clone(), joining_account.clone(), joining_realname.clone()]).with_prefix(&source)
+                Message::new(
+                    "JOIN",
+                    vec![
+                        ch_key.clone(),
+                        joining_account.clone(),
+                        joining_realname.clone(),
+                    ],
+                )
+                .with_prefix(&source)
             } else {
                 Message::new("JOIN", vec![ch_key.clone()]).with_prefix(&source)
             };
@@ -279,8 +376,11 @@ pub async fn handle_join(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("333", vec![nick.clone(), ch_key.clone(), setter.to_string(), time_str])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "333",
+                    vec![nick.clone(), ch_key.clone(), setter.to_string(), time_str],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -289,8 +389,11 @@ pub async fn handle_join(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("329", vec![nick.clone(), ch_key.clone(), created_at.to_string()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "329",
+                vec![nick.clone(), ch_key.clone(), created_at.to_string()],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -298,15 +401,36 @@ pub async fn handle_join(
         // no-implicit-names: send NAMES to joining user unless they have the cap
         if !client_caps.contains("no-implicit-names") {
             if let Some(ch_ref) = ch_store.channels.get(&ch_key) {
-                send_names_for_channel(ch_ref, &ch_key, &nick, &state, &senders, client_id, &cfg.server.name, &client_caps, label).await;
+                send_names_for_channel(
+                    ch_ref,
+                    &ch_key,
+                    &nick,
+                    &state,
+                    &senders,
+                    client_id,
+                    &cfg.server.name,
+                    &client_caps,
+                    label,
+                )
+                .await;
             }
         }
         // 324 RPL_CHANNELMODE: send current channel modes after NAMES burst
         {
             let mut rp = vec![nick.clone(), ch_key.clone(), join_mode_str.clone()];
-            if let Some(ref k) = join_mode_key { rp.push(k.clone()); }
-            if let Some(lim) = join_mode_limit { rp.push(lim.to_string()); }
-            reply_to_client(&senders, client_id, Message::new("324", rp).with_prefix(&cfg.server.name), label).await;
+            if let Some(ref k) = join_mode_key {
+                rp.push(k.clone());
+            }
+            if let Some(lim) = join_mode_limit {
+                rp.push(lim.to_string());
+            }
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("324", rp).with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
         }
         // draft/read-marker: send MARKREAD for channel (before ENDOFNAMES per spec; we send after NAMES)
         if client_caps.contains("draft/read-marker") {
@@ -321,7 +445,8 @@ pub async fn handle_join(
             } else {
                 format!("timestamp={}", ts)
             };
-            let m = Message::new("MARKREAD", vec![ch_key.clone(), ts_param]).with_prefix(&cfg.server.name);
+            let m = Message::new("MARKREAD", vec![ch_key.clone(), ts_param])
+                .with_prefix(&cfg.server.name);
             send_to_client(&senders, client_id, m).await;
         }
 
@@ -362,7 +487,11 @@ pub async fn handle_part(
         Some(c) => c.clone(),
         None => return Ok(()),
     };
-    let source = client.read().await.source().unwrap_or_else(|| client_id.to_string());
+    let source = client
+        .read()
+        .await
+        .source()
+        .unwrap_or_else(|| client_id.to_string());
     let ch_names = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let reason = msg.trailing().unwrap_or("Leaving").to_string();
 
@@ -373,7 +502,8 @@ pub async fn handle_part(
         }
         let ch_key = canonical_channel_key(ch_name);
 
-        let part_msg = Message::new("PART", vec![ch_name.to_string(), reason.clone()]).with_prefix(&source);
+        let part_msg =
+            Message::new("PART", vec![ch_name.to_string(), reason.clone()]).with_prefix(&source);
 
         let mut ch_store = channels.write().await;
         let mut should_remove = false;
@@ -387,8 +517,15 @@ pub async fn handle_part(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("442", vec![nick, ch_name.to_string(), "You're not on that channel".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "442",
+                        vec![
+                            nick,
+                            ch_name.to_string(),
+                            "You're not on that channel".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -435,12 +572,27 @@ pub async fn handle_names(
         None => Default::default(),
     };
 
-    let ch_names: Vec<&str> = msg.params.first().map(|s| s.split(',').collect()).unwrap_or_default();
+    let ch_names: Vec<&str> = msg
+        .params
+        .first()
+        .map(|s| s.split(',').collect())
+        .unwrap_or_default();
     let ch_store = channels.read().await;
 
     if ch_names.is_empty() {
         for (ch_name, ch) in &ch_store.channels {
-            send_names_for_channel(&ch, ch_name, &nick, &state, &senders, client_id, &cfg.server.name, &client_caps, label).await;
+            send_names_for_channel(
+                &ch,
+                ch_name,
+                &nick,
+                &state,
+                &senders,
+                client_id,
+                &cfg.server.name,
+                &client_caps,
+                label,
+            )
+            .await;
         }
         return Ok(());
     }
@@ -448,7 +600,18 @@ pub async fn handle_names(
     for ch_name in ch_names {
         let ch_key = canonical_channel_key(ch_name);
         if let Some(ch) = ch_store.channels.get(&ch_key) {
-            send_names_for_channel(ch, &ch_key, &nick, &state, &senders, client_id, &cfg.server.name, &client_caps, label).await;
+            send_names_for_channel(
+                ch,
+                &ch_key,
+                &nick,
+                &state,
+                &senders,
+                client_id,
+                &cfg.server.name,
+                &client_caps,
+                label,
+            )
+            .await;
         }
     }
 
@@ -479,7 +642,11 @@ async fn send_names_for_channel(
                 memb.modes.prefix().to_string()
             };
             let entry = if use_userhost {
-                format!("{}{}", prefix_str, c.source().unwrap_or_else(|| c.nick_or_id().to_string()))
+                format!(
+                    "{}{}",
+                    prefix_str,
+                    c.source().unwrap_or_else(|| c.nick_or_id().to_string())
+                )
             } else {
                 format!("{}{}", prefix_str, c.nick_or_id())
             };
@@ -491,14 +658,26 @@ async fn send_names_for_channel(
 
     if use_batch {
         let batch_ref = generate_msgid();
-        let batch_start = Message::new("BATCH", vec![format!("+{}", batch_ref), "names".into(), ch_name.into()]).with_prefix(server);
+        let batch_start = Message::new(
+            "BATCH",
+            vec![format!("+{}", batch_ref), "names".into(), ch_name.into()],
+        )
+        .with_prefix(server);
         let batch_end = Message::new("BATCH", vec![format!("-{}", batch_ref)]).with_prefix(server);
         let msg = add_batch_tag(
-            Message::new("353", vec![nick.into(), "=".into(), ch_name.into(), names_str]).with_prefix(server),
+            Message::new(
+                "353",
+                vec![nick.into(), "=".into(), ch_name.into(), names_str],
+            )
+            .with_prefix(server),
             &batch_ref,
         );
         let end_msg = add_batch_tag(
-            Message::new("366", vec![nick.into(), ch_name.into(), "End of /NAMES list".into()]).with_prefix(server),
+            Message::new(
+                "366",
+                vec![nick.into(), ch_name.into(), "End of /NAMES list".into()],
+            )
+            .with_prefix(server),
             &batch_ref,
         );
         reply_to_client(senders, client_id, batch_start, label).await;
@@ -506,9 +685,17 @@ async fn send_names_for_channel(
         reply_to_client(senders, client_id, end_msg, label).await;
         reply_to_client(senders, client_id, batch_end, label).await;
     } else {
-        let msg = Message::new("353", vec![nick.into(), "=".into(), ch_name.into(), names_str]).with_prefix(server);
+        let msg = Message::new(
+            "353",
+            vec![nick.into(), "=".into(), ch_name.into(), names_str],
+        )
+        .with_prefix(server);
         reply_to_client(senders, client_id, msg, label).await;
-        let end_msg = Message::new("366", vec![nick.into(), ch_name.into(), "End of /NAMES list".into()]).with_prefix(server);
+        let end_msg = Message::new(
+            "366",
+            vec![nick.into(), ch_name.into(), "End of /NAMES list".into()],
+        )
+        .with_prefix(server);
         reply_to_client(senders, client_id, end_msg, label).await;
     }
 }
@@ -525,13 +712,22 @@ pub async fn handle_list(
     // Parse optional filter: LIST [<filter>]
     // Filter can be: ">N" (more than N users), "<N" (fewer than N), or a channel name mask
     let filter = msg.params.first().map(|s| s.as_str()).unwrap_or("");
-    let min_users: Option<usize> = if filter.starts_with('>') { filter[1..].parse().ok() } else { None };
-    let max_users: Option<usize> = if filter.starts_with('<') { filter[1..].parse().ok() } else { None };
-    let name_mask: Option<&str> = if !filter.is_empty() && !filter.starts_with('>') && !filter.starts_with('<') {
-        Some(filter)
+    let min_users: Option<usize> = if filter.starts_with('>') {
+        filter[1..].parse().ok()
     } else {
         None
     };
+    let max_users: Option<usize> = if filter.starts_with('<') {
+        filter[1..].parse().ok()
+    } else {
+        None
+    };
+    let name_mask: Option<&str> =
+        if !filter.is_empty() && !filter.starts_with('>') && !filter.starts_with('<') {
+            Some(filter)
+        } else {
+            None
+        };
 
     let state = state.read().await;
     let client = match state.clients.get(client_id) {
@@ -549,8 +745,16 @@ pub async fn handle_list(
         }
         let count = ch.member_count();
         // Apply filters
-        if let Some(min) = min_users { if count <= min { continue; } }
-        if let Some(max) = max_users { if count >= max { continue; } }
+        if let Some(min) = min_users {
+            if count <= min {
+                continue;
+            }
+        }
+        if let Some(max) = max_users {
+            if count >= max {
+                continue;
+            }
+        }
         if let Some(mask) = name_mask {
             let mask_lower = mask.to_lowercase();
             if !crate::user::glob_match(&mask_lower, &ch_name.to_lowercase()) {
@@ -558,12 +762,21 @@ pub async fn handle_list(
             }
         }
         let topic = ch.topic.as_deref().unwrap_or("");
-        let m = Message::new("322", vec![nick.clone(), ch_name.clone(), count.to_string(), topic.to_string()])
-            .with_prefix(&cfg.server.name);
+        let m = Message::new(
+            "322",
+            vec![
+                nick.clone(),
+                ch_name.clone(),
+                count.to_string(),
+                topic.to_string(),
+            ],
+        )
+        .with_prefix(&cfg.server.name);
         reply_to_client(&senders, client_id, m, label).await;
     }
 
-    let end_msg = Message::new("323", vec![nick, "End of /LIST".into()]).with_prefix(&cfg.server.name);
+    let end_msg =
+        Message::new("323", vec![nick, "End of /LIST".into()]).with_prefix(&cfg.server.name);
     reply_to_client(&senders, client_id, end_msg, label).await;
 
     Ok(())
@@ -600,20 +813,46 @@ pub async fn handle_mode(
 
             if msg.params.len() == 1 {
                 let mut modes = String::new();
-                if ch.modes.invite_only { modes.push('i'); }
-                if ch.modes.moderated { modes.push('m'); }
-                if ch.modes.no_external { modes.push('n'); }
-                if ch.modes.secret { modes.push('s'); }
-                if ch.modes.topic_protect { modes.push('t'); }
-                if ch.modes.registered_only { modes.push('R'); }
-                if ch.modes.no_colors { modes.push('c'); }
-                if ch.modes.no_ctcp { modes.push('C'); }
-                if ch.modes.private { modes.push('p'); }
-                if ch.key.is_some() { modes.push('k'); }
-                if ch.modes.user_limit.is_some() { modes.push('l'); }
+                if ch.modes.invite_only {
+                    modes.push('i');
+                }
+                if ch.modes.moderated {
+                    modes.push('m');
+                }
+                if ch.modes.no_external {
+                    modes.push('n');
+                }
+                if ch.modes.secret {
+                    modes.push('s');
+                }
+                if ch.modes.topic_protect {
+                    modes.push('t');
+                }
+                if ch.modes.registered_only {
+                    modes.push('R');
+                }
+                if ch.modes.no_colors {
+                    modes.push('c');
+                }
+                if ch.modes.no_ctcp {
+                    modes.push('C');
+                }
+                if ch.modes.private {
+                    modes.push('p');
+                }
+                if ch.key.is_some() {
+                    modes.push('k');
+                }
+                if ch.modes.user_limit.is_some() {
+                    modes.push('l');
+                }
                 let mut reply_params = vec![nick.clone(), target.into(), format!("+{}", modes)];
-                if let Some(ref key) = ch.key { reply_params.push(key.clone()); }
-                if let Some(limit) = ch.modes.user_limit { reply_params.push(limit.to_string()); }
+                if let Some(ref key) = ch.key {
+                    reply_params.push(key.clone());
+                }
+                if let Some(limit) = ch.modes.user_limit {
+                    reply_params.push(limit.to_string());
+                }
                 let msg = Message::new("324", reply_params).with_prefix(&cfg.server.name);
                 reply_to_client(&senders, client_id, msg, label).await;
                 return Ok(());
@@ -624,8 +863,15 @@ pub async fn handle_mode(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("482", vec![nick.clone(), target.into(), "You're not channel operator".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "482",
+                        vec![
+                            nick.clone(),
+                            target.into(),
+                            "You're not channel operator".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -658,7 +904,9 @@ pub async fn handle_mode(
                     }
                     'o' => {
                         if let Some(target_nick) = msg.params.get(param_idx) {
-                            if let Some(target_id) = state.nick_to_id.get(&target_nick.to_uppercase()) {
+                            if let Some(target_id) =
+                                state.nick_to_id.get(&target_nick.to_uppercase())
+                            {
                                 if let Some(memb) = ch.members.get_mut(target_id) {
                                     memb.modes.op = plus;
                                 }
@@ -679,13 +927,32 @@ pub async fn handle_mode(
                         } else {
                             // No param: list bans (367 RPL_BANLIST / 368 RPL_ENDOFBANLIST)
                             let bans = ch.bans.clone();
-                            drop(ch); drop(ch_store);
+                            drop(ch);
+                            drop(ch_store);
                             for ban in &bans {
-                                reply_to_client(&senders, client_id,
-                                    Message::new("367", vec![nick.clone(), target.into(), ban.clone()]).with_prefix(&cfg.server.name), label).await;
+                                reply_to_client(
+                                    &senders,
+                                    client_id,
+                                    Message::new(
+                                        "367",
+                                        vec![nick.clone(), target.into(), ban.clone()],
+                                    )
+                                    .with_prefix(&cfg.server.name),
+                                    label,
+                                )
+                                .await;
                             }
-                            reply_to_client(&senders, client_id,
-                                Message::new("368", vec![nick, target.into(), "End of channel ban list".into()]).with_prefix(&cfg.server.name), label).await;
+                            reply_to_client(
+                                &senders,
+                                client_id,
+                                Message::new(
+                                    "368",
+                                    vec![nick, target.into(), "End of channel ban list".into()],
+                                )
+                                .with_prefix(&cfg.server.name),
+                                label,
+                            )
+                            .await;
                             return Ok(());
                         }
                     }
@@ -702,19 +969,52 @@ pub async fn handle_mode(
                         } else {
                             // No param: list quiets (728 RPL_QUIETLIST / 729 RPL_ENDOFQUIETLIST)
                             let quiets = ch.quiet_list.clone();
-                            drop(ch); drop(ch_store);
+                            drop(ch);
+                            drop(ch_store);
                             for q in &quiets {
-                                reply_to_client(&senders, client_id,
-                                    Message::new("728", vec![nick.clone(), target.into(), "q".into(), q.clone(), String::new(), "0".into()]).with_prefix(&cfg.server.name), label).await;
+                                reply_to_client(
+                                    &senders,
+                                    client_id,
+                                    Message::new(
+                                        "728",
+                                        vec![
+                                            nick.clone(),
+                                            target.into(),
+                                            "q".into(),
+                                            q.clone(),
+                                            String::new(),
+                                            "0".into(),
+                                        ],
+                                    )
+                                    .with_prefix(&cfg.server.name),
+                                    label,
+                                )
+                                .await;
                             }
-                            reply_to_client(&senders, client_id,
-                                Message::new("729", vec![nick, target.into(), "q".into(), "End of channel quiet list".into()]).with_prefix(&cfg.server.name), label).await;
+                            reply_to_client(
+                                &senders,
+                                client_id,
+                                Message::new(
+                                    "729",
+                                    vec![
+                                        nick,
+                                        target.into(),
+                                        "q".into(),
+                                        "End of channel quiet list".into(),
+                                    ],
+                                )
+                                .with_prefix(&cfg.server.name),
+                                label,
+                            )
+                            .await;
                             return Ok(());
                         }
                     }
                     'v' => {
                         if let Some(target_nick) = msg.params.get(param_idx) {
-                            if let Some(target_id) = state.nick_to_id.get(&target_nick.to_uppercase()) {
+                            if let Some(target_id) =
+                                state.nick_to_id.get(&target_nick.to_uppercase())
+                            {
                                 if let Some(memb) = ch.members.get_mut(target_id) {
                                     memb.modes.voice = plus;
                                 }
@@ -724,7 +1024,9 @@ pub async fn handle_mode(
                     }
                     'h' => {
                         if let Some(target_nick) = msg.params.get(param_idx) {
-                            if let Some(target_id) = state.nick_to_id.get(&target_nick.to_uppercase()) {
+                            if let Some(target_id) =
+                                state.nick_to_id.get(&target_nick.to_uppercase())
+                            {
                                 if let Some(memb) = ch.members.get_mut(target_id) {
                                     memb.modes.halfop = plus;
                                 }
@@ -755,13 +1057,36 @@ pub async fn handle_mode(
                         } else {
                             // No param: list ban exceptions (348/349)
                             let exceptions = ch.ban_exceptions.clone();
-                            drop(ch); drop(ch_store);
+                            drop(ch);
+                            drop(ch_store);
                             for exc in &exceptions {
-                                reply_to_client(&senders, client_id,
-                                    Message::new("348", vec![nick.clone(), target.into(), exc.clone()]).with_prefix(&cfg.server.name), label).await;
+                                reply_to_client(
+                                    &senders,
+                                    client_id,
+                                    Message::new(
+                                        "348",
+                                        vec![nick.clone(), target.into(), exc.clone()],
+                                    )
+                                    .with_prefix(&cfg.server.name),
+                                    label,
+                                )
+                                .await;
                             }
-                            reply_to_client(&senders, client_id,
-                                Message::new("349", vec![nick, target.into(), "End of channel exception list".into()]).with_prefix(&cfg.server.name), label).await;
+                            reply_to_client(
+                                &senders,
+                                client_id,
+                                Message::new(
+                                    "349",
+                                    vec![
+                                        nick,
+                                        target.into(),
+                                        "End of channel exception list".into(),
+                                    ],
+                                )
+                                .with_prefix(&cfg.server.name),
+                                label,
+                            )
+                            .await;
                             return Ok(());
                         }
                     }
@@ -778,13 +1103,32 @@ pub async fn handle_mode(
                         } else {
                             // No param: list invite exceptions (346/347)
                             let invexes = ch.invite_exceptions.clone();
-                            drop(ch); drop(ch_store);
+                            drop(ch);
+                            drop(ch_store);
                             for exc in &invexes {
-                                reply_to_client(&senders, client_id,
-                                    Message::new("346", vec![nick.clone(), target.into(), exc.clone()]).with_prefix(&cfg.server.name), label).await;
+                                reply_to_client(
+                                    &senders,
+                                    client_id,
+                                    Message::new(
+                                        "346",
+                                        vec![nick.clone(), target.into(), exc.clone()],
+                                    )
+                                    .with_prefix(&cfg.server.name),
+                                    label,
+                                )
+                                .await;
                             }
-                            reply_to_client(&senders, client_id,
-                                Message::new("347", vec![nick, target.into(), "End of channel invite list".into()]).with_prefix(&cfg.server.name), label).await;
+                            reply_to_client(
+                                &senders,
+                                client_id,
+                                Message::new(
+                                    "347",
+                                    vec![nick, target.into(), "End of channel invite list".into()],
+                                )
+                                .with_prefix(&cfg.server.name),
+                                label,
+                            )
+                            .await;
                             return Ok(());
                         }
                     }
@@ -795,14 +1139,30 @@ pub async fn handle_mode(
             // Collect data needed after dropping ch
             let mode_flags_str = {
                 let mut flags = String::new();
-                if ch.modes.invite_only { flags.push('i'); }
-                if ch.modes.moderated { flags.push('m'); }
-                if ch.modes.no_external { flags.push('n'); }
-                if ch.modes.secret { flags.push('s'); }
-                if ch.modes.topic_protect { flags.push('t'); }
-                if ch.modes.registered_only { flags.push('R'); }
-                if ch.modes.no_colors { flags.push('c'); }
-                if ch.modes.no_ctcp { flags.push('C'); }
+                if ch.modes.invite_only {
+                    flags.push('i');
+                }
+                if ch.modes.moderated {
+                    flags.push('m');
+                }
+                if ch.modes.no_external {
+                    flags.push('n');
+                }
+                if ch.modes.secret {
+                    flags.push('s');
+                }
+                if ch.modes.topic_protect {
+                    flags.push('t');
+                }
+                if ch.modes.registered_only {
+                    flags.push('R');
+                }
+                if ch.modes.no_colors {
+                    flags.push('c');
+                }
+                if ch.modes.no_ctcp {
+                    flags.push('C');
+                }
                 flags
             };
             let mode_key_val = ch.key.clone();
@@ -818,7 +1178,14 @@ pub async fn handle_mode(
             }
             // Persist channel modes to database
             if let Some(ref pool) = cfg.db {
-                crate::persist::save_channel_modes(pool, &ch_key, &mode_flags_str, mode_key_val.as_deref(), mode_limit_val).await;
+                crate::persist::save_channel_modes(
+                    pool,
+                    &ch_key,
+                    &mode_flags_str,
+                    mode_key_val.as_deref(),
+                    mode_limit_val,
+                )
+                .await;
             }
         }
     } else if target.eq_ignore_ascii_case(&nick) {
@@ -829,12 +1196,23 @@ pub async fn handle_mode(
             if let Some(client_ref) = state.clients.get(client_id) {
                 let g = client_ref.read().await;
                 let mut modes = String::from("+");
-                if g.invisible { modes.push('i'); }
-                if g.oper { modes.push('o'); }
-                if g.account.is_some() { modes.push('r'); }
-                if g.wallops { modes.push('w'); }
-                if g.bot { modes.push('B'); }
-                let m = Message::new("221", vec![nick.clone(), modes]).with_prefix(&cfg.server.name);
+                if g.invisible {
+                    modes.push('i');
+                }
+                if g.oper {
+                    modes.push('o');
+                }
+                if g.account.is_some() {
+                    modes.push('r');
+                }
+                if g.wallops {
+                    modes.push('w');
+                }
+                if g.bot {
+                    modes.push('B');
+                }
+                let m =
+                    Message::new("221", vec![nick.clone(), modes]).with_prefix(&cfg.server.name);
                 reply_to_client(&senders, client_id, m, label).await;
             }
             return Ok(());
@@ -849,24 +1227,33 @@ pub async fn handle_mode(
                     if let Some(client_ref) = state.clients.get(client_id) {
                         client_ref.write().await.bot = plus;
                     }
-                    let m = Message::new("MODE", vec![nick.clone(), format!("{}B", if plus { "+" } else { "-" })])
-                        .with_prefix(&nick);
+                    let m = Message::new(
+                        "MODE",
+                        vec![nick.clone(), format!("{}B", if plus { "+" } else { "-" })],
+                    )
+                    .with_prefix(&nick);
                     reply_to_client(&senders, client_id, m, label).await;
                 }
                 'i' => {
                     if let Some(client_ref) = state.clients.get(client_id) {
                         client_ref.write().await.invisible = plus;
                     }
-                    let m = Message::new("MODE", vec![nick.clone(), format!("{}i", if plus { "+" } else { "-" })])
-                        .with_prefix(&nick);
+                    let m = Message::new(
+                        "MODE",
+                        vec![nick.clone(), format!("{}i", if plus { "+" } else { "-" })],
+                    )
+                    .with_prefix(&nick);
                     reply_to_client(&senders, client_id, m, label).await;
                 }
                 'w' => {
                     if let Some(client_ref) = state.clients.get(client_id) {
                         client_ref.write().await.wallops = plus;
                     }
-                    let m = Message::new("MODE", vec![nick.clone(), format!("{}w", if plus { "+" } else { "-" })])
-                        .with_prefix(&nick);
+                    let m = Message::new(
+                        "MODE",
+                        vec![nick.clone(), format!("{}w", if plus { "+" } else { "-" })],
+                    )
+                    .with_prefix(&nick);
                     reply_to_client(&senders, client_id, m, label).await;
                 }
                 _ => {}
@@ -901,7 +1288,11 @@ pub async fn handle_topic(
     let mut ch_store = channels.write().await;
     if let Some(ch) = ch_store.channels.get_mut(&ch_key) {
         let mut ch = ch.write().await;
-        let is_op = ch.members.get(client_id).map(|m| m.modes.op).unwrap_or(false);
+        let is_op = ch
+            .members
+            .get(client_id)
+            .map(|m| m.modes.op)
+            .unwrap_or(false);
 
         if new_topic.is_none() {
             if let Some(ref topic) = ch.topic {
@@ -917,8 +1308,11 @@ pub async fn handle_topic(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("331", vec![nick.clone(), ch_name.into(), "No topic is set".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "331",
+                        vec![nick.clone(), ch_name.into(), "No topic is set".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -930,8 +1324,15 @@ pub async fn handle_topic(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("482", vec![nick.clone(), ch_name.into(), "You're not channel operator".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "482",
+                    vec![
+                        nick.clone(),
+                        ch_name.into(),
+                        "You're not channel operator".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -943,11 +1344,8 @@ pub async fn handle_topic(
         ch.topic_setter = Some(source.clone());
         ch.topic_time = Some(topic_time_ts);
 
-        let topic_msg = Message::new(
-            "TOPIC",
-            vec![ch_name.into(), new_topic.unwrap_or_default()],
-        )
-        .with_prefix(&source);
+        let topic_msg = Message::new("TOPIC", vec![ch_name.into(), new_topic.unwrap_or_default()])
+            .with_prefix(&source);
         let member_ids_for_topic: Vec<String> = ch.members.keys().cloned().collect();
         drop(ch);
         for mid in &member_ids_for_topic {
@@ -959,8 +1357,16 @@ pub async fn handle_topic(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("333", vec![nick.clone(), ch_name.into(), source.clone(), topic_time_ts.to_string()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "333",
+                vec![
+                    nick.clone(),
+                    ch_name.into(),
+                    source.clone(),
+                    topic_time_ts.to_string(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -968,8 +1374,11 @@ pub async fn handle_topic(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("403", vec![nick.clone(), ch_name.into(), "No such channel".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "403",
+                vec![nick.clone(), ch_name.into(), "No such channel".into()],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1000,7 +1409,11 @@ pub async fn handle_kick(
         Some(c) => c.clone(),
         None => return Ok(()),
     };
-    let source = client.read().await.source().unwrap_or_else(|| client_id.to_string());
+    let source = client
+        .read()
+        .await
+        .source()
+        .unwrap_or_else(|| client_id.to_string());
 
     let target_id = state.nick_to_id.get(&target_nick.to_uppercase()).cloned();
 
@@ -1008,14 +1421,21 @@ pub async fn handle_kick(
     let mut ch_store = channels.write().await;
     if let Some(ch) = ch_store.channels.get_mut(&ch_key) {
         let mut ch = ch.write().await;
-        let is_op = ch.members.get(client_id).map(|m| m.modes.op).unwrap_or(false);
+        let is_op = ch
+            .members
+            .get(client_id)
+            .map(|m| m.modes.op)
+            .unwrap_or(false);
         if !is_op {
             let nick = client.read().await.nick_or_id().to_string();
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("482", vec![nick, ch_name.into(), "You're not channel operator".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "482",
+                    vec![nick, ch_name.into(), "You're not channel operator".into()],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1028,8 +1448,9 @@ pub async fn handle_kick(
                 if let Some(target_client) = state.clients.get(&tid) {
                     target_client.write().await.channels.remove(&ch_key);
                 }
-                let kick_msg = Message::new("KICK", vec![ch_name.into(), target_nick.into(), reason])
-                    .with_prefix(&source);
+                let kick_msg =
+                    Message::new("KICK", vec![ch_name.into(), target_nick.into(), reason])
+                        .with_prefix(&source);
                 for (mid, _) in &ch.members.clone() {
                     if let Some(tx) = senders.read().await.get(mid) {
                         let _ = tx.send(kick_msg.clone()).await;
@@ -1071,20 +1492,31 @@ pub async fn handle_invite(
         Some(c) => c.clone(),
         None => return Ok(()),
     };
-    let source = client.read().await.source().unwrap_or_else(|| client_id.to_string());
+    let source = client
+        .read()
+        .await
+        .source()
+        .unwrap_or_else(|| client_id.to_string());
 
     let ch_key = canonical_channel_key(ch_name);
     let mut ch_store = channels.write().await;
     if let Some(ch) = ch_store.channels.get_mut(&ch_key) {
         let mut ch = ch.write().await;
-        let is_op = ch.members.get(client_id).map(|m| m.modes.op).unwrap_or(false);
+        let is_op = ch
+            .members
+            .get(client_id)
+            .map(|m| m.modes.op)
+            .unwrap_or(false);
         if !is_op {
             let nick = client.read().await.nick_or_id().to_string();
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("482", vec![nick, ch_name.into(), "You're not channel operator".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "482",
+                    vec![nick, ch_name.into(), "You're not channel operator".into()],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1101,8 +1533,11 @@ pub async fn handle_invite(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("341", vec![source.clone(), target_nick.into(), ch_name.into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "341",
+                    vec![source.clone(), target_nick.into(), ch_name.into()],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1167,8 +1602,17 @@ pub async fn handle_rename(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec!["RENAME".into(), "CANNOT_RENAME".into(), old_name.into(), new_name.into(), "You cannot change a channel prefix type".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "FAIL",
+                vec![
+                    "RENAME".into(),
+                    "CANNOT_RENAME".into(),
+                    old_name.into(),
+                    new_name.into(),
+                    "You cannot change a channel prefix type".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1179,7 +1623,11 @@ pub async fn handle_rename(
     let client_arc = state_r.clients.get(client_id).cloned();
     drop(state_r);
     let source = match client_arc.as_ref() {
-        Some(c) => c.read().await.source().unwrap_or_else(|| client_id.to_string()),
+        Some(c) => c
+            .read()
+            .await
+            .source()
+            .unwrap_or_else(|| client_id.to_string()),
         None => {
             reply_to_client(
                 &senders,
@@ -1206,8 +1654,15 @@ pub async fn handle_rename(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("403", vec![nick.clone().unwrap_or_else(|| "*".into()), old_name.into(), "No such channel".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "403",
+                    vec![
+                        nick.clone().unwrap_or_else(|| "*".into()),
+                        old_name.into(),
+                        "No such channel".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1217,7 +1672,11 @@ pub async fn handle_rename(
     let (is_member, is_op, member_ids, topic, topic_setter, topic_time) = {
         let ch = ch_ref.read().await;
         let is_member = ch.members.contains_key(client_id);
-        let is_op = ch.members.get(client_id).map(|m| m.modes.op).unwrap_or(false);
+        let is_op = ch
+            .members
+            .get(client_id)
+            .map(|m| m.modes.op)
+            .unwrap_or(false);
         let member_ids: Vec<String> = ch.members.keys().cloned().collect();
         (
             is_member,
@@ -1233,8 +1692,15 @@ pub async fn handle_rename(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("442", vec![nick.unwrap_or_else(|| "*".into()), old_name.into(), "You're not on that channel".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "442",
+                vec![
+                    nick.unwrap_or_else(|| "*".into()),
+                    old_name.into(),
+                    "You're not on that channel".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1244,8 +1710,15 @@ pub async fn handle_rename(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("482", vec![nick.unwrap_or_else(|| "*".into()), old_name.into(), "You must be a channel operator".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "482",
+                vec![
+                    nick.unwrap_or_else(|| "*".into()),
+                    old_name.into(),
+                    "You must be a channel operator".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1255,8 +1728,17 @@ pub async fn handle_rename(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec!["RENAME".into(), "CHANNEL_NAME_IN_USE".into(), old_name.into(), new_name.into(), "Channel already exists".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "FAIL",
+                vec![
+                    "RENAME".into(),
+                    "CHANNEL_NAME_IN_USE".into(),
+                    old_name.into(),
+                    new_name.into(),
+                    "Channel already exists".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1282,7 +1764,11 @@ pub async fn handle_rename(
         drop(state_r);
     }
 
-    let rename_msg = Message::new("RENAME", vec![old_name.into(), new_name.into(), format!(":{}", reason)]).with_prefix(&source);
+    let rename_msg = Message::new(
+        "RENAME",
+        vec![old_name.into(), new_name.into(), format!(":{}", reason)],
+    )
+    .with_prefix(&source);
     let mut use_rename_per_client: Vec<(String, bool)> = Vec::new();
     for mid in &member_ids {
         let client_arc = state.read().await.clients.get(mid).cloned();
@@ -1299,18 +1785,49 @@ pub async fn handle_rename(
         if *use_rename {
             send_to_client(&senders, mid, rename_msg.clone()).await;
         } else {
-            send_to_client(&senders, mid, Message::new("PART", vec![old_name.into(), format!(":{}", reason)]).with_prefix(&source)).await;
-            send_to_client(&senders, mid, Message::new("JOIN", vec![new_name.into()]).with_prefix(&source)).await;
+            send_to_client(
+                &senders,
+                mid,
+                Message::new("PART", vec![old_name.into(), format!(":{}", reason)])
+                    .with_prefix(&source),
+            )
+            .await;
+            send_to_client(
+                &senders,
+                mid,
+                Message::new("JOIN", vec![new_name.into()]).with_prefix(&source),
+            )
+            .await;
             let client_arc = state.read().await.clients.get(mid).cloned();
             let recv_nick = match client_arc {
                 Some(c) => c.read().await.nick_or_id().to_string(),
                 None => "*".to_string(),
             };
             if let Some(ref t) = topic {
-                send_to_client(&senders, mid, Message::new("332", vec![recv_nick.clone(), new_name.into(), t.clone()]).with_prefix(&cfg.server.name)).await;
+                send_to_client(
+                    &senders,
+                    mid,
+                    Message::new("332", vec![recv_nick.clone(), new_name.into(), t.clone()])
+                        .with_prefix(&cfg.server.name),
+                )
+                .await;
             }
             if let (Some(ref ts), Some(tt)) = (&topic_setter, topic_time) {
-                send_to_client(&senders, mid, Message::new("333", vec![recv_nick.clone(), new_name.into(), ts.clone(), tt.to_string()]).with_prefix(&cfg.server.name)).await;
+                send_to_client(
+                    &senders,
+                    mid,
+                    Message::new(
+                        "333",
+                        vec![
+                            recv_nick.clone(),
+                            new_name.into(),
+                            ts.clone(),
+                            tt.to_string(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                )
+                .await;
             }
             let ch_store = channels.read().await;
             if let Some(ch_ref) = ch_store.channels.get(&new_key) {
@@ -1320,7 +1837,18 @@ pub async fn handle_rename(
                     None => std::collections::HashSet::new(),
                 };
                 let state_r = state.read().await;
-                send_names_for_channel(ch_ref, &new_key, &recv_nick, &*state_r, &senders, mid, &cfg.server.name, &caps, label).await;
+                send_names_for_channel(
+                    ch_ref,
+                    &new_key,
+                    &recv_nick,
+                    &*state_r,
+                    &senders,
+                    mid,
+                    &cfg.server.name,
+                    &caps,
+                    label,
+                )
+                .await;
             }
         }
     }

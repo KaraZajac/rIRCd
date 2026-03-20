@@ -13,7 +13,10 @@ fn parse_whox_type(s: &str) -> (Vec<char>, Option<String>) {
         Some(i) => (&s[..i], Some(s[i + 1..].to_string())),
         None => (s, None),
     };
-    let requested: Vec<char> = fields_str.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    let requested: Vec<char> = fields_str
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .collect();
     let token = token.filter(|t| t.chars().all(|c| c.is_ascii_digit()) && t.len() <= 3);
     (requested, token)
 }
@@ -36,7 +39,9 @@ fn build_354_params(
     oplevel: &str,
     realname: &str,
 ) -> Vec<String> {
-    let order = ['t', 'c', 'u', 'i', 'h', 's', 'n', 'f', 'd', 'l', 'a', 'o', 'r'];
+    let order = [
+        't', 'c', 'u', 'i', 'h', 's', 'n', 'f', 'd', 'l', 'a', 'o', 'r',
+    ];
     let mut params = vec![nick.to_string()];
     for &f in &order {
         if !requested.contains(&f) {
@@ -92,7 +97,9 @@ pub async fn handle_who(
     };
     let use_multi_prefix = client_caps.contains("multi-prefix");
     let (whox_requested, whox_token) = if use_whox && client_caps.contains("whox") {
-        whox_type.map(|s| parse_whox_type(s)).unwrap_or((vec![], None))
+        whox_type
+            .map(|s| parse_whox_type(s))
+            .unwrap_or((vec![], None))
     } else {
         (vec![], None)
     };
@@ -139,16 +146,20 @@ pub async fn handle_who(
                         // RPL_WHOREPLY: channel user host server nick flags :hopcount realname
                         let oper_flag = if c.oper { "*" } else { "" };
                         let flags_field = format!("{}{}{}", flags, oper_flag, prefix_str);
-                        let msg = Message::new("352", vec![
-                            nick.clone(),
-                            target.to_string(),
-                            c.display_user().to_string(),
-                            c.display_host().to_string(),
-                            cfg.server.name.clone(),
-                            c.nick_or_id().to_string(),
-                            flags_field,
-                            format!(":{} {}", hopcount, realname),
-                        ]).with_prefix(&cfg.server.name);
+                        let msg = Message::new(
+                            "352",
+                            vec![
+                                nick.clone(),
+                                target.to_string(),
+                                c.display_user().to_string(),
+                                c.display_host().to_string(),
+                                cfg.server.name.clone(),
+                                c.nick_or_id().to_string(),
+                                flags_field,
+                                format!(":{} {}", hopcount, realname),
+                            ],
+                        )
+                        .with_prefix(&cfg.server.name);
                         reply_to_client(&senders, client_id, msg, label).await;
                     }
                 }
@@ -156,21 +167,29 @@ pub async fn handle_who(
         }
     } else {
         // Determine which clients share a channel with the requester (for invisible filtering)
-        let requester_channels: std::collections::HashSet<String> = match state.clients.get(client_id) {
-            Some(c) => c.read().await.channels.keys().cloned().collect(),
-            None => Default::default(),
-        };
+        let requester_channels: std::collections::HashSet<String> =
+            match state.clients.get(client_id) {
+                Some(c) => c.read().await.channels.keys().cloned().collect(),
+                None => Default::default(),
+            };
         let has_wildcards = target.contains('*') || target.contains('?');
         let target_upper = target.to_uppercase();
 
         // Collect matching client IDs
         let matching_ids: Vec<String> = if !has_wildcards && target != "*" {
             // Exact nick lookup
-            state.nick_to_id.get(&target_upper).cloned().into_iter().collect()
+            state
+                .nick_to_id
+                .get(&target_upper)
+                .cloned()
+                .into_iter()
+                .collect()
         } else {
             // Glob or wildcard: iterate all clients
             let target_lower = target.to_lowercase();
-            state.clients.keys()
+            state
+                .clients
+                .keys()
                 .filter(|id| {
                     if let Some(c) = state.clients.get(*id) {
                         if let Ok(g) = c.try_read() {
@@ -195,7 +214,8 @@ pub async fn handle_who(
                 let c = c.read().await;
                 // +i invisible: skip unless requester shares a channel or is the same user
                 if c.invisible && target_id != client_id {
-                    let shares_channel = c.channels.keys().any(|ch| requester_channels.contains(ch));
+                    let shares_channel =
+                        c.channels.keys().any(|ch| requester_channels.contains(ch));
                     if !shares_channel {
                         continue;
                     }
@@ -228,16 +248,20 @@ pub async fn handle_who(
                 } else {
                     let oper_flag = if c.oper { "*" } else { "" };
                     let flags_field = format!("{}{}", flags, oper_flag);
-                    let msg = Message::new("352", vec![
-                        nick.clone(),
-                        "*".to_string(),
-                        c.display_user().to_string(),
-                        c.display_host().to_string(),
-                        cfg.server.name.clone(),
-                        c.nick_or_id().to_string(),
-                        flags_field,
-                        format!(":{} {}", hopcount, realname),
-                    ]).with_prefix(&cfg.server.name);
+                    let msg = Message::new(
+                        "352",
+                        vec![
+                            nick.clone(),
+                            "*".to_string(),
+                            c.display_user().to_string(),
+                            c.display_host().to_string(),
+                            cfg.server.name.clone(),
+                            c.nick_or_id().to_string(),
+                            flags_field,
+                            format!(":{} {}", hopcount, realname),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name);
                     reply_to_client(&senders, client_id, msg, label).await;
                 }
             }
@@ -290,14 +314,17 @@ pub async fn handle_whois(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("311", vec![
-                    nick.clone(),
-                    target_nick.into(),
-                    c.display_user().into(),
-                    c.display_host().into(),
-                    "*".into(),
-                    c.realname.as_deref().unwrap_or("").into(),
-                ])
+                Message::new(
+                    "311",
+                    vec![
+                        nick.clone(),
+                        target_nick.into(),
+                        c.display_user().into(),
+                        c.display_host().into(),
+                        "*".into(),
+                        c.realname.as_deref().unwrap_or("").into(),
+                    ],
+                )
                 .with_prefix(&cfg.server.name),
                 label,
             )
@@ -317,8 +344,16 @@ pub async fn handle_whois(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("312", vec![nick.clone(), target_nick.into(), cfg.server.name.clone(), "rIRCd server".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "312",
+                    vec![
+                        nick.clone(),
+                        target_nick.into(),
+                        cfg.server.name.clone(),
+                        "rIRCd server".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -328,8 +363,17 @@ pub async fn handle_whois(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("317", vec![nick.clone(), target_nick.into(), idle_secs.to_string(), c.signon_at.to_string(), "seconds idle, signon time".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "317",
+                        vec![
+                            nick.clone(),
+                            target_nick.into(),
+                            idle_secs.to_string(),
+                            c.signon_at.to_string(),
+                            "seconds idle, signon time".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -339,8 +383,11 @@ pub async fn handle_whois(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("301", vec![nick.clone(), target_nick.into(), away_msg.clone()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "301",
+                        vec![nick.clone(), target_nick.into(), away_msg.clone()],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -349,8 +396,11 @@ pub async fn handle_whois(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("335", vec![nick.clone(), target_nick.into(), "is a bot".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "335",
+                        vec![nick.clone(), target_nick.into(), "is a bot".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -359,8 +409,15 @@ pub async fn handle_whois(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("313", vec![nick.clone(), target_nick.into(), "is an IRC operator".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "313",
+                        vec![
+                            nick.clone(),
+                            target_nick.into(),
+                            "is an IRC operator".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -368,16 +425,33 @@ pub async fn handle_whois(
             // 379 RPL_WHOISMODES — user modes
             {
                 let mut modes = String::from("+");
-                if c.invisible { modes.push('i'); }
-                if c.oper { modes.push('o'); }
-                if c.account.is_some() { modes.push('r'); }
-                if c.wallops { modes.push('w'); }
-                if c.bot { modes.push('B'); }
+                if c.invisible {
+                    modes.push('i');
+                }
+                if c.oper {
+                    modes.push('o');
+                }
+                if c.account.is_some() {
+                    modes.push('r');
+                }
+                if c.wallops {
+                    modes.push('w');
+                }
+                if c.bot {
+                    modes.push('B');
+                }
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("379", vec![nick.clone(), target_nick.into(), format!("is using modes {}", modes)])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "379",
+                        vec![
+                            nick.clone(),
+                            target_nick.into(),
+                            format!("is using modes {}", modes),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -385,8 +459,11 @@ pub async fn handle_whois(
         }
     }
 
-    let end_msg = Message::new("318", vec![nick, target_nick.into(), "End of /WHOIS list".into()])
-        .with_prefix(&cfg.server.name);
+    let end_msg = Message::new(
+        "318",
+        vec![nick, target_nick.into(), "End of /WHOIS list".into()],
+    )
+    .with_prefix(&cfg.server.name);
     reply_to_client(&senders, client_id, end_msg, label).await;
 
     Ok(())
@@ -404,7 +481,12 @@ pub async fn handle_monitor(
     label: Option<&str>,
 ) -> anyhow::Result<()> {
     let param0 = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
-    let targets_preview = msg.params.get(1).cloned().or_else(|| msg.trailing().map(String::from)).unwrap_or_default();
+    let targets_preview = msg
+        .params
+        .get(1)
+        .cloned()
+        .or_else(|| msg.trailing().map(String::from))
+        .unwrap_or_default();
     tracing::info!(
         client_id = %client_id,
         op = %param0,
@@ -426,9 +508,18 @@ pub async fn handle_monitor(
         tracing::info!(client_id = %client_id, nick = %nick, "MONITOR: client does not have 'monitor' capability, ignoring (client must CAP REQ :monitor)");
         return Ok(());
     }
-    let targets_str = msg.params.get(1).cloned().or_else(|| msg.trailing().map(String::from));
+    let targets_str = msg
+        .params
+        .get(1)
+        .cloned()
+        .or_else(|| msg.trailing().map(String::from));
     let targets: Vec<String> = targets_str
-        .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
 
     drop(state_guard);
@@ -469,14 +560,26 @@ pub async fn handle_monitor(
                 guard.monitor_list = current_list;
             }
             for n in &added_nicks {
-                state_w.monitor_watchers.add(n.clone(), client_id.to_string());
+                state_w
+                    .monitor_watchers
+                    .add(n.clone(), client_id.to_string());
             }
             for p in &added_patterns {
-                state_w.monitor_watchers.add_pattern(p.clone(), client_id.to_string());
+                state_w
+                    .monitor_watchers
+                    .add_pattern(p.clone(), client_id.to_string());
             }
             if !failed.is_empty() {
-                let fail_msg = Message::new("734", vec![nick.clone(), MONITOR_LIMIT.to_string(), failed.join(","), "Monitor list is full.".to_string()])
-                    .with_prefix(server);
+                let fail_msg = Message::new(
+                    "734",
+                    vec![
+                        nick.clone(),
+                        MONITOR_LIMIT.to_string(),
+                        failed.join(","),
+                        "Monitor list is full.".to_string(),
+                    ],
+                )
+                .with_prefix(server);
                 reply_to_client(&senders, client_id, fail_msg, label).await;
             }
             drop(state_w);
@@ -516,11 +619,19 @@ pub async fn handle_monitor(
             }
 
             if !online_list.is_empty() {
-                let m = Message::new("730", vec![nick.clone(), format!(":{}", online_list.join(","))]).with_prefix(server);
+                let m = Message::new(
+                    "730",
+                    vec![nick.clone(), format!(":{}", online_list.join(","))],
+                )
+                .with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
             if !offline_list.is_empty() {
-                let m = Message::new("731", vec![nick.clone(), format!(":{}", offline_list.join(","))]).with_prefix(server);
+                let m = Message::new(
+                    "731",
+                    vec![nick.clone(), format!(":{}", offline_list.join(","))],
+                )
+                .with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
         }
@@ -567,10 +678,12 @@ pub async fn handle_monitor(
                 }
             };
             for chunk in list.chunks(20) {
-                let m = Message::new("732", vec![nick.clone(), format!(":{}", chunk.join(","))]).with_prefix(server);
+                let m = Message::new("732", vec![nick.clone(), format!(":{}", chunk.join(","))])
+                    .with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
-            let m = Message::new("733", vec![nick.clone(), "End of MONITOR list".into()]).with_prefix(server);
+            let m = Message::new("733", vec![nick.clone(), "End of MONITOR list".into()])
+                .with_prefix(server);
             reply_to_client(&senders, client_id, m, label).await;
         }
         "S" => {
@@ -619,11 +732,13 @@ pub async fn handle_monitor(
                 }
             }
             if !online.is_empty() {
-                let m = Message::new("730", vec![nick.clone(), format!(":{}", online.join(","))]).with_prefix(server);
+                let m = Message::new("730", vec![nick.clone(), format!(":{}", online.join(","))])
+                    .with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
             if !offline.is_empty() {
-                let m = Message::new("731", vec![nick.clone(), format!(":{}", offline.join(","))]).with_prefix(server);
+                let m = Message::new("731", vec![nick.clone(), format!(":{}", offline.join(","))])
+                    .with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
         }
@@ -649,7 +764,9 @@ pub async fn handle_ison(
     };
 
     // Nicks may be space-separated across multiple params or in trailing
-    let all: Vec<String> = msg.params.iter()
+    let all: Vec<String> = msg
+        .params
+        .iter()
         .flat_map(|p| p.split_whitespace().map(String::from))
         .collect();
 
@@ -660,7 +777,8 @@ pub async fn handle_ison(
         }
     }
 
-    let m = Message::new("303", vec![nick, format!(":{}", online.join(" "))]).with_prefix(&cfg.server.name);
+    let m = Message::new("303", vec![nick, format!(":{}", online.join(" "))])
+        .with_prefix(&cfg.server.name);
     reply_to_client(&senders, client_id, m, label).await;
     Ok(())
 }
@@ -687,13 +805,20 @@ pub async fn handle_userhost(
                 let g = c.read().await;
                 let oper_star = if g.oper { "*" } else { "" };
                 let away_sign = if g.away_message.is_some() { "-" } else { "+" };
-                results.push(format!("{}{}={}{}@{}",
-                    g.nick_or_id(), oper_star, away_sign, g.display_user(), g.display_host()));
+                results.push(format!(
+                    "{}{}={}{}@{}",
+                    g.nick_or_id(),
+                    oper_star,
+                    away_sign,
+                    g.display_user(),
+                    g.display_host()
+                ));
             }
         }
     }
 
-    let m = Message::new("302", vec![nick, format!(":{}", results.join(" "))]).with_prefix(&cfg.server.name);
+    let m = Message::new("302", vec![nick, format!(":{}", results.join(" "))])
+        .with_prefix(&cfg.server.name);
     reply_to_client(&senders, client_id, m, label).await;
     Ok(())
 }

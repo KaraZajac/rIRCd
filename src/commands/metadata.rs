@@ -18,8 +18,14 @@ const MAX_SUBS: usize = 50;
 
 fn meta_key_valid(key: &str) -> bool {
     !key.is_empty()
-        && key.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.' || c == '/' || c == '-')
+        && key.chars().all(|c| {
+            c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || c == '_'
+                || c == '.'
+                || c == '/'
+                || c == '-'
+        })
 }
 
 fn normalize_target(target: &str, self_nick: &str) -> String {
@@ -42,7 +48,11 @@ async fn target_exists(
     if is_channel(target) {
         channels.read().await.channels.contains_key(target)
     } else {
-        state.read().await.nick_to_id.contains_key(&target.to_lowercase())
+        state
+            .read()
+            .await
+            .nick_to_id
+            .contains_key(&target.to_lowercase())
     }
 }
 
@@ -59,14 +69,25 @@ async fn send_metadata_batch(
     has_batch: bool,
     label: Option<&str>,
 ) {
-    let batch_ref: Option<String> = if has_batch { Some(generate_msgid()) } else { None };
+    let batch_ref: Option<String> = if has_batch {
+        Some(generate_msgid())
+    } else {
+        None
+    };
 
     if let Some(ref ref_id) = batch_ref {
         reply_to_client(
             senders,
             client_id,
-            Message::new("BATCH", vec![format!("+{}", ref_id), "metadata".into(), target.to_string()])
-                .with_prefix(server_name),
+            Message::new(
+                "BATCH",
+                vec![
+                    format!("+{}", ref_id),
+                    "metadata".into(),
+                    target.to_string(),
+                ],
+            )
+            .with_prefix(server_name),
             label,
         )
         .await;
@@ -75,7 +96,13 @@ async fn send_metadata_batch(
     for (key, value) in entries {
         let mut m = Message::new(
             "761",
-            vec![nick.to_string(), target.to_string(), key.clone(), "*".to_string(), format!(":{}", value)],
+            vec![
+                nick.to_string(),
+                target.to_string(),
+                key.clone(),
+                "*".to_string(),
+                format!(":{}", value),
+            ],
         )
         .with_prefix(server_name);
         if let Some(ref ref_id) = batch_ref {
@@ -87,7 +114,9 @@ async fn send_metadata_batch(
     let mut end_msg = Message::new("762", vec![nick.to_string(), "End of METADATA".to_string()])
         .with_prefix(server_name);
     if let Some(ref ref_id) = batch_ref {
-        end_msg.tags.insert("batch".to_string(), Some(ref_id.clone()));
+        end_msg
+            .tags
+            .insert("batch".to_string(), Some(ref_id.clone()));
     }
     reply_to_client(senders, client_id, end_msg, label).await;
 
@@ -164,7 +193,8 @@ async fn broadcast_metadata_event(
         }
         if let Some(client) = state_r.clients.get(id) {
             let g = client.read().await;
-            if g.capabilities.contains("draft/metadata-2") && g.metadata_subscriptions.contains(key) {
+            if g.capabilities.contains("draft/metadata-2") && g.metadata_subscriptions.contains(key)
+            {
                 notify_ids.push(id.clone());
             }
         }
@@ -192,7 +222,17 @@ pub async fn send_channel_metadata_on_join(
     if entries.is_empty() {
         return;
     }
-    send_metadata_batch(senders, client_id, nick, channel, &entries, server_name, has_batch, None).await;
+    send_metadata_batch(
+        senders,
+        client_id,
+        nick,
+        channel,
+        &entries,
+        server_name,
+        has_batch,
+        None,
+    )
+    .await;
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
@@ -208,16 +248,26 @@ pub async fn handle_metadata(
 ) -> anyhow::Result<()> {
     let s = &cfg.server.name;
     let target_param = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
-    let subcommand = msg.params.get(1).map(|s| s.as_str()).unwrap_or("").to_uppercase();
+    let subcommand = msg
+        .params
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("")
+        .to_uppercase();
 
     if target_param.is_empty() || subcommand.is_empty() {
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec![
-                "METADATA".into(), "SUBCOMMAND_INVALID".into(), "*".into(),
-                " :invalid subcommand".into(),
-            ])
+            Message::new(
+                "FAIL",
+                vec![
+                    "METADATA".into(),
+                    "SUBCOMMAND_INVALID".into(),
+                    "*".into(),
+                    " :invalid subcommand".into(),
+                ],
+            )
             .with_prefix(s),
             label,
         )
@@ -231,8 +281,10 @@ pub async fn handle_metadata(
             Some(c) => c.clone(),
             None => {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("451", vec!["*".into(), "You have not registered".into()]).with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new("451", vec!["*".into(), "You have not registered".into()])
+                        .with_prefix(s),
                     label,
                 )
                 .await;
@@ -253,9 +305,18 @@ pub async fn handle_metadata(
             let keys: Vec<String> = msg.params.iter().skip(2).map(|s| s.to_string()).collect();
             if keys.is_empty() {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("FAIL", vec!["METADATA".into(), "KEY_INVALID".into(), "*".into(), " :invalid key".into()])
-                        .with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "METADATA".into(),
+                            "KEY_INVALID".into(),
+                            "*".into(),
+                            " :invalid key".into(),
+                        ],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
@@ -264,9 +325,18 @@ pub async fn handle_metadata(
 
             if !target_exists(&target, &state, &channels).await {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("FAIL", vec!["METADATA".into(), "INVALID_TARGET".into(), target.clone(), " :No such target".into()])
-                        .with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "METADATA".into(),
+                            "INVALID_TARGET".into(),
+                            target.clone(),
+                            " :No such target".into(),
+                        ],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
@@ -281,9 +351,18 @@ pub async fn handle_metadata(
             for key in &keys {
                 if !meta_key_valid(key) {
                     reply_to_client(
-                        &senders, client_id,
-                        Message::new("FAIL", vec!["METADATA".into(), "KEY_INVALID".into(), key.clone(), " :invalid key".into()])
-                            .with_prefix(s),
+                        &senders,
+                        client_id,
+                        Message::new(
+                            "FAIL",
+                            vec![
+                                "METADATA".into(),
+                                "KEY_INVALID".into(),
+                                key.clone(),
+                                " :invalid key".into(),
+                            ],
+                        )
+                        .with_prefix(s),
                         label,
                     )
                     .await;
@@ -298,34 +377,64 @@ pub async fn handle_metadata(
             let has_batch_cap = has_batch;
             drop(state_r);
 
-            let batch_ref: Option<String> = if has_batch_cap { Some(generate_msgid()) } else { None };
+            let batch_ref: Option<String> = if has_batch_cap {
+                Some(generate_msgid())
+            } else {
+                None
+            };
             if let Some(ref ref_id) = batch_ref {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("BATCH", vec![format!("+{}", ref_id), "metadata".into(), target.clone()]).with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "BATCH",
+                        vec![format!("+{}", ref_id), "metadata".into(), target.clone()],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
             }
 
             for (key, value) in &entries {
-                let mut m = Message::new("761", vec![self_nick.clone(), target.clone(), key.clone(), "*".into(), format!(":{}", value)])
-                    .with_prefix(s);
+                let mut m = Message::new(
+                    "761",
+                    vec![
+                        self_nick.clone(),
+                        target.clone(),
+                        key.clone(),
+                        "*".into(),
+                        format!(":{}", value),
+                    ],
+                )
+                .with_prefix(s);
                 if let Some(ref ref_id) = batch_ref {
                     m.tags.insert("batch".to_string(), Some(ref_id.clone()));
                 }
                 reply_to_client(&senders, client_id, m, label).await;
             }
             for key in &missing {
-                let mut m = Message::new("766", vec![self_nick.clone(), target.clone(), key.clone(), " :key not set".into()])
-                    .with_prefix(s);
+                let mut m = Message::new(
+                    "766",
+                    vec![
+                        self_nick.clone(),
+                        target.clone(),
+                        key.clone(),
+                        " :key not set".into(),
+                    ],
+                )
+                .with_prefix(s);
                 if let Some(ref ref_id) = batch_ref {
                     m.tags.insert("batch".to_string(), Some(ref_id.clone()));
                 }
                 reply_to_client(&senders, client_id, m, label).await;
             }
 
-            let mut end = Message::new("762", vec![self_nick.clone(), "End of METADATA".to_string()]).with_prefix(s);
+            let mut end = Message::new(
+                "762",
+                vec![self_nick.clone(), "End of METADATA".to_string()],
+            )
+            .with_prefix(s);
             if let Some(ref ref_id) = batch_ref {
                 end.tags.insert("batch".to_string(), Some(ref_id.clone()));
             }
@@ -333,7 +442,8 @@ pub async fn handle_metadata(
 
             if let Some(ref ref_id) = batch_ref {
                 reply_to_client(
-                    &senders, client_id,
+                    &senders,
+                    client_id,
                     Message::new("BATCH", vec![format!("-{}", ref_id)]).with_prefix(s),
                     label,
                 )
@@ -345,9 +455,18 @@ pub async fn handle_metadata(
         "LIST" => {
             if !target_exists(&target, &state, &channels).await {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("FAIL", vec!["METADATA".into(), "INVALID_TARGET".into(), target.clone(), " :No such target".into()])
-                        .with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "METADATA".into(),
+                            "INVALID_TARGET".into(),
+                            target.clone(),
+                            " :No such target".into(),
+                        ],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
@@ -356,12 +475,17 @@ pub async fn handle_metadata(
 
             let entries: Vec<(String, String)> = {
                 let state_r = state.read().await;
-                state_r.metadata.get(&target)
+                state_r
+                    .metadata
+                    .get(&target)
                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default()
             };
 
-            send_metadata_batch(&senders, client_id, &self_nick, &target, &entries, s, has_batch, label).await;
+            send_metadata_batch(
+                &senders, client_id, &self_nick, &target, &entries, s, has_batch, label,
+            )
+            .await;
         }
 
         // ── SET ───────────────────────────────────────────────────────────────
@@ -371,9 +495,18 @@ pub async fn handle_metadata(
 
             if key.is_empty() {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("FAIL", vec!["METADATA".into(), "KEY_INVALID".into(), "*".into(), " :invalid key".into()])
-                        .with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "METADATA".into(),
+                            "KEY_INVALID".into(),
+                            "*".into(),
+                            " :invalid key".into(),
+                        ],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
@@ -381,9 +514,18 @@ pub async fn handle_metadata(
             }
             if !meta_key_valid(key) {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("FAIL", vec!["METADATA".into(), "KEY_INVALID".into(), key.to_string(), " :invalid key".into()])
-                        .with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "METADATA".into(),
+                            "KEY_INVALID".into(),
+                            key.to_string(),
+                            " :invalid key".into(),
+                        ],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
@@ -396,7 +538,12 @@ pub async fn handle_metadata(
             } else if is_channel(&target) {
                 let ch_store = channels.read().await;
                 if let Some(ch) = ch_store.channels.get(&target) {
-                    ch.read().await.members.get(client_id).map(|m| m.modes.op).unwrap_or(false)
+                    ch.read()
+                        .await
+                        .members
+                        .get(client_id)
+                        .map(|m| m.modes.op)
+                        .unwrap_or(false)
                 } else {
                     false
                 }
@@ -405,12 +552,21 @@ pub async fn handle_metadata(
             };
             if !can_set {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("FAIL", vec![
-                        "METADATA".into(), "KEY_NO_PERMISSION".into(),
-                        target.clone(), key.to_string(),
-                        format!(":You do not have permission to set '{}' on '{}'", key, target),
-                    ])
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "METADATA".into(),
+                            "KEY_NO_PERMISSION".into(),
+                            target.clone(),
+                            key.to_string(),
+                            format!(
+                                ":You do not have permission to set '{}' on '{}'",
+                                key, target
+                            ),
+                        ],
+                    )
                     .with_prefix(s),
                     label,
                 )
@@ -422,9 +578,17 @@ pub async fn handle_metadata(
             if let Some(ref v) = value {
                 if v.len() > 2048 {
                     reply_to_client(
-                        &senders, client_id,
-                        Message::new("FAIL", vec!["METADATA".into(), "VALUE_INVALID".into(), " :value too long".into()])
-                            .with_prefix(s),
+                        &senders,
+                        client_id,
+                        Message::new(
+                            "FAIL",
+                            vec![
+                                "METADATA".into(),
+                                "VALUE_INVALID".into(),
+                                " :value too long".into(),
+                            ],
+                        )
+                        .with_prefix(s),
                         label,
                     )
                     .await;
@@ -435,18 +599,27 @@ pub async fn handle_metadata(
             // Key count limit (only when setting, not deleting)
             if value.is_some() {
                 let state_r = state.read().await;
-                let current_count = state_r.metadata.get(&target)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                let already_set = state_r.metadata.get(&target)
+                let current_count = state_r.metadata.get(&target).map(|m| m.len()).unwrap_or(0);
+                let already_set = state_r
+                    .metadata
+                    .get(&target)
                     .and_then(|m| m.get(key))
                     .is_some();
                 drop(state_r);
                 if !already_set && current_count >= MAX_METADATA_KEYS {
                     reply_to_client(
-                        &senders, client_id,
-                        Message::new("FAIL", vec!["METADATA".into(), "LIMIT_REACHED".into(), target.clone(), format!(":Metadata key limit ({}) reached", MAX_METADATA_KEYS)])
-                            .with_prefix(s),
+                        &senders,
+                        client_id,
+                        Message::new(
+                            "FAIL",
+                            vec![
+                                "METADATA".into(),
+                                "LIMIT_REACHED".into(),
+                                target.clone(),
+                                format!(":Metadata key limit ({}) reached", MAX_METADATA_KEYS),
+                            ],
+                        )
+                        .with_prefix(s),
                         label,
                     )
                     .await;
@@ -478,17 +651,36 @@ pub async fn handle_metadata(
             // Reply to setter
             if let Some(ref v) = new_value {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("761", vec![self_nick.clone(), target.clone(), key.to_string(), "*".into(), format!(":{}", v)])
-                        .with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "761",
+                        vec![
+                            self_nick.clone(),
+                            target.clone(),
+                            key.to_string(),
+                            "*".into(),
+                            format!(":{}", v),
+                        ],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
             } else {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("766", vec![self_nick.clone(), target.clone(), key.to_string(), " :key not set".into()])
-                        .with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "766",
+                        vec![
+                            self_nick.clone(),
+                            target.clone(),
+                            key.to_string(),
+                            " :key not set".into(),
+                        ],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
@@ -496,9 +688,14 @@ pub async fn handle_metadata(
 
             // Broadcast METADATA event to subscribers
             broadcast_metadata_event(
-                &state, &channels, &senders,
-                &setter_source, client_id,
-                &target, key, new_value.as_deref(),
+                &state,
+                &channels,
+                &senders,
+                &setter_source,
+                client_id,
+                &target,
+                key,
+                new_value.as_deref(),
             )
             .await;
         }
@@ -510,7 +707,12 @@ pub async fn handle_metadata(
             } else if is_channel(&target) {
                 let ch_store = channels.read().await;
                 if let Some(ch) = ch_store.channels.get(&target) {
-                    ch.read().await.members.get(client_id).map(|m| m.modes.op).unwrap_or(false)
+                    ch.read()
+                        .await
+                        .members
+                        .get(client_id)
+                        .map(|m| m.modes.op)
+                        .unwrap_or(false)
                 } else {
                     false
                 }
@@ -519,11 +721,20 @@ pub async fn handle_metadata(
             };
             if !can_set {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("FAIL", vec![
-                        "METADATA".into(), "KEY_NO_PERMISSION".into(), "*".into(),
-                        format!(":You do not have permission to clear metadata on '{}'", target),
-                    ])
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "METADATA".into(),
+                            "KEY_NO_PERMISSION".into(),
+                            "*".into(),
+                            format!(
+                                ":You do not have permission to clear metadata on '{}'",
+                                target
+                            ),
+                        ],
+                    )
                     .with_prefix(s),
                     label,
                 )
@@ -544,16 +755,26 @@ pub async fn handle_metadata(
             // Broadcast deletion events for each cleared key
             for (key, _) in &cleared {
                 broadcast_metadata_event(
-                    &state, &channels, &senders,
-                    &setter_source, client_id,
-                    &target, key, None,
+                    &state,
+                    &channels,
+                    &senders,
+                    &setter_source,
+                    client_id,
+                    &target,
+                    key,
+                    None,
                 )
                 .await;
             }
 
             reply_to_client(
-                &senders, client_id,
-                Message::new("762", vec![self_nick.clone(), "End of METADATA".to_string()]).with_prefix(s),
+                &senders,
+                client_id,
+                Message::new(
+                    "762",
+                    vec![self_nick.clone(), "End of METADATA".to_string()],
+                )
+                .with_prefix(s),
                 label,
             )
             .await;
@@ -564,9 +785,18 @@ pub async fn handle_metadata(
             let keys: Vec<String> = msg.params.iter().skip(2).map(|s| s.to_string()).collect();
             if keys.is_empty() {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("FAIL", vec!["METADATA".into(), "KEY_INVALID".into(), "*".into(), " :no keys specified".into()])
-                        .with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "METADATA".into(),
+                            "KEY_INVALID".into(),
+                            "*".into(),
+                            " :no keys specified".into(),
+                        ],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
@@ -576,9 +806,18 @@ pub async fn handle_metadata(
             for key in &keys {
                 if !meta_key_valid(key) {
                     reply_to_client(
-                        &senders, client_id,
-                        Message::new("FAIL", vec!["METADATA".into(), "KEY_INVALID".into(), key.clone(), " :invalid key".into()])
-                            .with_prefix(s),
+                        &senders,
+                        client_id,
+                        Message::new(
+                            "FAIL",
+                            vec![
+                                "METADATA".into(),
+                                "KEY_INVALID".into(),
+                                key.clone(),
+                                " :invalid key".into(),
+                            ],
+                        )
+                        .with_prefix(s),
                         label,
                     )
                     .await;
@@ -605,11 +844,17 @@ pub async fn handle_metadata(
                 match result {
                     Err(()) => {
                         reply_to_client(
-                            &senders, client_id,
-                            Message::new("FAIL", vec![
-                                "METADATA".into(), "TOO_MANY_SUBS".into(), key.clone(),
-                                format!(":Subscription limit ({}) reached", MAX_SUBS),
-                            ])
+                            &senders,
+                            client_id,
+                            Message::new(
+                                "FAIL",
+                                vec![
+                                    "METADATA".into(),
+                                    "TOO_MANY_SUBS".into(),
+                                    key.clone(),
+                                    format!(":Subscription limit ({}) reached", MAX_SUBS),
+                                ],
+                            )
                             .with_prefix(s),
                             label,
                         )
@@ -617,8 +862,13 @@ pub async fn handle_metadata(
                     }
                     Ok(()) => {
                         reply_to_client(
-                            &senders, client_id,
-                            Message::new("770", vec![self_nick.clone(), key.clone(), "Subscribed".to_string()]).with_prefix(s),
+                            &senders,
+                            client_id,
+                            Message::new(
+                                "770",
+                                vec![self_nick.clone(), key.clone(), "Subscribed".to_string()],
+                            )
+                            .with_prefix(s),
                             label,
                         )
                         .await;
@@ -632,9 +882,18 @@ pub async fn handle_metadata(
             let keys: Vec<String> = msg.params.iter().skip(2).map(|s| s.to_string()).collect();
             if keys.is_empty() {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("FAIL", vec!["METADATA".into(), "KEY_INVALID".into(), "*".into(), " :no keys specified".into()])
-                        .with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "METADATA".into(),
+                            "KEY_INVALID".into(),
+                            "*".into(),
+                            " :no keys specified".into(),
+                        ],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
@@ -649,8 +908,13 @@ pub async fn handle_metadata(
                     }
                 }
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("771", vec![self_nick.clone(), key.clone(), "Unsubscribed".to_string()]).with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "771",
+                        vec![self_nick.clone(), key.clone(), "Unsubscribed".to_string()],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
@@ -662,30 +926,50 @@ pub async fn handle_metadata(
             let subs: Vec<String> = {
                 let state_r = state.read().await;
                 match state_r.clients.get(client_id) {
-                    Some(c) => c.read().await.metadata_subscriptions.iter().cloned().collect(),
+                    Some(c) => c
+                        .read()
+                        .await
+                        .metadata_subscriptions
+                        .iter()
+                        .cloned()
+                        .collect(),
                     None => vec![],
                 }
             };
 
-            let batch_ref: Option<String> = if has_batch { Some(generate_msgid()) } else { None };
+            let batch_ref: Option<String> = if has_batch {
+                Some(generate_msgid())
+            } else {
+                None
+            };
             if let Some(ref ref_id) = batch_ref {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("BATCH", vec![format!("+{}", ref_id), "metadata-subs".into()]).with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "BATCH",
+                        vec![format!("+{}", ref_id), "metadata-subs".into()],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
             }
 
             for key in &subs {
-                let mut m = Message::new("772", vec![self_nick.clone(), key.clone()]).with_prefix(s);
+                let mut m =
+                    Message::new("772", vec![self_nick.clone(), key.clone()]).with_prefix(s);
                 if let Some(ref ref_id) = batch_ref {
                     m.tags.insert("batch".to_string(), Some(ref_id.clone()));
                 }
                 reply_to_client(&senders, client_id, m, label).await;
             }
 
-            let mut end = Message::new("762", vec![self_nick.clone(), "End of METADATA".to_string()]).with_prefix(s);
+            let mut end = Message::new(
+                "762",
+                vec![self_nick.clone(), "End of METADATA".to_string()],
+            )
+            .with_prefix(s);
             if let Some(ref ref_id) = batch_ref {
                 end.tags.insert("batch".to_string(), Some(ref_id.clone()));
             }
@@ -693,7 +977,8 @@ pub async fn handle_metadata(
 
             if let Some(ref ref_id) = batch_ref {
                 reply_to_client(
-                    &senders, client_id,
+                    &senders,
+                    client_id,
                     Message::new("BATCH", vec![format!("-{}", ref_id)]).with_prefix(s),
                     label,
                 )
@@ -705,9 +990,18 @@ pub async fn handle_metadata(
         "SYNC" => {
             if !target_exists(&target, &state, &channels).await {
                 reply_to_client(
-                    &senders, client_id,
-                    Message::new("FAIL", vec!["METADATA".into(), "INVALID_TARGET".into(), target.clone(), " :No such target".into()])
-                        .with_prefix(s),
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "METADATA".into(),
+                            "INVALID_TARGET".into(),
+                            target.clone(),
+                            " :No such target".into(),
+                        ],
+                    )
+                    .with_prefix(s),
                     label,
                 )
                 .await;
@@ -717,19 +1011,33 @@ pub async fn handle_metadata(
             // Return all metadata for target (client can filter by their subscriptions locally)
             let entries: Vec<(String, String)> = {
                 let state_r = state.read().await;
-                state_r.metadata.get(&target)
+                state_r
+                    .metadata
+                    .get(&target)
                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default()
             };
 
-            send_metadata_batch(&senders, client_id, &self_nick, &target, &entries, s, has_batch, label).await;
+            send_metadata_batch(
+                &senders, client_id, &self_nick, &target, &entries, s, has_batch, label,
+            )
+            .await;
         }
 
         _ => {
             reply_to_client(
-                &senders, client_id,
-                Message::new("FAIL", vec!["METADATA".into(), "SUBCOMMAND_INVALID".into(), "*".into(), " :invalid subcommand".into()])
-                    .with_prefix(s),
+                &senders,
+                client_id,
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "METADATA".into(),
+                        "SUBCOMMAND_INVALID".into(),
+                        "*".into(),
+                        " :invalid subcommand".into(),
+                    ],
+                )
+                .with_prefix(s),
                 label,
             )
             .await;

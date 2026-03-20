@@ -211,27 +211,25 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
         let mode_limit: Option<u32> = row.try_get("mode_limit").unwrap_or(None);
         let created_at: i64 = row.try_get("created_ts").unwrap_or(0);
 
-        let ops: Vec<String> = sqlx::query(
-            "SELECT nick_or_account FROM channel_operators WHERE channel_id = ?",
-        )
-        .bind(id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r: sqlx::mysql::MySqlRow| r.get("nick_or_account"))
-        .collect();
+        let ops: Vec<String> =
+            sqlx::query("SELECT nick_or_account FROM channel_operators WHERE channel_id = ?")
+                .bind(id)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r: sqlx::mysql::MySqlRow| r.get("nick_or_account"))
+                .collect();
 
-        let voice: Vec<String> = sqlx::query(
-            "SELECT nick_or_account FROM channel_voice WHERE channel_id = ?",
-        )
-        .bind(id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r: sqlx::mysql::MySqlRow| r.get("nick_or_account"))
-        .collect();
+        let voice: Vec<String> =
+            sqlx::query("SELECT nick_or_account FROM channel_voice WHERE channel_id = ?")
+                .bind(id)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r: sqlx::mysql::MySqlRow| r.get("nick_or_account"))
+                .collect();
 
         entries.push(ChannelEntry {
             name,
@@ -273,7 +271,12 @@ pub async fn save_channel_modes(
 // ─── Read markers ─────────────────────────────────────────────────────────────
 
 /// Upsert a read marker timestamp for an account+target.
-pub async fn save_read_marker(pool: &sqlx::MySqlPool, account: &str, target: &str, timestamp: &str) {
+pub async fn save_read_marker(
+    pool: &sqlx::MySqlPool,
+    account: &str,
+    target: &str,
+    timestamp: &str,
+) {
     let _ = sqlx::query(
         "INSERT INTO read_markers (account, target, timestamp) VALUES (?, ?, ?)
          ON DUPLICATE KEY UPDATE timestamp = VALUES(timestamp)",
@@ -286,9 +289,12 @@ pub async fn save_read_marker(pool: &sqlx::MySqlPool, account: &str, target: &st
 }
 
 /// Load all read markers from the database into a nested HashMap.
-pub async fn load_read_markers(pool: &sqlx::MySqlPool) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+pub async fn load_read_markers(
+    pool: &sqlx::MySqlPool,
+) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
     use sqlx::Row;
-    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, String>> = Default::default();
+    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+        Default::default();
     let rows = sqlx::query("SELECT account, target, timestamp FROM read_markers")
         .fetch_all(pool)
         .await
@@ -335,9 +341,12 @@ pub async fn clear_metadata(pool: &sqlx::MySqlPool, target: &str) {
 }
 
 /// Load all metadata from the database.
-pub async fn load_all_metadata(pool: &sqlx::MySqlPool) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+pub async fn load_all_metadata(
+    pool: &sqlx::MySqlPool,
+) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
     use sqlx::Row;
-    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, String>> = Default::default();
+    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+        Default::default();
     let rows = sqlx::query("SELECT target, meta_key, value FROM metadata")
         .fetch_all(pool)
         .await
@@ -440,13 +449,11 @@ pub async fn register_user(
 
     let nick_lower = nick.to_lowercase();
 
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM users WHERE nick_lower = ?",
-    )
-    .bind(&nick_lower)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| RegisterError::Io(e.to_string()))?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE nick_lower = ?")
+        .bind(&nick_lower)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| RegisterError::Io(e.to_string()))?;
 
     if count > 0 {
         return Err(RegisterError::AccountExists);
@@ -542,22 +549,19 @@ pub async fn append_channel_history(
     .await?;
 
     // Prune rows beyond the cap using MariaDB's DELETE ... ORDER BY ... LIMIT
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM channel_history WHERE channel = ?")
-            .bind(channel_name)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_history WHERE channel = ?")
+        .bind(channel_name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
 
     if count > MAX_HISTORY_ENTRIES {
         let excess = count - MAX_HISTORY_ENTRIES;
-        sqlx::query(
-            "DELETE FROM channel_history WHERE channel = ? ORDER BY id ASC LIMIT ?",
-        )
-        .bind(channel_name)
-        .bind(excess)
-        .execute(pool)
-        .await?;
+        sqlx::query("DELETE FROM channel_history WHERE channel = ? ORDER BY id ASC LIMIT ?")
+            .bind(channel_name)
+            .bind(excess)
+            .execute(pool)
+            .await?;
     }
 
     Ok(())
@@ -611,23 +615,17 @@ pub async fn read_channel_history(
 /// Resolve a CHATHISTORY cursor (`msgid=xxx` or `timestamp=xxx`) to a row id.
 /// For msgid cursors, returns the id of that exact row.
 /// For timestamp cursors, returns the id of the last row at or before that timestamp.
-async fn resolve_cursor(
-    pool: &sqlx::MySqlPool,
-    channel_name: &str,
-    cursor: &str,
-) -> Option<i64> {
+async fn resolve_cursor(pool: &sqlx::MySqlPool, channel_name: &str, cursor: &str) -> Option<i64> {
     use sqlx::Row;
     if let Some(msgid) = cursor.strip_prefix("msgid=") {
-        sqlx::query(
-            "SELECT id FROM channel_history WHERE channel = ? AND msgid = ? LIMIT 1",
-        )
-        .bind(channel_name)
-        .bind(msgid)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .map(|r: sqlx::mysql::MySqlRow| r.get::<i64, _>("id"))
+        sqlx::query("SELECT id FROM channel_history WHERE channel = ? AND msgid = ? LIMIT 1")
+            .bind(channel_name)
+            .bind(msgid)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|r: sqlx::mysql::MySqlRow| r.get::<i64, _>("id"))
     } else if let Some(ts) = cursor.strip_prefix("timestamp=") {
         sqlx::query(
             "SELECT id FROM channel_history WHERE channel = ? AND ts <= ? ORDER BY id DESC LIMIT 1",
@@ -790,7 +788,12 @@ pub async fn list_history_targets(
     .unwrap_or_default();
 
     rows.into_iter()
-        .map(|r| (r.get::<String, _>("channel"), r.get::<String, _>("latest_ts")))
+        .map(|r| {
+            (
+                r.get::<String, _>("channel"),
+                r.get::<String, _>("latest_ts"),
+            )
+        })
         .collect()
 }
 
@@ -823,7 +826,11 @@ pub async fn read_redacted_in_range(
             })
             .collect(),
         Err(e) => {
-            tracing::warn!("read_redacted_in_range failed for channel={}: {}", channel_name, e);
+            tracing::warn!(
+                "read_redacted_in_range failed for channel={}: {}",
+                channel_name,
+                e
+            );
             Vec::new()
         }
     }
@@ -841,7 +848,11 @@ pub async fn delete_channel_history_by_msgid(pool: &sqlx::MySqlPool, msgid: &str
     {
         Ok(r) => r.rows_affected(),
         Err(e) => {
-            tracing::warn!("delete_channel_history_by_msgid failed for msgid={}: {}", msgid, e);
+            tracing::warn!(
+                "delete_channel_history_by_msgid failed for msgid={}: {}",
+                msgid,
+                e
+            );
             0
         }
     }
@@ -871,12 +882,10 @@ pub async fn update_channel_history_message(
     new_text: &str,
     new_msgid: &str,
 ) {
-    let _ = sqlx::query(
-        "UPDATE channel_history SET text = ?, msgid = ? WHERE msgid = ?",
-    )
-    .bind(new_text)
-    .bind(new_msgid)
-    .bind(original_msgid)
-    .execute(pool)
-    .await;
+    let _ = sqlx::query("UPDATE channel_history SET text = ?, msgid = ? WHERE msgid = ?")
+        .bind(new_text)
+        .bind(new_msgid)
+        .bind(original_msgid)
+        .execute(pool)
+        .await;
 }

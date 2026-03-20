@@ -1,9 +1,9 @@
 use crate::channel::ChannelMembership;
 use crate::protocol::Message;
+use chrono::Utc;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use chrono::Utc;
 
 // ─── WHOWAS ───────────────────────────────────────────────────────────────────
 
@@ -98,7 +98,11 @@ impl Client {
         let (n, u, h) = match (&self.nick, &self.user) {
             (Some(n), Some(u)) => {
                 let display_user = self.vuser.as_deref().unwrap_or(u.as_str());
-                let display_host = self.vhost.as_deref().map(|s| &s[..]).unwrap_or(&self.host[..]);
+                let display_host = self
+                    .vhost
+                    .as_deref()
+                    .map(|s| &s[..])
+                    .unwrap_or(&self.host[..]);
                 (n.as_str(), display_user, display_host)
             }
             _ => return None,
@@ -178,9 +182,8 @@ impl PendingConnection {
     /// Ready to complete registration: have NICK+USER, either legacy client or CAP END, and SASL
     /// is not actively in progress (if the client requested the sasl cap, wait for it to complete).
     pub fn ready_to_register(&self) -> bool {
-        let sasl_in_progress = self.sasl_mechanism.is_some()
-            && self.account.is_none()
-            && !self.sasl_failed;
+        let sasl_in_progress =
+            self.sasl_mechanism.is_some() && self.account.is_none() && !self.sasl_failed;
         self.nick.is_some()
             && self.user.is_some()
             && (!self.cap_negotiating || self.cap_ended)
@@ -264,7 +267,10 @@ pub struct MonitorWatchers {
 
 impl MonitorWatchers {
     pub fn add(&mut self, nick_lower: String, client_id: String) {
-        self.by_nick.entry(nick_lower).or_default().insert(client_id);
+        self.by_nick
+            .entry(nick_lower)
+            .or_default()
+            .insert(client_id);
     }
     pub fn remove(&mut self, nick_lower: &str, client_id: &str) {
         if let Some(set) = self.by_nick.get_mut(nick_lower) {
@@ -276,7 +282,10 @@ impl MonitorWatchers {
     }
     /// extended-monitor: add a glob pattern watcher.
     pub fn add_pattern(&mut self, pattern: String, client_id: String) {
-        self.by_pattern.entry(pattern).or_default().insert(client_id);
+        self.by_pattern
+            .entry(pattern)
+            .or_default()
+            .insert(client_id);
     }
     /// extended-monitor: remove a glob pattern watcher.
     pub fn remove_pattern(&mut self, pattern: &str, client_id: &str) {
@@ -294,7 +303,11 @@ impl MonitorWatchers {
         }
     }
     /// Remove client_id from all pattern watcher sets (e.g. on QUIT).
-    pub fn remove_client_patterns(&mut self, client_id: &str, patterns: &std::collections::HashSet<String>) {
+    pub fn remove_client_patterns(
+        &mut self,
+        client_id: &str,
+        patterns: &std::collections::HashSet<String>,
+    ) {
         for pat in patterns {
             self.remove_pattern(pat, client_id);
         }
@@ -447,7 +460,9 @@ impl ServerState {
     }
 
     pub fn get_or_create_pending(&mut self, client_id: &str, host: &str) -> &mut PendingConnection {
-        self.pending.entry(client_id.to_string()).or_insert_with(|| PendingConnection::new(host.to_string()))
+        self.pending
+            .entry(client_id.to_string())
+            .or_insert_with(|| PendingConnection::new(host.to_string()))
     }
 
     pub fn record_msgid(&mut self, msgid: String, target: String, sender_id: String) {

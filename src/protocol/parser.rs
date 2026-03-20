@@ -8,8 +8,11 @@ const MAX_TOTAL_TAGGED: usize = 8191;
 /// Parse an IRC message from a line (without CRLF).
 /// Returns error if line exceeds limits or is malformed.
 pub fn parse_message(line: &str) -> Result<Message, ParseError> {
-    let line = line.trim_end_matches("\r\n").trim_end_matches('\n').trim_end_matches('\r');
-    
+    let line = line
+        .trim_end_matches("\r\n")
+        .trim_end_matches('\n')
+        .trim_end_matches('\r');
+
     if line.len() > MAX_TOTAL_TAGGED {
         return Err(ParseError::InputTooLong);
     }
@@ -66,7 +69,9 @@ pub fn parse_message(line: &str) -> Result<Message, ParseError> {
     };
 
     // Check body length (from prefix or command onwards)
-    let body_start = if tags.is_empty() { 0 } else {
+    let body_start = if tags.is_empty() {
+        0
+    } else {
         line.find(' ').map(|p| p + 1).unwrap_or(0)
     };
     let body = &line[body_start.min(line.len())..];

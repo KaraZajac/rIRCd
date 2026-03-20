@@ -72,15 +72,15 @@ pub struct Channel {
 
 #[derive(Debug, Clone, Default)]
 pub struct ChannelModeSet {
-    pub secret: bool,           // +s
-    pub private: bool,          // +p
-    pub invite_only: bool,      // +i
-    pub topic_protect: bool,    // +t
-    pub no_external: bool,      // +n
-    pub moderated: bool,        // +m
-    pub registered_only: bool,  // +R: only authed users may join/speak
-    pub no_colors: bool,        // +c: strip mIRC color codes
-    pub no_ctcp: bool,          // +C: block CTCP to channel
+    pub secret: bool,          // +s
+    pub private: bool,         // +p
+    pub invite_only: bool,     // +i
+    pub topic_protect: bool,   // +t
+    pub no_external: bool,     // +n
+    pub moderated: bool,       // +m
+    pub registered_only: bool, // +R: only authed users may join/speak
+    pub no_colors: bool,       // +c: strip mIRC color codes
+    pub no_ctcp: bool,         // +C: block CTCP to channel
     pub user_limit: Option<u32>,
 }
 
@@ -109,7 +109,10 @@ impl Channel {
     pub fn is_quieted(&self, account: Option<&str>, source: &str) -> bool {
         for mask in &self.quiet_list {
             if let Some(account_mask) = mask.strip_prefix("~a:") {
-                if account.map(|a| a.eq_ignore_ascii_case(account_mask)).unwrap_or(false) {
+                if account
+                    .map(|a| a.eq_ignore_ascii_case(account_mask))
+                    .unwrap_or(false)
+                {
                     return true;
                 }
             } else if mask == source {
@@ -123,8 +126,14 @@ impl Channel {
     pub fn persisted_modes_for(&self, nick: &str, account: Option<&str>) -> (bool, bool) {
         let nick_lower = nick.to_lowercase();
         let account_str = account.unwrap_or("").to_lowercase();
-        let is_op = self.persisted_operators.iter().any(|s| s.to_lowercase() == nick_lower || s.to_lowercase() == account_str);
-        let is_voice = self.persisted_voice.iter().any(|s| s.to_lowercase() == nick_lower || s.to_lowercase() == account_str);
+        let is_op = self
+            .persisted_operators
+            .iter()
+            .any(|s| s.to_lowercase() == nick_lower || s.to_lowercase() == account_str);
+        let is_voice = self
+            .persisted_voice
+            .iter()
+            .any(|s| s.to_lowercase() == nick_lower || s.to_lowercase() == account_str);
         (is_op, is_voice)
     }
 
@@ -146,7 +155,10 @@ impl Channel {
     pub fn is_ban_exempt(&self, account: Option<&str>, source: &str) -> bool {
         for exc in &self.ban_exceptions {
             if let Some(acc) = exc.strip_prefix("~a:") {
-                if account.map(|a| a.eq_ignore_ascii_case(acc)).unwrap_or(false) {
+                if account
+                    .map(|a| a.eq_ignore_ascii_case(acc))
+                    .unwrap_or(false)
+                {
                     return true;
                 }
             } else if crate::user::glob_match(exc, source) {
@@ -160,7 +172,10 @@ impl Channel {
     pub fn is_invite_exempt(&self, account: Option<&str>, source: &str) -> bool {
         for exc in &self.invite_exceptions {
             if let Some(acc) = exc.strip_prefix("~a:") {
-                if account.map(|a| a.eq_ignore_ascii_case(acc)).unwrap_or(false) {
+                if account
+                    .map(|a| a.eq_ignore_ascii_case(acc))
+                    .unwrap_or(false)
+                {
                     return true;
                 }
             } else if crate::user::glob_match(exc, source) {
