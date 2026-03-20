@@ -324,6 +324,25 @@ pub async fn handle_join(
             let m = Message::new("MARKREAD", vec![ch_key.clone(), ts_param]).with_prefix(&cfg.server.name);
             send_to_client(&senders, client_id, m).await;
         }
+
+        // draft/metadata-2: push existing channel metadata to the joining client
+        if client_caps.contains("draft/metadata-2") {
+            let ch_meta: Vec<(String, String)> = state
+                .metadata
+                .get(&ch_key)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default();
+            crate::commands::metadata::send_channel_metadata_on_join(
+                &senders,
+                client_id,
+                &ch_key,
+                &nick,
+                &cfg.server.name,
+                client_caps.contains("batch"),
+                ch_meta,
+            )
+            .await;
+        }
     }
 
     Ok(())

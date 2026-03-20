@@ -57,10 +57,11 @@ pub fn build_cap_list(version_302: bool, tls_port: Option<u16>) -> Vec<String> {
         .filter(|c| *c != "capability-negotiation")
         .filter(|c| *c != "sts" || tls_port.is_some())
         .map(|c| match c {
-            "sasl"            => "sasl=PLAIN,SCRAM-SHA-256".to_string(),
-            "draft/multiline" => "draft/multiline=max-bytes=4096,max-lines=20".to_string(),
-            "sts"             => format!("sts=port={},duration=2592000", tls_port.unwrap_or(6697)),
-            _                 => c.to_string(),
+            "sasl"             => "sasl=PLAIN,SCRAM-SHA-256".to_string(),
+            "draft/multiline"  => "draft/multiline=max-bytes=4096,max-lines=20".to_string(),
+            "draft/metadata-2" => "draft/metadata-2=max-subs=50,max-keys=50".to_string(),
+            "sts"              => format!("sts=port={},duration=2592000", tls_port.unwrap_or(6697)),
+            _                  => c.to_string(),
         })
         .collect();
 
