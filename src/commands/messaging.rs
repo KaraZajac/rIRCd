@@ -771,7 +771,7 @@ pub async fn handle_redact(
     let msgid = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
     let reason = msg.trailing().unwrap_or("message redacted").to_string();
 
-    debug!("REDACT from client={} target_param={} msgid={}", client_id, target_param, msgid);
+    tracing::info!(client_id, target_param, msgid, "REDACT received");
 
     if target_param.is_empty() || msgid.is_empty() {
         reply_to_client(
@@ -797,11 +797,12 @@ pub async fn handle_redact(
     let (target, sender_nick): (String, Option<String>) = if let Some((t, sender_id)) = in_mem {
         debug!("REDACT: msgid={} found in memory store (target={} sender_id={})", msgid, t, sender_id);
         let nick = {
-            let state_r = state.read().await;
-            state_r.clients.get(&sender_id).map(|c| {
-                // Use try_read to avoid blocking; fall back to None if contended
-                c.try_read().ok().and_then(|g| g.nick.clone())
-            }).flatten()
+            let c_arc = state.read().await.clients.get(&sender_id).cloned();
+            if let Some(c) = c_arc {
+                c.read().await.nick.clone()
+            } else {
+                None
+            }
         };
         (t, nick)
     } else {
@@ -861,8 +862,11 @@ pub async fn handle_redact(
     };
 
     let allowed = is_own || is_op || is_oper;
-    debug!("REDACT: allowed={} (is_own={} is_op={} is_oper={}) current_nick={} sender_nick={:?}",
-        allowed, is_own, is_op, is_oper, current_nick, sender_nick);
+    tracing::info!(
+        client_id, allowed, is_own, is_op, is_oper,
+        current_nick = %current_nick, sender_nick = ?sender_nick,
+        "REDACT auth check"
+    );
 
     if !allowed {
         reply_to_client(
@@ -885,7 +889,7 @@ pub async fn handle_redact(
     // Delete from DB
     if let Some(ref pool) = cfg.db {
         let deleted = persist::delete_channel_history_by_msgid(pool, msgid).await;
-        debug!("REDACT: DB delete rows_affected={} for msgid={}", deleted, msgid);
+        tracing::info!(client_id, msgid, rows_affected = deleted, "REDACT DB delete");
     }
 
     // Per spec: :<nick!user@host> REDACT <target> <msgid> :<reason>
