@@ -872,14 +872,6 @@ pub async fn handle_authenticate(
         return Ok(());
     }
 
-    // Store PLAIN mechanism on first call
-    if mechanism == "PLAIN" {
-        let mut sg = state.write().await;
-        if let Some(conn) = sg.pending.get_mut(client_id) {
-            conn.sasl_mechanism = Some("PLAIN".to_string());
-        }
-    }
-
     // Token: first message is "AUTHENTICATE PLAIN" [optional first chunk]; continuation is "AUTHENTICATE <chunk>".
     // When client sends only "AUTHENTICATE PLAIN", params = ["PLAIN"] and trailing() returns the last param "PLAIN" —
     // we must not treat the mechanism name as a credential chunk.
@@ -941,6 +933,11 @@ pub async fn handle_authenticate(
     let (to_decode, is_end, explicit_end) = {
         let mut state_guard = state.write().await;
         let conn = state_guard.get_or_create_pending(client_id, host);
+        // Store mechanism atomically with pending creation. This handles the case where the
+        // pending connection was removed by complete_registration() and just recreated above.
+        if mechanism == "PLAIN" {
+            conn.sasl_mechanism = Some("PLAIN".to_string());
+        }
         // is_end = true when we have the full response: token is "+" or token.len() < 400.
         let explicit_end = token == "+";
         let chunk_lt_400 = token.len() < 400;

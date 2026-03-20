@@ -175,9 +175,16 @@ impl PendingConnection {
         }
     }
 
-    /// Ready to complete registration: have NICK+USER and either legacy client or CAP END received
+    /// Ready to complete registration: have NICK+USER, either legacy client or CAP END, and SASL
+    /// is not actively in progress (if the client requested the sasl cap, wait for it to complete).
     pub fn ready_to_register(&self) -> bool {
-        self.nick.is_some() && self.user.is_some() && (!self.cap_negotiating || self.cap_ended)
+        let sasl_in_progress = self.sasl_mechanism.is_some()
+            && self.account.is_none()
+            && !self.sasl_failed;
+        self.nick.is_some()
+            && self.user.is_some()
+            && (!self.cap_negotiating || self.cap_ended)
+            && !sasl_in_progress
     }
 }
 

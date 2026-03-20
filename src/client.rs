@@ -104,8 +104,13 @@ async fn handle_client_stream<S>(
                         flood_tokens = (flood_tokens + elapsed * FLOOD_REFILL_RATE).min(FLOOD_CAPACITY);
                         flood_last_refill = now;
 
-                        // Bypass flood control for PONG (keeps connection alive)
-                        if msg.command != "PONG" {
+                        // Bypass flood control for connection setup and PONG.
+                        // CAP/NICK/USER/PASS/AUTHENTICATE are pre-registration commands that
+                        // clients send in rapid succession; dropping them silently breaks auth.
+                        const FLOOD_EXEMPT: &[&str] = &[
+                            "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PONG", "QUIT",
+                        ];
+                        if !FLOOD_EXEMPT.contains(&msg.command.as_str()) {
                             if flood_tokens < 1.0 {
                                 let reply = Message::new("NOTICE", vec!["*".into(), "Flood control: you are sending messages too fast".into()])
                                     .with_prefix(&server_name);
