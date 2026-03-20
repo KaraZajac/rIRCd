@@ -64,6 +64,8 @@ pub struct Client {
     pub signon_at: i64,
     /// Unix timestamp of the last message received from this client (for WHOIS 317 idle)
     pub last_active: i64,
+    /// draft/metadata-2: keys this client has subscribed to for change notifications
+    pub metadata_subscriptions: std::collections::HashSet<String>,
 }
 
 impl Client {
@@ -88,6 +90,7 @@ impl Client {
             wallops: false,
             signon_at: Utc::now().timestamp(),
             last_active: Utc::now().timestamp(),
+            metadata_subscriptions: std::collections::HashSet::new(),
         }
     }
 
