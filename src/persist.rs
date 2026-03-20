@@ -780,11 +780,35 @@ pub async fn list_history_targets(
 }
 
 /// Delete a single message from channel history by its msgid (used by REDACT).
-pub async fn delete_channel_history_by_msgid(pool: &sqlx::MySqlPool, msgid: &str) {
-    let _ = sqlx::query("DELETE FROM channel_history WHERE msgid = ?")
+/// Returns the number of rows deleted (0 means the msgid wasn't in the DB).
+pub async fn delete_channel_history_by_msgid(pool: &sqlx::MySqlPool, msgid: &str) -> u64 {
+    match sqlx::query("DELETE FROM channel_history WHERE msgid = ?")
         .bind(msgid)
         .execute(pool)
-        .await;
+        .await
+    {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            tracing::warn!("delete_channel_history_by_msgid failed for msgid={}: {}", msgid, e);
+            0
+        }
+    }
+}
+
+/// Look up a channel history entry by msgid.
+/// Returns (channel, source) where source is the original nick!user@host of the sender.
+pub async fn lookup_channel_history_by_msgid(
+    pool: &sqlx::MySqlPool,
+    msgid: &str,
+) -> Option<(String, String)> {
+    use sqlx::Row;
+    sqlx::query("SELECT channel, source FROM channel_history WHERE msgid = ? LIMIT 1")
+        .bind(msgid)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| (r.get("channel"), r.get("source")))
 }
 
 /// Update the text (and replace the msgid) of a channel history entry identified by the original
