@@ -324,6 +324,8 @@ pub struct ServerState {
     pub whowas: HashMap<String, VecDeque<WhowasEntry>>,
     /// Server start time (Unix timestamp)
     pub started_at: i64,
+    /// Path to the config file on disk (used by REHASH to reload)
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 /// In-flight draft/multiline batch for one client

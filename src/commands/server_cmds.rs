@@ -8,6 +8,7 @@ use crate::user::ServerState;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
+use tracing::info;
 
 async fn send_to_client(
     senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
@@ -770,6 +771,94 @@ pub async fn handle_wallops(
     for tid in &wallops_ids {
         send_to_client(&senders, tid, wallops_msg.clone()).await;
     }
+
+    Ok(())
+}
+
+// ─── REHASH ───────────────────────────────────────────────────────────────────
+
+/// REHASH — reload the config file without restarting (oper only).
+/// Replies: 382 RPL_REHASHING
+pub async fn handle_rehash(
+    client_id: &str,
+    state: Arc<RwLock<ServerState>>,
+    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    cfg: Arc<RwLock<Config>>,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let server_name = cfg.read().await.server.name.clone();
+
+    let (is_oper, nick) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.oper, g.nick_or_id().to_string())
+            }
+            None => return Ok(()),
+        }
+    };
+
+    if !is_oper {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("481", vec![nick, "Permission Denied- You're not an IRC operator".into()])
+                .with_prefix(&server_name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let config_path = state.read().await.config_path.clone();
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("FAIL", vec!["REHASH".into(), "INTERNAL_ERROR".into(), "*".into(), "No config path available".into()])
+                    .with_prefix(&server_name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    let new_cfg = match crate::config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("FAIL", vec!["REHASH".into(), "INTERNAL_ERROR".into(), "*".into(), format!("Failed to load config: {}", e)])
+                    .with_prefix(&server_name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    // Preserve the live database pool — REHASH does not reconnect
+    let existing_db = cfg.read().await.db.clone();
+    let mut new_cfg = new_cfg;
+    new_cfg.db = existing_db;
+
+    let config_file = config_path.to_string_lossy().to_string();
+    *cfg.write().await = new_cfg;
+
+    info!("Config reloaded by {}", nick);
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new("382", vec![nick, config_file, "Rehashing".into()])
+            .with_prefix(&server_name),
+        label,
+    )
+    .await;
 
     Ok(())
 }
