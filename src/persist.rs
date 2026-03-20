@@ -141,6 +141,21 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Migrate existing channel_history table to add soft-delete support
+    sqlx::query(
+        "ALTER TABLE channel_history ADD COLUMN IF NOT EXISTS redacted TINYINT NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await
+    .ok(); // ok() because IF NOT EXISTS makes this idempotent
+
+    sqlx::query(
+        "ALTER TABLE channel_history ADD INDEX IF NOT EXISTS idx_channel_redacted (channel, redacted, id)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS read_markers (
             account   VARCHAR(64)  NOT NULL,
@@ -561,7 +576,7 @@ pub async fn read_channel_history(
          FROM (
              SELECT id, ts, source, text, msgid
              FROM channel_history
-             WHERE channel = ?
+             WHERE channel = ? AND redacted=0
              ORDER BY id DESC
              LIMIT ?
          ) AS recent
@@ -646,7 +661,7 @@ pub async fn read_channel_history_before(
          FROM (
              SELECT id, ts, source, text, msgid
              FROM channel_history
-             WHERE channel = ? AND id < ?
+             WHERE channel = ? AND id < ? AND redacted=0
              ORDER BY id DESC
              LIMIT ?
          ) AS sub
@@ -683,7 +698,7 @@ pub async fn read_channel_history_after(
     let rows = sqlx::query(
         "SELECT id, ts, source, text, msgid
          FROM channel_history
-         WHERE channel = ? AND id > ?
+         WHERE channel = ? AND id > ? AND redacted=0
          ORDER BY id ASC
          LIMIT ?",
     )
@@ -720,7 +735,7 @@ pub async fn read_channel_history_around(
 
     // Rows at or before pivot, newest-first.
     let before = sqlx::query(
-        "SELECT id, ts, source, text, msgid FROM channel_history WHERE channel = ? AND id <= ? ORDER BY id DESC LIMIT ?",
+        "SELECT id, ts, source, text, msgid FROM channel_history WHERE channel = ? AND id <= ? AND redacted=0 ORDER BY id DESC LIMIT ?",
     )
     .bind(channel_name)
     .bind(pivot_id)
@@ -731,7 +746,7 @@ pub async fn read_channel_history_around(
 
     // Rows after pivot, oldest-first.
     let after = sqlx::query(
-        "SELECT id, ts, source, text, msgid FROM channel_history WHERE channel = ? AND id > ? ORDER BY id ASC LIMIT ?",
+        "SELECT id, ts, source, text, msgid FROM channel_history WHERE channel = ? AND id > ? AND redacted=0 ORDER BY id ASC LIMIT ?",
     )
     .bind(channel_name)
     .bind(pivot_id)
@@ -779,10 +794,47 @@ pub async fn list_history_targets(
         .collect()
 }
 
-/// Delete a single message from channel history by its msgid (used by REDACT).
-/// Returns the number of rows deleted (0 means the msgid wasn't in the DB).
+/// Fetch redacted (soft-deleted) messages for a channel within a time range.
+/// Returns (msgid, source) pairs. Used to include REDACT events in CHATHISTORY responses.
+pub async fn read_redacted_in_range(
+    pool: &sqlx::MySqlPool,
+    channel_name: &str,
+    since_ts: &str,
+    until_ts: &str,
+) -> Vec<(String, String)> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT msgid, source FROM channel_history
+         WHERE channel = ? AND redacted = 1 AND ts >= ? AND ts <= ? AND msgid IS NOT NULL
+         ORDER BY id ASC",
+    )
+    .bind(channel_name)
+    .bind(since_ts)
+    .bind(until_ts)
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|r| {
+                let msgid: Option<String> = r.get("msgid");
+                let source: String = r.get("source");
+                msgid.map(|m| (m, source))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("read_redacted_in_range failed for channel={}: {}", channel_name, e);
+            Vec::new()
+        }
+    }
+}
+
+/// Soft-delete a single message from channel history by its msgid (used by REDACT).
+/// Marks the row as redacted=1 instead of physically deleting it, so CHATHISTORY
+/// replays can include REDACT events for clients to update their local buffers.
+/// Returns the number of rows affected (0 means the msgid wasn't in the DB or was already redacted).
 pub async fn delete_channel_history_by_msgid(pool: &sqlx::MySqlPool, msgid: &str) -> u64 {
-    match sqlx::query("DELETE FROM channel_history WHERE msgid = ?")
+    match sqlx::query("UPDATE channel_history SET redacted=1 WHERE msgid = ? AND redacted=0")
         .bind(msgid)
         .execute(pool)
         .await
