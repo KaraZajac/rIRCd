@@ -1,8 +1,8 @@
+use bcrypt::{hash, DEFAULT_COST};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::fs;
 use std::io::{self, Write};
-use bcrypt::{hash, DEFAULT_COST};
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CONFIG_DIR: &str = "/etc/rIRCd";
 
@@ -46,9 +46,15 @@ pub struct DatabaseConfig {
     pub database: String,
 }
 
-fn default_db_host() -> String { "localhost".into() }
-fn default_db_port() -> u16 { 3306 }
-fn default_db_name() -> String { "rircdb".into() }
+fn default_db_host() -> String {
+    "localhost".into()
+}
+fn default_db_port() -> u16 {
+    3306
+}
+fn default_db_name() -> String {
+    "rircdb".into()
+}
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
@@ -104,12 +110,24 @@ pub struct ServerConfig {
     pub cloak_key: Option<String>,
 }
 
-fn default_server_name() -> String { "rIRCd.local".into() }
-fn default_listen() -> Vec<String> { vec![":6667".into()] }
-fn default_motd() -> String { "Welcome to rIRCd!".into() }
-fn default_registration_timeout() -> u64 { 60 }
-fn default_ping_timeout() -> u64 { 90 }
-fn default_disconnect_timeout() -> u64 { 150 }
+fn default_server_name() -> String {
+    "rIRCd.local".into()
+}
+fn default_listen() -> Vec<String> {
+    vec![":6667".into()]
+}
+fn default_motd() -> String {
+    "Welcome to rIRCd!".into()
+}
+fn default_registration_timeout() -> u64 {
+    60
+}
+fn default_ping_timeout() -> u64 {
+    90
+}
+fn default_disconnect_timeout() -> u64 {
+    150
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -135,10 +153,16 @@ pub struct NetworkConfig {
     pub name: String,
 }
 
-fn default_network_name() -> String { "rIRCd".into() }
+fn default_network_name() -> String {
+    "rIRCd".into()
+}
 
 impl Default for NetworkConfig {
-    fn default() -> Self { Self { name: default_network_name() } }
+    fn default() -> Self {
+        Self {
+            name: default_network_name(),
+        }
+    }
 }
 
 // ─── TLS ──────────────────────────────────────────────────────────────────────
@@ -150,7 +174,12 @@ pub struct TlsConfig {
 }
 
 impl Default for TlsConfig {
-    fn default() -> Self { Self { cert: None, key: None } }
+    fn default() -> Self {
+        Self {
+            cert: None,
+            key: None,
+        }
+    }
 }
 
 // ─── Limits ───────────────────────────────────────────────────────────────────
@@ -163,8 +192,12 @@ pub struct LimitsConfig {
     pub max_line_length: usize,
 }
 
-fn default_max_channels() -> usize { 50 }
-fn default_max_line_length() -> usize { 8191 }
+fn default_max_channels() -> usize {
+    50
+}
+fn default_max_line_length() -> usize {
+    8191
+}
 
 impl Default for LimitsConfig {
     fn default() -> Self {
@@ -220,7 +253,11 @@ fn prompt(label: &str, default: &str) -> String {
     let mut s = String::new();
     std::io::stdin().read_line(&mut s).unwrap();
     let s = s.trim().to_string();
-    if s.is_empty() { default.to_string() } else { s }
+    if s.is_empty() {
+        default.to_string()
+    } else {
+        s
+    }
 }
 
 fn prompt_bool(label: &str, default: bool) -> bool {
@@ -230,7 +267,11 @@ fn prompt_bool(label: &str, default: bool) -> bool {
     let mut s = String::new();
     std::io::stdin().read_line(&mut s).unwrap();
     let s = s.trim().to_lowercase();
-    if s.is_empty() { default } else { s.starts_with('y') }
+    if s.is_empty() {
+        default
+    } else {
+        s.starts_with('y')
+    }
 }
 
 fn prompt_password_twice(label: &str) -> String {
@@ -279,7 +320,7 @@ pub fn init_config_dir(dir: &Path) -> anyhow::Result<()> {
     let (tls_port, tls_cert, tls_key) = if want_tls {
         let port = prompt("TLS port", "6697");
         let cert = prompt("Path to certificate (PEM)", "/etc/rIRCd/cert.pem");
-        let key  = prompt("Path to private key (PEM)", "/etc/rIRCd/key.pem");
+        let key = prompt("Path to private key (PEM)", "/etc/rIRCd/key.pem");
         (Some(port), Some(cert), Some(key))
     } else {
         (None, None, None)
@@ -325,10 +366,7 @@ pub fn init_config_dir(dir: &Path) -> anyhow::Result<()> {
         None => String::new(),
     };
     let tls_block = match (&tls_cert, &tls_key) {
-        (Some(cert), Some(key)) => format!(
-            "\n[tls]\ncert = \"{}\"\nkey  = \"{}\"\n",
-            cert, key
-        ),
+        (Some(cert), Some(key)) => format!("\n[tls]\ncert = \"{}\"\nkey  = \"{}\"\n", cert, key),
         _ => String::new(),
     };
 
@@ -391,14 +429,20 @@ pub fn genpasswd() -> anyhow::Result<()> {
 fn read_pidfile(pidfile: &Path) -> Option<nix::unistd::Pid> {
     let s = fs::read_to_string(pidfile).ok()?;
     let pid: i32 = s.trim().parse().ok()?;
-    if pid <= 0 { return None; }
+    if pid <= 0 {
+        return None;
+    }
     Some(nix::unistd::Pid::from_raw(pid))
 }
 
 pub fn stop_cmd(config_path: &Path) -> anyhow::Result<()> {
     let pidfile = pidfile_path(config_path);
-    let pid = read_pidfile(&pidfile)
-        .ok_or_else(|| anyhow::anyhow!("No PID file at {} (is the server running?)", pidfile.display()))?;
+    let pid = read_pidfile(&pidfile).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No PID file at {} (is the server running?)",
+            pidfile.display()
+        )
+    })?;
 
     #[cfg(unix)]
     {
@@ -420,7 +464,10 @@ pub fn status_cmd(config_path: &Path) -> anyhow::Result<()> {
     let pid = match read_pidfile(&pidfile) {
         Some(p) => p,
         None => {
-            println!("rIRCd is not running (no PID file at {})", pidfile.display());
+            println!(
+                "rIRCd is not running (no PID file at {})",
+                pidfile.display()
+            );
             return Ok(());
         }
     };
@@ -436,7 +483,10 @@ pub fn status_cmd(config_path: &Path) -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        println!("rIRCd status: PID file present (PID {}), run only supported on Unix", pid);
+        println!(
+            "rIRCd status: PID file present (PID {}), run only supported on Unix",
+            pid
+        );
     }
 
     Ok(())

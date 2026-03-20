@@ -27,7 +27,9 @@ fn sha256_reg(data: &[u8]) -> [u8; 32] {
 
 fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let mut out = [0u8; 32];
-    for i in 0..32 { out[i] = a[i] ^ b[i]; }
+    for i in 0..32 {
+        out[i] = a[i] ^ b[i];
+    }
     out
 }
 
@@ -84,8 +86,15 @@ pub async fn complete_registration(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("433", vec!["*".into(), nick.clone(), "Nickname is already in use".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "433",
+                vec![
+                    "*".into(),
+                    nick.clone(),
+                    "Nickname is already in use".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -118,32 +127,56 @@ pub async fn complete_registration(
     reply_to_client(
         &senders,
         client_id,
-        Message::new("001", vec![nick_str.clone(), format!("Welcome to the Internet Relay Network {}", nick_str)])
-            .with_prefix(server),
+        Message::new(
+            "001",
+            vec![
+                nick_str.clone(),
+                format!("Welcome to the Internet Relay Network {}", nick_str),
+            ],
+        )
+        .with_prefix(server),
         label,
     )
     .await;
     reply_to_client(
         &senders,
         client_id,
-        Message::new("002", vec![nick_str.clone(), format!("Your host is {}, running rIRCd", server)])
-            .with_prefix(server),
+        Message::new(
+            "002",
+            vec![
+                nick_str.clone(),
+                format!("Your host is {}, running rIRCd", server),
+            ],
+        )
+        .with_prefix(server),
         label,
     )
     .await;
     reply_to_client(
         &senders,
         client_id,
-        Message::new("003", vec![nick_str.clone(), "This server was created for IRCv3".into()])
-            .with_prefix(server),
+        Message::new(
+            "003",
+            vec![nick_str.clone(), "This server was created for IRCv3".into()],
+        )
+        .with_prefix(server),
         label,
     )
     .await;
     reply_to_client(
         &senders,
         client_id,
-        Message::new("004", vec![nick_str.clone(), server.clone(), "rIRCd-0.1".into(), "BiorRw".into(), "beIqklimntspRcC".into()])
-            .with_prefix(server),
+        Message::new(
+            "004",
+            vec![
+                nick_str.clone(),
+                server.clone(),
+                "rIRCd-0.1".into(),
+                "BiorRw".into(),
+                "beIqklimntspRcC".into(),
+            ],
+        )
+        .with_prefix(server),
         label,
     )
     .await;
@@ -152,8 +185,15 @@ pub async fn complete_registration(
     reply_to_client(
         &senders,
         client_id,
-        Message::new("005", vec![nick_str.clone(), isupport.clone(), "are supported by this server".to_string()])
-            .with_prefix(server),
+        Message::new(
+            "005",
+            vec![
+                nick_str.clone(),
+                isupport.clone(),
+                "are supported by this server".to_string(),
+            ],
+        )
+        .with_prefix(server),
         label,
     )
     .await;
@@ -161,7 +201,11 @@ pub async fn complete_registration(
     send_motd(nick_str, server, &senders, cfg, label, client_id).await;
 
     // monitor: notify clients monitoring this nick that they came online (730)
-    let source = client.read().await.source().unwrap_or_else(|| nick_str.clone());
+    let source = client
+        .read()
+        .await
+        .source()
+        .unwrap_or_else(|| nick_str.clone());
     let watchers: Vec<String> = state
         .read()
         .await
@@ -216,8 +260,11 @@ pub async fn handle_isupport(
     reply_to_client(
         &senders,
         client_id,
-        Message::new("005", vec![nick, isupport, "are supported by this server".to_string()])
-            .with_prefix(&cfg.server.name),
+        Message::new(
+            "005",
+            vec![nick, isupport, "are supported by this server".to_string()],
+        )
+        .with_prefix(&cfg.server.name),
         label,
     )
     .await;
@@ -247,7 +294,10 @@ pub async fn handle_webirc(
         let tx = senders.read().await.get(client_id).cloned();
         if let Some(tx) = tx {
             let _ = tx
-                .send(Message::new("ERROR", vec![":Invalid WebIRC password".into()]).with_prefix(&cfg.server.name))
+                .send(
+                    Message::new("ERROR", vec![":Invalid WebIRC password".into()])
+                        .with_prefix(&cfg.server.name),
+                )
                 .await;
         }
         return Ok(());
@@ -277,7 +327,9 @@ pub async fn handle_cap(
         "LS" => {
             conn.cap_negotiating = true;
             let tls_port: Option<u16> = if cfg.tls_enabled() {
-                cfg.server.listen_tls.first()
+                cfg.server
+                    .listen_tls
+                    .first()
                     .and_then(|addr| addr.rsplit(':').next())
                     .and_then(|p| p.parse().ok())
             } else {
@@ -303,7 +355,12 @@ pub async fn handle_cap(
             }
         }
         "LIST" => {
-            let cap_line = conn.capabilities.iter().cloned().collect::<Vec<_>>().join(" ");
+            let cap_line = conn
+                .capabilities
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
             let mut reply = Message::new("CAP", vec!["*".into(), "LIST".into(), cap_line]);
             reply.prefix = Some(cfg.server.name.clone());
             reply_to_client(&senders, client_id, reply, label).await;
@@ -377,19 +434,33 @@ pub async fn handle_nick(
     if let Some(client) = state_guard.clients.get(client_id) {
         let client_guard = client.write().await;
         if client_guard.registered {
-            if state_guard.nick_to_id.get(&nick.to_uppercase()).map(|id| id != client_id) == Some(true) {
+            if state_guard
+                .nick_to_id
+                .get(&nick.to_uppercase())
+                .map(|id| id != client_id)
+                == Some(true)
+            {
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("433", vec![client_guard.nick_or_id().to_string(), nick.clone(), "Nickname is already in use".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "433",
+                        vec![
+                            client_guard.nick_or_id().to_string(),
+                            nick.clone(),
+                            "Nickname is already in use".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
                 return Ok(());
             }
             let old_nick = client_guard.nick.clone();
-            let old_source = client_guard.source().unwrap_or_else(|| client_guard.nick_or_id().to_string());
+            let old_source = client_guard
+                .source()
+                .unwrap_or_else(|| client_guard.nick_or_id().to_string());
             // Record old nick in WHOWAS before changing it.
             // Build the entry while we hold client_guard, then drop it before mutating state_guard.
             let whowas_entry = old_nick.as_ref().map(|n| crate::user::WhowasEntry {
@@ -401,19 +472,28 @@ pub async fn handle_nick(
                 timestamp: chrono::Utc::now().timestamp(),
             });
             drop(client_guard);
-            if let Some(entry) = whowas_entry { state_guard.push_whowas(entry); }
+            if let Some(entry) = whowas_entry {
+                state_guard.push_whowas(entry);
+            }
             if let Some(ref o) = old_nick {
                 state_guard.nick_to_id.remove(&o.to_uppercase());
             }
             if let Some(client) = state_guard.clients.get(client_id) {
                 client.write().await.nick = Some(nick.clone());
             }
-            state_guard.nick_to_id.insert(nick.to_uppercase(), client_id.to_string());
+            state_guard
+                .nick_to_id
+                .insert(nick.to_uppercase(), client_id.to_string());
             // monitor: 731 to watchers of old nick, 730 to watchers of new nick
             let watchers_old: Vec<String> = state_guard
                 .monitor_watchers
                 .by_nick
-                .get(&old_nick.as_ref().map(|n| n.to_lowercase()).unwrap_or_default())
+                .get(
+                    &old_nick
+                        .as_ref()
+                        .map(|n| n.to_lowercase())
+                        .unwrap_or_default(),
+                )
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default();
             let watchers_new: Vec<String> = state_guard
@@ -438,7 +518,11 @@ pub async fn handle_nick(
                     Some(c) => c.read().await.nick_or_id().to_string(),
                     None => "*".to_string(),
                 };
-                let m = Message::new("731", vec![recv_nick, format!(":{}", old_nick.as_deref().unwrap_or(""))]).with_prefix(server);
+                let m = Message::new(
+                    "731",
+                    vec![recv_nick, format!(":{}", old_nick.as_deref().unwrap_or(""))],
+                )
+                .with_prefix(server);
                 send_to_client(&senders, w, m).await;
             }
             for w in &watchers_new {
@@ -450,7 +534,8 @@ pub async fn handle_nick(
                     Some(c) => c.read().await.nick_or_id().to_string(),
                     None => "*".to_string(),
                 };
-                let m = Message::new("730", vec![recv_nick, format!(":{}", new_source)]).with_prefix(server);
+                let m = Message::new("730", vec![recv_nick, format!(":{}", new_source)])
+                    .with_prefix(server);
                 send_to_client(&senders, w, m).await;
             }
 
@@ -486,8 +571,15 @@ pub async fn handle_nick(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("433", vec!["*".into(), nick.clone(), "Nickname is already in use".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "433",
+                vec![
+                    "*".into(),
+                    nick.clone(),
+                    "Nickname is already in use".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -511,7 +603,9 @@ fn is_valid_nick(n: &str) -> bool {
     if n.is_empty() || n.len() > 32 {
         return false;
     }
-    let bad_start = ['#', '&', '@', '%', '+', ':', '$', '.', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+    let bad_start = [
+        '#', '&', '@', '%', '+', ':', '$', '.', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    ];
     if bad_start.contains(&n.chars().next().unwrap_or(' ')) {
         return false;
     }
@@ -570,7 +664,11 @@ pub async fn handle_pass(
     _senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
     _label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let pass = msg.params.first().map(String::clone).or_else(|| msg.trailing().map(String::from));
+    let pass = msg
+        .params
+        .first()
+        .map(String::clone)
+        .or_else(|| msg.trailing().map(String::from));
     if let Some(p) = pass {
         let mut state = state.write().await;
         let conn = state.get_or_create_pending(client_id, "unknown");
@@ -591,8 +689,14 @@ async fn send_motd(
     reply_to_client(
         senders,
         client_id,
-        Message::new("375", vec![nick.to_string(), format!("- {} Message of the day -", server)])
-            .with_prefix(server),
+        Message::new(
+            "375",
+            vec![
+                nick.to_string(),
+                format!("- {} Message of the day -", server),
+            ],
+        )
+        .with_prefix(server),
         label,
     )
     .await;
@@ -612,8 +716,11 @@ async fn send_motd(
     reply_to_client(
         senders,
         client_id,
-        Message::new("376", vec![nick.to_string(), "End of /MOTD command.".into()])
-            .with_prefix(server),
+        Message::new(
+            "376",
+            vec![nick.to_string(), "End of /MOTD command.".into()],
+        )
+        .with_prefix(server),
         label,
     )
     .await;
@@ -645,7 +752,11 @@ pub async fn handle_ping(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let token = msg.params.first().map(|s| s.as_str()).unwrap_or(&cfg.server.name);
+    let token = msg
+        .params
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or(&cfg.server.name);
     reply_to_client(
         &senders,
         client_id,
@@ -698,8 +809,7 @@ pub async fn handle_quit(
         }
     };
 
-    let quit_msg = Message::new("QUIT", vec![reason.clone()])
-        .with_prefix(&source);
+    let quit_msg = Message::new("QUIT", vec![reason.clone()]).with_prefix(&source);
 
     for ch_name in &channel_names {
         let mut ch_store = channels.write().await;
@@ -776,7 +886,9 @@ pub async fn handle_quit(
     }
     {
         let mut state_w = state.write().await;
-        state_w.monitor_watchers.remove_client(client_id, &monitor_list);
+        state_w
+            .monitor_watchers
+            .remove_client(client_id, &monitor_list);
         state_w.remove_client(client_id).await;
     }
     senders.write().await.remove(client_id);
@@ -790,13 +902,22 @@ fn sasl_preview(s: &str) -> String {
     let bytes = s.as_bytes();
     let to_hex = |b: &[u8]| {
         b.iter()
-            .flat_map(|&x| [HEX[(x >> 4) as usize] as char, HEX[(x & 15) as usize] as char])
+            .flat_map(|&x| {
+                [
+                    HEX[(x >> 4) as usize] as char,
+                    HEX[(x & 15) as usize] as char,
+                ]
+            })
             .collect::<String>()
     };
     if bytes.len() <= 64 {
         format!("len={} hex={}", bytes.len(), to_hex(bytes))
     } else {
-        format!("len={} hex_prefix={}", bytes.len(), to_hex(&bytes[..16.min(bytes.len())]))
+        format!(
+            "len={} hex_prefix={}",
+            bytes.len(),
+            to_hex(&bytes[..16.min(bytes.len())])
+        )
     }
 }
 
@@ -815,7 +936,9 @@ pub async fn handle_authenticate(
     // ── Check stored mechanism for routing ────────────────────────────────────
     let stored_mechanism = {
         let sg = state.read().await;
-        sg.pending.get(client_id).and_then(|c| c.sasl_mechanism.clone())
+        sg.pending
+            .get(client_id)
+            .and_then(|c| c.sasl_mechanism.clone())
     };
 
     // Already-authenticated guard
@@ -826,8 +949,17 @@ pub async fn handle_authenticate(
                 let nick = conn.nick.clone().unwrap_or_else(|| "*".to_string());
                 drop(sg);
                 tracing::info!(client_id, "SASL: already authenticated, sending 907");
-                reply_to_client(&senders, client_id,
-                    Message::new("907", vec![nick, "You have already authenticated using SASL".into()]).with_prefix(&cfg.server.name), label).await;
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "907",
+                        vec![nick, "You have already authenticated using SASL".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
                 return Ok(());
             }
             if conn.sasl_failed {
@@ -849,26 +981,56 @@ pub async fn handle_authenticate(
             // Client may have sent data inline
             let inline = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
             if inline.is_empty() || inline == "SCRAM-SHA-256" {
-                reply_to_client(&senders, client_id,
-                    Message::new("AUTHENTICATE", vec!["+".into()]).with_prefix(&cfg.server.name), label).await;
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("AUTHENTICATE", vec!["+".into()]).with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
                 return Ok(());
             }
-            return handle_authenticate_scram_step(client_id, host, inline, state, channels, senders, cfg, label).await;
+            return handle_authenticate_scram_step(
+                client_id, host, inline, state, channels, senders, cfg, label,
+            )
+            .await;
         } else {
             // Continuation
-            return handle_authenticate_scram_step(client_id, host, mechanism, state, channels, senders, cfg, label).await;
+            return handle_authenticate_scram_step(
+                client_id, host, mechanism, state, channels, senders, cfg, label,
+            )
+            .await;
         }
     }
 
     // Unknown mechanism (not PLAIN, not SCRAM, not a continuation of either)
-    if mechanism != "PLAIN" && mechanism != "+" && !mechanism.is_empty()
+    if mechanism != "PLAIN"
+        && mechanism != "+"
+        && !mechanism.is_empty()
         && stored_mechanism.is_none()
     {
-        let nick = state.read().await.pending.get(client_id)
-            .and_then(|c| c.nick.clone()).unwrap_or_else(|| "*".to_string());
-        reply_to_client(&senders, client_id,
-            Message::new("908", vec![nick, "PLAIN,SCRAM-SHA-256".into(), "are available SASL mechanisms".into()])
-                .with_prefix(&cfg.server.name), label).await;
+        let nick = state
+            .read()
+            .await
+            .pending
+            .get(client_id)
+            .and_then(|c| c.nick.clone())
+            .unwrap_or_else(|| "*".to_string());
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "908",
+                vec![
+                    nick,
+                    "PLAIN,SCRAM-SHA-256".into(),
+                    "are available SASL mechanisms".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
         return Ok(());
     }
 
@@ -888,7 +1050,11 @@ pub async fn handle_authenticate(
             raw
         }
     } else {
-        msg.params.get(0).map(|s| s.as_str()).or_else(|| msg.trailing()).unwrap_or("")
+        msg.params
+            .get(0)
+            .map(|s| s.as_str())
+            .or_else(|| msg.trailing())
+            .unwrap_or("")
     };
 
     let token_from = if mechanism == "PLAIN" {
@@ -1096,7 +1262,16 @@ pub async fn handle_authenticate(
                 decode_error = %e,
                 "SASL AUTHENTICATE: base64 decode failed (malformed payload)"
             );
-            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+            sasl_fail(
+                state,
+                &senders,
+                client_id,
+                cfg,
+                label,
+                &nick,
+                "SASL authentication failed",
+            )
+            .await;
             return Ok(());
         }
     };
@@ -1124,7 +1299,16 @@ pub async fn handle_authenticate(
 
     if parts.len() != 3 {
         tracing::info!(client_id = %client_id, parts_len = parts.len(), "SASL AUTHENTICATE: malformed PLAIN (expected 3 NUL-separated parts), sending 904");
-        sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+        sasl_fail(
+            state,
+            &senders,
+            client_id,
+            cfg,
+            label,
+            &nick,
+            "SASL authentication failed",
+        )
+        .await;
         return Ok(());
     }
 
@@ -1135,20 +1319,41 @@ pub async fn handle_authenticate(
     // RFC 4616: "if preparation fails or results in an empty string, verification SHALL fail"
     if authcid.is_empty() || passwd.is_empty() {
         tracing::info!(client_id = %client_id, "SASL AUTHENTICATE: empty authcid or passwd, sending 904");
-        sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+        sasl_fail(
+            state,
+            &senders,
+            client_id,
+            cfg,
+            label,
+            &nick,
+            "SASL authentication failed",
+        )
+        .await;
         return Ok(());
     }
 
     // RFC 4616: "MUST be capable of accepting authzid, authcid, and passwd ... up to and including 255 octets"
     const MAX_PLAIN_FIELD: usize = 255;
-    if authzid.len() > MAX_PLAIN_FIELD || authcid.len() > MAX_PLAIN_FIELD || passwd.len() > MAX_PLAIN_FIELD {
+    if authzid.len() > MAX_PLAIN_FIELD
+        || authcid.len() > MAX_PLAIN_FIELD
+        || passwd.len() > MAX_PLAIN_FIELD
+    {
         tracing::info!(
             client_id = %client_id,
             authzid_len = authzid.len(),
             authcid_len = authcid.len(),
             "SASL AUTHENTICATE: field exceeds 255 octets, sending 904"
         );
-        sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+        sasl_fail(
+            state,
+            &senders,
+            client_id,
+            cfg,
+            label,
+            &nick,
+            "SASL authentication failed",
+        )
+        .await;
         return Ok(());
     }
 
@@ -1175,7 +1380,16 @@ pub async fn handle_authenticate(
     };
     if !verified {
         tracing::info!(client_id = %client_id, authcid = %authcid, "SASL AUTHENTICATE: invalid credentials, sending 904");
-        sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+        sasl_fail(
+            state,
+            &senders,
+            client_id,
+            cfg,
+            label,
+            &nick,
+            "SASL authentication failed",
+        )
+        .await;
         return Ok(());
     }
 
@@ -1196,8 +1410,18 @@ pub async fn handle_authenticate(
     let (channel_list, source, user_ident_host) = {
         let mut state = state.write().await;
         if let Some(client) = state.clients.get_mut(client_id) {
-            let ch_list = client.read().await.channels.keys().cloned().collect::<Vec<_>>();
-            let src = client.read().await.source().unwrap_or_else(|| client_id.to_string());
+            let ch_list = client
+                .read()
+                .await
+                .channels
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            let src = client
+                .read()
+                .await
+                .source()
+                .unwrap_or_else(|| client_id.to_string());
             let uih = src.clone();
             (ch_list, src, uih)
         } else if let Some(conn) = state.pending.get(client_id) {
@@ -1233,8 +1457,11 @@ pub async fn handle_authenticate(
     reply_to_client(
         &senders,
         client_id,
-        Message::new("903", vec![nick.to_string(), "SASL authentication successful".into()])
-            .with_prefix(server_name),
+        Message::new(
+            "903",
+            vec![nick.to_string(), "SASL authentication successful".into()],
+        )
+        .with_prefix(server_name),
         label,
     )
     .await;
@@ -1285,7 +1512,8 @@ async fn sasl_fail(
         conn.sasl_failed = true;
     }
     tracing::warn!(client_id = %client_id, nick = %nick, "SASL PLAIN authentication failed: {}", reason);
-    let msg = Message::new("904", vec![nick.to_string(), reason.to_string()]).with_prefix(&cfg.server.name);
+    let msg = Message::new("904", vec![nick.to_string(), reason.to_string()])
+        .with_prefix(&cfg.server.name);
     reply_to_client(senders, client_id, msg, label).await;
     tracing::info!(client_id = %client_id, nick = %nick, "SASL AUTHENTICATE: failure, sent 904");
 }
@@ -1293,7 +1521,8 @@ async fn sasl_fail(
 /// Decode base64 to UTF-8 string. Fails on invalid UTF-8 per RFC 4616 (PLAIN uses UTF-8).
 fn base64_decode(s: &str) -> anyhow::Result<String> {
     let decoded = B64.decode(s)?;
-    String::from_utf8(decoded).map_err(|e| anyhow::anyhow!("SASL PLAIN message must be valid UTF-8: {}", e))
+    String::from_utf8(decoded)
+        .map_err(|e| anyhow::anyhow!("SASL PLAIN message must be valid UTF-8: {}", e))
 }
 
 // ─── SASL SCRAM-SHA-256 ───────────────────────────────────────────────────────
@@ -1313,7 +1542,10 @@ async fn handle_authenticate_scram_step(
 ) -> anyhow::Result<()> {
     let nick = {
         let sg = state.read().await;
-        sg.pending.get(client_id).and_then(|c| c.nick.clone()).unwrap_or_else(|| "*".to_string())
+        sg.pending
+            .get(client_id)
+            .and_then(|c| c.nick.clone())
+            .unwrap_or_else(|| "*".to_string())
     };
 
     // Decode the base64 payload
@@ -1321,19 +1553,42 @@ async fn handle_authenticate_scram_step(
         Ok(b) => match String::from_utf8(b) {
             Ok(s) => s,
             Err(_) => {
-                sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: invalid UTF-8").await;
+                sasl_fail(
+                    state,
+                    &senders,
+                    client_id,
+                    cfg,
+                    label,
+                    &nick,
+                    "SASL SCRAM: invalid UTF-8",
+                )
+                .await;
                 return Ok(());
             }
         },
         Err(_) => {
-            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: invalid base64").await;
+            sasl_fail(
+                state,
+                &senders,
+                client_id,
+                cfg,
+                label,
+                &nick,
+                "SASL SCRAM: invalid base64",
+            )
+            .await;
             return Ok(());
         }
     };
 
     // Determine which step we're on by checking sasl_scram
-    let has_scram_state = state.read().await.pending.get(client_id)
-        .map(|c| c.sasl_scram.is_some()).unwrap_or(false);
+    let has_scram_state = state
+        .read()
+        .await
+        .pending
+        .get(client_id)
+        .map(|c| c.sasl_scram.is_some())
+        .unwrap_or(false);
 
     if !has_scram_state {
         // ── Step 1: process client-first-message ─────────────────────────────
@@ -1342,18 +1597,40 @@ async fn handle_authenticate_scram_step(
         let bare = if let Some(b) = payload.strip_prefix("n,,") {
             b
         } else {
-            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: invalid GS2 header").await;
+            sasl_fail(
+                state,
+                &senders,
+                client_id,
+                cfg,
+                label,
+                &nick,
+                "SASL SCRAM: invalid GS2 header",
+            )
+            .await;
             return Ok(());
         };
 
         let mut username = String::new();
         let mut client_nonce = String::new();
         for part in bare.split(',') {
-            if let Some(v) = part.strip_prefix("n=") { username = v.to_string(); }
-            if let Some(v) = part.strip_prefix("r=") { client_nonce = v.to_string(); }
+            if let Some(v) = part.strip_prefix("n=") {
+                username = v.to_string();
+            }
+            if let Some(v) = part.strip_prefix("r=") {
+                client_nonce = v.to_string();
+            }
         }
         if username.is_empty() || client_nonce.is_empty() {
-            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: missing n= or r= in client-first").await;
+            sasl_fail(
+                state,
+                &senders,
+                client_id,
+                cfg,
+                label,
+                &nick,
+                "SASL SCRAM: missing n= or r= in client-first",
+            )
+            .await;
             return Ok(());
         }
 
@@ -1361,7 +1638,16 @@ async fn handle_authenticate_scram_step(
         let pool = match cfg.db.as_ref() {
             Some(p) => p,
             None => {
-                sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: database unavailable").await;
+                sasl_fail(
+                    state,
+                    &senders,
+                    client_id,
+                    cfg,
+                    label,
+                    &nick,
+                    "SASL SCRAM: database unavailable",
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -1370,7 +1656,16 @@ async fn handle_authenticate_scram_step(
             None => {
                 // Account not found or not SCRAM-enrolled — still fail with generic message
                 tracing::info!(client_id, account = %username, "SASL SCRAM: account not found or not SCRAM-enrolled");
-                sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+                sasl_fail(
+                    state,
+                    &senders,
+                    client_id,
+                    cfg,
+                    label,
+                    &nick,
+                    "SASL authentication failed",
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -1382,7 +1677,10 @@ async fn handle_authenticate_scram_step(
             .map(char::from)
             .collect();
         let full_nonce = format!("{}{}", client_nonce, server_nonce);
-        let server_first = format!("r={},s={},i={}", full_nonce, creds.salt_b64, creds.iterations);
+        let server_first = format!(
+            "r={},s={},i={}",
+            full_nonce, creds.salt_b64, creds.iterations
+        );
 
         // Store SCRAM state
         {
@@ -1400,19 +1698,35 @@ async fn handle_authenticate_scram_step(
 
         // Send server-first
         let encoded = B64.encode(server_first.as_bytes());
-        reply_to_client(&senders, client_id,
-            Message::new("AUTHENTICATE", vec![encoded]).with_prefix(&cfg.server.name), label).await;
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("AUTHENTICATE", vec![encoded]).with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
     } else {
         // ── Step 2: process client-final-message ─────────────────────────────
         // Format: c=biws,r=fullnonce,p=base64(ClientProof)
         let scram = {
             let mut sg = state.write().await;
-            sg.pending.get_mut(client_id).and_then(|c| c.sasl_scram.take())
+            sg.pending
+                .get_mut(client_id)
+                .and_then(|c| c.sasl_scram.take())
         };
         let scram = match scram {
             Some(s) => s,
             None => {
-                sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: internal state error").await;
+                sasl_fail(
+                    state,
+                    &senders,
+                    client_id,
+                    cfg,
+                    label,
+                    &nick,
+                    "SASL SCRAM: internal state error",
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -1422,36 +1736,75 @@ async fn handle_authenticate_scram_step(
         let mut client_proof_b64 = String::new();
         // We need client-final-without-proof for auth message
         let proof_prefix = ",p=";
-        let client_final_without_proof = payload.find(proof_prefix)
+        let client_final_without_proof = payload
+            .find(proof_prefix)
             .map(|i| &payload[..i])
             .unwrap_or(&payload);
         for part in payload.split(',') {
-            if let Some(v) = part.strip_prefix("c=") { cbind = v.to_string(); }
-            else if let Some(v) = part.strip_prefix("r=") { recv_nonce = v.to_string(); }
-            else if let Some(v) = part.strip_prefix("p=") { client_proof_b64 = v.to_string(); }
+            if let Some(v) = part.strip_prefix("c=") {
+                cbind = v.to_string();
+            } else if let Some(v) = part.strip_prefix("r=") {
+                recv_nonce = v.to_string();
+            } else if let Some(v) = part.strip_prefix("p=") {
+                client_proof_b64 = v.to_string();
+            }
         }
 
         // Validate nonce
         if recv_nonce != scram.full_nonce {
-            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+            sasl_fail(
+                state,
+                &senders,
+                client_id,
+                cfg,
+                label,
+                &nick,
+                "SASL authentication failed",
+            )
+            .await;
             return Ok(());
         }
         // Validate channel binding header (no channel binding = "biws" = base64("n,,"))
         if cbind != "biws" {
-            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+            sasl_fail(
+                state,
+                &senders,
+                client_id,
+                cfg,
+                label,
+                &nick,
+                "SASL authentication failed",
+            )
+            .await;
             return Ok(());
         }
 
         let client_proof = match B64.decode(&client_proof_b64) {
-            Ok(b) if b.len() == 32 => { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); arr }
+            Ok(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                arr
+            }
             _ => {
-                sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL SCRAM: invalid client proof").await;
+                sasl_fail(
+                    state,
+                    &senders,
+                    client_id,
+                    cfg,
+                    label,
+                    &nick,
+                    "SASL SCRAM: invalid client proof",
+                )
+                .await;
                 return Ok(());
             }
         };
 
         // auth_message = client_first_bare + "," + server_first + "," + client_final_without_proof
-        let auth_message = format!("{},{},{}", scram.client_first_bare, scram.server_first, client_final_without_proof);
+        let auth_message = format!(
+            "{},{},{}",
+            scram.client_first_bare, scram.server_first, client_final_without_proof
+        );
 
         // Verify: ClientSignature = HMAC(StoredKey, AuthMessage)
         //         RecoveredClientKey = ClientProof XOR ClientSignature
@@ -1461,15 +1814,30 @@ async fn handle_authenticate_scram_step(
         let recovered_stored_key = sha256_reg(&recovered_client_key);
 
         if recovered_stored_key != scram.stored_key {
-            sasl_fail(state, &senders, client_id, cfg, label, &nick, "SASL authentication failed").await;
+            sasl_fail(
+                state,
+                &senders,
+                client_id,
+                cfg,
+                label,
+                &nick,
+                "SASL authentication failed",
+            )
+            .await;
             return Ok(());
         }
 
         // Compute and send server-final: v=base64(ServerSignature)
         let server_sig = hmac_sha256_reg(&scram.server_key, auth_message.as_bytes());
         let server_final = format!("v={}", B64.encode(server_sig));
-        reply_to_client(&senders, client_id,
-            Message::new("AUTHENTICATE", vec![B64.encode(server_final.as_bytes())]).with_prefix(&cfg.server.name), label).await;
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("AUTHENTICATE", vec![B64.encode(server_final.as_bytes())])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
 
         let account = scram.username.clone();
 
@@ -1487,19 +1855,45 @@ async fn handle_authenticate_scram_step(
         let (channel_list, source, user_ident_host) = {
             let sg = state.write().await;
             if let Some(conn) = sg.pending.get(client_id) {
-                let uih = format!("{}!{}@{}", nick, conn.nick.as_deref().unwrap_or("*"), conn.host);
+                let uih = format!(
+                    "{}!{}@{}",
+                    nick,
+                    conn.nick.as_deref().unwrap_or("*"),
+                    conn.host
+                );
                 (Vec::<String>::new(), uih.clone(), uih)
             } else {
                 (Vec::new(), nick.clone(), nick.clone())
             }
         };
 
-        reply_to_client(&senders, client_id,
-            Message::new("900", vec![nick.to_string(), user_ident_host, account.clone(), format!("You are now logged in as {}", account)])
-                .with_prefix(&cfg.server.name), label).await;
-        reply_to_client(&senders, client_id,
-            Message::new("903", vec![nick.to_string(), "SASL authentication successful".into()])
-                .with_prefix(&cfg.server.name), label).await;
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "900",
+                vec![
+                    nick.to_string(),
+                    user_ident_host,
+                    account.clone(),
+                    format!("You are now logged in as {}", account),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "903",
+                vec![nick.to_string(), "SASL authentication successful".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
 
         // account-notify
         let account_msg = Message::new("ACCOUNT", vec![account.clone()]).with_prefix(&source);
@@ -1510,7 +1904,9 @@ async fn handle_authenticate_scram_step(
                 drop(ch_store);
                 let sg = state.read().await;
                 for mid in &member_ids {
-                    if *mid == client_id { continue; }
+                    if *mid == client_id {
+                        continue;
+                    }
                     if let Some(c) = sg.clients.get(mid) {
                         if c.read().await.has_cap("account-notify") {
                             send_to_client(&senders, mid, account_msg.clone()).await;
@@ -1556,8 +1952,11 @@ pub async fn handle_oper(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("381", vec!["*".into(), "You are now an IRC operator".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "381",
+                        vec!["*".into(), "You are now an IRC operator".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -1600,8 +1999,16 @@ pub async fn handle_register(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["REGISTER".into(), "TEMPORARILY_UNAVAILABLE".into(), "*".into(), " :Registration unavailable".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "REGISTER".into(),
+                        "TEMPORARILY_UNAVAILABLE".into(),
+                        "*".into(),
+                        " :Registration unavailable".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1613,7 +2020,21 @@ pub async fn handle_register(
         let client = match state_guard.clients.get(client_id) {
             Some(c) => c.clone(),
             None => {
-                reply_to_client(&senders, client_id, Message::new("FAIL", vec!["REGISTER".into(), "COMPLETE_CONNECTION_REQUIRED".into(), " :Complete connection registration first".into()]).with_prefix(&cfg.server.name), label).await;
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "REGISTER".into(),
+                            "COMPLETE_CONNECTION_REQUIRED".into(),
+                            " :Complete connection registration first".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -1623,8 +2044,16 @@ pub async fn handle_register(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["REGISTER".into(), "NEED_NICK".into(), "*".into(), " :Send NICK first".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "REGISTER".into(),
+                        "NEED_NICK".into(),
+                        "*".into(),
+                        " :Send NICK first".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1635,8 +2064,16 @@ pub async fn handle_register(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["REGISTER".into(), "ALREADY_AUTHENTICATED".into(), acc.into(), " :Already logged in".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "REGISTER".into(),
+                        "ALREADY_AUTHENTICATED".into(),
+                        acc.into(),
+                        " :Already logged in".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1650,8 +2087,16 @@ pub async fn handle_register(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["REGISTER".into(), "ACCOUNT_NAME_MUST_BE_NICK".into(), account_param.into(), " :Account name must match your current nick".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "REGISTER".into(),
+                        "ACCOUNT_NAME_MUST_BE_NICK".into(),
+                        account_param.into(),
+                        " :Account name must match your current nick".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1659,14 +2104,28 @@ pub async fn handle_register(
         };
         (nick, account)
     };
-    let email = msg.params.get(1).and_then(|s| if s == "*" { None } else { Some(s.as_str()) });
-    let password = msg.trailing().or_else(|| msg.params.get(2).map(|s| s.as_str())).unwrap_or("");
+    let email = msg
+        .params
+        .get(1)
+        .and_then(|s| if s == "*" { None } else { Some(s.as_str()) });
+    let password = msg
+        .trailing()
+        .or_else(|| msg.params.get(2).map(|s| s.as_str()))
+        .unwrap_or("");
     if password.is_empty() {
         reply_to_client(
             &senders,
             client_id,
-            Message::new("FAIL", vec!["REGISTER".into(), "UNACCEPTABLE_PASSWORD".into(), account.clone(), " :Password required".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "FAIL",
+                vec![
+                    "REGISTER".into(),
+                    "UNACCEPTABLE_PASSWORD".into(),
+                    account.clone(),
+                    " :Password required".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1677,8 +2136,15 @@ pub async fn handle_register(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("REGISTER", vec!["SUCCESS".into(), account.clone(), " :Account successfully registered".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "REGISTER",
+                    vec![
+                        "SUCCESS".into(),
+                        account.clone(),
+                        " :Account successfully registered".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1687,8 +2153,16 @@ pub async fn handle_register(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["REGISTER".into(), "ACCOUNT_EXISTS".into(), account.clone(), " :Account already exists".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "REGISTER".into(),
+                        "ACCOUNT_EXISTS".into(),
+                        account.clone(),
+                        " :Account already exists".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1697,8 +2171,16 @@ pub async fn handle_register(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["REGISTER".into(), "WEAK_PASSWORD".into(), account.clone(), " :Password too weak".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "REGISTER".into(),
+                        "WEAK_PASSWORD".into(),
+                        account.clone(),
+                        " :Password too weak".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1708,8 +2190,16 @@ pub async fn handle_register(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["REGISTER".into(), "TEMPORARILY_UNAVAILABLE".into(), account.clone(), " :Registration temporarily unavailable".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "REGISTER".into(),
+                        "TEMPORARILY_UNAVAILABLE".into(),
+                        account.clone(),
+                        " :Registration temporarily unavailable".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1736,8 +2226,16 @@ pub async fn handle_verify(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["VERIFY".into(), "ALREADY_AUTHENTICATED".into(), acc.clone(), " :Already logged in".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "VERIFY".into(),
+                        "ALREADY_AUTHENTICATED".into(),
+                        acc.clone(),
+                        " :Already logged in".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1748,8 +2246,16 @@ pub async fn handle_verify(
     reply_to_client(
         &senders,
         client_id,
-        Message::new("FAIL", vec!["VERIFY".into(), "INVALID_CODE".into(), account_str, " :Verification not required or code invalid".into()])
-            .with_prefix(&cfg.server.name),
+        Message::new(
+            "FAIL",
+            vec![
+                "VERIFY".into(),
+                "INVALID_CODE".into(),
+                account_str,
+                " :Verification not required or code invalid".into(),
+            ],
+        )
+        .with_prefix(&cfg.server.name),
         label,
     )
     .await;
@@ -1777,7 +2283,9 @@ pub async fn handle_away(
         let client = state.clients.get(client_id).cloned().unwrap();
         let mut client_guard = client.write().await;
         client_guard.away_message = away_msg.clone();
-        let source = client_guard.source().unwrap_or_else(|| client_id.to_string());
+        let source = client_guard
+            .source()
+            .unwrap_or_else(|| client_id.to_string());
         let channel_list: Vec<String> = client_guard.channels.keys().cloned().collect();
         (source, channel_list)
     };
@@ -1810,18 +2318,21 @@ pub async fn handle_away(
         let state = state.read().await;
         let away_message = Message::new(
             "AWAY",
-            away_msg.as_ref().map(|s| vec![s.clone()]).unwrap_or_default(),
+            away_msg
+                .as_ref()
+                .map(|s| vec![s.clone()])
+                .unwrap_or_default(),
         )
         .with_prefix(&source);
         for mid in &member_ids {
             if *mid == client_id {
                 continue;
             }
-                        let caps = match state.clients.get(mid) {
-                            Some(c) => c.read().await.capabilities.clone(),
-                            None => Default::default(),
-                        };
-                        if caps.contains("away-notify") {
+            let caps = match state.clients.get(mid) {
+                Some(c) => c.read().await.capabilities.clone(),
+                None => Default::default(),
+            };
+            if caps.contains("away-notify") {
                 send_to_client(&senders, mid, away_message.clone()).await;
             }
         }
@@ -1856,8 +2367,15 @@ pub async fn handle_setname(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("FAIL", vec!["SETNAME".into(), "INVALID_REALNAME".into(), "Realname is not valid".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "SETNAME".into(),
+                        "INVALID_REALNAME".into(),
+                        "Realname is not valid".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1871,7 +2389,11 @@ pub async fn handle_setname(
             Some(c) => c.clone(),
             None => return Ok(()),
         };
-        let source = client.read().await.source().unwrap_or_else(|| client_id.to_string());
+        let source = client
+            .read()
+            .await
+            .source()
+            .unwrap_or_else(|| client_id.to_string());
         let channel_list: Vec<String> = client.read().await.channels.keys().cloned().collect();
         drop(client);
         if let Some(c) = state.clients.get_mut(client_id) {
@@ -1927,13 +2449,21 @@ pub async fn handle_sethost(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let new_host = msg.trailing().or_else(|| msg.params.get(0).map(|s| s.as_str())).unwrap_or("").trim().to_string();
+    let new_host = msg
+        .trailing()
+        .or_else(|| msg.params.get(0).map(|s| s.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if new_host.is_empty() {
         reply_to_client(
             &senders,
             client_id,
-            Message::new("461", vec!["SETHOST".into(), "Not enough parameters".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "461",
+                vec!["SETHOST".into(), "Not enough parameters".into()],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1943,8 +2473,11 @@ pub async fn handle_sethost(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("461", vec!["SETHOST".into(), "Host cannot contain spaces".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "461",
+                vec!["SETHOST".into(), "Host cannot contain spaces".into()],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1955,26 +2488,62 @@ pub async fn handle_sethost(
         let client = match state_guard.clients.get(client_id) {
             Some(c) => c.clone(),
             None => {
-                reply_to_client(&senders, client_id, Message::new("451", vec!["*".into(), "You have not registered".into()]).with_prefix(&cfg.server.name), label).await;
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("451", vec!["*".into(), "You have not registered".into()])
+                        .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
                 return Ok(());
             }
         };
         let mut guard = client.write().await;
         if !guard.oper {
-            reply_to_client(&senders, client_id, Message::new("481", vec!["*".into(), "Permission denied - You're not an IRC operator".into()]).with_prefix(&cfg.server.name), label).await;
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "481",
+                    vec![
+                        "*".into(),
+                        "Permission denied - You're not an IRC operator".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
             return Ok(());
         }
         let old_source = guard.source().unwrap_or_else(|| client_id.to_string());
-        let display_user = guard.vuser.as_deref().unwrap_or_else(|| guard.user.as_deref().unwrap_or("")).to_string();
+        let display_user = guard
+            .vuser
+            .as_deref()
+            .unwrap_or_else(|| guard.user.as_deref().unwrap_or(""))
+            .to_string();
         guard.vhost = Some(new_host.clone());
         (old_source, display_user, new_host)
     };
-    send_chghost_if_changed(state, channels, senders.clone(), client_id, &old_source, &new_user, &new_host_owned).await;
+    send_chghost_if_changed(
+        state,
+        channels,
+        senders.clone(),
+        client_id,
+        &old_source,
+        &new_user,
+        &new_host_owned,
+    )
+    .await;
     reply_to_client(
         &senders,
         client_id,
-        Message::new("NOTICE", vec!["*".into(), format!("Host changed to '{}'", new_host_owned)])
-            .with_prefix(&cfg.server.name),
+        Message::new(
+            "NOTICE",
+            vec!["*".into(), format!("Host changed to '{}'", new_host_owned)],
+        )
+        .with_prefix(&cfg.server.name),
         label,
     )
     .await;
@@ -1991,13 +2560,20 @@ pub async fn handle_setuser(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let new_user = msg.trailing().or_else(|| msg.params.get(0).map(|s| s.as_str())).unwrap_or("").to_string();
+    let new_user = msg
+        .trailing()
+        .or_else(|| msg.params.get(0).map(|s| s.as_str()))
+        .unwrap_or("")
+        .to_string();
     if new_user.is_empty() {
         reply_to_client(
             &senders,
             client_id,
-            Message::new("461", vec!["SETUSER".into(), "Not enough parameters".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "461",
+                vec!["SETUSER".into(), "Not enough parameters".into()],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -2008,21 +2584,54 @@ pub async fn handle_setuser(
         let client = match state_guard.clients.get(client_id) {
             Some(c) => c.clone(),
             None => {
-                reply_to_client(&senders, client_id, Message::new("451", vec!["*".into(), "You have not registered".into()]).with_prefix(&cfg.server.name), label).await;
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("451", vec!["*".into(), "You have not registered".into()])
+                        .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
                 return Ok(());
             }
         };
         let mut guard = client.write().await;
         if !guard.oper {
-            reply_to_client(&senders, client_id, Message::new("481", vec!["*".into(), "Permission denied - You're not an IRC operator".into()]).with_prefix(&cfg.server.name), label).await;
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "481",
+                    vec![
+                        "*".into(),
+                        "Permission denied - You're not an IRC operator".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
             return Ok(());
         }
         let old_source = guard.source().unwrap_or_else(|| client_id.to_string());
-        let display_host = guard.vhost.as_deref().map(|s| s.to_string()).unwrap_or_else(|| guard.host.clone());
+        let display_host = guard
+            .vhost
+            .as_deref()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| guard.host.clone());
         guard.vuser = Some(new_user.clone());
         (old_source, display_host)
     };
-    send_chghost_if_changed(state, channels, senders, client_id, &old_source, &new_user, &new_host).await;
+    send_chghost_if_changed(
+        state,
+        channels,
+        senders,
+        client_id,
+        &old_source,
+        &new_user,
+        &new_host,
+    )
+    .await;
     Ok(())
 }
 
@@ -2043,7 +2652,8 @@ pub async fn send_chghost_if_changed(
             None => return,
         }
     };
-    let chghost_msg = Message::new("CHGHOST", vec![new_user.into(), new_host.into()]).with_prefix(old_source);
+    let chghost_msg =
+        Message::new("CHGHOST", vec![new_user.into(), new_host.into()]).with_prefix(old_source);
     for ch_name in channel_names {
         let member_ids: Vec<String> = {
             let ch_store = channels.read().await;

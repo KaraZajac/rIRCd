@@ -57,11 +57,11 @@ pub fn build_cap_list(version_302: bool, tls_port: Option<u16>) -> Vec<String> {
         .filter(|c| *c != "capability-negotiation")
         .filter(|c| *c != "sts" || tls_port.is_some())
         .map(|c| match c {
-            "sasl"             => "sasl=PLAIN,SCRAM-SHA-256".to_string(),
-            "draft/multiline"  => "draft/multiline=max-bytes=4096,max-lines=20".to_string(),
+            "sasl" => "sasl=PLAIN,SCRAM-SHA-256".to_string(),
+            "draft/multiline" => "draft/multiline=max-bytes=4096,max-lines=20".to_string(),
             "draft/metadata-2" => "draft/metadata-2=max-subs=50,max-keys=50".to_string(),
-            "sts"              => format!("sts=port={},duration=2592000", tls_port.unwrap_or(6697)),
-            _                  => c.to_string(),
+            "sts" => format!("sts=port={},duration=2592000", tls_port.unwrap_or(6697)),
+            _ => c.to_string(),
         })
         .collect();
 
@@ -78,7 +78,10 @@ pub fn build_cap_list(version_302: bool, tls_port: Option<u16>) -> Vec<String> {
 }
 
 /// Filter requested caps to only those we support. Requested cap may include =value (e.g. draft/multiline=max-lines=10).
-pub fn filter_requested(requested: &[String], enabled_in_config: &HashSet<String>) -> (Vec<String>, Vec<String>) {
+pub fn filter_requested(
+    requested: &[String],
+    enabled_in_config: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
     let mut ack = Vec::new();
     let mut nak = Vec::new();
 
@@ -88,7 +91,9 @@ pub fn filter_requested(requested: &[String], enabled_in_config: &HashSet<String
             continue;
         }
         let base = cap.split('=').next().unwrap_or(cap);
-        if CAPS.contains(&base) && (enabled_in_config.is_empty() || enabled_in_config.contains(base)) {
+        if CAPS.contains(&base)
+            && (enabled_in_config.is_empty() || enabled_in_config.contains(base))
+        {
             ack.push(base.to_string());
         } else {
             nak.push(cap.to_string());

@@ -49,10 +49,9 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
         let entries = crate::persist::load_channels(pool).await;
         let mut store = channels.write().await;
         for e in entries {
-            let ch = store
-                .channels
-                .entry(e.name.clone())
-                .or_insert_with(|| tokio::sync::RwLock::new(crate::channel::Channel::new(e.name.clone())));
+            let ch = store.channels.entry(e.name.clone()).or_insert_with(|| {
+                tokio::sync::RwLock::new(crate::channel::Channel::new(e.name.clone()))
+            });
             let mut ch_guard = ch.write().await;
             if !e.topic.is_empty() {
                 ch_guard.topic = Some(e.topic.clone());
@@ -98,8 +97,11 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
         let key_path = cfg.tls.key.as_ref().unwrap();
         let mut cert_file = std::io::BufReader::new(fs::File::open(cert_path)?);
         let mut key_file = std::io::BufReader::new(fs::File::open(key_path)?);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_file).filter_map(|r| r.ok()).collect();
-        let key = rustls_pemfile::private_key(&mut key_file)?.ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_file)
+            .filter_map(|r| r.ok())
+            .collect();
+        let key = rustls_pemfile::private_key(&mut key_file)?
+            .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
         let cfg_tls = tokio_rustls::rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)?;
@@ -169,7 +171,16 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                             let server_name = server_name.clone();
                             tokio::spawn(async move {
                                 match acc.accept(stream).await {
-                                    Ok(tls_stream) => client::handle_client_tls(tls_stream, client_id, host, tx, server_name).await,
+                                    Ok(tls_stream) => {
+                                        client::handle_client_tls(
+                                            tls_stream,
+                                            client_id,
+                                            host,
+                                            tx,
+                                            server_name,
+                                        )
+                                        .await
+                                    }
                                     Err(e) => error!("TLS handshake failed: {}", e),
                                 }
                             });

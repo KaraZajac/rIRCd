@@ -89,13 +89,16 @@ pub fn add_tags_for_recipient(
         }
         if recipient_caps.contains("account-tag") {
             if let Some(acc) = sender_account {
-                msg.tags.insert("account".to_string(), Some(acc.to_string()));
+                msg.tags
+                    .insert("account".to_string(), Some(acc.to_string()));
             } else {
                 msg.tags.insert("account".to_string(), None); // * means not logged in
             }
         }
     }
-    let deny_all = client_tag_deny.map(|d| d.contains(&"*".to_string())).unwrap_or(false);
+    let deny_all = client_tag_deny
+        .map(|d| d.contains(&"*".to_string()))
+        .unwrap_or(false);
     if let Some(tags) = client_only_tags {
         for (k, v) in tags {
             if k.starts_with('+') {
@@ -103,7 +106,10 @@ pub fn add_tags_for_recipient(
                     continue;
                 }
                 if let Some(deny) = client_tag_deny {
-                    if deny.iter().any(|d| d == k || d.as_str() == k.trim_start_matches('+')) {
+                    if deny
+                        .iter()
+                        .any(|d| d == k || d.as_str() == k.trim_start_matches('+'))
+                    {
                         continue;
                     }
                 }
@@ -116,12 +122,18 @@ pub fn add_tags_for_recipient(
 
 /// Generate a short unique message id (for message-ids cap)
 pub fn generate_msgid() -> String {
-    uuid::Uuid::new_v4().to_string().replace('-', "").chars().take(12).collect()
+    uuid::Uuid::new_v4()
+        .to_string()
+        .replace('-', "")
+        .chars()
+        .take(12)
+        .collect()
 }
 
 /// Add batch tag to a message (for batch cap). Reference must match BATCH +ref / BATCH -ref.
 pub fn add_batch_tag(mut msg: Message, batch_ref: &str) -> Message {
-    msg.tags.insert("batch".to_string(), Some(batch_ref.to_string()));
+    msg.tags
+        .insert("batch".to_string(), Some(batch_ref.to_string()));
     msg
 }
 
