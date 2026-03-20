@@ -25,7 +25,7 @@ pub async fn run_server(mut cfg: Config, config_path: &Path) -> anyhow::Result<(
     cfg.db = Some(pool);
 
     let pidfile = Some(config::pidfile_path(config_path));
-    server::run(cfg, pidfile.as_deref()).await
+    server::run(cfg, config_path, pidfile.as_deref()).await
 }
 
 pub fn genpasswd_cmd() -> anyhow::Result<()> {

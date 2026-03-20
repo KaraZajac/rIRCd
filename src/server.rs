@@ -39,7 +39,7 @@ pub struct ClientMessage {
     pub send_tx: mpsc::Sender<Message>,
 }
 
-pub async fn run(cfg: Config, pidfile: Option<&Path>) -> anyhow::Result<()> {
+pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> anyhow::Result<()> {
     let _pidfile = pidfile.map(|p| PidfileGuard::new(p)).transpose()?;
 
     let state = ServerState::new();
@@ -86,6 +86,8 @@ pub async fn run(cfg: Config, pidfile: Option<&Path>) -> anyhow::Result<()> {
         state_w.read_markers = markers;
         state_w.metadata = meta;
     }
+    // Store the config path so REHASH can reload from disk
+    state.write().await.config_path = Some(config_path.to_path_buf());
     let senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
@@ -126,7 +128,7 @@ pub async fn run(cfg: Config, pidfile: Option<&Path>) -> anyhow::Result<()> {
                     Ok((stream, addr)) => {
                         client_counter += 1;
                         let client_id = format!("client-{}", client_counter);
-                        let host = addr.to_string();
+                        let host = addr.ip().to_string();
                         let tx = tx.clone();
                         let server_name = server_name.clone();
                         tokio::spawn(async move {
@@ -161,7 +163,7 @@ pub async fn run(cfg: Config, pidfile: Option<&Path>) -> anyhow::Result<()> {
                         Ok((stream, addr)) => {
                             client_counter += 1;
                             let client_id = format!("client-{}", client_counter);
-                            let host = addr.to_string();
+                            let host = addr.ip().to_string();
                             let tx = tx.clone();
                             let acc = tls_acc.clone();
                             let server_name = server_name.clone();
@@ -178,6 +180,9 @@ pub async fn run(cfg: Config, pidfile: Option<&Path>) -> anyhow::Result<()> {
             });
         }
     }
+
+    // Wrap config in Arc<RwLock<>> so REHASH can reload it at runtime
+    let cfg_arc = Arc::new(RwLock::new(cfg));
 
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -204,7 +209,7 @@ pub async fn run(cfg: Config, pidfile: Option<&Path>) -> anyhow::Result<()> {
                     state.clone(),
                     channels.clone(),
                     senders.clone(),
-                    &cfg,
+                    cfg_arc.clone(),
                 )
                 .await;
 

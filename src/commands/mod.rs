@@ -22,9 +22,17 @@ pub async fn handle_message(
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
     senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
-    cfg: &Config,
+    cfg: Arc<RwLock<Config>>,
 ) -> anyhow::Result<()> {
     let label = msg.tags.get("label").and_then(|v| v.as_ref()).cloned();
+
+    // REHASH needs write access to cfg — handle before acquiring the read lock
+    if msg.command == "REHASH" {
+        return server_cmds::handle_rehash(&client_id, state, senders, cfg, label.as_deref()).await;
+    }
+
+    let cfg_guard = cfg.read().await;
+    let cfg = &*cfg_guard;
 
     // draft/multiline: BATCH + ref draft/multiline target
     if msg.command == "BATCH" {
