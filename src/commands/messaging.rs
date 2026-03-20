@@ -1092,7 +1092,12 @@ pub async fn handle_chathistory(
             send_to_client(&senders, client_id, batch_start).await;
         }
     }
-    for e in entries {
+
+    // Capture the time range spanned by the fetched entries so we can query redacted messages.
+    let oldest_ts = entries.first().map(|e| e.ts.clone()).unwrap_or_default();
+    let newest_ts = entries.last().map(|e| e.ts.clone()).unwrap_or_default();
+
+    for e in &entries {
         let mut m = Message::new("PRIVMSG", vec![target.into(), e.text.clone()]);
         m.prefix = Some(e.source.clone());
         m.tags.insert("time".to_string(), Some(e.ts.clone()));
@@ -1105,6 +1110,25 @@ pub async fn handle_chathistory(
         let tagged = add_tags_for_recipient(m, &caps, None, e.msgid.as_deref(), None, cfg.server.client_tag_deny.as_deref());
         send_to_client(&senders, client_id, tagged).await;
     }
+
+    // If the client supports message-redaction, include REDACT events for any messages
+    // that were soft-deleted within the returned time range, so the client can update
+    // its local buffer on reconnect.
+    if !entries.is_empty() && caps.contains("message-redaction") {
+        let redacted = persist::read_redacted_in_range(pool, target, &oldest_ts, &newest_ts).await;
+        for (msgid, source) in redacted {
+            let mut redact_msg = Message::new(
+                "REDACT",
+                vec![target.to_string(), msgid.clone(), "Message redacted".into()],
+            )
+            .with_prefix(&source);
+            if let Some(ref ref_id) = batch_ref {
+                redact_msg.tags.insert("batch".to_string(), Some(ref_id.clone()));
+            }
+            send_to_client(&senders, client_id, redact_msg).await;
+        }
+    }
+
     if use_batch {
         if let Some(ref ref_id) = batch_ref {
             let batch_end = Message::new("BATCH", vec![format!("-{}", ref_id)]).with_prefix(&cfg.server.name);
