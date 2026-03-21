@@ -516,3 +516,4 @@ pub fn status_cmd(config_path: &Path) -> anyhow::Result<()> {
 
     Ok(())
 }
+
