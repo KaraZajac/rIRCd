@@ -35,6 +35,10 @@ pub async fn run_server(mut cfg: Config, config_path: &Path) -> anyhow::Result<(
     persist::init_schema(&pool).await?;
     cfg.db = Some(pool);
 
+    if let Some(ref fh) = cfg.filehost {
+        tracing::info!("Filehost configured: listen={}, url={}", fh.listen, fh.public_url);
+    }
+
     let pidfile = Some(config::pidfile_path(config_path));
     server::run(cfg, config_path, pidfile.as_deref()).await
 }

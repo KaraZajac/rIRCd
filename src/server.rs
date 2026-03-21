@@ -137,6 +137,8 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                 error!("Filehost server error: {}", e);
             }
         });
+    } else {
+        debug!("Filehost not configured (no [filehost] section in config)");
     }
 
     let server_name = cfg.server.name.clone();
