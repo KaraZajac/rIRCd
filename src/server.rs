@@ -131,12 +131,63 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
         let app = crate::filehost::router(fh_state);
         let listen_addr = fh_cfg.listen.clone();
         let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
-        info!("Filehost HTTP listening on {}", listen_addr);
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
-                error!("Filehost server error: {}", e);
+
+        if fh_cfg.public_url.starts_with("https://") {
+            if let Some(ref acceptor) = tls_acceptor {
+                let acceptor = acceptor.clone();
+                info!("Filehost HTTPS listening on {}", listen_addr);
+                tokio::spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok((stream, _addr)) => {
+                                let acceptor = acceptor.clone();
+                                let app = app.clone();
+                                tokio::spawn(async move {
+                                    match acceptor.accept(stream).await {
+                                        Ok(tls_stream) => {
+                                            let io = hyper_util::rt::TokioIo::new(tls_stream);
+                                            let service =
+                                                hyper_util::service::TowerToHyperService::new(app);
+                                            if let Err(e) =
+                                                hyper_util::server::conn::auto::Builder::new(
+                                                    hyper_util::rt::TokioExecutor::new(),
+                                                )
+                                                .serve_connection(io, service)
+                                                .await
+                                            {
+                                                tracing::debug!("Filehost connection error: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!("Filehost TLS handshake failed: {}", e);
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => error!("Filehost accept error: {}", e),
+                        }
+                    }
+                });
+            } else {
+                error!(
+                    "Filehost public_url is HTTPS but no [tls] cert/key configured — \
+                     falling back to plain HTTP"
+                );
+                info!("Filehost HTTP listening on {}", listen_addr);
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, app).await {
+                        error!("Filehost server error: {}", e);
+                    }
+                });
             }
-        });
+        } else {
+            info!("Filehost HTTP listening on {}", listen_addr);
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, app).await {
+                    error!("Filehost server error: {}", e);
+                }
+            });
+        }
     } else {
         debug!("Filehost not configured (no [filehost] section in config)");
     }
