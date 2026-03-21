@@ -3,6 +3,7 @@ use crate::channel::{
 };
 use crate::commands::reply_to_client;
 use crate::config::Config;
+use crate::persist;
 use crate::protocol::{add_batch_tag, generate_msgid, Message};
 use crate::user::ServerState;
 use std::collections::HashMap;
@@ -190,7 +191,7 @@ pub async fn handle_join(
         }
 
         if ch.modes.invite_only
-            && !ch.invite_list.contains(&client_id.to_string())
+            && !ch.invite_list.contains(client_id)
             && !ch.is_invite_exempt(account.as_deref(), &source)
         {
             reply_to_client(
@@ -255,9 +256,11 @@ pub async fn handle_join(
 
         let is_first = ch.members.is_empty();
         let (persisted_op, persisted_voice) = ch.persisted_modes_for(&nick, account.as_deref());
-        let mut modes = ChannelMemberModeSet::default();
-        modes.op = is_first || persisted_op;
-        modes.voice = persisted_voice;
+        let modes = ChannelMemberModeSet {
+            op: is_first || persisted_op,
+            voice: persisted_voice,
+            ..Default::default()
+        };
         ch.members.insert(
             client_id.to_string(),
             ChannelMembership {
@@ -359,6 +362,11 @@ pub async fn handle_join(
             if let Some(tx) = senders.read().await.get(mid) {
                 let _ = tx.send(join_msg).await;
             }
+        }
+
+        // Record JOIN event for draft/event-playback
+        if let Some(ref pool) = cfg.db {
+            let _ = persist::append_channel_history(pool, &ch_key, &source, "", None, "JOIN").await;
         }
 
         if let Some(ref topic_str) = topic {
@@ -531,7 +539,7 @@ pub async fn handle_part(
                 .await;
                 continue;
             }
-            for (mid, _) in &ch.members.clone() {
+            for mid in ch.members.clone().keys() {
                 if let Some(tx) = senders.read().await.get(mid) {
                     let _ = tx.send(part_msg.clone()).await;
                 }
@@ -541,6 +549,13 @@ pub async fn handle_part(
         }
         if should_remove {
             ch_store.channels.remove(&ch_key);
+        }
+        drop(ch_store);
+
+        // Record PART event for draft/event-playback
+        if let Some(ref pool) = cfg.db {
+            let _ = persist::append_channel_history(pool, &ch_key, &source, &reason, None, "PART")
+                .await;
         }
 
         if let Some(client) = state.clients.get(client_id) {
@@ -582,7 +597,7 @@ pub async fn handle_names(
     if ch_names.is_empty() {
         for (ch_name, ch) in &ch_store.channels {
             send_names_for_channel(
-                &ch,
+                ch,
                 ch_name,
                 &nick,
                 &state,
@@ -618,6 +633,7 @@ pub async fn handle_names(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_names_for_channel(
     ch: &RwLock<Channel>,
     ch_name: &str,
@@ -712,13 +728,13 @@ pub async fn handle_list(
     // Parse optional filter: LIST [<filter>]
     // Filter can be: ">N" (more than N users), "<N" (fewer than N), or a channel name mask
     let filter = msg.params.first().map(|s| s.as_str()).unwrap_or("");
-    let min_users: Option<usize> = if filter.starts_with('>') {
-        filter[1..].parse().ok()
+    let min_users: Option<usize> = if let Some(stripped) = filter.strip_prefix('>') {
+        stripped.parse().ok()
     } else {
         None
     };
-    let max_users: Option<usize> = if filter.starts_with('<') {
-        filter[1..].parse().ok()
+    let max_users: Option<usize> = if let Some(stripped) = filter.strip_prefix('<') {
+        stripped.parse().ok()
     } else {
         None
     };
@@ -1344,8 +1360,9 @@ pub async fn handle_topic(
         ch.topic_setter = Some(source.clone());
         ch.topic_time = Some(topic_time_ts);
 
-        let topic_msg = Message::new("TOPIC", vec![ch_name.into(), new_topic.unwrap_or_default()])
-            .with_prefix(&source);
+        let topic_text = new_topic.unwrap_or_default();
+        let topic_msg =
+            Message::new("TOPIC", vec![ch_name.into(), topic_text.clone()]).with_prefix(&source);
         let member_ids_for_topic: Vec<String> = ch.members.keys().cloned().collect();
         drop(ch);
         for mid in &member_ids_for_topic {
@@ -1353,6 +1370,14 @@ pub async fn handle_topic(
                 let _ = tx.send(topic_msg.clone()).await;
             }
         }
+
+        // Record TOPIC event for draft/event-playback
+        if let Some(ref pool) = cfg.db {
+            let _ =
+                persist::append_channel_history(pool, &ch_key, &source, &topic_text, None, "TOPIC")
+                    .await;
+        }
+
         // 333 RPL_TOPICWHOTIME to the setter
         reply_to_client(
             &senders,
@@ -1396,7 +1421,7 @@ pub async fn handle_kick(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let ch_name = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
+    let ch_name = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let target_nick = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
     let reason = msg.trailing().unwrap_or("Kicked").to_string();
 
@@ -1451,7 +1476,7 @@ pub async fn handle_kick(
                 let kick_msg =
                     Message::new("KICK", vec![ch_name.into(), target_nick.into(), reason])
                         .with_prefix(&source);
-                for (mid, _) in &ch.members.clone() {
+                for mid in ch.members.clone().keys() {
                     if let Some(tx) = senders.read().await.get(mid) {
                         let _ = tx.send(kick_msg.clone()).await;
                     }
@@ -1480,7 +1505,7 @@ pub async fn handle_invite(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let target_nick = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
+    let target_nick = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let ch_name = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
 
     if target_nick.is_empty() || ch_name.is_empty() {
@@ -1574,7 +1599,7 @@ pub async fn handle_rename(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let old_name = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
+    let old_name = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let new_name = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
     let reason = msg.trailing().unwrap_or("").to_string();
 
@@ -1841,7 +1866,7 @@ pub async fn handle_rename(
                     ch_ref,
                     &new_key,
                     &recv_nick,
-                    &*state_r,
+                    &state_r,
                     &senders,
                     mid,
                     &cfg.server.name,

@@ -65,6 +65,7 @@ fn is_ctcp(text: &str) -> bool {
 }
 
 /// Send message to a recipient, adding server-time/msgid/account tags and client-only (+prefix) tags.
+#[allow(clippy::too_many_arguments)]
 async fn send_to_client_with_caps(
     senders: &Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
     to_id: &str,
@@ -129,6 +130,7 @@ pub async fn handle_privmsg(
     let source = sender_data
         .source()
         .unwrap_or_else(|| client_id.to_string());
+    let sender_nick = sender_data.nick_or_id().to_string();
     let sender_account = sender_data.account.clone();
     let echo_message = sender_data.has_cap("echo-message");
     drop(sender_data);
@@ -139,20 +141,54 @@ pub async fn handle_privmsg(
 
     // draft/message-edit: if the client sends +draft/edit=<original-msgid>, verify ownership
     // before accepting the message. Only the original sender may edit their own message.
+    // Falls back to DB lookup when the in-memory msgid store doesn't have the entry
+    // (after server restart or LRU eviction).
     let pending_edit_msgid: Option<String> = msg
         .tags
         .get("+draft/edit")
         .and_then(|v| v.as_ref())
         .cloned();
     if let Some(ref edit_msgid) = pending_edit_msgid {
-        let is_owner = {
+        // Resolve original sender nick: try in-memory store first, then DB.
+        // We compare nicks (not client_ids) because the user may have reconnected
+        // on a different connection since sending the original message.
+        let in_mem = {
             let state_r = state.read().await;
             state_r
                 .msgid_store
                 .get(edit_msgid.as_str())
-                .map(|(_, sid)| sid == client_id)
-                .unwrap_or(false)
+                .map(|(_, sid)| sid.to_string())
         };
+
+        let original_nick: Option<String> = if let Some(ref stored_sender_id) = in_mem {
+            // Found in memory — resolve the stored sender's nick
+            let c_arc = state.read().await.clients.get(stored_sender_id).cloned();
+            if let Some(c) = c_arc {
+                c.read().await.nick.clone()
+            } else {
+                // Stored client_id no longer connected; fall back to DB
+                None
+            }
+        } else {
+            None
+        };
+
+        // If we couldn't resolve from memory, try DB
+        let original_nick = match original_nick {
+            Some(n) => Some(n),
+            None => match cfg.db {
+                Some(ref pool) => persist::lookup_channel_history_by_msgid(pool, edit_msgid)
+                    .await
+                    .and_then(|(_, db_source)| db_source.split('!').next().map(|s| s.to_string())),
+                None => None,
+            },
+        };
+
+        let is_owner = original_nick
+            .as_deref()
+            .map(|orig| orig.eq_ignore_ascii_case(&sender_nick))
+            .unwrap_or(false);
+
         if !is_owner {
             reply_to_client(
                 &senders,
@@ -193,13 +229,21 @@ pub async fn handle_privmsg(
     // If this is an edit, update the channel history entry in the DB.
     if let Some(ref orig_msgid) = pending_edit_msgid {
         if let Some(ref pool) = cfg.db {
-            persist::update_channel_history_message(pool, orig_msgid, &text, &msgid).await;
+            let rows =
+                persist::update_channel_history_message(pool, orig_msgid, &text, &msgid).await;
+            tracing::info!(
+                client_id,
+                orig_msgid,
+                new_msgid = %msgid,
+                rows_affected = rows,
+                "EDIT DB update"
+            );
         }
     }
     let state_guard = state.read().await;
 
     if target.starts_with('#') || target.starts_with('&') {
-        let ch_key = canonical_channel_key(&target);
+        let ch_key = canonical_channel_key(target);
         let ch_store = channels.read().await;
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
@@ -339,10 +383,19 @@ pub async fn handle_privmsg(
                 )
                 .await;
             }
-            if let Some(ref pool) = cfg.db {
-                let _ =
-                    persist::append_channel_history(pool, &ch_key, &source, &text, Some(&msgid))
-                        .await;
+            // Only append new history if this is NOT an edit (edits already updated in-place)
+            if pending_edit_msgid.is_none() {
+                if let Some(ref pool) = cfg.db {
+                    let _ = persist::append_channel_history(
+                        pool,
+                        &ch_key,
+                        &source,
+                        &text,
+                        Some(&msgid),
+                        "PRIVMSG",
+                    )
+                    .await;
+                }
             }
         } else {
             reply_to_client(
@@ -475,7 +528,7 @@ pub async fn handle_notice(
     let base_msg = Message::new("NOTICE", vec![display_target, text.clone()]).with_prefix(&source);
 
     if target.starts_with('#') || target.starts_with('&') {
-        let ch_key = canonical_channel_key(&target);
+        let ch_key = canonical_channel_key(target);
         let ch_store = channels.read().await;
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
@@ -554,6 +607,7 @@ pub async fn handle_notice(
                         &source,
                         &text,
                         Some(&msgid),
+                        "NOTICE",
                     )
                     .await;
                 }
@@ -895,6 +949,11 @@ pub async fn deliver_multiline_batch(
 
     if let Some(ref pool) = cfg.db {
         if batch.target.starts_with('#') || batch.target.starts_with('&') {
+            let cmd = if batch.command == "NOTICE" {
+                "NOTICE"
+            } else {
+                "PRIVMSG"
+            };
             for (_, text) in &batch.lines {
                 let _ = persist::append_channel_history(
                     pool,
@@ -902,6 +961,7 @@ pub async fn deliver_multiline_batch(
                     &source,
                     text,
                     Some(&msgid),
+                    cmd,
                 )
                 .await;
             }
@@ -958,12 +1018,12 @@ pub async fn handle_tagmsg(
     let base_msg = Message::new("TAGMSG", vec![target.into()]).with_prefix(&source);
 
     if target.starts_with('#') || target.starts_with('&') {
-        let ch_key = canonical_channel_key(&target);
+        let ch_key = canonical_channel_key(target);
         let ch_store = channels.read().await;
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
             if ch.is_member(client_id) {
-                for (mid, _) in &ch.members {
+                for mid in ch.members.keys() {
                     let caps = match state_guard.clients.get(mid) {
                         Some(c) => c.read().await.capabilities.clone(),
                         None => Default::default(),
@@ -1053,7 +1113,7 @@ pub async fn handle_redact(
     label: Option<&str>,
 ) -> anyhow::Result<()> {
     // Per IRCv3 message-redaction spec: REDACT <target> <msgid> [:<reason>]
-    let target_param = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
+    let target_param = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let msgid = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
     let reason = msg.trailing().unwrap_or("message redacted").to_string();
 
@@ -1295,7 +1355,7 @@ pub async fn handle_chathistory(
         None => return Ok(()),
     };
     let params = &msg.params;
-    let subcommand = params.get(0).map(|s| s.to_uppercase()).unwrap_or_default();
+    let subcommand = params.first().map(|s| s.to_uppercase()).unwrap_or_default();
 
     // TARGETS is a special subcommand that returns a list of conversations, not messages.
     if subcommand == "TARGETS" {
@@ -1377,17 +1437,28 @@ pub async fn handle_chathistory(
         return Ok(());
     }
 
-    // Parse target, cursor, and limit for LATEST/BEFORE/AFTER/AROUND and legacy forms.
-    let (target, cursor, limit) = if matches!(
+    // Parse target, cursor, and limit for LATEST/BEFORE/AFTER/AROUND/BETWEEN and legacy forms.
+    // BETWEEN has two cursors: CHATHISTORY BETWEEN <target> <start> <end> <limit>
+    let (target, cursor, cursor2, limit) = if matches!(
         subcommand.as_str(),
-        "LATEST" | "BEFORE" | "AFTER" | "AROUND"
+        "LATEST" | "BEFORE" | "AFTER" | "AROUND" | "BETWEEN"
     ) {
         let target = params.get(1).map(|s| s.as_str()).unwrap_or("");
         let cursor = params.get(2).map(|s| s.as_str()).unwrap_or("*");
-        let limit_param = params
-            .get(3)
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(50);
+        let (cursor2, limit_param) = if subcommand == "BETWEEN" {
+            let c2 = params.get(3).map(|s| s.as_str()).unwrap_or("*");
+            let lim = params
+                .get(4)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(50);
+            (Some(c2), lim)
+        } else {
+            let lim = params
+                .get(3)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(50);
+            (None, lim)
+        };
         if target.is_empty() {
             reply_to_client(
                 &senders,
@@ -1407,15 +1478,15 @@ pub async fn handle_chathistory(
             .await;
             return Ok(());
         }
-        (target, cursor, limit_param.min(CHATHISTORY_LIMIT))
+        (target, cursor, cursor2, limit_param.min(CHATHISTORY_LIMIT))
     } else {
         // Legacy: CHATHISTORY #channel [count]
-        let target = params.get(0).map(|s| s.as_str()).unwrap_or("");
+        let target = params.first().map(|s| s.as_str()).unwrap_or("");
         let limit_param = params
             .get(1)
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(50);
-        (target, "*", limit_param.min(CHATHISTORY_LIMIT))
+        (target, "*", None, limit_param.min(CHATHISTORY_LIMIT))
     };
 
     if target.is_empty() || (!target.starts_with('#') && !target.starts_with('&')) {
@@ -1434,7 +1505,7 @@ pub async fn handle_chathistory(
     }
 
     let is_member = {
-        let ch_key = canonical_channel_key(&target);
+        let ch_key = canonical_channel_key(target);
         let ch_store = channels.read().await;
         match ch_store.channels.get(&ch_key) {
             Some(ch) => ch.read().await.members.contains_key(client_id),
@@ -1462,24 +1533,35 @@ pub async fn handle_chathistory(
         return Ok(());
     }
 
-    let entries = match (subcommand.as_str(), cursor) {
-        ("AROUND", c) if c != "*" => {
-            persist::read_channel_history_around(pool, target, c, limit).await
-        }
-        ("BEFORE", c) if c != "*" => {
-            persist::read_channel_history_before(pool, target, c, limit).await
-        }
-        ("AFTER", c) if c != "*" => {
-            persist::read_channel_history_after(pool, target, c, limit).await
-        }
-        _ => persist::read_channel_history(pool, target, limit).await,
-    };
     let caps = {
         let state_r = state.read().await;
         match state_r.clients.get(client_id) {
             Some(c) => c.read().await.capabilities.clone(),
             None => std::collections::HashSet::new(),
         }
+    };
+    let include_events = caps.contains("draft/event-playback");
+
+    let entries = match (subcommand.as_str(), cursor) {
+        ("AROUND", c) if c != "*" => {
+            persist::read_channel_history_around(pool, target, c, limit, include_events).await
+        }
+        ("BEFORE", c) if c != "*" => {
+            persist::read_channel_history_before(pool, target, c, limit, include_events).await
+        }
+        ("AFTER", c) if c != "*" => {
+            persist::read_channel_history_after(pool, target, c, limit, include_events).await
+        }
+        ("BETWEEN", c) if c != "*" => {
+            let end = cursor2.unwrap_or("*");
+            if end == "*" {
+                persist::read_channel_history(pool, target, limit, include_events).await
+            } else {
+                persist::read_channel_history_between(pool, target, c, end, limit, include_events)
+                    .await
+            }
+        }
+        _ => persist::read_channel_history(pool, target, limit, include_events).await,
     };
     let use_batch = caps.contains("batch") && caps.contains("message-tags");
     let batch_ref = if use_batch {
@@ -1504,7 +1586,22 @@ pub async fn handle_chathistory(
     let newest_ts = entries.last().map(|e| e.ts.clone()).unwrap_or_default();
 
     for e in &entries {
-        let mut m = Message::new("PRIVMSG", vec![target.into(), e.text.clone()]);
+        // Build the correct IRC message based on the stored command type
+        let mut m = match e.command.as_str() {
+            "JOIN" => Message::new("JOIN", vec![target.into()]),
+            "PART" => {
+                let mut params = vec![target.into()];
+                if !e.text.is_empty() {
+                    params.push(e.text.clone());
+                }
+                Message::new("PART", params)
+            }
+            "QUIT" => Message::new("QUIT", vec![e.text.clone()]),
+            "TOPIC" => Message::new("TOPIC", vec![target.into(), e.text.clone()]),
+            "NICK" => Message::new("NICK", vec![e.text.clone()]),
+            "NOTICE" => Message::new("NOTICE", vec![target.into(), e.text.clone()]),
+            _ => Message::new("PRIVMSG", vec![target.into(), e.text.clone()]),
+        };
         m.prefix = Some(e.source.clone());
         m.tags.insert("time".to_string(), Some(e.ts.clone()));
         if let Some(ref id) = e.msgid {
@@ -1512,6 +1609,13 @@ pub async fn handle_chathistory(
         }
         if let Some(ref ref_id) = batch_ref {
             m.tags.insert("batch".to_string(), Some(ref_id.clone()));
+        }
+        // If this message was edited, include the +draft/edit tag pointing to the original msgid
+        if let Some(ref orig_id) = e.original_msgid {
+            if caps.contains("draft/message-edit") {
+                m.tags
+                    .insert("+draft/edit".to_string(), Some(orig_id.clone()));
+            }
         }
         let tagged = add_tags_for_recipient(
             m,
@@ -1564,7 +1668,7 @@ pub async fn handle_markread(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let target = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
+    let target = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     if target.is_empty() {
         reply_to_client(
             &senders,
@@ -1623,10 +1727,10 @@ pub async fn handle_markread(
             let mut state_w = state.write().await;
             let entry = state_w.read_markers.entry(key.clone()).or_default();
             let current = entry.get(target).cloned();
-            if current.as_ref().map(|c| c.as_str()) < Some(ts.as_str()) {
+            if current.as_deref() < Some(ts.as_str()) {
                 entry.insert(target.to_string(), ts.clone());
             }
-            entry.get(target).cloned().unwrap_or_else(|| ts)
+            entry.get(target).cloned().unwrap_or(ts)
         };
         // Persist to database
         if let Some(ref pool) = cfg.db {

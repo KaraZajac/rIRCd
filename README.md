@@ -120,6 +120,7 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 | Key | Default | Description |
 |-----|---------|-------------|
 | `name` | `rIRCd` | Network name (shown in 005 NETWORK) |
+| `icon` | _(unset)_ | URL to a network icon image (advertised as `ICON=` in ISUPPORT; draft/network-icon) |
 
 ### `[database]`
 
@@ -169,6 +170,27 @@ hostmask = "*"           # optional; restrict by host
 password_hash = "$2a$..." # generate with: rircd genpasswd
 ```
 
+### `[filehost]`
+
+Optional. Enables the `draft/filehost` HTTP file upload endpoint. When configured, rIRCd embeds an HTTP server that accepts authenticated file uploads and serves them back. Authenticated IRC users upload via HTTP Basic auth (same credentials as SASL PLAIN). The `draft/FILEHOST=<url>` ISUPPORT token is advertised to clients.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `listen` | `0.0.0.0:8080` | HTTP listen address for the filehost |
+| `public_url` | _(required)_ | Public base URL clients use to reach uploads (e.g. `https://irc.example.com/uploads`) |
+| `upload_dir` | `/var/lib/rircd/uploads` | Local directory where uploaded files are stored |
+| `max_size` | `52428800` (50 MiB) | Maximum upload size in bytes |
+
+Example:
+
+```toml
+[filehost]
+listen = "0.0.0.0:8080"
+public_url = "https://irc.example.com/uploads"
+upload_dir = "/var/lib/rircd/uploads"
+max_size = 52428800
+```
+
 ### `[webirc]`
 
 Optional. Enables WEBIRC gateway support so reverse proxies can pass the real client IP.
@@ -215,6 +237,12 @@ max_line_length = 8191
 name = "admin"
 hostmask = "*"
 password_hash = "$2a$12$..."
+
+[filehost]
+listen = "0.0.0.0:8080"
+public_url = "https://irc.example.com/uploads"
+upload_dir = "/var/lib/rircd/uploads"
+max_size = 52428800
 ```
 
 ---
@@ -273,7 +301,8 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 - **Topic** — persisted whenever a channel topic is set; 333 RPL_TOPICWHOTIME and 329 RPL_CREATIONTIME sent on JOIN.
 - **Channel modes** — mode flags (`+imnstRcC`), key (`+k`), and user limit (`+l`) are saved to the database on every MODE change and restored on startup.
 - **Operators / Voice** — stored per channel; users in these lists receive `@`/`+` automatically when they join.
-- **Message history** — PRIVMSG and NOTICE to channels are appended (up to 1,000 messages per channel, oldest pruned). Clients with `draft/chathistory` can request history via `CHATHISTORY LATEST/BEFORE/AFTER/AROUND #channel <cursor> <limit>` or list active conversations with `CHATHISTORY TARGETS timestamp=<from> timestamp=<to> <limit>`.
+- **Message history** — PRIVMSG, NOTICE, and channel events (JOIN, PART, QUIT, TOPIC, NICK) are appended (up to 1,000 entries per channel, oldest pruned). Clients with `draft/chathistory` can request history via `CHATHISTORY LATEST/BEFORE/AFTER/AROUND/BETWEEN #channel <cursor> <limit>` or list active conversations with `CHATHISTORY TARGETS timestamp=<from> timestamp=<to> <limit>`. Clients with `draft/event-playback` receive the full event timeline; otherwise only messages are returned.
+- **Edit history** — Edited messages retain a pointer to their original msgid. On CHATHISTORY replay, clients with `draft/message-edit` receive the `+draft/edit` tag so they can update their local buffer.
 - **Read markers** — `MARKREAD` timestamps are persisted per account in MariaDB and survive server restarts.
 - **Metadata** — `METADATA` key-value entries set on users and channels are persisted in MariaDB.
 
@@ -307,8 +336,8 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **draft/extended-isupport** | Full | ISUPPORT command; 005 before registration |
 | **whox** | Full | WHO with %fields; 354 RPL_WHOSPCRPL |
 | **bot** | Full | Umode +B; RPL_WHOISBOT (335) in WHOIS |
-| **message-redaction** | Full | REDACT command; msgid store; broadcast to channel/DM recipients |
-| **draft/message-edit** | Full | PRIVMSG with `+draft/edit=<msgid>` tag; sender ownership validated |
+| **message-redaction** | Full | REDACT command; soft-delete in DB; CHATHISTORY replays REDACT events for client sync |
+| **draft/message-edit** | Full | PRIVMSG with `+draft/edit=<msgid>` tag; DB-backed ownership check; edit history replayed in CHATHISTORY |
 | **draft/react** | Full | TAGMSG with `+draft/react=<emoji>`; forwarded via client-only tag relay |
 | **typing** | Full | TAGMSG with `+typing=active/paused/done`; forwarded via client-only tag relay |
 | **reply** | Full | Messages with `+reply=<msgid>` tag forwarded as-is |
@@ -318,7 +347,9 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **extended-monitor** | Full | MONITOR patterns with `nick!user@host` globs (`*`/`?` wildcards) |
 | **sts** | Full | Strict Transport Security; advertised in CAP LS only when TLS is configured; `duration=2592000` |
 | **draft/channel-rename** | Full | RENAME old new [reason]; op-only; fallback PART+JOIN for clients without cap |
-| **draft/chathistory** | Full | CHATHISTORY LATEST/BEFORE/AFTER/AROUND/TARGETS; BATCH chathistory; DB-backed; limit 200 |
+| **draft/chathistory** | Full | CHATHISTORY LATEST/BEFORE/AFTER/AROUND/BETWEEN/TARGETS; BATCH chathistory; DB-backed; limit 200 |
+| **draft/event-playback** | Full | JOIN/PART/QUIT/TOPIC/NICK events stored in DB and replayed in CHATHISTORY |
+| **draft/network-icon** | Full | Optional `ICON=` ISUPPORT token; config `network.icon` |
 | **draft/read-marker** | Full | MARKREAD target [timestamp]; per-account, persisted in MariaDB |
 | **draft/metadata-2** | Full | METADATA GET/LIST/SET/CLEAR; key-value per user/channel, persisted in MariaDB |
 | **STATUSMSG** | Full | PRIVMSG/NOTICE to `@#channel` (ops+) or `+#channel` (voiced+); advertised in 005 `STATUSMSG=@+` |
@@ -329,6 +360,20 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **draft/client-batch** | Full | Client-originated BATCH types collected and relayed to recipients |
 | **CLIENTTAGDENY** | Full | Optional 005 token; config `server.client_tag_deny` |
 | **WebIRC** | Full | WEBIRC password gateway hostname ip; config `[webirc]` |
+| **draft/filehost** | Full | HTTP file upload endpoint; SASL PLAIN auth (HTTP Basic); `draft/FILEHOST=` ISUPPORT token; MIME-typed downloads |
+
+---
+
+## Roadmap
+
+Features under consideration for future releases:
+
+| Feature | Description |
+|---------|-------------|
+| **cap-notify (dynamic)** | Send `CAP NEW`/`CAP DEL` on REHASH when enabled capabilities change |
+| **draft/webpush** | Web Push notifications (RFC 8291) via `WEBPUSH REGISTER`/`UNREGISTER` |
+| **+draft/unreact** | Remove a previously sent reaction |
+| **draft/account-registration VERIFY** | Email-based account verification (currently returns `INVALID_CODE`) |
 
 ---
 

@@ -99,21 +99,24 @@ pub fn add_tags_for_recipient(
     let deny_all = client_tag_deny
         .map(|d| d.contains(&"*".to_string()))
         .unwrap_or(false);
-    if let Some(tags) = client_only_tags {
-        for (k, v) in tags {
-            if k.starts_with('+') {
-                if deny_all {
-                    continue;
-                }
-                if let Some(deny) = client_tag_deny {
-                    if deny
-                        .iter()
-                        .any(|d| d == k || d.as_str() == k.trim_start_matches('+'))
-                    {
+    // Client-only tags (+ prefix) require the message-tags capability per IRCv3 spec
+    if recipient_caps.contains("message-tags") {
+        if let Some(tags) = client_only_tags {
+            for (k, v) in tags {
+                if k.starts_with('+') {
+                    if deny_all {
                         continue;
                     }
+                    if let Some(deny) = client_tag_deny {
+                        if deny
+                            .iter()
+                            .any(|d| d == k || d.as_str() == k.trim_start_matches('+'))
+                        {
+                            continue;
+                        }
+                    }
+                    msg.tags.insert(k.clone(), v.clone());
                 }
-                msg.tags.insert(k.clone(), v.clone());
             }
         }
     }

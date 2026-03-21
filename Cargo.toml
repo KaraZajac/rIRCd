@@ -28,3 +28,6 @@ hmac = "0.12"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 rand = "0.8"
 nix = { version = "0.29", features = ["signal", "process"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+mime_guess = "2"

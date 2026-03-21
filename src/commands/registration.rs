@@ -56,7 +56,18 @@ fn isupport_tokens(cfg: &Config) -> String {
         .as_ref()
         .map(|v| format!(" CLIENTTAGDENY={}", v.join(",")))
         .unwrap_or_default();
-    format!("{}{}", base, deny)
+    let icon = cfg
+        .network
+        .icon
+        .as_ref()
+        .map(|url| format!(" ICON={}", url))
+        .unwrap_or_default();
+    let filehost = cfg
+        .filehost
+        .as_ref()
+        .map(|fh| format!(" draft/FILEHOST={}", fh.public_url))
+        .unwrap_or_default();
+    format!("{}{}{}{}", base, deny, icon, filehost)
 }
 
 pub async fn complete_registration(
@@ -287,7 +298,7 @@ pub async fn handle_webirc(
         return Ok(());
     }
     let expected = cfg.webirc.as_ref().map(|w| w.password.as_str());
-    let password = msg.params.get(0).map(|s| s.as_str());
+    let password = msg.params.first().map(|s| s.as_str());
     let ip = msg.params.get(3).map(|s| s.as_str()).unwrap_or("");
     drop(state_guard);
     if expected != password || ip.is_empty() {
@@ -404,6 +415,7 @@ pub async fn handle_cap(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_nick(
     client_id: &str,
     host: &str,
@@ -560,6 +572,19 @@ pub async fn handle_nick(
                         send_to_client(&senders, &mid, nick_msg.clone()).await;
                     }
                 }
+
+                // Record NICK event for draft/event-playback (one per channel)
+                if let Some(ref pool) = cfg.db {
+                    let _ = persist::append_channel_history(
+                        pool,
+                        ch_name,
+                        &old_source,
+                        &nick,
+                        None,
+                        "NICK",
+                    )
+                    .await;
+                }
             }
 
             return Ok(());
@@ -640,7 +665,7 @@ pub async fn handle_user(
         return Ok(());
     }
 
-    let user = msg.params.get(0).cloned().unwrap_or_else(|| "user".into());
+    let user = msg.params.first().cloned().unwrap_or_else(|| "user".into());
     let realname = msg.trailing().unwrap_or("").to_string();
 
     let conn = state_guard.get_or_create_pending(client_id, host);
@@ -667,7 +692,7 @@ pub async fn handle_pass(
     let pass = msg
         .params
         .first()
-        .map(String::clone)
+        .cloned()
         .or_else(|| msg.trailing().map(String::from));
     if let Some(p) = pass {
         let mut state = state.write().await;
@@ -795,7 +820,7 @@ pub async fn handle_quit(
         let client = state_guard.clients.get(client_id).cloned();
         if let Some(client) = client {
             let c = client.read().await;
-            let source = c.source().unwrap_or_else(|| format!("{}", c.nick_or_id()));
+            let source = c.source().unwrap_or_else(|| c.nick_or_id().to_string());
             let chans: Vec<String> = c.channels.keys().cloned().collect();
             let had_account = c.account.is_some();
             let nick = c.nick.clone().unwrap_or_else(|| client_id.to_string());
@@ -828,6 +853,13 @@ pub async fn handle_quit(
         }
         if should_remove {
             ch_store.channels.remove(ch_name);
+        }
+        drop(ch_store);
+
+        // Record QUIT event for draft/event-playback (one per channel)
+        if let Some(ref pool) = cfg.db {
+            let _ = persist::append_channel_history(pool, ch_name, &source, &reason, None, "QUIT")
+                .await;
         }
     }
 
@@ -921,6 +953,7 @@ fn sasl_preview(s: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_authenticate(
     client_id: &str,
     host: &str,
@@ -1051,7 +1084,7 @@ pub async fn handle_authenticate(
         }
     } else {
         msg.params
-            .get(0)
+            .first()
             .map(|s| s.as_str())
             .or_else(|| msg.trailing())
             .unwrap_or("")
@@ -1065,14 +1098,12 @@ pub async fn handle_authenticate(
         } else {
             "empty"
         }
+    } else if !msg.params.is_empty() {
+        "params[0]"
+    } else if msg.trailing().is_some() {
+        "trailing"
     } else {
-        if msg.params.get(0).is_some() {
-            "params[0]"
-        } else if msg.trailing().is_some() {
-            "trailing"
-        } else {
-            "empty"
-        }
+        "empty"
     };
 
     // RFC 4616: authzid + authcid + passwd ≤ 255+255+255 octets decoded → base64 ≤ 1024 bytes. Use 1200 to allow real-world clients that send slightly over (e.g. padding).
@@ -1530,6 +1561,7 @@ fn base64_decode(s: &str) -> anyhow::Result<String> {
 /// Handle one AUTHENTICATE step for SCRAM-SHA-256.
 /// Step 1: receive client-first, send server-first.
 /// Step 2: receive client-final, verify proof, send server-final + 903/904.
+#[allow(clippy::too_many_arguments)]
 async fn handle_authenticate_scram_step(
     client_id: &str,
     host: &str,
@@ -1927,7 +1959,7 @@ pub async fn handle_oper(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let name = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
+    let name = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let password = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
     if name.is_empty() || password.is_empty() {
         reply_to_client(
@@ -1942,7 +1974,7 @@ pub async fn handle_oper(
     }
     for oper in &cfg.opers {
         if oper.name == name && bcrypt::verify(password, &oper.password_hash).unwrap_or(false) {
-            let found = if let Some(ref c) = state.read().await.clients.get(client_id) {
+            let found = if let Some(c) = state.read().await.clients.get(client_id) {
                 c.write().await.oper = true;
                 true
             } else {
@@ -2079,7 +2111,7 @@ pub async fn handle_register(
             .await;
             return Ok(());
         }
-        let account_param = msg.params.get(0).map(|s| s.as_str()).unwrap_or("*");
+        let account_param = msg.params.first().map(|s| s.as_str()).unwrap_or("*");
         // Accept "*" (use current nick) or the nick itself; anything else is rejected.
         let account = if account_param == "*" || account_param.eq_ignore_ascii_case(&nick) {
             nick.clone()
@@ -2217,7 +2249,7 @@ pub async fn handle_verify(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let account = msg.params.get(0).map(|s| s.as_str()).unwrap_or("*");
+    let account = msg.params.first().map(|s| s.as_str()).unwrap_or("*");
     let _code = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
     let state_guard = state.read().await;
     if let Some(c) = state_guard.clients.get(client_id) {
@@ -2274,7 +2306,7 @@ pub async fn handle_away(
     let away_msg = msg.trailing().map(String::from);
     let (source, channel_list) = {
         let mut state = state.write().await;
-        if state.clients.get(client_id).is_none() {
+        if !state.clients.contains_key(client_id) {
             if let Some(pending) = state.pending.get_mut(client_id) {
                 pending.away_message = away_msg;
             }
@@ -2451,7 +2483,7 @@ pub async fn handle_sethost(
 ) -> anyhow::Result<()> {
     let new_host = msg
         .trailing()
-        .or_else(|| msg.params.get(0).map(|s| s.as_str()))
+        .or_else(|| msg.params.first().map(|s| s.as_str()))
         .unwrap_or("")
         .trim()
         .to_string();
@@ -2562,7 +2594,7 @@ pub async fn handle_setuser(
 ) -> anyhow::Result<()> {
     let new_user = msg
         .trailing()
-        .or_else(|| msg.params.get(0).map(|s| s.as_str()))
+        .or_else(|| msg.params.first().map(|s| s.as_str()))
         .unwrap_or("")
         .to_string();
     if new_user.is_empty() {

@@ -22,6 +22,9 @@ pub struct Config {
     pub opers: Vec<OperConfig>,
     #[serde(default)]
     pub webirc: Option<WebircConfig>,
+    /// File hosting endpoint (draft/filehost).
+    #[serde(default)]
+    pub filehost: Option<FilehostConfig>,
     /// MariaDB connection settings.
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -75,6 +78,33 @@ impl DatabaseConfig {
             self.user, self.password, self.host, self.port, self.database
         )
     }
+}
+
+// ─── Filehost ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FilehostConfig {
+    /// HTTP listen address (e.g. "0.0.0.0:8080").
+    #[serde(default = "default_filehost_listen")]
+    pub listen: String,
+    /// Public base URL that clients use to reach uploads (e.g. "https://irc.example.com/uploads").
+    pub public_url: String,
+    /// Directory on disk where uploaded files are stored.
+    #[serde(default = "default_filehost_dir")]
+    pub upload_dir: String,
+    /// Maximum upload size in bytes (default 50 MiB).
+    #[serde(default = "default_filehost_max_size")]
+    pub max_size: usize,
+}
+
+fn default_filehost_listen() -> String {
+    "0.0.0.0:8080".into()
+}
+fn default_filehost_dir() -> String {
+    "/var/lib/rircd/uploads".into()
+}
+fn default_filehost_max_size() -> usize {
+    50 * 1024 * 1024
 }
 
 // ─── Server ───────────────────────────────────────────────────────────────────
@@ -151,6 +181,9 @@ impl Default for ServerConfig {
 pub struct NetworkConfig {
     #[serde(default = "default_network_name")]
     pub name: String,
+    /// Optional URL to a network icon image (draft/network-icon; advertised as ICON= in ISUPPORT).
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 fn default_network_name() -> String {
@@ -161,25 +194,17 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             name: default_network_name(),
+            icon: None,
         }
     }
 }
 
 // ─── TLS ──────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct TlsConfig {
     pub cert: Option<String>,
     pub key: Option<String>,
-}
-
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            cert: None,
-            key: None,
-        }
-    }
 }
 
 // ─── Limits ───────────────────────────────────────────────────────────────────
