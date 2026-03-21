@@ -65,7 +65,12 @@ fn isupport_tokens(cfg: &Config) -> String {
     let filehost = cfg
         .filehost
         .as_ref()
-        .map(|fh| format!(" draft/FILEHOST={}", fh.public_url))
+        .map(|fh| {
+            format!(
+                " FILEHOST={} draft/FILEHOST={}",
+                fh.public_url, fh.public_url
+            )
+        })
         .unwrap_or_default();
     format!("{}{}{}{}", base, deny, icon, filehost)
 }
