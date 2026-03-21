@@ -40,7 +40,7 @@ pub struct ClientMessage {
 }
 
 pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> anyhow::Result<()> {
-    let _pidfile = pidfile.map(|p| PidfileGuard::new(p)).transpose()?;
+    let _pidfile = pidfile.map(PidfileGuard::new).transpose()?;
 
     let state = ServerState::new();
     let channels = ChannelStore::new();
@@ -109,6 +109,35 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
     } else {
         None
     };
+
+    // ── Filehost HTTP endpoint ─────────────────────────────────────────────────
+    if let Some(ref fh_cfg) = cfg.filehost {
+        let upload_dir = std::path::PathBuf::from(&fh_cfg.upload_dir);
+        if let Err(e) = std::fs::create_dir_all(&upload_dir) {
+            error!(
+                "Failed to create filehost upload dir {}: {}",
+                upload_dir.display(),
+                e
+            );
+        }
+
+        let fh_state = Arc::new(crate::filehost::FilehostState {
+            upload_dir,
+            public_url: fh_cfg.public_url.clone(),
+            max_size: fh_cfg.max_size,
+            db_pool: cfg.db.clone().expect("database pool required for filehost"),
+        });
+
+        let app = crate::filehost::router(fh_state);
+        let listen_addr = fh_cfg.listen.clone();
+        let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+        info!("Filehost HTTP listening on {}", listen_addr);
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                error!("Filehost server error: {}", e);
+            }
+        });
+    }
 
     let server_name = cfg.server.name.clone();
     for listen_addr in &cfg.server.listen {

@@ -42,6 +42,7 @@ pub const CAPS: &[&str] = &[
     "reply",
     "draft/channel-context",
     "draft/client-batch",
+    "draft/event-playback",
     "sts",
 ];
 

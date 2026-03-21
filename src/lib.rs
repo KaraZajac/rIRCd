@@ -3,6 +3,7 @@ pub mod channel;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod filehost;
 pub mod persist;
 pub mod protocol;
 pub mod server;

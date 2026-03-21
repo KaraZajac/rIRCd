@@ -46,6 +46,10 @@ pub struct HistoryEntry {
     pub source: String,
     pub text: String,
     pub msgid: Option<String>,
+    /// IRC command: PRIVMSG, NOTICE, JOIN, PART, QUIT, TOPIC, NICK (for event-playback)
+    pub command: String,
+    /// If this message was edited, the msgid it replaced (for draft/message-edit replay)
+    pub original_msgid: Option<String>,
 }
 
 /// Maximum number of history rows retained per channel.
@@ -151,6 +155,22 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
 
     sqlx::query(
         "ALTER TABLE channel_history ADD INDEX IF NOT EXISTS idx_channel_redacted (channel, redacted, id)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    // Migrate: add command column for event-playback (JOIN/PART/QUIT/TOPIC/NICK events)
+    sqlx::query(
+        "ALTER TABLE channel_history ADD COLUMN IF NOT EXISTS command VARCHAR(16) NOT NULL DEFAULT 'PRIVMSG'",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    // Migrate: add original_msgid column for edit replay in CHATHISTORY
+    sqlx::query(
+        "ALTER TABLE channel_history ADD COLUMN IF NOT EXISTS original_msgid VARCHAR(128) DEFAULT NULL",
     )
     .execute(pool)
     .await
@@ -527,24 +547,27 @@ pub async fn verify_user(pool: &sqlx::MySqlPool, account: &str, password: &str) 
 
 // ─── Channel history ──────────────────────────────────────────────────────────
 
-/// Append a message to channel history. Prunes oldest rows beyond the per-channel cap.
+/// Append a message or event to channel history. Prunes oldest rows beyond the per-channel cap.
+/// `command` is the IRC command: "PRIVMSG", "NOTICE", "JOIN", "PART", "QUIT", "TOPIC", "NICK".
 pub async fn append_channel_history(
     pool: &sqlx::MySqlPool,
     channel_name: &str,
     source: &str,
     text: &str,
     msgid: Option<&str>,
+    command: &str,
 ) -> anyhow::Result<()> {
     let ts = chrono::Utc::now().to_rfc3339();
 
     sqlx::query(
-        "INSERT INTO channel_history (channel, ts, source, text, msgid) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO channel_history (channel, ts, source, text, msgid, command) VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(channel_name)
     .bind(&ts)
     .bind(source)
     .bind(text)
     .bind(msgid)
+    .bind(command)
     .execute(pool)
     .await?;
 
@@ -567,40 +590,53 @@ pub async fn append_channel_history(
     Ok(())
 }
 
-/// Read the most recent `limit` messages for a channel, oldest-first (for CHATHISTORY playback).
+/// Convert a sqlx row into a HistoryEntry.
+fn row_to_entry(r: &sqlx::mysql::MySqlRow) -> HistoryEntry {
+    use sqlx::Row;
+    HistoryEntry {
+        ts: r.get("ts"),
+        source: r.get("source"),
+        text: r.get("text"),
+        msgid: r.get("msgid"),
+        command: r
+            .try_get::<String, _>("command")
+            .unwrap_or_else(|_| "PRIVMSG".into()),
+        original_msgid: r.try_get("original_msgid").unwrap_or(None),
+    }
+}
+
+/// Read the most recent `limit` entries for a channel, oldest-first (for CHATHISTORY playback).
+/// If `include_events` is false, only PRIVMSG and NOTICE are returned.
 pub async fn read_channel_history(
     pool: &sqlx::MySqlPool,
     channel_name: &str,
     limit: usize,
+    include_events: bool,
 ) -> Vec<HistoryEntry> {
-    use sqlx::Row;
-
-    let rows = sqlx::query(
-        "SELECT ts, source, text, msgid
+    let event_filter = if include_events {
+        ""
+    } else {
+        " AND (command = 'PRIVMSG' OR command = 'NOTICE')"
+    };
+    let sql = format!(
+        "SELECT ts, source, text, msgid, command, original_msgid
          FROM (
-             SELECT id, ts, source, text, msgid
+             SELECT id, ts, source, text, msgid, command, original_msgid
              FROM channel_history
-             WHERE channel = ? AND redacted=0
+             WHERE channel = ? AND redacted=0{event_filter}
              ORDER BY id DESC
              LIMIT ?
          ) AS recent
-         ORDER BY id ASC",
-    )
-    .bind(channel_name)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await;
+         ORDER BY id ASC"
+    );
+    let rows = sqlx::query(&sql)
+        .bind(channel_name)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await;
 
     match rows {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|r| HistoryEntry {
-                ts: r.get("ts"),
-                source: r.get("source"),
-                text: r.get("text"),
-                msgid: r.get("msgid"),
-            })
-            .collect(),
+        Ok(rows) => rows.iter().map(row_to_entry).collect(),
         Err(e) => {
             tracing::warn!(
                 "Failed to read channel history for '{}': {}",
@@ -642,128 +678,129 @@ async fn resolve_cursor(pool: &sqlx::MySqlPool, channel_name: &str, cursor: &str
     }
 }
 
-/// Read up to `limit` messages strictly BEFORE the cursor, returned oldest-first.
+/// Read up to `limit` entries strictly BEFORE the cursor, returned oldest-first.
 pub async fn read_channel_history_before(
     pool: &sqlx::MySqlPool,
     channel_name: &str,
     cursor: &str,
     limit: usize,
+    include_events: bool,
 ) -> Vec<HistoryEntry> {
-    use sqlx::Row;
     let pivot = match resolve_cursor(pool, channel_name, cursor).await {
         Some(id) => id,
         None => return Vec::new(),
     };
-    let rows = sqlx::query(
-        "SELECT ts, source, text, msgid
+    let event_filter = if include_events {
+        ""
+    } else {
+        " AND (command = 'PRIVMSG' OR command = 'NOTICE')"
+    };
+    let sql = format!(
+        "SELECT ts, source, text, msgid, command, original_msgid
          FROM (
-             SELECT id, ts, source, text, msgid
+             SELECT id, ts, source, text, msgid, command, original_msgid
              FROM channel_history
-             WHERE channel = ? AND id < ? AND redacted=0
+             WHERE channel = ? AND id < ? AND redacted=0{event_filter}
              ORDER BY id DESC
              LIMIT ?
          ) AS sub
-         ORDER BY id ASC",
-    )
-    .bind(channel_name)
-    .bind(pivot)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    rows.into_iter()
-        .map(|r| HistoryEntry {
-            ts: r.get("ts"),
-            source: r.get("source"),
-            text: r.get("text"),
-            msgid: r.get("msgid"),
-        })
+         ORDER BY id ASC"
+    );
+    sqlx::query(&sql)
+        .bind(channel_name)
+        .bind(pivot)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(row_to_entry)
         .collect()
 }
 
-/// Read up to `limit` messages strictly AFTER the cursor, returned oldest-first.
+/// Read up to `limit` entries strictly AFTER the cursor, returned oldest-first.
 pub async fn read_channel_history_after(
     pool: &sqlx::MySqlPool,
     channel_name: &str,
     cursor: &str,
     limit: usize,
+    include_events: bool,
 ) -> Vec<HistoryEntry> {
-    use sqlx::Row;
     let pivot = match resolve_cursor(pool, channel_name, cursor).await {
         Some(id) => id,
         None => return Vec::new(),
     };
-    let rows = sqlx::query(
-        "SELECT id, ts, source, text, msgid
+    let event_filter = if include_events {
+        ""
+    } else {
+        " AND (command = 'PRIVMSG' OR command = 'NOTICE')"
+    };
+    let sql = format!(
+        "SELECT id, ts, source, text, msgid, command, original_msgid
          FROM channel_history
-         WHERE channel = ? AND id > ? AND redacted=0
+         WHERE channel = ? AND id > ? AND redacted=0{event_filter}
          ORDER BY id ASC
-         LIMIT ?",
-    )
-    .bind(channel_name)
-    .bind(pivot)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    rows.into_iter()
-        .map(|r| HistoryEntry {
-            ts: r.get("ts"),
-            source: r.get("source"),
-            text: r.get("text"),
-            msgid: r.get("msgid"),
-        })
+         LIMIT ?"
+    );
+    sqlx::query(&sql)
+        .bind(channel_name)
+        .bind(pivot)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(row_to_entry)
         .collect()
 }
 
-/// Read messages centered around a reference point (`msgid=xxx` or `timestamp=xxx`), oldest-first.
+/// Read entries centered around a reference point (`msgid=xxx` or `timestamp=xxx`), oldest-first.
 pub async fn read_channel_history_around(
     pool: &sqlx::MySqlPool,
     channel_name: &str,
     cursor: &str,
     limit: usize,
+    include_events: bool,
 ) -> Vec<HistoryEntry> {
-    use sqlx::Row;
-
-    let half = ((limit + 1) / 2).max(1) as i64;
+    let half = limit.div_ceil(2).max(1) as i64;
     let pivot_id = match resolve_cursor(pool, channel_name, cursor).await {
         Some(id) => id,
         None => return Vec::new(),
     };
 
-    // Rows at or before pivot, newest-first.
-    let before = sqlx::query(
-        "SELECT id, ts, source, text, msgid FROM channel_history WHERE channel = ? AND id <= ? AND redacted=0 ORDER BY id DESC LIMIT ?",
-    )
-    .bind(channel_name)
-    .bind(pivot_id)
-    .bind(half)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let event_filter = if include_events {
+        ""
+    } else {
+        " AND (command = 'PRIVMSG' OR command = 'NOTICE')"
+    };
 
-    // Rows after pivot, oldest-first.
-    let after = sqlx::query(
-        "SELECT id, ts, source, text, msgid FROM channel_history WHERE channel = ? AND id > ? AND redacted=0 ORDER BY id ASC LIMIT ?",
-    )
-    .bind(channel_name)
-    .bind(pivot_id)
-    .bind(half)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let before_sql = format!(
+        "SELECT id, ts, source, text, msgid, command, original_msgid FROM channel_history WHERE channel = ? AND id <= ? AND redacted=0{event_filter} ORDER BY id DESC LIMIT ?"
+    );
+    let before = sqlx::query(&before_sql)
+        .bind(channel_name)
+        .bind(pivot_id)
+        .bind(half)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
 
-    // Reverse before (to restore chronological order) then append after.
+    let after_sql = format!(
+        "SELECT id, ts, source, text, msgid, command, original_msgid FROM channel_history WHERE channel = ? AND id > ? AND redacted=0{event_filter} ORDER BY id ASC LIMIT ?"
+    );
+    let after = sqlx::query(&after_sql)
+        .bind(channel_name)
+        .bind(pivot_id)
+        .bind(half)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
     before
-        .into_iter()
+        .iter()
         .rev()
-        .chain(after)
-        .map(|r| HistoryEntry {
-            ts: r.get("ts"),
-            source: r.get("source"),
-            text: r.get("text"),
-            msgid: r.get("msgid"),
-        })
+        .chain(after.iter())
+        .map(row_to_entry)
         .collect()
 }
 
@@ -794,6 +831,49 @@ pub async fn list_history_targets(
                 r.get::<String, _>("latest_ts"),
             )
         })
+        .collect()
+}
+
+/// Read entries BETWEEN two cursors (inclusive start, exclusive end), oldest-first.
+/// Used by CHATHISTORY BETWEEN subcommand.
+pub async fn read_channel_history_between(
+    pool: &sqlx::MySqlPool,
+    channel_name: &str,
+    start_cursor: &str,
+    end_cursor: &str,
+    limit: usize,
+    include_events: bool,
+) -> Vec<HistoryEntry> {
+    let start_id = match resolve_cursor(pool, channel_name, start_cursor).await {
+        Some(id) => id,
+        None => return Vec::new(),
+    };
+    let end_id = match resolve_cursor(pool, channel_name, end_cursor).await {
+        Some(id) => id,
+        None => return Vec::new(),
+    };
+    let event_filter = if include_events {
+        ""
+    } else {
+        " AND (command = 'PRIVMSG' OR command = 'NOTICE')"
+    };
+    let sql = format!(
+        "SELECT id, ts, source, text, msgid, command, original_msgid
+         FROM channel_history
+         WHERE channel = ? AND id >= ? AND id < ? AND redacted=0{event_filter}
+         ORDER BY id ASC
+         LIMIT ?"
+    );
+    sqlx::query(&sql)
+        .bind(channel_name)
+        .bind(start_id)
+        .bind(end_id)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(row_to_entry)
         .collect()
 }
 
@@ -876,16 +956,29 @@ pub async fn lookup_channel_history_by_msgid(
 
 /// Update the text (and replace the msgid) of a channel history entry identified by the original
 /// msgid. Used when a client edits a previously-sent message via `+draft/edit`.
+/// Returns the number of rows affected (0 if the message was not found or already redacted).
 pub async fn update_channel_history_message(
     pool: &sqlx::MySqlPool,
     original_msgid: &str,
     new_text: &str,
     new_msgid: &str,
-) {
-    let _ = sqlx::query("UPDATE channel_history SET text = ?, msgid = ? WHERE msgid = ?")
-        .bind(new_text)
-        .bind(new_msgid)
-        .bind(original_msgid)
-        .execute(pool)
-        .await;
+) -> u64 {
+    // Set original_msgid to preserve the edit chain for CHATHISTORY replay.
+    // Only set it if original_msgid column is still NULL (first edit keeps the true original).
+    match sqlx::query(
+        "UPDATE channel_history SET text = ?, msgid = ?, original_msgid = COALESCE(original_msgid, ?) WHERE msgid = ? AND redacted = 0",
+    )
+    .bind(new_text)
+    .bind(new_msgid)
+    .bind(original_msgid)  // only written if original_msgid IS NULL
+    .bind(original_msgid)
+    .execute(pool)
+    .await
+    {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            tracing::warn!(original_msgid, ?e, "EDIT DB update failed");
+            0
+        }
+    }
 }
