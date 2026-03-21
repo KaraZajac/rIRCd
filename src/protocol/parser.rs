@@ -95,8 +95,8 @@ fn parse_params(s: &str) -> Result<Vec<String>, ParseError> {
         if rest.is_empty() {
             break;
         }
-        if rest.starts_with(':') {
-            params.push(rest[1..].to_string());
+        if let Some(stripped) = rest.strip_prefix(':') {
+            params.push(stripped.to_string());
             break;
         }
         match rest.find(' ') {

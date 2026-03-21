@@ -22,6 +22,7 @@ fn parse_whox_type(s: &str) -> (Vec<char>, Option<String>) {
 }
 
 /// Build 354 RPL_WHOSPCRPL params for WHOX: nick then requested field values in spec order (t,c,u,i,h,s,n,f,d,l,a,o,r).
+#[allow(clippy::too_many_arguments)]
 fn build_354_params(
     nick: &str,
     requested: &[char],
@@ -97,9 +98,7 @@ pub async fn handle_who(
     };
     let use_multi_prefix = client_caps.contains("multi-prefix");
     let (whox_requested, whox_token) = if use_whox && client_caps.contains("whox") {
-        whox_type
-            .map(|s| parse_whox_type(s))
-            .unwrap_or((vec![], None))
+        whox_type.map(parse_whox_type).unwrap_or((vec![], None))
     } else {
         (vec![], None)
     };
@@ -480,7 +479,7 @@ pub async fn handle_monitor(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let param0 = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
+    let param0 = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let targets_preview = msg
         .params
         .get(1)

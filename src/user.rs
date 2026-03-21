@@ -98,11 +98,7 @@ impl Client {
         let (n, u, h) = match (&self.nick, &self.user) {
             (Some(n), Some(u)) => {
                 let display_user = self.vuser.as_deref().unwrap_or(u.as_str());
-                let display_host = self
-                    .vhost
-                    .as_deref()
-                    .map(|s| &s[..])
-                    .unwrap_or(&self.host[..]);
+                let display_host = self.vhost.as_deref().unwrap_or(&self.host[..]);
                 (n.as_str(), display_user, display_host)
             }
             _ => return None,
@@ -398,18 +394,14 @@ impl ServerState {
     pub fn record_whowas_for_kill(&mut self, client_id: &str, server_name: &str) {
         let entry_opt = if let Some(c) = self.clients.get(client_id) {
             if let Ok(g) = c.try_read() {
-                if let Some(ref nick) = g.nick {
-                    Some(WhowasEntry {
-                        nick: nick.clone(),
-                        user: g.user.as_deref().unwrap_or("*").to_string(),
-                        host: g.host.clone(),
-                        realname: g.realname.as_deref().unwrap_or("").to_string(),
-                        server: server_name.to_string(),
-                        timestamp: chrono::Utc::now().timestamp(),
-                    })
-                } else {
-                    None
-                }
+                g.nick.as_ref().map(|nick| WhowasEntry {
+                    nick: nick.clone(),
+                    user: g.user.as_deref().unwrap_or("*").to_string(),
+                    host: g.host.clone(),
+                    realname: g.realname.as_deref().unwrap_or("").to_string(),
+                    server: server_name.to_string(),
+                    timestamp: chrono::Utc::now().timestamp(),
+                })
             } else {
                 None
             }
