@@ -36,9 +36,9 @@ pub async fn handle_message(
 
     // draft/multiline: BATCH + ref draft/multiline target
     if msg.command == "BATCH" {
-        let first = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
-        if first.starts_with('+') {
-            let ref_tag = first[1..].to_string();
+        let first = msg.params.first().map(|s| s.as_str()).unwrap_or("");
+        if let Some(stripped) = first.strip_prefix('+') {
+            let ref_tag = stripped.to_string();
             let batch_type = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
             if batch_type == "draft/multiline" {
                 let target = msg.params.get(2).map(|s| s.to_string()).unwrap_or_default();
@@ -68,8 +68,8 @@ pub async fn handle_message(
                 );
                 return Ok(());
             }
-        } else if first.starts_with('-') {
-            let ref_tag = first[1..].to_string();
+        } else if let Some(stripped) = first.strip_prefix('-') {
+            let ref_tag = stripped.to_string();
             let batch = {
                 let mut state_w = state.write().await;
                 state_w.pending_multiline.remove(&client_id)
@@ -117,7 +117,7 @@ pub async fn handle_message(
             let mut state_w = state.write().await;
             if let Some(pending) = state_w.pending_multiline.get_mut(&client_id) {
                 if pending.ref_tag == *ref_val {
-                    let line_target = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
+                    let line_target = msg.params.first().map(|s| s.as_str()).unwrap_or("");
                     if line_target != pending.target {
                         let (batch_target, line_target_owned) =
                             (pending.target.clone(), line_target.to_string());

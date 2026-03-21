@@ -59,6 +59,7 @@ async fn target_exists(
 /// Send a metadata batch (GET / LIST / SYNC) to one client.
 /// Uses `metadata` batch wrapping when the client has `batch` cap.
 /// Always ends with 762 RPL_METADATAEND.
+#[allow(clippy::too_many_arguments)]
 async fn send_metadata_batch(
     senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
     client_id: &str,
@@ -134,6 +135,7 @@ async fn send_metadata_batch(
 /// Broadcast a METADATA change event to all eligible subscribers.
 /// `value = None` means the key was deleted.
 /// The setter (setter_id) does not receive their own notification.
+#[allow(clippy::too_many_arguments)]
 async fn broadcast_metadata_event(
     state: &Arc<RwLock<ServerState>>,
     channels: &Arc<RwLock<ChannelStore>>,
@@ -247,7 +249,7 @@ pub async fn handle_metadata(
     label: Option<&str>,
 ) -> anyhow::Result<()> {
     let s = &cfg.server.name;
-    let target_param = msg.params.get(0).map(|s| s.as_str()).unwrap_or("");
+    let target_param = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let subcommand = msg
         .params
         .get(1)

@@ -73,7 +73,7 @@ async fn handle_client_stream<S>(
         match reader.read_until(b'\n', &mut buf).await {
             Ok(0) => break,
             Ok(_) => {
-                while buf.ends_with(&[b'\r']) || buf.ends_with(&[b'\n']) {
+                while buf.ends_with(b"\r") || buf.ends_with(b"\n") {
                     buf.pop();
                 }
                 if buf.is_empty() {
