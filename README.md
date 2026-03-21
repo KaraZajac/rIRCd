@@ -360,7 +360,7 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **draft/client-batch** | Full | Client-originated BATCH types collected and relayed to recipients |
 | **CLIENTTAGDENY** | Full | Optional 005 token; config `server.client_tag_deny` |
 | **WebIRC** | Full | WEBIRC password gateway hostname ip; config `[webirc]` |
-| **draft/filehost** | Full | HTTP file upload endpoint; SASL PLAIN auth (HTTP Basic); `draft/FILEHOST=` ISUPPORT token; MIME-typed downloads |
+| **draft/filehost** | Full | HTTPS file upload endpoint with HTTP Basic auth (same credentials as SASL PLAIN); reuses `[tls]` certs; `FILEHOST=` / `draft/FILEHOST=` ISUPPORT tokens; MIME-typed downloads; configurable max upload size |
 
 ---
 
