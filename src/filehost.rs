@@ -26,8 +26,15 @@ pub struct FilehostState {
 }
 
 /// Build the axum router for the filehost.
+/// Routes are nested under the path component of `public_url` so that requests
+/// arriving at e.g. `/uploads` or `/uploads/<file>` match correctly regardless
+/// of reverse-proxy configuration.
 pub fn router(fh_state: Arc<FilehostState>) -> Router {
     let max_size = fh_state.max_size;
+
+    // Extract the path prefix from public_url (e.g. "https://example.com/uploads" → "/uploads")
+    let prefix = extract_url_path(&fh_state.public_url);
+    info!(prefix = %prefix, "Filehost routes mounted");
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -40,10 +47,13 @@ pub fn router(fh_state: Arc<FilehostState>) -> Router {
         ])
         .expose_headers([header::LOCATION, header::CONTENT_LENGTH]);
 
-    Router::new()
+    let filehost_routes = Router::new()
         .route("/", post(upload_file))
         .route("/{filename}", get(download_file))
-        .route("/{filename}", head(head_file))
+        .route("/{filename}", head(head_file));
+
+    Router::new()
+        .nest(&prefix, filehost_routes)
         .layer(DefaultBodyLimit::max(max_size))
         .layer(middleware::from_fn_with_state(
             fh_state.clone(),
@@ -288,5 +298,28 @@ fn sanitize_filename(name: &str) -> String {
         "invalid".to_string()
     } else {
         name
+    }
+}
+
+/// Extract the path component from a URL string.
+/// e.g. "https://example.com/uploads" → "/uploads"
+/// e.g. "https://example.com" → "/"
+fn extract_url_path(url: &str) -> String {
+    // Find the start of the path after "://host"
+    if let Some(after_scheme) = url.find("://") {
+        let rest = &url[after_scheme + 3..];
+        if let Some(slash_pos) = rest.find('/') {
+            let path = &rest[slash_pos..];
+            let path = path.trim_end_matches('/');
+            if path.is_empty() {
+                "/".to_string()
+            } else {
+                path.to_string()
+            }
+        } else {
+            "/".to_string()
+        }
+    } else {
+        "/".to_string()
     }
 }
