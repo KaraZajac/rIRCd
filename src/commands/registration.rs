@@ -47,9 +47,13 @@ async fn send_to_client(
     }
 }
 
+/// Maximum ISUPPORT tokens per 005 line (RFC recommends ≤13).
+const ISUPPORT_TOKENS_PER_LINE: usize = 13;
+
 /// ISUPPORT (005) token list; used at registration and for extended-isupport.
 fn isupport_tokens(cfg: &Config) -> String {
-    let base = "CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ EXCEPTS INVEX UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1 METADATA=50";
+    let network = format!(" NETWORK={}", cfg.network.name);
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={} MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST EXCEPTS INVEX UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1 METADATA=50{}", cfg.limits.max_line_length, network);
     let deny = cfg
         .server
         .client_tag_deny
@@ -188,8 +192,8 @@ pub async fn complete_registration(
                 nick_str.clone(),
                 server.clone(),
                 "rIRCd-0.1".into(),
-                "BiorRw".into(),
-                "beIqklimntspRcC".into(),
+                "BioRrw".into(),
+                "bceIklmnopqRstvC".into(),
             ],
         )
         .with_prefix(server),
@@ -198,21 +202,24 @@ pub async fn complete_registration(
     .await;
 
     let isupport = isupport_tokens(cfg);
-    reply_to_client(
-        &senders,
-        client_id,
-        Message::new(
-            "005",
-            vec![
-                nick_str.clone(),
-                isupport.clone(),
-                "are supported by this server".to_string(),
-            ],
+    let tokens: Vec<&str> = isupport.split(' ').collect();
+    for chunk in tokens.chunks(ISUPPORT_TOKENS_PER_LINE) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "005",
+                vec![
+                    nick_str.clone(),
+                    chunk.join(" "),
+                    "are supported by this server".to_string(),
+                ],
+            )
+            .with_prefix(server),
+            label,
         )
-        .with_prefix(server),
-        label,
-    )
-    .await;
+        .await;
+    }
 
     send_motd(nick_str, server, &senders, cfg, label, client_id).await;
 
@@ -273,17 +280,24 @@ pub async fn handle_isupport(
         }
     };
     let isupport = isupport_tokens(cfg);
-    reply_to_client(
-        &senders,
-        client_id,
-        Message::new(
-            "005",
-            vec![nick, isupport, "are supported by this server".to_string()],
+    let tokens: Vec<&str> = isupport.split(' ').collect();
+    for chunk in tokens.chunks(ISUPPORT_TOKENS_PER_LINE) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "005",
+                vec![
+                    nick.clone(),
+                    chunk.join(" "),
+                    "are supported by this server".to_string(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
         )
-        .with_prefix(&cfg.server.name),
-        label,
-    )
-    .await;
+        .await;
+    }
     Ok(())
 }
 
@@ -336,12 +350,28 @@ pub async fn handle_cap(
     let subcmd = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let version_302 = msg.params.get(1).map(|s| s.as_str()) == Some("302");
 
+    // Determine if client is already registered; use nick for responses, "*" during registration
+    let (is_registered, cap_nick) = {
+        let state_r = state.read().await;
+        let reg = state_r.clients.contains_key(client_id);
+        let nick = if reg {
+            match state_r.clients.get(client_id) {
+                Some(c) => c.read().await.nick_or_id().to_string(),
+                None => "*".to_string(),
+            }
+        } else {
+            "*".to_string()
+        };
+        (reg, nick)
+    };
     let mut state_guard = state.write().await;
-    let conn = state_guard.get_or_create_pending(client_id, host);
 
     match subcmd {
         "LS" => {
-            conn.cap_negotiating = true;
+            if !is_registered {
+                let conn = state_guard.get_or_create_pending(client_id, host);
+                conn.cap_negotiating = true;
+            }
             let tls_port: Option<u16> = if cfg.tls_enabled() {
                 cfg.server
                     .listen_tls
@@ -351,19 +381,15 @@ pub async fn handle_cap(
             } else {
                 None
             };
-            // CAP LS 302 multi-line format per IRCv3 spec:
-            //   continuation lines: CAP * LS * :cap1 cap2 ...
-            //   final line:         CAP * LS :cap1 cap2 ...
-            // Without 302 (or single-line): CAP * LS :cap1 cap2 ...
-            let caps = build_cap_list(version_302, tls_port);
+            let sasl_external = cfg.tls.client_certs && cfg.tls_enabled();
+            let caps = build_cap_list(version_302, tls_port, sasl_external);
             let total = caps.len();
             for (i, cap_line) in caps.iter().enumerate() {
                 let is_last = i == total - 1;
                 let params = if !is_last {
-                    // Continuation: the asterisk is a separate third parameter.
-                    vec!["*".into(), "LS".into(), "*".into(), cap_line.clone()]
+                    vec![cap_nick.clone(), "LS".into(), "*".into(), cap_line.clone()]
                 } else {
-                    vec!["*".into(), "LS".into(), cap_line.clone()]
+                    vec![cap_nick.clone(), "LS".into(), cap_line.clone()]
                 };
                 let mut reply = Message::new("CAP", params);
                 reply.prefix = Some(cfg.server.name.clone());
@@ -371,46 +397,138 @@ pub async fn handle_cap(
             }
         }
         "LIST" => {
-            let cap_line = conn
-                .capabilities
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" ");
-            let mut reply = Message::new("CAP", vec!["*".into(), "LIST".into(), cap_line]);
+            let cap_line = if is_registered {
+                match state_guard.clients.get(client_id) {
+                    Some(c) => {
+                        let cg = c.read().await;
+                        cg.capabilities
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }
+                    None => String::new(),
+                }
+            } else {
+                let conn = state_guard.get_or_create_pending(client_id, host);
+                conn.capabilities
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let mut reply =
+                Message::new("CAP", vec![cap_nick.clone(), "LIST".into(), cap_line]);
             reply.prefix = Some(cfg.server.name.clone());
             reply_to_client(&senders, client_id, reply, label).await;
         }
         "REQ" => {
-            let requested: Vec<String> = msg
+            let raw: Vec<String> = msg
                 .trailing()
                 .unwrap_or("")
                 .split_whitespace()
                 .map(String::from)
                 .collect();
-            let (ack, nak) = filter_requested(&requested, &std::collections::HashSet::new());
-            if nak.is_empty() {
-                for c in &ack {
-                    conn.capabilities.insert(c.clone());
+
+            // Separate caps to enable vs disable (prefixed with `-`)
+            let mut to_enable: Vec<String> = Vec::new();
+            let mut to_disable: Vec<String> = Vec::new();
+            for cap in &raw {
+                if let Some(stripped) = cap.strip_prefix('-') {
+                    to_disable.push(stripped.to_string());
+                } else {
+                    to_enable.push(cap.clone());
                 }
-                let mut reply = Message::new("CAP", vec!["*".into(), "ACK".into(), ack.join(" ")]);
+            }
+
+            let (ack_enable, nak) =
+                filter_requested(&to_enable, &std::collections::HashSet::new());
+            let mut nak_disable = Vec::new();
+            for cap in &to_disable {
+                let base = cap.split('=').next().unwrap_or(cap);
+                if !crate::capability::CAPS.contains(&base) {
+                    nak_disable.push(format!("-{}", cap));
+                }
+            }
+
+            if nak.is_empty() && nak_disable.is_empty() {
+                if is_registered {
+                    if let Some(c) = state_guard.clients.get(client_id) {
+                        let mut cg = c.write().await;
+                        for cap in &ack_enable {
+                            cg.capabilities.insert(cap.clone());
+                        }
+                        for cap in &to_disable {
+                            let base = cap.split('=').next().unwrap_or(cap);
+                            cg.capabilities.remove(base);
+                        }
+                    }
+                } else {
+                    let conn = state_guard.get_or_create_pending(client_id, host);
+                    for c in &ack_enable {
+                        conn.capabilities.insert(c.clone());
+                    }
+                    for c in &to_disable {
+                        let base = c.split('=').next().unwrap_or(c);
+                        conn.capabilities.remove(base);
+                    }
+                }
+                let ack_str: Vec<String> = ack_enable
+                    .iter()
+                    .cloned()
+                    .chain(to_disable.iter().map(|c| format!("-{}", c)))
+                    .collect();
+                let mut reply = Message::new(
+                    "CAP",
+                    vec![cap_nick.clone(), "ACK".into(), ack_str.join(" ")],
+                );
                 reply.prefix = Some(cfg.server.name.clone());
                 reply_to_client(&senders, client_id, reply, label).await;
-                // cap-notify: no action needed here; CAP NEW/DEL would be sent if
-                // the server's capability list changed at runtime (it doesn't).
             } else {
-                let mut reply = Message::new("CAP", vec!["*".into(), "NAK".into(), nak.join(" ")]);
+                let mut all_nak: Vec<String> = nak;
+                all_nak.extend(nak_disable);
+                let mut reply = Message::new(
+                    "CAP",
+                    vec![cap_nick.clone(), "NAK".into(), all_nak.join(" ")],
+                );
                 reply.prefix = Some(cfg.server.name.clone());
                 reply_to_client(&senders, client_id, reply, label).await;
             }
         }
         "END" => {
-            conn.cap_ended = true;
+            if !is_registered {
+                let conn = state_guard.get_or_create_pending(client_id, host);
+                conn.cap_ended = true;
+            }
         }
-        _ => {}
+        _ => {
+            // 410 ERR_INVALIDCAPCMD
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "410",
+                    vec![
+                        cap_nick,
+                        subcmd.to_string(),
+                        "Invalid CAP subcommand".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+        }
     }
 
-    let should_complete = conn.ready_to_register();
+    let should_complete = if !is_registered {
+        state_guard
+            .pending
+            .get(client_id)
+            .is_some_and(|p| p.ready_to_register())
+    } else {
+        false
+    };
     drop(state_guard);
 
     if should_complete {
@@ -816,7 +934,7 @@ pub async fn handle_quit(
     channels: Arc<RwLock<ChannelStore>>,
     senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
     cfg: &Config,
-    _label: Option<&str>,
+    label: Option<&str>,
 ) -> anyhow::Result<()> {
     let reason = msg.trailing().unwrap_or("Client quit").to_string();
 
@@ -866,6 +984,25 @@ pub async fn handle_quit(
             let _ = persist::append_channel_history(pool, ch_name, &source, &reason, None, "QUIT")
                 .await;
         }
+    }
+
+    // 901 RPL_LOGGEDOUT: notify the client they are no longer logged in
+    if had_account {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "901",
+                vec![
+                    quit_nick.clone(),
+                    source.clone(),
+                    "You are now logged out".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
     }
 
     // account-notify: on logout send ACCOUNT * to channel peers that have the cap
@@ -926,6 +1063,10 @@ pub async fn handle_quit(
         state_w
             .monitor_watchers
             .remove_client(client_id, &monitor_list);
+        state_w
+            .monitor_watchers
+            .remove_client_patterns(client_id, &monitor_list);
+        state_w.certfps.remove(client_id);
         state_w.remove_client(client_id).await;
     }
     senders.write().await.remove(client_id);
@@ -1041,7 +1182,186 @@ pub async fn handle_authenticate(
         }
     }
 
-    // Unknown mechanism (not PLAIN, not SCRAM, not a continuation of either)
+    // AUTHENTICATE * — abort in-progress SASL (IRCv3: 906 ERR_SASLABORTED)
+    if mechanism == "*" {
+        let nick = state
+            .read()
+            .await
+            .pending
+            .get(client_id)
+            .and_then(|c| c.nick.clone())
+            .unwrap_or_else(|| "*".to_string());
+        {
+            let mut sg = state.write().await;
+            if let Some(conn) = sg.pending.get_mut(client_id) {
+                conn.sasl_mechanism = None;
+                conn.sasl_plain_buffer.clear();
+                conn.sasl_chunk_count = 0;
+                conn.sasl_scram = None;
+            }
+        }
+        tracing::info!(client_id, "SASL: authentication aborted by client");
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "906",
+                vec![nick, "SASL authentication aborted".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Route SASL EXTERNAL: TLS client certificate authentication
+    if mechanism == "EXTERNAL" || stored_mechanism.as_deref() == Some("EXTERNAL") {
+        if mechanism == "EXTERNAL" {
+            {
+                let mut sg = state.write().await;
+                if let Some(conn) = sg.pending.get_mut(client_id) {
+                    conn.sasl_mechanism = Some("EXTERNAL".to_string());
+                }
+            }
+            // If client sent data inline (authzid), use it; otherwise request with AUTHENTICATE +
+            let inline = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
+            if inline.is_empty() || inline == "EXTERNAL" {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("AUTHENTICATE", vec!["+".into()]).with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+        }
+        // Client sent the authzid payload (or "+")
+        // Look up certfp for this client
+        let certfp = {
+            let sg = state.read().await;
+            sg.certfps.get(client_id).cloned()
+        };
+        let certfp = match certfp {
+            Some(fp) => fp,
+            None => {
+                let nick = state
+                    .read()
+                    .await
+                    .pending
+                    .get(client_id)
+                    .and_then(|c| c.nick.clone())
+                    .unwrap_or_else(|| "*".to_string());
+                tracing::info!(client_id, "SASL EXTERNAL: no TLS client certificate");
+                sasl_fail(
+                    state.clone(),
+                    &senders,
+                    client_id,
+                    cfg,
+                    label,
+                    &nick,
+                    "SASL authentication failed",
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        // Look up account by certfp in the database
+        let account = if let Some(ref pool) = cfg.db {
+            crate::persist::lookup_account_by_certfp(pool, &certfp).await
+        } else {
+            None
+        };
+        let account = match account {
+            Some(a) => a,
+            None => {
+                let nick = state
+                    .read()
+                    .await
+                    .pending
+                    .get(client_id)
+                    .and_then(|c| c.nick.clone())
+                    .unwrap_or_else(|| "*".to_string());
+                tracing::info!(client_id, certfp = %certfp, "SASL EXTERNAL: no account for certfp");
+                sasl_fail(
+                    state.clone(),
+                    &senders,
+                    client_id,
+                    cfg,
+                    label,
+                    &nick,
+                    "SASL authentication failed",
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        // Authentication successful
+        {
+            let mut sg = state.write().await;
+            if let Some(conn) = sg.pending.get_mut(client_id) {
+                conn.account = Some(account.clone());
+                conn.sasl_mechanism = None;
+            }
+        }
+        tracing::info!(client_id, account = %account, "SASL EXTERNAL authentication successful");
+        let nick = state
+            .read()
+            .await
+            .pending
+            .get(client_id)
+            .and_then(|c| c.nick.clone())
+            .unwrap_or_else(|| "*".to_string());
+        let source = format!(
+            "{}!{}@{}",
+            &nick,
+            state.read().await.pending.get(client_id).and_then(|c| c.user.as_deref()).unwrap_or("*"),
+            host
+        );
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "900",
+                vec![
+                    nick.clone(),
+                    source,
+                    account.clone(),
+                    format!("You are now logged in as {}", account),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "903",
+                vec![nick, "SASL authentication successful".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        // Try to complete registration if ready
+        {
+            let ready = state
+                .read()
+                .await
+                .pending
+                .get(client_id)
+                .is_some_and(|p| p.ready_to_register());
+            if ready {
+                complete_registration(client_id, state, senders, cfg, label).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Unknown mechanism (not PLAIN, not SCRAM, not EXTERNAL, not a continuation)
     if mechanism != "PLAIN"
         && mechanism != "+"
         && !mechanism.is_empty()
@@ -1054,6 +1374,11 @@ pub async fn handle_authenticate(
             .get(client_id)
             .and_then(|c| c.nick.clone())
             .unwrap_or_else(|| "*".to_string());
+        let mechs = if cfg.tls.client_certs && cfg.tls_enabled() {
+            "PLAIN,SCRAM-SHA-256,EXTERNAL"
+        } else {
+            "PLAIN,SCRAM-SHA-256"
+        };
         reply_to_client(
             &senders,
             client_id,
@@ -1061,7 +1386,7 @@ pub async fn handle_authenticate(
                 "908",
                 vec![
                     nick,
-                    "PLAIN,SCRAM-SHA-256".into(),
+                    mechs.into(),
                     "are available SASL mechanisms".into(),
                 ],
             )
@@ -1176,16 +1501,17 @@ pub async fn handle_authenticate(
                     token_len = token.len(),
                     new_len,
                     max = MAX_SASL_PLAIN_BUF,
-                    "SASL AUTHENTICATE: buffer exceeded max length, sending 904"
+                    "SASL AUTHENTICATE: buffer exceeded max length, sending 905"
                 );
-                sasl_fail(
-                    state,
+                reply_to_client(
                     &senders,
                     client_id,
-                    cfg,
+                    Message::new(
+                        "905",
+                        vec![nick, "SASL message too long".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
-                    &nick,
-                    "SASL authentication failed",
                 )
                 .await;
                 return Ok(());
@@ -1443,6 +1769,16 @@ pub async fn handle_authenticate(
     }
 
     tracing::info!(client_id = %client_id, account = %account, "SASL PLAIN authentication successful");
+
+    // Auto-associate TLS certfp with the account for SASL EXTERNAL
+    if let Some(ref pool) = cfg.db {
+        let certfp = state.read().await.certfps.get(client_id).cloned();
+        if let Some(fp) = certfp {
+            tracing::info!(client_id = %client_id, account = %account, "Auto-associating certfp with account");
+            crate::persist::set_certfp(pool, account, &fp).await;
+        }
+    }
+
     let (channel_list, source, user_ident_host) = {
         let mut state = state.write().await;
         if let Some(client) = state.clients.get_mut(client_id) {
@@ -1888,6 +2224,15 @@ async fn handle_authenticate_scram_step(
 
         tracing::info!(client_id, account = %account, "SASL SCRAM-SHA-256 authentication successful");
 
+        // Auto-associate TLS certfp with the account for SASL EXTERNAL
+        if let Some(ref pool) = cfg.db {
+            let certfp = state.read().await.certfps.get(client_id).cloned();
+            if let Some(fp) = certfp {
+                tracing::info!(client_id, account = %account, "Auto-associating certfp with account");
+                crate::persist::set_certfp(pool, &account, &fp).await;
+            }
+        }
+
         // 900 RPL_LOGGEDIN + 903 RPL_SASLSUCCESS
         let (channel_list, source, user_ident_host) = {
             let sg = state.write().await;
@@ -2308,7 +2653,11 @@ pub async fn handle_away(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let away_msg = msg.trailing().map(String::from);
+    // AWAYLEN=307 (matches ISUPPORT)
+    let away_msg = msg
+        .trailing()
+        .map(|s| if s.len() > 307 { &s[..307] } else { s })
+        .map(String::from);
     let (source, channel_list) = {
         let mut state = state.write().await;
         if !state.clients.contains_key(client_id) {

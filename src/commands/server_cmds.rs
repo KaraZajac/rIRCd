@@ -1225,6 +1225,28 @@ pub async fn handle_rehash(
         }
     };
 
+    // Snapshot old cap list before replacing config
+    let old_tls_port: Option<u16> = if cfg.read().await.tls_enabled() {
+        cfg.read()
+            .await
+            .server
+            .listen_tls
+            .first()
+            .and_then(|addr| addr.rsplit(':').next())
+            .and_then(|p| p.parse().ok())
+    } else {
+        None
+    };
+    let old_sasl_external = {
+        let c = cfg.read().await;
+        c.tls.client_certs && c.tls_enabled()
+    };
+    let old_caps_raw = crate::capability::build_cap_list(false, old_tls_port, old_sasl_external);
+    let old_caps: std::collections::HashSet<String> = old_caps_raw[0]
+        .split(' ')
+        .map(|s| s.to_string())
+        .collect();
+
     // Preserve the live database pool — REHASH does not reconnect
     let existing_db = cfg.read().await.db.clone();
     let mut new_cfg = new_cfg;
@@ -1232,6 +1254,101 @@ pub async fn handle_rehash(
 
     let config_file = config_path.to_string_lossy().to_string();
     *cfg.write().await = new_cfg;
+
+    // Compute new cap list and diff
+    let new_tls_port: Option<u16> = if cfg.read().await.tls_enabled() {
+        cfg.read()
+            .await
+            .server
+            .listen_tls
+            .first()
+            .and_then(|addr| addr.rsplit(':').next())
+            .and_then(|p| p.parse().ok())
+    } else {
+        None
+    };
+    let new_sasl_external = {
+        let c = cfg.read().await;
+        c.tls.client_certs && c.tls_enabled()
+    };
+    let new_caps_raw = crate::capability::build_cap_list(false, new_tls_port, new_sasl_external);
+    let new_caps: std::collections::HashSet<String> = new_caps_raw[0]
+        .split(' ')
+        .map(|s| s.to_string())
+        .collect();
+
+    // Extract just cap names (strip =value) for comparison
+    let old_names: std::collections::HashSet<String> = old_caps
+        .iter()
+        .map(|s| s.split('=').next().unwrap_or(s).to_string())
+        .collect();
+    let new_names: std::collections::HashSet<String> = new_caps
+        .iter()
+        .map(|s| s.split('=').next().unwrap_or(s).to_string())
+        .collect();
+
+    // Caps added or whose values changed
+    let mut cap_new: Vec<String> = Vec::new();
+    let mut cap_del: Vec<String> = Vec::new();
+
+    for name in new_names.difference(&old_names) {
+        // Newly added cap — include with value from new_caps
+        if let Some(full) = new_caps.iter().find(|s| s.split('=').next().unwrap_or(s) == name) {
+            cap_new.push(full.clone());
+        }
+    }
+    for name in old_names.difference(&new_names) {
+        cap_del.push(name.clone());
+    }
+    // Check for value changes on caps present in both
+    for name in old_names.intersection(&new_names) {
+        let old_full = old_caps
+            .iter()
+            .find(|s| s.split('=').next().unwrap_or(s) == name);
+        let new_full = new_caps
+            .iter()
+            .find(|s| s.split('=').next().unwrap_or(s) == name);
+        if old_full != new_full {
+            if let Some(full) = new_full {
+                cap_new.push(full.clone());
+            }
+        }
+    }
+
+    // Send CAP NEW / CAP DEL to clients with cap-notify
+    if !cap_new.is_empty() || !cap_del.is_empty() {
+        let state_r = state.read().await;
+        let client_ids: Vec<String> = state_r.clients.keys().cloned().collect();
+        for cid in &client_ids {
+            let has_cap_notify = match state_r.clients.get(cid) {
+                Some(c) => c.read().await.has_cap("cap-notify"),
+                None => false,
+            };
+            if !has_cap_notify {
+                continue;
+            }
+            if !cap_new.is_empty() {
+                let cap_line = cap_new.join(" ");
+                send_to_client(
+                    &senders,
+                    cid,
+                    Message::new("CAP", vec!["*".into(), "NEW".into(), cap_line])
+                        .with_prefix(&server_name),
+                )
+                .await;
+            }
+            if !cap_del.is_empty() {
+                let cap_line = cap_del.join(" ");
+                send_to_client(
+                    &senders,
+                    cid,
+                    Message::new("CAP", vec!["*".into(), "DEL".into(), cap_line])
+                        .with_prefix(&server_name),
+                )
+                .await;
+            }
+        }
+    }
 
     info!("Config reloaded by {}", nick);
     reply_to_client(

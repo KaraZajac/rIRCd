@@ -108,6 +108,8 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 | `name` | `rIRCd.local` | Server hostname shown to clients |
 | `listen` | `[":6667"]` | Plain-text listener addresses |
 | `listen_tls` | `[]` | TLS listener addresses (requires `[tls]`) |
+| `listen_ws` | `[]` | WebSocket listener addresses (e.g. `[":7667"]`) |
+| `listen_wss` | `[]` | WebSocket-over-TLS listener addresses (requires `[tls]`) |
 | `motd` | `"Welcome to rIRCd!"` | Message of the day (inline text, multiline OK) |
 | `registration_timeout_secs` | `60` | Time allowed to complete NICK/USER before disconnect |
 | `ping_timeout_secs` | `90` | How long to wait for PONG before sending next PING |
@@ -140,6 +142,7 @@ Optional. Both fields must be set to enable TLS listeners.
 |-----|-------------|
 | `cert` | Path to PEM certificate file |
 | `key` | Path to PEM private key file |
+| `client_certs` | If `true`, request TLS client certificates for SASL EXTERNAL (default `false`) |
 
 Example:
 
@@ -332,17 +335,18 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **no-implicit-names** | Full | No NAMES burst on JOIN when client has cap |
 | **userhost-in-names** | Full | NAMES (353) with full `nick!user@host` when client has cap |
 | **utf8only** | Full | Non-UTF-8 rejected with FAIL when client has standard-replies |
-| **cap-notify** | Full | CAP NOTIFY with current cap list on REQ/ACK and END |
+| **cap-notify** | Full | CAP NOTIFY with current cap list on REQ/ACK and END; dynamic `CAP NEW`/`CAP DEL` on REHASH |
 | **draft/extended-isupport** | Full | ISUPPORT command; 005 before registration |
 | **whox** | Full | WHO with %fields; 354 RPL_WHOSPCRPL |
 | **bot** | Full | Umode +B; RPL_WHOISBOT (335) in WHOIS |
 | **message-redaction** | Full | REDACT command; soft-delete in DB; CHATHISTORY replays REDACT events for client sync |
 | **draft/message-edit** | Full | PRIVMSG with `+draft/edit=<msgid>` tag; DB-backed ownership check; edit history replayed in CHATHISTORY |
 | **draft/react** | Full | TAGMSG with `+draft/react=<emoji>`; forwarded via client-only tag relay |
+| **draft/unreact** | Full | TAGMSG with `+draft/unreact=<emoji>`; forwarded via client-only tag relay |
 | **typing** | Full | TAGMSG with `+typing=active/paused/done`; forwarded via client-only tag relay |
 | **reply** | Full | Messages with `+reply=<msgid>` tag forwarded as-is |
 | **account-extban** | Full | MODE +b ~a:account; JOIN 474 when banned by account |
-| **sasl** | Full | AUTHENTICATE PLAIN and SCRAM-SHA-256; 903/904; advertised as `sasl=PLAIN,SCRAM-SHA-256` |
+| **sasl** | Full | AUTHENTICATE PLAIN, SCRAM-SHA-256, and EXTERNAL (TLS client cert); 903/904; certfp auto-associated on PLAIN/SCRAM login |
 | **monitor** | Full | MONITOR +/−/C/L/S; 730/731/732/733/734; on join/quit/nick |
 | **extended-monitor** | Full | MONITOR patterns with `nick!user@host` globs (`*`/`?` wildcards) |
 | **sts** | Full | Strict Transport Security; advertised in CAP LS only when TLS is configured; `duration=2592000` |
@@ -360,6 +364,7 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **draft/client-batch** | Full | Client-originated BATCH types collected and relayed to recipients |
 | **CLIENTTAGDENY** | Full | Optional 005 token; config `server.client_tag_deny` |
 | **WebIRC** | Full | WEBIRC password gateway hostname ip; config `[webirc]` |
+| **WebSocket** | Full | IRCv3 WebSocket transport; `listen_ws`/`listen_wss` config; subprotocol `text.ircv3.net` |
 | **draft/filehost** | Full | HTTPS file upload endpoint with HTTP Basic auth (same credentials as SASL PLAIN); reuses `[tls]` certs; `FILEHOST=` / `draft/FILEHOST=` ISUPPORT tokens; MIME-typed downloads; configurable max upload size |
 
 ---
@@ -370,9 +375,7 @@ Features under consideration for future releases:
 
 | Feature | Description |
 |---------|-------------|
-| **cap-notify (dynamic)** | Send `CAP NEW`/`CAP DEL` on REHASH when enabled capabilities change |
 | **draft/webpush** | Web Push notifications (RFC 8291) via `WEBPUSH REGISTER`/`UNREGISTER` |
-| **+draft/unreact** | Remove a previously sent reaction |
 | **draft/account-registration VERIFY** | Email-based account verification (currently returns `INVALID_CODE`) |
 
 ---

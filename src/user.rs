@@ -345,6 +345,8 @@ pub struct ServerState {
     pub started_at: i64,
     /// Path to the config file on disk (used by REHASH to reload)
     pub config_path: Option<std::path::PathBuf>,
+    /// TLS client certificate fingerprints: client_id → SHA-256 hex (for SASL EXTERNAL)
+    pub certfps: HashMap<String, String>,
 }
 
 /// In-flight draft/multiline batch for one client

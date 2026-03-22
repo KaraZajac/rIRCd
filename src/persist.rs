@@ -198,8 +198,47 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Migrate: add certfp column for SASL EXTERNAL (TLS client certificate fingerprint)
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS certfp VARCHAR(128) DEFAULT NULL",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    sqlx::query(
+        "ALTER TABLE users ADD INDEX IF NOT EXISTS idx_certfp (certfp)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
     tracing::info!("Database schema ready");
     Ok(())
+}
+
+// ─── SASL EXTERNAL (certfp) ──────────────────────────────────────────────────
+
+/// Look up an account by TLS client certificate fingerprint (SHA-256 hex).
+pub async fn lookup_account_by_certfp(pool: &sqlx::MySqlPool, certfp: &str) -> Option<String> {
+    use sqlx::Row;
+    sqlx::query("SELECT nick FROM users WHERE certfp = ? LIMIT 1")
+        .bind(certfp)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.get("nick"))
+}
+
+/// Associate a TLS certificate fingerprint with an account.
+pub async fn set_certfp(pool: &sqlx::MySqlPool, account: &str, certfp: &str) {
+    let account_lower = account.to_lowercase();
+    let _ = sqlx::query("UPDATE users SET certfp = ? WHERE nick_lower = ?")
+        .bind(certfp)
+        .bind(&account_lower)
+        .execute(pool)
+        .await;
 }
 
 // ─── Channels ─────────────────────────────────────────────────────────────────

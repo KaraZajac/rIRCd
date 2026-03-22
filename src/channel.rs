@@ -137,14 +137,17 @@ impl Channel {
         (is_op, is_voice)
     }
 
-    /// Check if the client is banned (account-extban ~a: or hostmask match).
+    /// Check if the client is banned (account-extban ~a: or hostmask glob match).
     pub fn is_banned(&self, account: Option<&str>, source: &str) -> bool {
         for ban in &self.bans {
             if let Some(account_ban) = ban.strip_prefix("~a:") {
-                if account.map(|a| a == account_ban).unwrap_or(false) {
+                if account
+                    .map(|a| a.eq_ignore_ascii_case(account_ban))
+                    .unwrap_or(false)
+                {
                     return true;
                 }
-            } else if ban == source {
+            } else if crate::user::glob_match(ban, source) {
                 return true;
             }
         }

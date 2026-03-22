@@ -111,6 +111,29 @@ pub async fn handle_privmsg(
         return Ok(());
     }
 
+    // TARGMAX enforcement: only 1 target allowed per PRIVMSG
+    if target.contains(',') {
+        let nick = {
+            let sg = state.read().await;
+            match sg.clients.get(client_id) {
+                Some(c) => c.read().await.nick_or_id().to_string(),
+                None => "*".to_string(),
+            }
+        };
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "407",
+                vec![nick, target.into(), "Too many recipients".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
     let state_guard = state.read().await;
     let client = match state_guard.clients.get(client_id) {
         Some(c) => c.clone(),
@@ -247,12 +270,16 @@ pub async fn handle_privmsg(
         let ch_store = channels.read().await;
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
-            if !ch.is_member(client_id) {
+            // +n: reject non-members when no-external-messages is set
+            if !ch.is_member(client_id) && ch.modes.no_external {
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("404", vec![target.into(), "Cannot send to channel".into()])
-                        .with_prefix(&cfg.server.name),
+                    Message::new(
+                        "404",
+                        vec![target.into(), "Cannot send to channel (+n)".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -304,6 +331,31 @@ pub async fn handle_privmsg(
                         vec![
                             target.into(),
                             "You must be registered to speak here (+R)".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+
+            // +m: only voiced/halfop/op may send to moderated channels
+            if ch.modes.moderated
+                && !ch
+                    .members
+                    .get(client_id)
+                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .unwrap_or(false)
+            {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "404",
+                        vec![
+                            target.into(),
+                            "Cannot send to channel (+m)".into(),
                         ],
                     )
                     .with_prefix(&cfg.server.name),
@@ -489,6 +541,11 @@ pub async fn handle_notice(
         return Ok(());
     }
 
+    // TARGMAX enforcement: only 1 target allowed per NOTICE
+    if raw_target.contains(',') {
+        return Ok(());
+    }
+
     let state_guard = state.read().await;
     let client = match state_guard.clients.get(client_id) {
         Some(c) => c.clone(),
@@ -532,7 +589,8 @@ pub async fn handle_notice(
         let ch_store = channels.read().await;
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
-            if !ch.is_member(client_id) {
+            // +n: reject non-members when no-external-messages is set
+            if !ch.is_member(client_id) && ch.modes.no_external {
                 return Ok(());
             }
             // +m: only voiced/op may send
