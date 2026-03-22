@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rIRCd - Bleeding-edge IRC Server</title>
+  <meta name="description" content="A modern IRC server written in Rust with comprehensive IRCv3 support, SASL authentication, message history, file uploads, and more.">
+  <style>
+    :root {
+      --bg: #0e1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-hover: #79c0ff;
+      --green: #3fb950;
+      --orange: #d29922;
+      --red: #f85149;
+      --purple: #bc8cff;
+      --pink: #f778ba;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-hover); text-decoration: underline; }
+
+    .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+
+    /* ── Hero ── */
+    .hero {
+      text-align: center;
+      padding: 80px 24px 60px;
+      background: linear-gradient(180deg, #161b22 0%, var(--bg) 100%);
+      border-bottom: 1px solid var(--border);
+    }
+    .hero h1 {
+      font-size: 3.5rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 12px;
+    }
+    .hero h1 span { color: var(--accent); }
+    .hero .tagline {
+      font-size: 1.25rem;
+      color: var(--text-muted);
+      max-width: 600px;
+      margin: 0 auto 32px;
+    }
+    .hero-badges {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-bottom: 32px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .badge-green { color: var(--green); border-color: #23492e; }
+    .badge-blue { color: var(--accent); border-color: #1a3a5c; }
+    .badge-purple { color: var(--purple); border-color: #3b2d5e; }
+    .badge-orange { color: var(--orange); border-color: #4b3a1a; }
+
+    .hero-buttons {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 28px;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #0e1117;
+      border-color: var(--accent);
+    }
+    .btn-primary:hover { background: var(--accent-hover); text-decoration: none; }
+    .btn-secondary {
+      background: var(--surface);
+      color: var(--text);
+    }
+    .btn-secondary:hover { border-color: var(--accent); text-decoration: none; }
+
+    /* ── Sections ── */
+    section { padding: 60px 0; border-bottom: 1px solid var(--border); }
+    section:last-child { border-bottom: none; }
+    section h2 {
+      font-size: 2rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    section .subtitle {
+      color: var(--text-muted);
+      margin-bottom: 32px;
+      font-size: 1.05rem;
+    }
+
+    /* ── Feature grid ── */
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 20px;
+    }
+    .feature-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      transition: border-color 0.15s;
+    }
+    .feature-card:hover { border-color: var(--accent); }
+    .feature-card h3 {
+      font-size: 1.1rem;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .feature-card p { color: var(--text-muted); font-size: 0.95rem; }
+    .feature-icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1rem;
+      flex-shrink: 0;
+    }
+    .fi-blue { background: #1a3a5c; color: var(--accent); }
+    .fi-green { background: #23492e; color: var(--green); }
+    .fi-purple { background: #3b2d5e; color: var(--purple); }
+    .fi-orange { background: #4b3a1a; color: var(--orange); }
+    .fi-pink { background: #4b1a3a; color: var(--pink); }
+    .fi-red { background: #4b1a1a; color: var(--red); }
+
+    /* ── IRCv3 table ── */
+    .cap-table-wrapper {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+    .cap-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    .cap-table th {
+      text-align: left;
+      padding: 12px 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: 0.05em;
+    }
+    .cap-table td {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .cap-table tr:last-child td { border-bottom: none; }
+    .cap-table tr:hover { background: rgba(88, 166, 255, 0.04); }
+    .cap-table code {
+      background: var(--surface);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.85em;
+      border: 1px solid var(--border);
+    }
+    .status-full {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      background: #23492e;
+      color: var(--green);
+    }
+
+    /* ── Quick start ── */
+    .quickstart {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .quickstart-header {
+      padding: 12px 20px;
+      background: rgba(0,0,0,0.3);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .quickstart-dots { display: flex; gap: 6px; }
+    .quickstart-dot {
+      width: 12px; height: 12px; border-radius: 50%;
+    }
+    .quickstart-dot:nth-child(1) { background: var(--red); }
+    .quickstart-dot:nth-child(2) { background: var(--orange); }
+    .quickstart-dot:nth-child(3) { background: var(--green); }
+    .quickstart-title {
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      margin-left: 8px;
+    }
+    pre {
+      padding: 20px 24px;
+      overflow-x: auto;
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 0.9rem;
+      line-height: 1.7;
+    }
+    pre .comment { color: var(--text-muted); }
+    pre .cmd { color: var(--green); }
+    pre .flag { color: var(--orange); }
+
+    /* ── Config ── */
+    .config-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 20px;
+    }
+    .config-block {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+    }
+    .config-block h3 {
+      font-size: 1rem;
+      margin-bottom: 12px;
+      color: var(--accent);
+      font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+    .config-block table { width: 100%; font-size: 0.85rem; }
+    .config-block td {
+      padding: 4px 0;
+      vertical-align: top;
+    }
+    .config-block td:first-child {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      color: var(--green);
+      padding-right: 16px;
+      white-space: nowrap;
+    }
+    .config-block td:last-child { color: var(--text-muted); }
+
+    /* ── Commands ── */
+    .cmd-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 12px;
+    }
+    .cmd-item {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      padding: 12px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.9rem;
+    }
+    .cmd-item code {
+      color: var(--green);
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.85em;
+      white-space: nowrap;
+    }
+    .cmd-item span { color: var(--text-muted); }
+
+    /* ── Modes ── */
+    .mode-columns {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+    }
+    @media (max-width: 700px) { .mode-columns { grid-template-columns: 1fr; } }
+    .mode-list h3 {
+      font-size: 1.1rem;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .mode-item {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      padding: 6px 0;
+      font-size: 0.9rem;
+    }
+    .mode-item code {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      color: var(--accent);
+      min-width: 30px;
+    }
+    .mode-item span { color: var(--text-muted); }
+
+    /* ── Footer ── */
+    footer {
+      text-align: center;
+      padding: 40px 24px;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+    footer a { color: var(--accent); }
+
+    /* ── Responsive ── */
+    @media (max-width: 600px) {
+      .hero h1 { font-size: 2.5rem; }
+      .hero .tagline { font-size: 1.05rem; }
+      section { padding: 40px 0; }
+      .features { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════ HERO ═══════════════════════════════════════ -->
+<header class="hero">
+  <h1><span>r</span>IRCd</h1>
+  <p class="tagline">A bleeding-edge IRC server written in Rust with comprehensive IRCv3 support.</p>
+  <div class="hero-badges">
+    <span class="badge badge-green">45+ IRCv3 specs</span>
+    <span class="badge badge-blue">Rust + Tokio</span>
+    <span class="badge badge-purple">SASL PLAIN / SCRAM / EXTERNAL</span>
+    <span class="badge badge-orange">MariaDB-backed</span>
+  </div>
+  <div class="hero-buttons">
+    <a href="https://github.com/KaraZajac/rIRCd/releases/latest" class="btn btn-primary">Download Latest Release</a>
+    <a href="https://github.com/KaraZajac/rIRCd" class="btn btn-secondary">View on GitHub</a>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════════════ FEATURES ═══════════════════════════════════ -->
+<section>
+  <div class="container">
+    <h2>Features</h2>
+    <p class="subtitle">Everything you need for a modern IRC network, out of the box.</p>
+    <div class="features">
+      <div class="feature-card">
+        <h3><span class="feature-icon fi-blue">&#128274;</span> Strong Authentication</h3>
+        <p>SASL PLAIN, SCRAM-SHA-256 with mutual auth, and EXTERNAL via TLS client certificates. Bcrypt-hashed passwords. Account registration from any client.</p>
+      </div>
+      <div class="feature-card">
+        <h3><span class="feature-icon fi-green">&#128190;</span> Full Persistence</h3>
+        <p>Channels, topics, modes, bans, operators, voice lists, message history, read markers, and metadata all persisted in MariaDB. Nothing lost on restart.</p>
+      </div>
+      <div class="feature-card">
+        <h3><span class="feature-icon fi-purple">&#128172;</span> Message History</h3>
+        <p>CHATHISTORY LATEST/BEFORE/AFTER/AROUND/BETWEEN/TARGETS with event playback. Edit history and REDACT events replayed for full client sync.</p>
+      </div>
+      <div class="feature-card">
+        <h3><span class="feature-icon fi-orange">&#128274;</span> TLS Everywhere</h3>
+        <p>Native TLS for IRC, WebSocket, and filehost. Strict Transport Security (STS). Host cloaking with HMAC-SHA256. SASL EXTERNAL with client certs.</p>
+      </div>
+      <div class="feature-card">
+        <h3><span class="feature-icon fi-pink">&#128206;</span> File Uploads</h3>
+        <p>Embedded HTTPS file upload endpoint (draft/filehost). HTTP Basic auth using IRC credentials. MIME-typed downloads. Configurable size limits.</p>
+      </div>
+      <div class="feature-card">
+        <h3><span class="feature-icon fi-red">&#127760;</span> WebSocket Transport</h3>
+        <p>Native WebSocket and WSS listeners for browser-based clients. IRCv3 <code>text.ircv3.net</code> and <code>binary.ircv3.net</code> subprotocols.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════ QUICK START ═══════════════════════════════════ -->
+<section>
+  <div class="container">
+    <h2>Quick Start</h2>
+    <p class="subtitle">Get running in under a minute.</p>
+    <div class="quickstart">
+      <div class="quickstart-header">
+        <div class="quickstart-dots">
+          <div class="quickstart-dot"></div>
+          <div class="quickstart-dot"></div>
+          <div class="quickstart-dot"></div>
+        </div>
+        <span class="quickstart-title">Terminal</span>
+      </div>
+      <pre><span class="comment"># Build from source</span>
+<span class="cmd">cargo build</span> <span class="flag">--release</span>
+<span class="cmd">sudo cp</span> target/release/rircd /usr/local/bin/
+
+<span class="comment"># Interactive setup (creates /etc/rIRCd/config.toml)</span>
+<span class="cmd">sudo rircd init</span>
+
+<span class="comment"># Start the server</span>
+<span class="cmd">sudo rircd run</span>
+
+<span class="comment"># Or install as a systemd service</span>
+<span class="cmd">sudo cp</span> distrib/rircd.service /etc/systemd/system/
+<span class="cmd">sudo systemctl enable</span> <span class="flag">--now</span> rircd</pre>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════ IRCv3 TABLE ═══════════════════════════════════ -->
+<section>
+  <div class="container">
+    <h2>IRCv3 Specification Support</h2>
+    <p class="subtitle">45+ capabilities and extensions implemented.</p>
+    <div class="cap-table-wrapper">
+      <table class="cap-table">
+        <thead>
+          <tr><th>Capability</th><th>Status</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>capability-negotiation</code></td><td><span class="status-full">Full</span></td><td>CAP LS/REQ/ACK/NAK/END, 302 multi-line</td></tr>
+          <tr><td><code>message-tags</code></td><td><span class="status-full">Full</span></td><td>Parse &amp; send tags; TAGMSG; msgid/server-time/account tags</td></tr>
+          <tr><td><code>server-time</code></td><td><span class="status-full">Full</span></td><td><code>time</code> tag on messages</td></tr>
+          <tr><td><code>message-ids</code></td><td><span class="status-full">Full</span></td><td><code>msgid</code> tag; unique ID per message</td></tr>
+          <tr><td><code>batch</code></td><td><span class="status-full">Full</span></td><td>NAMES and CHATHISTORY wrapped in BATCH</td></tr>
+          <tr><td><code>echo-message</code></td><td><span class="status-full">Full</span></td><td>PRIVMSG, NOTICE, TAGMSG echoed to sender</td></tr>
+          <tr><td><code>multi-prefix</code></td><td><span class="status-full">Full</span></td><td>NAMES/WHO send all prefixes in rank order</td></tr>
+          <tr><td><code>extended-join</code></td><td><span class="status-full">Full</span></td><td>JOIN with account and realname</td></tr>
+          <tr><td><code>account-tag</code></td><td><span class="status-full">Full</span></td><td><code>account=</code> tag on messages</td></tr>
+          <tr><td><code>account-notify</code></td><td><span class="status-full">Full</span></td><td>ACCOUNT on login/quit to channel peers</td></tr>
+          <tr><td><code>chghost</code></td><td><span class="status-full">Full</span></td><td>SETHOST/SETUSER (oper-only); CHGHOST broadcast</td></tr>
+          <tr><td><code>setname</code></td><td><span class="status-full">Full</span></td><td>SETNAME command with broadcast</td></tr>
+          <tr><td><code>away-notify</code></td><td><span class="status-full">Full</span></td><td>AWAY broadcast to channel peers</td></tr>
+          <tr><td><code>invite-notify</code></td><td><span class="status-full">Full</span></td><td>INVITE broadcast to channel members</td></tr>
+          <tr><td><code>labeled-response</code></td><td><span class="status-full">Full</span></td><td>Client <code>label</code> tag echoed on replies</td></tr>
+          <tr><td><code>standard-replies</code></td><td><span class="status-full">Full</span></td><td>FAIL for errors</td></tr>
+          <tr><td><code>no-implicit-names</code></td><td><span class="status-full">Full</span></td><td>Suppress NAMES burst on JOIN</td></tr>
+          <tr><td><code>userhost-in-names</code></td><td><span class="status-full">Full</span></td><td>Full nick!user@host in NAMES</td></tr>
+          <tr><td><code>utf8only</code></td><td><span class="status-full">Full</span></td><td>Non-UTF-8 rejected with FAIL</td></tr>
+          <tr><td><code>cap-notify</code></td><td><span class="status-full">Full</span></td><td>Dynamic CAP NEW/CAP DEL on REHASH</td></tr>
+          <tr><td><code>sasl</code></td><td><span class="status-full">Full</span></td><td>PLAIN, SCRAM-SHA-256, EXTERNAL (TLS client cert)</td></tr>
+          <tr><td><code>sts</code></td><td><span class="status-full">Full</span></td><td>Strict Transport Security</td></tr>
+          <tr><td><code>monitor</code></td><td><span class="status-full">Full</span></td><td>MONITOR +/&minus;/C/L/S with extended globs</td></tr>
+          <tr><td><code>whox</code></td><td><span class="status-full">Full</span></td><td>WHO with %fields; 354 RPL_WHOSPCRPL</td></tr>
+          <tr><td><code>bot</code></td><td><span class="status-full">Full</span></td><td>Umode +B; RPL_WHOISBOT</td></tr>
+          <tr><td><code>account-extban</code></td><td><span class="status-full">Full</span></td><td>MODE +b ~a:account</td></tr>
+          <tr><td><code>STATUSMSG</code></td><td><span class="status-full">Full</span></td><td>PRIVMSG/NOTICE to @# and +#</td></tr>
+          <tr><td><code>message-redaction</code></td><td><span class="status-full">Full</span></td><td>REDACT with soft-delete; replayed in CHATHISTORY</td></tr>
+          <tr><td><code>draft/message-edit</code></td><td><span class="status-full">Full</span></td><td>Edit with DB-backed ownership; edit history replay</td></tr>
+          <tr><td><code>draft/react</code></td><td><span class="status-full">Full</span></td><td>TAGMSG with +draft/react and +draft/unreact</td></tr>
+          <tr><td><code>typing</code></td><td><span class="status-full">Full</span></td><td>+typing=active/paused/done</td></tr>
+          <tr><td><code>reply</code></td><td><span class="status-full">Full</span></td><td>+reply=msgid forwarded</td></tr>
+          <tr><td><code>draft/chathistory</code></td><td><span class="status-full">Full</span></td><td>LATEST/BEFORE/AFTER/AROUND/BETWEEN/TARGETS</td></tr>
+          <tr><td><code>draft/event-playback</code></td><td><span class="status-full">Full</span></td><td>JOIN/PART/QUIT/TOPIC/NICK in history</td></tr>
+          <tr><td><code>draft/channel-rename</code></td><td><span class="status-full">Full</span></td><td>RENAME with fallback PART+JOIN</td></tr>
+          <tr><td><code>draft/read-marker</code></td><td><span class="status-full">Full</span></td><td>MARKREAD per-account, persisted</td></tr>
+          <tr><td><code>draft/metadata-2</code></td><td><span class="status-full">Full</span></td><td>GET/LIST/SET/CLEAR; persisted</td></tr>
+          <tr><td><code>draft/multiline</code></td><td><span class="status-full">Full</span></td><td>BATCH multiline; max 4096 bytes / 20 lines</td></tr>
+          <tr><td><code>draft/pre-away</code></td><td><span class="status-full">Full</span></td><td>AWAY during registration</td></tr>
+          <tr><td><code>draft/network-icon</code></td><td><span class="status-full">Full</span></td><td>ICON= ISUPPORT token</td></tr>
+          <tr><td><code>draft/filehost</code></td><td><span class="status-full">Full</span></td><td>HTTPS file uploads; HTTP Basic auth; MIME downloads</td></tr>
+          <tr><td><code>draft/account-registration</code></td><td><span class="status-full">Full</span></td><td>REGISTER from any client</td></tr>
+          <tr><td><code>draft/extended-isupport</code></td><td><span class="status-full">Full</span></td><td>ISUPPORT command</td></tr>
+          <tr><td><code>WebSocket</code></td><td><span class="status-full">Full</span></td><td>WS + WSS transport; text.ircv3.net subprotocol</td></tr>
+          <tr><td><code>WebIRC</code></td><td><span class="status-full">Full</span></td><td>Gateway IP passthrough</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════ CONFIG ═══════════════════════════════════════ -->
+<section>
+  <div class="container">
+    <h2>Configuration</h2>
+    <p class="subtitle">All settings live in a single <code>/etc/rIRCd/config.toml</code> file.</p>
+    <div class="config-grid">
+      <div class="config-block">
+        <h3>[server]</h3>
+        <table>
+          <tr><td>name</td><td>Server hostname</td></tr>
+          <tr><td>listen</td><td>Plain-text ports</td></tr>
+          <tr><td>listen_tls</td><td>TLS ports</td></tr>
+          <tr><td>listen_ws</td><td>WebSocket ports</td></tr>
+          <tr><td>listen_wss</td><td>WebSocket TLS ports</td></tr>
+          <tr><td>motd</td><td>Message of the day</td></tr>
+          <tr><td>cloak_key</td><td>Host cloaking secret</td></tr>
+        </table>
+      </div>
+      <div class="config-block">
+        <h3>[tls]</h3>
+        <table>
+          <tr><td>cert</td><td>PEM certificate path</td></tr>
+          <tr><td>key</td><td>PEM private key path</td></tr>
+          <tr><td>client_certs</td><td>Enable SASL EXTERNAL</td></tr>
+        </table>
+      </div>
+      <div class="config-block">
+        <h3>[database]</h3>
+        <table>
+          <tr><td>host</td><td>MariaDB/MySQL host</td></tr>
+          <tr><td>port</td><td>Database port</td></tr>
+          <tr><td>user</td><td>Database username</td></tr>
+          <tr><td>password</td><td>Database password</td></tr>
+          <tr><td>database</td><td>Database name</td></tr>
+        </table>
+      </div>
+      <div class="config-block">
+        <h3>[filehost]</h3>
+        <table>
+          <tr><td>listen</td><td>HTTP listen address</td></tr>
+          <tr><td>public_url</td><td>Public download URL</td></tr>
+          <tr><td>upload_dir</td><td>Local storage path</td></tr>
+          <tr><td>max_size</td><td>Max upload bytes</td></tr>
+        </table>
+      </div>
+      <div class="config-block">
+        <h3>[network]</h3>
+        <table>
+          <tr><td>name</td><td>Network name (005 NETWORK)</td></tr>
+          <tr><td>icon</td><td>Network icon URL</td></tr>
+        </table>
+      </div>
+      <div class="config-block">
+        <h3>[[opers]]</h3>
+        <table>
+          <tr><td>name</td><td>Operator username</td></tr>
+          <tr><td>hostmask</td><td>Restrict by host</td></tr>
+          <tr><td>password_hash</td><td>Bcrypt hash</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════ COMMANDS ═══════════════════════════════════════ -->
+<section>
+  <div class="container">
+    <h2>Standard IRC Commands</h2>
+    <p class="subtitle">Full command set beyond IRCv3 extensions.</p>
+    <div class="cmd-grid">
+      <div class="cmd-item"><code>LIST</code> <span>Channel listing with filters</span></div>
+      <div class="cmd-item"><code>LUSERS</code> <span>Server statistics</span></div>
+      <div class="cmd-item"><code>VERSION</code> <span>Server version</span></div>
+      <div class="cmd-item"><code>TIME</code> <span>Server local time</span></div>
+      <div class="cmd-item"><code>INFO</code> <span>Server info and uptime</span></div>
+      <div class="cmd-item"><code>LINKS</code> <span>Linked servers</span></div>
+      <div class="cmd-item"><code>STATS</code> <span>Server stats (u, o)</span></div>
+      <div class="cmd-item"><code>WHOWAS</code> <span>Historical nick info</span></div>
+      <div class="cmd-item"><code>WHO</code> <span>User query with glob masks</span></div>
+      <div class="cmd-item"><code>HELP</code> <span>Per-command help text</span></div>
+      <div class="cmd-item"><code>KNOCK</code> <span>Request invite to +i channel</span></div>
+      <div class="cmd-item"><code>KILL</code> <span>Oper: forcibly disconnect</span></div>
+      <div class="cmd-item"><code>WALLOPS</code> <span>Oper: broadcast to +w users</span></div>
+      <div class="cmd-item"><code>MOTD</code> <span>Message of the day</span></div>
+      <div class="cmd-item"><code>ISON</code> <span>Check nick online status</span></div>
+      <div class="cmd-item"><code>USERHOST</code> <span>User host info lookup</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════ MODES ═══════════════════════════════════════ -->
+<section>
+  <div class="container">
+    <h2>Modes</h2>
+    <p class="subtitle">User and channel modes supported by rIRCd.</p>
+    <div class="mode-columns">
+      <div class="mode-list">
+        <h3>User Modes</h3>
+        <div class="mode-item"><code>+B</code> <span>Bot mode (shown in WHOIS)</span></div>
+        <div class="mode-item"><code>+i</code> <span>Invisible (hidden from WHO)</span></div>
+        <div class="mode-item"><code>+o</code> <span>IRC operator</span></div>
+        <div class="mode-item"><code>+r</code> <span>Registered (auto on SASL login)</span></div>
+        <div class="mode-item"><code>+w</code> <span>Receives WALLOPS</span></div>
+      </div>
+      <div class="mode-list">
+        <h3>Channel Modes</h3>
+        <div class="mode-item"><code>+o</code> <span>Channel operator</span></div>
+        <div class="mode-item"><code>+v</code> <span>Voice</span></div>
+        <div class="mode-item"><code>+h</code> <span>Half-op</span></div>
+        <div class="mode-item"><code>+b</code> <span>Ban list (~a:account extban)</span></div>
+        <div class="mode-item"><code>+e</code> <span>Ban exception</span></div>
+        <div class="mode-item"><code>+I</code> <span>Invite exception</span></div>
+        <div class="mode-item"><code>+q</code> <span>Quiet (silence without kick)</span></div>
+        <div class="mode-item"><code>+i</code> <span>Invite-only</span></div>
+        <div class="mode-item"><code>+m</code> <span>Moderated</span></div>
+        <div class="mode-item"><code>+n</code> <span>No external messages</span></div>
+        <div class="mode-item"><code>+s</code> <span>Secret</span></div>
+        <div class="mode-item"><code>+t</code> <span>Topic restricted to ops</span></div>
+        <div class="mode-item"><code>+k</code> <span>Channel key</span></div>
+        <div class="mode-item"><code>+l</code> <span>User limit</span></div>
+        <div class="mode-item"><code>+R</code> <span>Registered users only</span></div>
+        <div class="mode-item"><code>+c</code> <span>Strip colours/formatting</span></div>
+        <div class="mode-item"><code>+C</code> <span>Block CTCP</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════ CLI ═══════════════════════════════════════ -->
+<section>
+  <div class="container">
+    <h2>CLI</h2>
+    <p class="subtitle">Server management commands.</p>
+    <div class="cmd-grid">
+      <div class="cmd-item"><code>rircd init</code> <span>Create config directory with defaults</span></div>
+      <div class="cmd-item"><code>rircd run</code> <span>Start the server</span></div>
+      <div class="cmd-item"><code>rircd stop</code> <span>Send SIGTERM to running server</span></div>
+      <div class="cmd-item"><code>rircd status</code> <span>Check if server is running</span></div>
+      <div class="cmd-item"><code>rircd genpasswd</code> <span>Hash a password for oper config</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════ FOOTER ═══════════════════════════════════════ -->
+<footer>
+  <div class="container">
+    <p>rIRCd is open source under the <a href="https://github.com/KaraZajac/rIRCd/blob/main/LICENSE">MIT License</a>.</p>
+    <p style="margin-top: 8px;">
+      <a href="https://github.com/KaraZajac/rIRCd">GitHub</a> &middot;
+      <a href="https://github.com/KaraZajac/rIRCd/releases">Releases</a> &middot;
+      <a href="https://ircv3.net/">IRCv3</a>
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
