@@ -12,6 +12,84 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
+// ─── TLS client certificate verifier (accepts any cert, for SASL EXTERNAL) ───
+
+/// Accepts any client certificate without verifying against a CA.
+/// Used when `[tls] client_certs = true` to enable SASL EXTERNAL.
+#[derive(Debug)]
+struct OptionalClientCertVerifier {
+    supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl OptionalClientCertVerifier {
+    fn new() -> Self {
+        Self {
+            supported_algs: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms,
+        }
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for OptionalClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_algs.supported_schemes()
+    }
+}
+
+/// Extract SHA-256 fingerprint from a TLS stream's peer certificate.
+fn extract_certfp(
+    tls_stream: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+) -> Option<String> {
+    use sha2::Digest;
+    let (_, session) = tls_stream.get_ref();
+    session
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|cert| {
+            let hash = sha2::Sha256::digest(cert.as_ref());
+            hash.iter().map(|b| format!("{:02x}", b)).collect()
+        })
+}
+
 /// Writes PID to file on creation, removes file on drop.
 struct PidfileGuard {
     path: std::path::PathBuf,
@@ -37,6 +115,8 @@ pub struct ClientMessage {
     pub host: String,
     pub msg: Message,
     pub send_tx: mpsc::Sender<Message>,
+    /// TLS client certificate SHA-256 fingerprint (hex), if available.
+    pub certfp: Option<String>,
 }
 
 pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> anyhow::Result<()> {
@@ -102,9 +182,16 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
             .collect();
         let key = rustls_pemfile::private_key(&mut key_file)?
             .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
-        let cfg_tls = tokio_rustls::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?;
+        let cfg_tls = if cfg.tls.client_certs {
+            info!("TLS client certificates enabled (SASL EXTERNAL available)");
+            tokio_rustls::rustls::ServerConfig::builder()
+                .with_client_cert_verifier(Arc::new(OptionalClientCertVerifier::new()))
+                .with_single_cert(certs, key)?
+        } else {
+            tokio_rustls::rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)?
+        };
         Some(TlsAcceptor::from(Arc::new(cfg_tls)))
     } else {
         None
@@ -193,6 +280,12 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
     }
 
     let server_name = cfg.server.name.clone();
+    let keepalive = client::KeepaliveConfig {
+        ping_secs: cfg.server.ping_timeout_secs,
+        disconnect_secs: cfg.server.disconnect_timeout_secs,
+        registration_secs: cfg.server.registration_timeout_secs,
+    };
+
     for listen_addr in &cfg.server.listen {
         let bind_addr = if listen_addr.starts_with(":") {
             format!("0.0.0.0{}", listen_addr)
@@ -216,7 +309,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                         let tx = tx.clone();
                         let server_name = server_name.clone();
                         tokio::spawn(async move {
-                            client::handle_client(stream, client_id, host, tx, server_name).await;
+                            client::handle_client(stream, client_id, host, tx, server_name, keepalive).await;
                         });
                     }
                     Err(e) => error!("Accept error: {}", e),
@@ -254,12 +347,15 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                             tokio::spawn(async move {
                                 match acc.accept(stream).await {
                                     Ok(tls_stream) => {
+                                        let certfp = extract_certfp(&tls_stream);
                                         client::handle_client_tls(
                                             tls_stream,
                                             client_id,
                                             host,
                                             tx,
                                             server_name,
+                                            certfp,
+                                            keepalive,
                                         )
                                         .await
                                     }
@@ -268,6 +364,153 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                             });
                         }
                         Err(e) => error!("Accept error: {}", e),
+                    }
+                }
+            });
+        }
+    }
+
+    // ── WebSocket listeners (IRCv3 WebSocket transport) ─────────────────────────
+    for listen_addr in &cfg.server.listen_ws {
+        let bind_addr = if listen_addr.starts_with(':') {
+            format!("0.0.0.0{}", listen_addr)
+        } else {
+            listen_addr.clone()
+        };
+
+        let tx_ws = tx.clone();
+        let server_name_ws = server_name.clone();
+        let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+        info!("Listening on {} (WebSocket)", bind_addr);
+
+        #[derive(Clone)]
+        struct WsState {
+            tx: mpsc::Sender<ClientMessage>,
+            server_name: String,
+            counter: Arc<std::sync::atomic::AtomicU64>,
+            keepalive: client::KeepaliveConfig,
+        }
+
+        let ws_state = WsState {
+            tx: tx_ws,
+            server_name: server_name_ws,
+            counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            keepalive,
+        };
+
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::get(
+                    |ws: axum::extract::ws::WebSocketUpgrade,
+                     headers: axum::http::HeaderMap,
+                     axum::extract::State(st): axum::extract::State<WsState>| async move {
+                        let id = st.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let client_id = format!("ws-{}", id);
+                        let host = headers
+                            .get("x-forwarded-for")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        ws.protocols(["text.ircv3.net", "binary.ircv3.net"]).on_upgrade(move |socket| {
+                            client::handle_client_ws(
+                                socket,
+                                client_id,
+                                host,
+                                st.tx,
+                                st.server_name,
+                                None,
+                                st.keepalive,
+                            )
+                        })
+                    },
+                ),
+            )
+            .with_state(ws_state);
+
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                error!("WebSocket server error: {}", e);
+            }
+        });
+    }
+
+    // WebSocket-over-TLS (WSS)
+    if let Some(ref acceptor) = tls_acceptor {
+        for listen_addr in &cfg.server.listen_wss {
+            let bind_addr = if listen_addr.starts_with(':') {
+                format!("0.0.0.0{}", listen_addr)
+            } else {
+                listen_addr.clone()
+            };
+
+            let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+            info!("Listening on {} (WebSocket TLS)", bind_addr);
+
+            let tls_acc = acceptor.clone();
+            let tx_wss = tx.clone();
+            let server_name_wss = server_name.clone();
+            tokio::spawn(async move {
+                let mut counter = 0u64;
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, addr)) => {
+                            counter += 1;
+                            let client_id = format!("wss-{}", counter);
+                            let host = addr.ip().to_string();
+                            let acc = tls_acc.clone();
+                            let tx = tx_wss.clone();
+                            let sn = server_name_wss.clone();
+                            tokio::spawn(async move {
+                                match acc.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        let certfp = extract_certfp(&tls_stream);
+                                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+                                        let tx_c = tx.clone();
+                                        let sn_c = sn.clone();
+                                        let host_c = host.clone();
+                                        let cid = client_id.clone();
+                                        let cfp = certfp.clone();
+
+                                        let app = axum::Router::new().route(
+                                            "/",
+                                            axum::routing::get(
+                                                move |ws: axum::extract::ws::WebSocketUpgrade| {
+                                                    let tx = tx_c;
+                                                    let sn = sn_c;
+                                                    let host = host_c;
+                                                    let client_id = cid;
+                                                    let certfp = cfp;
+                                                    async move {
+                                                        ws.protocols(["text.ircv3.net", "binary.ircv3.net"])
+                                                            .on_upgrade(move |socket| {
+                                                                client::handle_client_ws(
+                                                                    socket, client_id, host, tx,
+                                                                    sn, certfp, keepalive,
+                                                                )
+                                                            })
+                                                    }
+                                                },
+                                            ),
+                                        );
+
+                                        let service =
+                                            hyper_util::service::TowerToHyperService::new(app);
+                                        if let Err(e) =
+                                            hyper_util::server::conn::auto::Builder::new(
+                                                hyper_util::rt::TokioExecutor::new(),
+                                            )
+                                            .serve_connection(io, service)
+                                            .await
+                                        {
+                                            tracing::debug!("WSS connection error: {}", e);
+                                        }
+                                    }
+                                    Err(e) => error!("WSS TLS handshake failed: {}", e),
+                                }
+                            });
+                        }
+                        Err(e) => error!("WSS accept error: {}", e),
                     }
                 }
             });
@@ -289,6 +532,12 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                 };
                 let client_id = cm.client_id.clone();
                 senders.write().await.insert(client_id.clone(), cm.send_tx.clone());
+
+                // Store TLS client certificate fingerprint for SASL EXTERNAL
+                if let Some(ref fp) = cm.certfp {
+                    let mut state_w = state.write().await;
+                    state_w.certfps.entry(client_id.clone()).or_insert_with(|| fp.clone());
+                }
 
                 let cmd = cm.msg.command.clone();
                 let params_preview = cm.msg.params.iter().take(2).cloned().collect::<Vec<_>>().join(" ");

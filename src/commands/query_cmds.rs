@@ -304,6 +304,23 @@ pub async fn handle_whois(
     }
 
     let target_id = state.nick_to_id.get(&target_nick.to_uppercase()).cloned();
+    if target_id.is_none() {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "401",
+                vec![
+                    nick.clone(),
+                    target_nick.into(),
+                    "No such nick/channel".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+    }
     if let Some(tid) = target_id {
         if let Some(c) = state.clients.get(&tid) {
             let c = c.read().await;
@@ -398,6 +415,43 @@ pub async fn handle_whois(
                     Message::new(
                         "335",
                         vec![nick.clone(), target_nick.into(), "is a bot".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+            }
+            // 330 RPL_WHOISACCOUNT — account name
+            if let Some(ref account) = c.account {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "330",
+                        vec![
+                            nick.clone(),
+                            target_nick.into(),
+                            account.clone(),
+                            "is logged in as".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+            }
+            // 276 RPL_WHOISCERTFP — TLS certificate fingerprint
+            if let Some(ref fp) = state.certfps.get(&c.id) {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "276",
+                        vec![
+                            nick.clone(),
+                            target_nick.into(),
+                            format!("has client certificate fingerprint {}", fp),
+                        ],
                     )
                     .with_prefix(&cfg.server.name),
                     label,

@@ -103,11 +103,42 @@ pub async fn handle_join(
         return Ok(());
     }
 
-    for ch_name in ch_names.split(',') {
+    // Parse comma-separated keys (JOIN #a,#b key1,key2)
+    let keys_str = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
+    let keys: Vec<&str> = if keys_str.is_empty() {
+        Vec::new()
+    } else {
+        keys_str.split(',').collect()
+    };
+
+    for (ch_idx, ch_name) in ch_names.split(',').enumerate() {
         let ch_name = ch_name.trim();
-        if ch_name.is_empty() || !ch_name.starts_with('#') {
+        if ch_name.is_empty()
+            || !ch_name.starts_with('#')
+            || ch_name.len() > 64
+            || ch_name.contains(' ')
+            || ch_name.contains(',')
+            || ch_name.contains('\x07')
+            || ch_name.contains('\x00')
+        {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "403",
+                    vec![
+                        nick.clone(),
+                        ch_name.to_string(),
+                        "No such channel".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
             continue;
         }
+        let provided_key = keys.get(ch_idx).copied().unwrap_or("");
 
         // Check per-channel so joining multiple channels in one command can't bypass the limit
         let current_channel_count = match state.clients.get(client_id) {
@@ -213,7 +244,7 @@ pub async fn handle_join(
         }
 
         if let Some(ref key) = ch.key {
-            if msg.params.get(1).as_ref().map(|s| s.as_str()) != Some(key.as_str()) {
+            if provided_key != key.as_str() {
                 reply_to_client(
                     &senders,
                     client_id,
@@ -670,6 +701,8 @@ async fn send_names_for_channel(
         }
     }
     let names_str = names.join(" ");
+    // RPL_NAMREPLY channel type prefix: @ = secret, = = public
+    let chan_prefix = if ch.modes.secret { "@" } else { "=" };
     let use_batch = client_caps.contains("batch") && client_caps.contains("message-tags");
 
     if use_batch {
@@ -683,7 +716,7 @@ async fn send_names_for_channel(
         let msg = add_batch_tag(
             Message::new(
                 "353",
-                vec![nick.into(), "=".into(), ch_name.into(), names_str],
+                vec![nick.into(), chan_prefix.into(), ch_name.into(), names_str],
             )
             .with_prefix(server),
             &batch_ref,
@@ -703,7 +736,7 @@ async fn send_names_for_channel(
     } else {
         let msg = Message::new(
             "353",
-            vec![nick.into(), "=".into(), ch_name.into(), names_str],
+            vec![nick.into(), chan_prefix.into(), ch_name.into(), names_str],
         )
         .with_prefix(server);
         reply_to_client(senders, client_id, msg, label).await;
@@ -822,8 +855,25 @@ pub async fn handle_mode(
     if target.starts_with('#') || target.starts_with('&') {
         let ch_key = canonical_channel_key(target);
         let ch_store = channels.write().await;
-        if let Some(ch) = ch_store.channels.get(&ch_key) {
-            let mut ch = ch.write().await;
+        let ch_entry = match ch_store.channels.get(&ch_key) {
+            Some(ch) => ch,
+            None => {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "403",
+                        vec![nick, target.into(), "No such channel".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        {
+            let mut ch = ch_entry.write().await;
             let member = ch.members.get(client_id);
             let is_op = member.map(|m| m.modes.op).unwrap_or(false);
 
@@ -864,7 +914,12 @@ pub async fn handle_mode(
                 }
                 let mut reply_params = vec![nick.clone(), target.into(), format!("+{}", modes)];
                 if let Some(ref key) = ch.key {
-                    reply_params.push(key.clone());
+                    // Only show key value to channel operators
+                    if is_op {
+                        reply_params.push(key.clone());
+                    } else {
+                        reply_params.push("*".into());
+                    }
                 }
                 if let Some(limit) = ch.modes.user_limit {
                     reply_params.push(limit.to_string());
@@ -912,7 +967,11 @@ pub async fn handle_mode(
                     'C' => ch.modes.no_ctcp = plus,
                     'k' => {
                         if plus {
-                            ch.key = msg.params.get(param_idx).cloned();
+                            // Enforce KEYLEN=64
+                            ch.key = msg
+                                .params
+                                .get(param_idx)
+                                .map(|k| if k.len() > 64 { k[..64].to_string() } else { k.clone() });
                         } else {
                             ch.key = None;
                         }
@@ -925,6 +984,23 @@ pub async fn handle_mode(
                             {
                                 if let Some(memb) = ch.members.get_mut(target_id) {
                                     memb.modes.op = plus;
+                                } else {
+                                    let _ = reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "441",
+                                            vec![
+                                                nick.clone(),
+                                                target_nick.clone(),
+                                                target.into(),
+                                                "They aren't on that channel".into(),
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
                                 }
                             }
                             param_idx += 1;
@@ -933,7 +1009,24 @@ pub async fn handle_mode(
                     'b' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
-                                if !ch.bans.contains(mask) {
+                                if ch.bans.len() >= 100 {
+                                    reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "478",
+                                            vec![
+                                                nick.clone(),
+                                                target.into(),
+                                                mask.clone(),
+                                                "Channel ban list is full".into(),
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
+                                } else if !ch.bans.contains(mask) {
                                     ch.bans.push(mask.clone());
                                 }
                             } else {
@@ -975,7 +1068,24 @@ pub async fn handle_mode(
                     'q' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
-                                if !ch.quiet_list.contains(mask) {
+                                if ch.quiet_list.len() >= 100 {
+                                    reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "478",
+                                            vec![
+                                                nick.clone(),
+                                                target.into(),
+                                                mask.clone(),
+                                                "Channel quiet list is full".into(),
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
+                                } else if !ch.quiet_list.contains(mask) {
                                     ch.quiet_list.push(mask.clone());
                                 }
                             } else {
@@ -1033,6 +1143,23 @@ pub async fn handle_mode(
                             {
                                 if let Some(memb) = ch.members.get_mut(target_id) {
                                     memb.modes.voice = plus;
+                                } else {
+                                    let _ = reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "441",
+                                            vec![
+                                                nick.clone(),
+                                                target_nick.clone(),
+                                                target.into(),
+                                                "They aren't on that channel".into(),
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
                                 }
                             }
                             param_idx += 1;
@@ -1045,6 +1172,23 @@ pub async fn handle_mode(
                             {
                                 if let Some(memb) = ch.members.get_mut(target_id) {
                                     memb.modes.halfop = plus;
+                                } else {
+                                    let _ = reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "441",
+                                            vec![
+                                                nick.clone(),
+                                                target_nick.clone(),
+                                                target.into(),
+                                                "They aren't on that channel".into(),
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
                                 }
                             }
                             param_idx += 1;
@@ -1063,7 +1207,24 @@ pub async fn handle_mode(
                     'e' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
-                                if !ch.ban_exceptions.contains(mask) {
+                                if ch.ban_exceptions.len() >= 100 {
+                                    reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "478",
+                                            vec![
+                                                nick.clone(),
+                                                target.into(),
+                                                mask.clone(),
+                                                "Channel exception list is full".into(),
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
+                                } else if !ch.ban_exceptions.contains(mask) {
                                     ch.ban_exceptions.push(mask.clone());
                                 }
                             } else {
@@ -1109,7 +1270,24 @@ pub async fn handle_mode(
                     'I' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
-                                if !ch.invite_exceptions.contains(mask) {
+                                if ch.invite_exceptions.len() >= 100 {
+                                    reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "478",
+                                            vec![
+                                                nick.clone(),
+                                                target.into(),
+                                                mask.clone(),
+                                                "Channel invite exception list is full".into(),
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
+                                } else if !ch.invite_exceptions.contains(mask) {
                                     ch.invite_exceptions.push(mask.clone());
                                 }
                             } else {
@@ -1336,6 +1514,26 @@ pub async fn handle_topic(
             return Ok(());
         }
 
+        // Must be on channel to set topic
+        if !ch.is_member(client_id) {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "442",
+                    vec![
+                        nick.clone(),
+                        ch_name.into(),
+                        "You're not on that channel".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+
         if ch.modes.topic_protect && !is_op {
             reply_to_client(
                 &senders,
@@ -1354,6 +1552,15 @@ pub async fn handle_topic(
             .await;
             return Ok(());
         }
+
+        // Enforce TOPICLEN=307
+        let new_topic = new_topic.map(|t| {
+            if t.len() > 307 {
+                t[..307].to_string()
+            } else {
+                t
+            }
+        });
 
         let topic_time_ts = chrono::Utc::now().timestamp();
         ch.topic = new_topic.clone();
@@ -1423,7 +1630,13 @@ pub async fn handle_kick(
 ) -> anyhow::Result<()> {
     let ch_name = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let target_nick = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
-    let reason = msg.trailing().unwrap_or("Kicked").to_string();
+    // Enforce KICKLEN=307
+    let reason = msg
+        .trailing()
+        .unwrap_or("Kicked")
+        .chars()
+        .take(307)
+        .collect::<String>();
 
     if ch_name.is_empty() || target_nick.is_empty() {
         return Ok(());
@@ -1444,6 +1657,21 @@ pub async fn handle_kick(
 
     let ch_key = canonical_channel_key(ch_name);
     let mut ch_store = channels.write().await;
+    if !ch_store.channels.contains_key(&ch_key) {
+        let nick = client.read().await.nick_or_id().to_string();
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "403",
+                vec![nick, ch_name.into(), "No such channel".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
     if let Some(ch) = ch_store.channels.get_mut(&ch_key) {
         let mut ch = ch.write().await;
         let is_op = ch
@@ -1469,6 +1697,26 @@ pub async fn handle_kick(
 
         let mut should_remove_channel = false;
         if let Some(tid) = target_id {
+            if !ch.members.contains_key(&tid) {
+                let nick = client.read().await.nick_or_id().to_string();
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "441",
+                        vec![
+                            nick,
+                            target_nick.into(),
+                            ch_name.into(),
+                            "They aren't on that channel".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
             if ch.members.remove(&tid).is_some() {
                 if let Some(target_client) = state.clients.get(&tid) {
                     target_client.write().await.channels.remove(&ch_key);
@@ -1527,6 +1775,23 @@ pub async fn handle_invite(
     let mut ch_store = channels.write().await;
     if let Some(ch) = ch_store.channels.get_mut(&ch_key) {
         let mut ch = ch.write().await;
+        // Check sender is on the channel
+        if !ch.is_member(client_id) {
+            let nick = client.read().await.nick_or_id().to_string();
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "442",
+                    vec![nick, ch_name.into(), "You're not on that channel".into()],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+
         let is_op = ch
             .members
             .get(client_id)
@@ -1549,6 +1814,27 @@ pub async fn handle_invite(
         }
 
         if let Some(target_id) = state.nick_to_id.get(&target_nick.to_uppercase()) {
+            // 443 ERR_USERONCHANNEL: target is already on the channel
+            if ch.is_member(target_id) {
+                let nick = client.read().await.nick_or_id().to_string();
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "443",
+                        vec![
+                            nick,
+                            target_nick.into(),
+                            ch_name.into(),
+                            "is already on channel".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
             ch.invite_list.insert(target_id.clone());
             let invite_msg = Message::new("INVITE", vec![target_nick.into(), ch_name.into()])
                 .with_prefix(&source);
@@ -1583,6 +1869,20 @@ pub async fn handle_invite(
                 }
             }
             return Ok(());
+        } else {
+            // 401 ERR_NOSUCHNICK: target nick not found
+            let nick = client.read().await.nick_or_id().to_string();
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "401",
+                    vec![nick, target_nick.into(), "No such nick/channel".into()],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
         }
     }
 

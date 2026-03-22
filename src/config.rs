@@ -123,6 +123,12 @@ pub struct ServerConfig {
     pub listen: Vec<String>,
     #[serde(default)]
     pub listen_tls: Vec<String>,
+    /// WebSocket listen addresses (e.g. [":7667"]).
+    #[serde(default)]
+    pub listen_ws: Vec<String>,
+    /// WebSocket-over-TLS listen addresses (e.g. [":7697"]).
+    #[serde(default)]
+    pub listen_wss: Vec<String>,
     /// MOTD text displayed to clients on connect (inline, not a file path).
     #[serde(default = "default_motd")]
     pub motd: String,
@@ -165,6 +171,8 @@ impl Default for ServerConfig {
             name: default_server_name(),
             listen: default_listen(),
             listen_tls: Vec::new(),
+            listen_ws: Vec::new(),
+            listen_wss: Vec::new(),
             motd: default_motd(),
             registration_timeout_secs: default_registration_timeout(),
             ping_timeout_secs: default_ping_timeout(),
@@ -205,6 +213,9 @@ impl Default for NetworkConfig {
 pub struct TlsConfig {
     pub cert: Option<String>,
     pub key: Option<String>,
+    /// Request (but don't require) TLS client certificates for SASL EXTERNAL.
+    #[serde(default)]
+    pub client_certs: bool,
 }
 
 // ─── Limits ───────────────────────────────────────────────────────────────────

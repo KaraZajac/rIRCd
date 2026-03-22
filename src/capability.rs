@@ -38,6 +38,7 @@ pub const CAPS: &[&str] = &[
     "draft/pre-away",
     "draft/message-edit",
     "draft/react",
+    "draft/unreact",
     "typing",
     "reply",
     "draft/channel-context",
@@ -51,16 +52,27 @@ pub const TAGS_DEPENDENT: &[&str] = &["server-time", "batch", "account-tag"];
 
 /// Build CAP LS reply value (space-separated list).
 /// `tls_port` is required to advertise `sts`; omit it when TLS is not configured.
-pub fn build_cap_list(version_302: bool, tls_port: Option<u16>) -> Vec<String> {
+/// `sasl_external` adds EXTERNAL to the SASL mechanism list (when TLS client_certs is enabled).
+pub fn build_cap_list(
+    version_302: bool,
+    tls_port: Option<u16>,
+    sasl_external: bool,
+) -> Vec<String> {
     let caps: Vec<String> = CAPS
         .iter()
         .copied()
         .filter(|c| *c != "capability-negotiation")
         .filter(|c| *c != "sts" || tls_port.is_some())
         .map(|c| match c {
+            "sasl" if sasl_external => "sasl=PLAIN,SCRAM-SHA-256,EXTERNAL".to_string(),
             "sasl" => "sasl=PLAIN,SCRAM-SHA-256".to_string(),
             "draft/multiline" => "draft/multiline=max-bytes=4096,max-lines=20".to_string(),
-            "draft/metadata-2" => "draft/metadata-2=max-subs=50,max-keys=50".to_string(),
+            "draft/metadata-2" => {
+                "draft/metadata-2=max-subs=50,max-keys=50,max-value-bytes=4096".to_string()
+            }
+            "draft/account-registration" => {
+                "draft/account-registration=before-connect,custom-account-name".to_string()
+            }
             "sts" => format!("sts=port={},duration=2592000", tls_port.unwrap_or(6697)),
             _ => c.to_string(),
         })
