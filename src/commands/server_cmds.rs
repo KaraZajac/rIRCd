@@ -1,7 +1,9 @@
 //! Standard IRC server information commands: LUSERS, VERSION, TIME, INFO, LINKS, STATS, WHOWAS, HELP, KNOCK.
 
 use crate::channel::{canonical_channel_key, ChannelStore};
-use crate::commands::reply_to_client;
+use crate::commands::{
+    end_labeled_batch, reply_in_batch, reply_to_client, start_labeled_batch,
+};
 use crate::config::Config;
 use crate::protocol::Message;
 use crate::user::ServerState;
@@ -55,10 +57,24 @@ pub async fn handle_lusers(
     let visible_users = total_users.saturating_sub(invisible_users);
     let channels_count = channels.read().await.channels.len();
 
+    // labeled-response: LUSERS produces multiple messages, wrap in batch
+    let batch_ref = if let Some(l) = label {
+        Some(start_labeled_batch(&senders, client_id, l, s).await)
+    } else {
+        None
+    };
+    macro_rules! send_reply {
+        ($msg:expr) => {
+            if let Some(ref br) = batch_ref {
+                reply_in_batch(&senders, client_id, $msg, br).await;
+            } else {
+                reply_to_client(&senders, client_id, $msg, None).await;
+            }
+        };
+    }
+
     // 251 RPL_LUSERCLIENT
-    reply_to_client(
-        &senders,
-        client_id,
+    send_reply!(
         Message::new(
             "251",
             vec![
@@ -69,30 +85,22 @@ pub async fn handle_lusers(
                 ),
             ],
         )
-        .with_prefix(s),
-        label,
-    )
-    .await;
+        .with_prefix(s)
+    );
 
     if ops > 0 {
         // 252 RPL_LUSEROP
-        reply_to_client(
-            &senders,
-            client_id,
+        send_reply!(
             Message::new(
                 "252",
                 vec![nick.clone(), ops.to_string(), "IRC Operators online".into()],
             )
-            .with_prefix(s),
-            label,
-        )
-        .await;
+            .with_prefix(s)
+        );
     }
 
     // 254 RPL_LUSERCHANNELS
-    reply_to_client(
-        &senders,
-        client_id,
+    send_reply!(
         Message::new(
             "254",
             vec![
@@ -101,15 +109,11 @@ pub async fn handle_lusers(
                 "channels formed".into(),
             ],
         )
-        .with_prefix(s),
-        label,
-    )
-    .await;
+        .with_prefix(s)
+    );
 
     // 255 RPL_LUSERME
-    reply_to_client(
-        &senders,
-        client_id,
+    send_reply!(
         Message::new(
             "255",
             vec![
@@ -117,15 +121,11 @@ pub async fn handle_lusers(
                 format!("I have {} clients and 1 servers", total_users),
             ],
         )
-        .with_prefix(s),
-        label,
-    )
-    .await;
+        .with_prefix(s)
+    );
 
     // 265 RPL_LOCALUSERS
-    reply_to_client(
-        &senders,
-        client_id,
+    send_reply!(
         Message::new(
             "265",
             vec![
@@ -135,15 +135,11 @@ pub async fn handle_lusers(
                 format!("Current local users {}, max {}", total_users, total_users),
             ],
         )
-        .with_prefix(s),
-        label,
-    )
-    .await;
+        .with_prefix(s)
+    );
 
     // 266 RPL_GLOBALUSERS
-    reply_to_client(
-        &senders,
-        client_id,
+    send_reply!(
         Message::new(
             "266",
             vec![
@@ -153,10 +149,12 @@ pub async fn handle_lusers(
                 format!("Current global users {}, max {}", total_users, total_users),
             ],
         )
-        .with_prefix(s),
-        label,
-    )
-    .await;
+        .with_prefix(s)
+    );
+
+    if let Some(ref br) = batch_ref {
+        end_labeled_batch(&senders, client_id, br, s).await;
+    }
 
     Ok(())
 }
@@ -456,7 +454,7 @@ pub async fn handle_whowas(
         return Ok(());
     }
 
-    let entries: Vec<_> = {
+    let mut entries: Vec<_> = {
         let state = state.read().await;
         state
             .whowas
@@ -464,6 +462,13 @@ pub async fn handle_whowas(
             .map(|list| list.iter().rev().take(count).cloned().collect())
             .unwrap_or_default()
     };
+    // Fall back to database if no in-memory entries
+    if entries.is_empty() {
+        if let Some(ref pool) = cfg.db {
+            entries =
+                crate::persist::load_whowas(pool, target_nick, count as i64).await;
+        }
+    }
 
     if entries.is_empty() {
         reply_to_client(
@@ -1055,6 +1060,7 @@ pub async fn handle_kill(
         state_w.clients.remove(&tid);
         state_w.nick_to_id.remove(&target_nick_upper);
     }
+    tracing::warn!(client_id, killer = %killer_nick, target = %target_nick, reason = %reason, "KILL");
 
     // Notify the killer
     reply_to_client(
@@ -1132,6 +1138,7 @@ pub async fn handle_wallops(
         ids
     };
 
+    tracing::info!(client_id, recipients = wallops_ids.len(), "WALLOPS");
     for tid in &wallops_ids {
         send_to_client(&senders, tid, wallops_msg.clone()).await;
     }
@@ -1241,7 +1248,7 @@ pub async fn handle_rehash(
         let c = cfg.read().await;
         c.tls.client_certs && c.tls_enabled()
     };
-    let old_caps_raw = crate::capability::build_cap_list(false, old_tls_port, old_sasl_external);
+    let old_caps_raw = crate::capability::build_cap_list(false, old_tls_port, old_sasl_external, false);
     let old_caps: std::collections::HashSet<String> = old_caps_raw[0]
         .split(' ')
         .map(|s| s.to_string())
@@ -1271,7 +1278,7 @@ pub async fn handle_rehash(
         let c = cfg.read().await;
         c.tls.client_certs && c.tls_enabled()
     };
-    let new_caps_raw = crate::capability::build_cap_list(false, new_tls_port, new_sasl_external);
+    let new_caps_raw = crate::capability::build_cap_list(false, new_tls_port, new_sasl_external, false);
     let new_caps: std::collections::HashSet<String> = new_caps_raw[0]
         .split(' ')
         .map(|s| s.to_string())

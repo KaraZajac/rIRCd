@@ -67,7 +67,7 @@ pub fn add_server_time(tags: &mut HashMap<String, Option<String>>) {
     tags.insert("time".to_string(), Some(now));
 }
 
-/// Add IRCv3 tags for a recipient: server-time, msgid, account; then client-only tags (+prefix).
+/// Add IRCv3 tags for a recipient: server-time, msgid, account, bot; then client-only tags (+prefix).
 /// Server tags are added first per spec; client_only_tags (e.g. +typing, +react) are relayed as-is.
 /// If client_tag_deny is set, listed tags (or "*" for all) are not added.
 pub fn add_tags_for_recipient(
@@ -77,6 +77,7 @@ pub fn add_tags_for_recipient(
     msgid: Option<&str>,
     client_only_tags: Option<&HashMap<String, Option<String>>>,
     client_tag_deny: Option<&[String]>,
+    sender_is_bot: bool,
 ) -> Message {
     if !recipient_caps.is_empty() {
         if recipient_caps.contains("server-time") {
@@ -87,13 +88,16 @@ pub fn add_tags_for_recipient(
                 msg.tags.insert("msgid".to_string(), Some(id.to_string()));
             }
         }
+        // account-tag: MUST NOT be sent if the user is not identified
         if recipient_caps.contains("account-tag") {
             if let Some(acc) = sender_account {
                 msg.tags
                     .insert("account".to_string(), Some(acc.to_string()));
-            } else {
-                msg.tags.insert("account".to_string(), None); // * means not logged in
             }
+        }
+        // bot tag: SHOULD be added to messages from bots, only to clients with message-tags
+        if sender_is_bot && recipient_caps.contains("message-tags") {
+            msg.tags.insert("bot".to_string(), None);
         }
     }
     let deny_all = client_tag_deny

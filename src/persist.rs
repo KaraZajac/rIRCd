@@ -213,6 +213,22 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
     .await
     .ok();
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS whowas (
+            id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+            nick       VARCHAR(64)  NOT NULL,
+            nick_lower VARCHAR(64)  NOT NULL,
+            username   VARCHAR(64)  NOT NULL,
+            host       VARCHAR(255) NOT NULL,
+            realname   VARCHAR(255) NOT NULL DEFAULT '',
+            server     VARCHAR(255) NOT NULL,
+            quit_time  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_whowas_nick (nick_lower)
+        ) CHARACTER SET utf8mb4",
+    )
+    .execute(pool)
+    .await?;
+
     tracing::info!("Database schema ready");
     Ok(())
 }
@@ -1020,4 +1036,81 @@ pub async fn update_channel_history_message(
             0
         }
     }
+}
+
+// ─── WHOWAS persistence ────────────────────────────────────────────────────
+
+/// Maximum number of WHOWAS entries retained per nick in the database.
+const MAX_WHOWAS_DB: i64 = 20;
+
+/// Persist a WHOWAS entry and prune old entries for the same nick.
+pub async fn save_whowas(
+    pool: &sqlx::MySqlPool,
+    nick: &str,
+    username: &str,
+    host: &str,
+    realname: &str,
+    server: &str,
+) {
+    let nick_lower = nick.to_lowercase();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO whowas (nick, nick_lower, username, host, realname, server) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(nick)
+    .bind(&nick_lower)
+    .bind(username)
+    .bind(host)
+    .bind(realname)
+    .bind(server)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(%nick, ?e, "failed to persist WHOWAS entry");
+        return;
+    }
+    // Prune oldest entries beyond the limit
+    let _ = sqlx::query(
+        "DELETE FROM whowas WHERE nick_lower = ? AND id NOT IN (
+            SELECT id FROM (SELECT id FROM whowas WHERE nick_lower = ? ORDER BY quit_time DESC LIMIT ?) AS keep
+        )",
+    )
+    .bind(&nick_lower)
+    .bind(&nick_lower)
+    .bind(MAX_WHOWAS_DB)
+    .execute(pool)
+    .await;
+}
+
+/// Load WHOWAS entries for a nick (most recent first).
+pub async fn load_whowas(
+    pool: &sqlx::MySqlPool,
+    nick: &str,
+    limit: i64,
+) -> Vec<crate::user::WhowasEntry> {
+    use sqlx::Row;
+    let nick_lower = nick.to_lowercase();
+    let rows = match sqlx::query(
+        "SELECT nick, username, host, realname, server, UNIX_TIMESTAMP(quit_time) AS ts FROM whowas WHERE nick_lower = ? ORDER BY quit_time DESC LIMIT ?",
+    )
+    .bind(&nick_lower)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(%nick, ?e, "failed to load WHOWAS entries");
+            return Vec::new();
+        }
+    };
+    rows.iter()
+        .map(|r| crate::user::WhowasEntry {
+            nick: r.get::<String, _>("nick"),
+            user: r.get::<String, _>("username"),
+            host: r.get::<String, _>("host"),
+            realname: r.get::<String, _>("realname"),
+            server: r.get::<String, _>("server"),
+            timestamp: r.get::<i64, _>("ts"),
+        })
+        .collect()
 }

@@ -53,7 +53,7 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// ISUPPORT (005) token list; used at registration and for extended-isupport.
 fn isupport_tokens(cfg: &Config) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={} MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST EXCEPTS INVEX UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1 METADATA=50{}", cfg.limits.max_line_length, network);
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={} MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=U EXCEPTS INVEX UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1 METADATA=50{}", cfg.limits.max_line_length, network);
     let deny = cfg
         .server
         .client_tag_deny
@@ -129,6 +129,7 @@ pub async fn complete_registration(
     client.capabilities = pending.capabilities.clone();
     client.account = pending.account.clone();
     client.away_message = pending.away_message.take();
+    client.is_tls = pending.is_tls;
 
     // Auto-cloak: if cloak_key is set, derive a stable vhost from the real IP via HMAC-SHA256
     if let Some(ref cloak_key) = cfg.server.cloak_key {
@@ -143,6 +144,14 @@ pub async fn complete_registration(
 
     let server = &cfg.server.name;
     let nick_str = &client.read().await.nick.clone().unwrap();
+
+    tracing::info!(
+        client_id,
+        nick = %nick_str,
+        host = %client.read().await.display_host(),
+        tls = client.read().await.is_tls,
+        "Client registered"
+    );
 
     reply_to_client(
         &senders,
@@ -320,7 +329,17 @@ pub async fn handle_webirc(
     let password = msg.params.first().map(|s| s.as_str());
     let ip = msg.params.get(3).map(|s| s.as_str()).unwrap_or("");
     drop(state_guard);
-    if expected != password || ip.is_empty() {
+    // Constant-time comparison for WEBIRC password to prevent timing attacks
+    let password_ok = match (expected, password) {
+        (Some(e), Some(p)) => {
+            use subtle::ConstantTimeEq;
+            e.len() == p.len() && e.as_bytes().ct_eq(p.as_bytes()).into()
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if !password_ok || ip.is_empty() {
+        tracing::warn!(client_id, ip = %ip, "WEBIRC authentication failed");
         let tx = senders.read().await.get(client_id).cloned();
         if let Some(tx) = tx {
             let _ = tx
@@ -332,6 +351,7 @@ pub async fn handle_webirc(
         }
         return Ok(());
     }
+    tracing::info!(client_id, real_ip = %ip, "WEBIRC accepted, real IP set");
     let mut state_w = state.write().await;
     let pending = state_w.get_or_create_pending(client_id, host);
     pending.host = ip.to_string();
@@ -371,6 +391,14 @@ pub async fn handle_cap(
             if !is_registered {
                 let conn = state_guard.get_or_create_pending(client_id, host);
                 conn.cap_negotiating = true;
+                // CAP 302 implicitly enables cap-notify
+                if version_302 {
+                    conn.capabilities.insert("cap-notify".to_string());
+                }
+            } else if version_302 {
+                if let Some(c) = state_guard.clients.get(client_id) {
+                    c.write().await.capabilities.insert("cap-notify".to_string());
+                }
             }
             let tls_port: Option<u16> = if cfg.tls_enabled() {
                 cfg.server
@@ -382,7 +410,19 @@ pub async fn handle_cap(
                 None
             };
             let sasl_external = cfg.tls.client_certs && cfg.tls_enabled();
-            let caps = build_cap_list(version_302, tls_port, sasl_external);
+            let client_is_tls = if is_registered {
+                match state_guard.clients.get(client_id) {
+                    Some(c) => c.read().await.is_tls,
+                    None => false,
+                }
+            } else {
+                state_guard
+                    .pending
+                    .get(client_id)
+                    .map(|p| p.is_tls)
+                    .unwrap_or(false)
+            };
+            let caps = build_cap_list(version_302, tls_port, sasl_external, client_is_tls);
             let total = caps.len();
             for (i, cap_line) in caps.iter().enumerate() {
                 let is_last = i == total - 1;
@@ -443,10 +483,28 @@ pub async fn handle_cap(
 
             let (ack_enable, nak) =
                 filter_requested(&to_enable, &std::collections::HashSet::new());
+            // Gather current client caps to check cap-notify protection
+            let client_caps: std::collections::HashSet<String> = if is_registered {
+                match state_guard.clients.get(client_id) {
+                    Some(c) => c.read().await.capabilities.clone(),
+                    None => Default::default(),
+                }
+            } else {
+                state_guard
+                    .pending
+                    .get(client_id)
+                    .map(|p| p.capabilities.clone())
+                    .unwrap_or_default()
+            };
+
             let mut nak_disable = Vec::new();
             for cap in &to_disable {
                 let base = cap.split('=').next().unwrap_or(cap);
-                if !crate::capability::CAPS.contains(&base) {
+                // 302 clients implicitly enable cap-notify; MUST NOT be allowed to disable it.
+                // Also NAK unknown capabilities.
+                let is_protected_cap_notify =
+                    base == "cap-notify" && client_caps.contains("cap-notify");
+                if is_protected_cap_notify || !crate::capability::CAPS.contains(&base) {
                     nak_disable.push(format!("-{}", cap));
                 }
             }
@@ -600,17 +658,30 @@ pub async fn handle_nick(
             // Build the entry while we hold client_guard, then drop it before mutating state_guard.
             let whowas_entry = old_nick.as_ref().map(|n| crate::user::WhowasEntry {
                 nick: n.clone(),
-                user: client_guard.user.as_deref().unwrap_or("*").to_string(),
-                host: client_guard.host.clone(),
+                user: client_guard.display_user().to_string(),
+                host: client_guard.display_host().to_string(),
                 realname: client_guard.realname.as_deref().unwrap_or("").to_string(),
                 server: cfg.server.name.clone(),
                 timestamp: chrono::Utc::now().timestamp(),
             });
             drop(client_guard);
             if let Some(entry) = whowas_entry {
+                // Persist to DB
+                if let Some(ref pool) = cfg.db {
+                    persist::save_whowas(
+                        pool,
+                        &entry.nick,
+                        &entry.user,
+                        &entry.host,
+                        &entry.realname,
+                        &entry.server,
+                    )
+                    .await;
+                }
                 state_guard.push_whowas(entry);
             }
             if let Some(ref o) = old_nick {
+                tracing::info!(client_id, old_nick = %o, new_nick = %nick, "Nick change");
                 state_guard.nick_to_id.remove(&o.to_uppercase());
             }
             if let Some(client) = state_guard.clients.get(client_id) {
@@ -834,6 +905,29 @@ async fn send_motd(
     label: Option<&str>,
     client_id: &str,
 ) {
+    // 422 ERR_NOMOTD if MOTD is empty
+    let motd_content: Vec<&str> = cfg
+        .server
+        .motd
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if motd_content.is_empty() {
+        reply_to_client(
+            senders,
+            client_id,
+            Message::new(
+                "422",
+                vec![nick.to_string(), "MOTD File is missing".into()],
+            )
+            .with_prefix(server),
+            label,
+        )
+        .await;
+        return;
+    }
+
     reply_to_client(
         senders,
         client_id,
@@ -848,18 +942,15 @@ async fn send_motd(
         label,
     )
     .await;
-    for line in cfg.server.motd.lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            reply_to_client(
-                senders,
-                client_id,
-                Message::new("372", vec![nick.to_string(), format!("- {}", line)])
-                    .with_prefix(server),
-                label,
-            )
-            .await;
-        }
+    for line in &motd_content {
+        reply_to_client(
+            senders,
+            client_id,
+            Message::new("372", vec![nick.to_string(), format!("- {}", line)])
+                .with_prefix(server),
+            label,
+        )
+        .await;
     }
     reply_to_client(
         senders,
@@ -948,7 +1039,20 @@ pub async fn handle_quit(
             let had_account = c.account.is_some();
             let nick = c.nick.clone().unwrap_or_else(|| client_id.to_string());
             let list = c.monitor_list.clone();
-            // Record WHOWAS before the client is removed
+            // Record WHOWAS before the client is removed (use display_host to respect cloaking)
+            if let Some(ref pool) = cfg.db {
+                if let Some(ref n) = c.nick {
+                    persist::save_whowas(
+                        pool,
+                        n,
+                        c.display_user(),
+                        c.display_host(),
+                        c.realname.as_deref().unwrap_or(""),
+                        &cfg.server.name,
+                    )
+                    .await;
+                }
+            }
             state_guard.record_whowas(&c, &cfg.server.name);
             (source, chans, had_account, nick, list)
         } else {
@@ -956,6 +1060,8 @@ pub async fn handle_quit(
             return Ok(());
         }
     };
+
+    tracing::info!(client_id, nick = %quit_nick, reason = %reason, channels = channel_names.len(), "Client quit");
 
     let quit_msg = Message::new("QUIT", vec![reason.clone()]).with_prefix(&source);
 
@@ -1840,6 +1946,8 @@ pub async fn handle_authenticate(
     tracing::info!(client_id = %client_id, nick = %nick, account = %account, "SASL AUTHENTICATE: success, sent 900 and 903");
 
     // account-notify: tell channel peers that have the cap (prefix = user whose account changed)
+    let account_msg = Message::new("ACCOUNT", vec![account.to_string()]).with_prefix(&source);
+    let mut already_notified = std::collections::HashSet::new();
     for ch_name in &channel_list {
         let ch_store = channels.read().await;
         let ch_guard = match ch_store.channels.get(ch_name) {
@@ -1859,14 +1967,25 @@ pub async fn handle_authenticate(
                 None => Default::default(),
             };
             if caps.contains("account-notify") {
-                send_to_client(
-                    &senders,
-                    mid,
-                    Message::new("ACCOUNT", vec![account.to_string()]).with_prefix(&source),
-                )
-                .await;
+                send_to_client(&senders, mid, account_msg.clone()).await;
+                already_notified.insert(mid.clone());
             }
         }
+    }
+    // extended-monitor: notify monitor watchers with account-notify + extended-monitor
+    {
+        let state_r = state.read().await;
+        notify_extended_monitor_watchers(
+            &state_r,
+            &senders,
+            &nick,
+            &source,
+            account_msg,
+            "account-notify",
+            &already_notified,
+            client_id,
+        )
+        .await;
     }
     Ok(())
 }
@@ -2331,6 +2450,7 @@ pub async fn handle_oper(
                 false
             };
             if found {
+                tracing::warn!(client_id, oper_name = %name, "OPER login successful");
                 reply_to_client(
                     &senders,
                     client_id,
@@ -2355,6 +2475,7 @@ pub async fn handle_oper(
             return Ok(());
         }
     }
+    tracing::warn!(client_id, oper_name = %name, "OPER login failed: bad password");
     reply_to_client(
         &senders,
         client_id,
@@ -2530,6 +2651,7 @@ pub async fn handle_register(
                 label,
             )
             .await;
+            tracing::info!(client_id, account = %account, "Account registered");
         }
         Err(RegisterError::AccountExists) => {
             reply_to_client(
@@ -2658,7 +2780,7 @@ pub async fn handle_away(
         .trailing()
         .map(|s| if s.len() > 307 { &s[..307] } else { s })
         .map(String::from);
-    let (source, channel_list) = {
+    let (source, nick, channel_list) = {
         let mut state = state.write().await;
         if !state.clients.contains_key(client_id) {
             if let Some(pending) = state.pending.get_mut(client_id) {
@@ -2672,8 +2794,9 @@ pub async fn handle_away(
         let source = client_guard
             .source()
             .unwrap_or_else(|| client_id.to_string());
+        let nick = client_guard.nick_or_id().to_string();
         let channel_list: Vec<String> = client_guard.channels.keys().cloned().collect();
-        (source, channel_list)
+        (source, nick, channel_list)
     };
 
     // Send 306 RPL_NOWAWAY or 305 RPL_UNAWAY to the client
@@ -2685,12 +2808,21 @@ pub async fn handle_away(
     reply_to_client(
         &senders,
         client_id,
-        Message::new(reply_code, vec!["*".into(), reply_text.into()]).with_prefix(&cfg.server.name),
+        Message::new(reply_code, vec![nick.clone(), reply_text.into()]).with_prefix(&cfg.server.name),
         label,
     )
     .await;
 
     // away-notify: tell channel peers that have the cap
+    let away_message = Message::new(
+        "AWAY",
+        away_msg
+            .as_ref()
+            .map(|s| vec![s.clone()])
+            .unwrap_or_default(),
+    )
+    .with_prefix(&source);
+    let mut already_notified = std::collections::HashSet::new();
     for ch_name in &channel_list {
         let ch_store = channels.read().await;
         let ch_guard = match ch_store.channels.get(ch_name) {
@@ -2702,14 +2834,6 @@ pub async fn handle_away(
         drop(ch_store);
 
         let state = state.read().await;
-        let away_message = Message::new(
-            "AWAY",
-            away_msg
-                .as_ref()
-                .map(|s| vec![s.clone()])
-                .unwrap_or_default(),
-        )
-        .with_prefix(&source);
         for mid in &member_ids {
             if *mid == client_id {
                 continue;
@@ -2720,8 +2844,25 @@ pub async fn handle_away(
             };
             if caps.contains("away-notify") {
                 send_to_client(&senders, mid, away_message.clone()).await;
+                already_notified.insert(mid.clone());
             }
         }
+    }
+
+    // extended-monitor: notify monitor watchers with away-notify + extended-monitor
+    {
+        let state_r = state.read().await;
+        notify_extended_monitor_watchers(
+            &state_r,
+            &senders,
+            &nick,
+            &source,
+            away_message,
+            "away-notify",
+            &already_notified,
+            client_id,
+        )
+        .await;
     }
 
     Ok(())
@@ -2782,6 +2923,7 @@ pub async fn handle_setname(
             .unwrap_or_else(|| client_id.to_string());
         let channel_list: Vec<String> = client.read().await.channels.keys().cloned().collect();
         drop(client);
+        tracing::info!(client_id, realname = %realname, "SETNAME");
         if let Some(c) = state.clients.get_mut(client_id) {
             c.write().await.realname = Some(realname.clone());
         }
@@ -2799,6 +2941,7 @@ pub async fn handle_setname(
     if self_has_setname {
         reply_to_client(&senders, client_id, setname_msg.clone(), label).await;
     }
+    let mut already_notified = std::collections::HashSet::new();
     for ch_name in &channel_list {
         let ch_store = channels.read().await;
         let ch_guard = match ch_store.channels.get(ch_name) {
@@ -2818,9 +2961,27 @@ pub async fn handle_setname(
             };
             if has_setname {
                 send_to_client(&senders, mid, setname_msg.clone()).await;
+                already_notified.insert(mid.clone());
             }
         }
     }
+
+    // extended-monitor: notify monitor watchers with setname + extended-monitor
+    let nick = match state.clients.get(client_id) {
+        Some(c) => c.read().await.nick_or_id().to_string(),
+        None => client_id.to_string(),
+    };
+    notify_extended_monitor_watchers(
+        &state,
+        &senders,
+        &nick,
+        &source,
+        setname_msg,
+        "setname",
+        &already_notified,
+        client_id,
+    )
+    .await;
 
     Ok(())
 }
@@ -2910,6 +3071,7 @@ pub async fn handle_sethost(
             .unwrap_or_else(|| guard.user.as_deref().unwrap_or(""))
             .to_string();
         guard.vhost = Some(new_host.clone());
+        tracing::info!(client_id, new_host = %new_host, "SETHOST");
         (old_source, display_user, new_host)
     };
     send_chghost_if_changed(
@@ -3022,6 +3184,7 @@ pub async fn handle_setuser(
 }
 
 /// Notify channel peers with `chghost` cap when a client's username or host changes.
+/// For clients without the cap, send fallback QUIT/JOIN/MODE messages.
 pub async fn send_chghost_if_changed(
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
@@ -3031,20 +3194,39 @@ pub async fn send_chghost_if_changed(
     new_user: &str,
     new_host: &str,
 ) {
-    let channel_names: Vec<String> = {
+    let (channel_names, nick, new_source) = {
         let state = state.read().await;
         match state.clients.get(client_id) {
-            Some(c) => c.read().await.channels.keys().cloned().collect(),
+            Some(c) => {
+                let cg = c.read().await;
+                let channels: Vec<String> = cg.channels.keys().cloned().collect();
+                let nick = cg.nick.clone().unwrap_or_default();
+                let new_src = format!(
+                    "{}!{}@{}",
+                    nick,
+                    new_user,
+                    new_host
+                );
+                (channels, nick, new_src)
+            }
             None => return,
         }
     };
     let chghost_msg =
         Message::new("CHGHOST", vec![new_user.into(), new_host.into()]).with_prefix(old_source);
+    let quit_msg =
+        Message::new("QUIT", vec!["Changing host".into()]).with_prefix(old_source);
+    let mut already_notified = std::collections::HashSet::new();
     for ch_name in channel_names {
-        let member_ids: Vec<String> = {
+        let (member_ids, member_modes) = {
             let ch_store = channels.read().await;
             match ch_store.channels.get(&ch_name) {
-                Some(ch) => ch.read().await.members.keys().cloned().collect(),
+                Some(ch) => {
+                    let ch = ch.read().await;
+                    let ids: Vec<String> = ch.members.keys().cloned().collect();
+                    let modes = ch.members.get(client_id).map(|m| m.modes.clone());
+                    (ids, modes)
+                }
                 None => continue,
             }
         };
@@ -3054,10 +3236,99 @@ pub async fn send_chghost_if_changed(
                 continue;
             }
             if let Some(c) = state.clients.get(&mid) {
-                if c.read().await.capabilities.contains("chghost") {
+                let has_chghost = c.read().await.capabilities.contains("chghost");
+                if has_chghost {
                     send_to_client(&senders, &mid, chghost_msg.clone()).await;
+                } else {
+                    send_to_client(&senders, &mid, quit_msg.clone()).await;
+                    let join_msg =
+                        Message::new("JOIN", vec![ch_name.clone()]).with_prefix(&new_source);
+                    send_to_client(&senders, &mid, join_msg).await;
+                    if let Some(ref modes) = member_modes {
+                        let mut mode_chars = String::new();
+                        let mut mode_args = Vec::new();
+                        if modes.op {
+                            mode_chars.push('o');
+                            mode_args.push(nick.clone());
+                        }
+                        if modes.halfop {
+                            mode_chars.push('h');
+                            mode_args.push(nick.clone());
+                        }
+                        if modes.voice {
+                            mode_chars.push('v');
+                            mode_args.push(nick.clone());
+                        }
+                        if !mode_chars.is_empty() {
+                            let mut params = vec![
+                                ch_name.clone(),
+                                format!("+{}", mode_chars),
+                            ];
+                            params.extend(mode_args);
+                            let mode_msg = Message::new("MODE", params)
+                                .with_prefix(&new_source);
+                            send_to_client(&senders, &mid, mode_msg).await;
+                        }
+                    }
                 }
+                already_notified.insert(mid.clone());
             }
+        }
+    }
+
+    // extended-monitor: notify monitor watchers with chghost + extended-monitor
+    {
+        let state_r = state.read().await;
+        notify_extended_monitor_watchers(
+            &state_r,
+            &senders,
+            &nick,
+            old_source,
+            chghost_msg,
+            "chghost",
+            &already_notified,
+            client_id,
+        )
+        .await;
+    }
+}
+
+/// Send a notification to extended-monitor watchers of a nick.
+/// `required_cap` is the capability the watcher needs (e.g. "away-notify", "account-notify").
+/// `already_notified` are client IDs already notified via channel membership (to avoid duplicates).
+async fn notify_extended_monitor_watchers(
+    state: &ServerState,
+    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    nick: &str,
+    source: &str,
+    msg: Message,
+    required_cap: &str,
+    already_notified: &std::collections::HashSet<String>,
+    client_id: &str,
+) {
+    let nick_lower = nick.to_lowercase();
+    let source_lower = source.to_lowercase();
+
+    // Collect watchers from both exact nick and pattern matches
+    let mut watcher_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(watchers) = state.monitor_watchers.watchers(&nick_lower) {
+        watcher_ids.extend(watchers.iter().cloned());
+    }
+    for wid in state.monitor_watchers.pattern_watchers_for(&source_lower) {
+        watcher_ids.insert(wid);
+    }
+
+    for wid in &watcher_ids {
+        // Skip the user themselves and anyone already notified via channel
+        if wid == client_id || already_notified.contains(wid) {
+            continue;
+        }
+        let caps = match state.clients.get(wid) {
+            Some(c) => c.read().await.capabilities.clone(),
+            None => continue,
+        };
+        if caps.contains("extended-monitor") && caps.contains(required_cap) {
+            send_to_client(senders, wid, msg.clone()).await;
         }
     }
 }

@@ -66,6 +66,8 @@ pub struct Client {
     pub last_active: i64,
     /// draft/metadata-2: keys this client has subscribed to for change notifications
     pub metadata_subscriptions: std::collections::HashSet<String>,
+    /// True if this connection is over TLS (used for STS policy and WHOIS secure line)
+    pub is_tls: bool,
 }
 
 impl Client {
@@ -91,6 +93,7 @@ impl Client {
             signon_at: Utc::now().timestamp(),
             last_active: Utc::now().timestamp(),
             metadata_subscriptions: std::collections::HashSet::new(),
+            is_tls: false,
         }
     }
 
@@ -152,6 +155,8 @@ pub struct PendingConnection {
     pub sasl_mechanism: Option<String>,
     /// SCRAM-SHA-256: intermediate server state (set after step 1, consumed in step 2)
     pub sasl_scram: Option<ScramServerState>,
+    /// True if this connection is over TLS
+    pub is_tls: bool,
 }
 
 impl PendingConnection {
@@ -172,6 +177,7 @@ impl PendingConnection {
             sasl_failed: false,
             sasl_mechanism: None,
             sasl_scram: None,
+            is_tls: false,
         }
     }
 
@@ -376,6 +382,7 @@ impl ServerState {
     }
 
     /// Record a WHOWAS entry for the given client (call before removing the client or changing nick).
+    /// Uses display_host/display_user to respect cloaking — WHOWAS should not leak real IPs.
     pub fn record_whowas(&mut self, client: &Client, server_name: &str) {
         let nick = match &client.nick {
             Some(n) => n.clone(),
@@ -383,8 +390,8 @@ impl ServerState {
         };
         let entry = WhowasEntry {
             nick: nick.clone(),
-            user: client.user.as_deref().unwrap_or("*").to_string(),
-            host: client.host.clone(),
+            user: client.display_user().to_string(),
+            host: client.display_host().to_string(),
             realname: client.realname.as_deref().unwrap_or("").to_string(),
             server: server_name.to_string(),
             timestamp: Utc::now().timestamp(),
@@ -393,13 +400,14 @@ impl ServerState {
     }
 
     /// Record WHOWAS for a killed client by client_id (used by KILL handler).
+    /// Uses display_host/display_user to respect cloaking.
     pub fn record_whowas_for_kill(&mut self, client_id: &str, server_name: &str) {
         let entry_opt = if let Some(c) = self.clients.get(client_id) {
             if let Ok(g) = c.try_read() {
                 g.nick.as_ref().map(|nick| WhowasEntry {
                     nick: nick.clone(),
-                    user: g.user.as_deref().unwrap_or("*").to_string(),
-                    host: g.host.clone(),
+                    user: g.display_user().to_string(),
+                    host: g.display_host().to_string(),
                     realname: g.realname.as_deref().unwrap_or("").to_string(),
                     server: server_name.to_string(),
                     timestamp: chrono::Utc::now().timestamp(),

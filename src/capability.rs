@@ -53,10 +53,14 @@ pub const TAGS_DEPENDENT: &[&str] = &["server-time", "batch", "account-tag"];
 /// Build CAP LS reply value (space-separated list).
 /// `tls_port` is required to advertise `sts`; omit it when TLS is not configured.
 /// `sasl_external` adds EXTERNAL to the SASL mechanism list (when TLS client_certs is enabled).
+/// `client_is_tls` indicates whether the requesting client is on a TLS connection:
+///   - plaintext clients get `sts=port=<N>` (upgrade directive)
+///   - TLS clients get `sts=duration=<N>` (persistence policy)
 pub fn build_cap_list(
     version_302: bool,
     tls_port: Option<u16>,
     sasl_external: bool,
+    client_is_tls: bool,
 ) -> Vec<String> {
     let caps: Vec<String> = CAPS
         .iter()
@@ -73,7 +77,9 @@ pub fn build_cap_list(
             "draft/account-registration" => {
                 "draft/account-registration=before-connect,custom-account-name".to_string()
             }
-            "sts" => format!("sts=port={},duration=2592000", tls_port.unwrap_or(6697)),
+            // STS: plaintext clients get port (upgrade), TLS clients get duration (persistence)
+            "sts" if client_is_tls => "sts=duration=2592000".to_string(),
+            "sts" => format!("sts=port={}", tls_port.unwrap_or(6697)),
             _ => c.to_string(),
         })
         .collect();
