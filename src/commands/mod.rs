@@ -6,7 +6,9 @@ mod registration;
 mod reply;
 mod server_cmds;
 
-pub use reply::reply_to_client;
+pub use reply::{
+    end_labeled_batch, reply_in_batch, reply_to_client, send_labeled_ack, start_labeled_batch,
+};
 
 use crate::channel::ChannelStore;
 use crate::config::Config;
@@ -24,7 +26,13 @@ pub async fn handle_message(
     senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
     cfg: Arc<RwLock<Config>>,
 ) -> anyhow::Result<()> {
-    let label = msg.tags.get("label").and_then(|v| v.as_ref()).cloned();
+    // labeled-response: label values MUST NOT exceed 64 bytes
+    let label = msg
+        .tags
+        .get("label")
+        .and_then(|v| v.as_ref())
+        .filter(|l| l.len() <= 64)
+        .cloned();
 
     // REHASH needs write access to cfg — handle before acquiring the read lock
     if msg.command == "REHASH" {
@@ -217,6 +225,13 @@ pub async fn handle_message(
         }
     }
 
+    tracing::trace!(
+        client = %client_id,
+        command = %msg.command,
+        params = %msg.params.iter().take(2).cloned().collect::<Vec<_>>().join(" "),
+        "Command"
+    );
+
     match msg.command.as_str() {
         "WEBIRC" => {
             registration::handle_webirc(
@@ -274,7 +289,12 @@ pub async fn handle_message(
             registration::handle_ping(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
         "PONG" => {
-            registration::handle_pong(&client_id, msg, state, senders, cfg, label.as_deref()).await
+            let result = registration::handle_pong(&client_id, msg, state, senders.clone(), cfg, label.as_deref()).await;
+            // labeled-response: PONG produces no reply, so send ACK if labeled
+            if let Some(ref l) = label {
+                reply::send_labeled_ack(&senders, &client_id, l, &cfg.server.name).await;
+            }
+            result
         }
         "QUIT" => {
             registration::handle_quit(
@@ -648,6 +668,7 @@ pub async fn handle_message(
                 Some(c) => c.read().await.nick_or_id().to_string(),
                 None => "*".to_string(),
             };
+            tracing::debug!(client = %client_id, command = %msg.command, "Unknown command");
             reply_to_client(
                 &senders,
                 &client_id,

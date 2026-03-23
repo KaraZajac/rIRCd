@@ -75,6 +75,7 @@ async fn send_to_client_with_caps(
     msgid: Option<&str>,
     client_only_tags: Option<&std::collections::HashMap<String, Option<String>>>,
     client_tag_deny: Option<&[String]>,
+    sender_is_bot: bool,
 ) {
     let tagged = add_tags_for_recipient(
         msg,
@@ -83,6 +84,7 @@ async fn send_to_client_with_caps(
         msgid,
         client_only_tags,
         client_tag_deny,
+        sender_is_bot,
     );
     send_to_client(senders, to_id, tagged).await;
 }
@@ -155,6 +157,7 @@ pub async fn handle_privmsg(
         .unwrap_or_else(|| client_id.to_string());
     let sender_nick = sender_data.nick_or_id().to_string();
     let sender_account = sender_data.account.clone();
+    let sender_is_bot = sender_data.bot;
     let echo_message = sender_data.has_cap("echo-message");
     drop(sender_data);
     drop(state_guard);
@@ -414,6 +417,7 @@ pub async fn handle_privmsg(
                             Some(&msgid),
                             Some(&msg.tags),
                             cfg.server.client_tag_deny.as_deref(),
+                            sender_is_bot,
                         );
                         reply_to_client(&senders, client_id, tagged, label).await;
                     }
@@ -432,6 +436,7 @@ pub async fn handle_privmsg(
                     Some(&msgid),
                     Some(&msg.tags),
                     cfg.server.client_tag_deny.as_deref(),
+                    sender_is_bot,
                 )
                 .await;
             }
@@ -477,6 +482,7 @@ pub async fn handle_privmsg(
                 Some(&msgid),
                 Some(&msg.tags),
                 cfg.server.client_tag_deny.as_deref(),
+            sender_is_bot,
             )
             .await;
             // 301 RPL_AWAY if target is away
@@ -507,6 +513,7 @@ pub async fn handle_privmsg(
                     Some(&msgid),
                     Some(&msg.tags),
                     cfg.server.client_tag_deny.as_deref(),
+                    sender_is_bot,
                 );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
@@ -556,6 +563,7 @@ pub async fn handle_notice(
         .source()
         .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
+    let sender_is_bot = sender_data.bot;
     let echo_message = sender_data.has_cap("echo-message");
     drop(sender_data);
     drop(state_guard);
@@ -636,6 +644,7 @@ pub async fn handle_notice(
                             Some(&msgid),
                             Some(&msg.tags),
                             cfg.server.client_tag_deny.as_deref(),
+                            sender_is_bot,
                         );
                         reply_to_client(&senders, client_id, tagged, label).await;
                     }
@@ -654,6 +663,7 @@ pub async fn handle_notice(
                     Some(&msgid),
                     Some(&msg.tags),
                     cfg.server.client_tag_deny.as_deref(),
+                    sender_is_bot,
                 )
                 .await;
             }
@@ -687,6 +697,7 @@ pub async fn handle_notice(
                 Some(&msgid),
                 Some(&msg.tags),
                 cfg.server.client_tag_deny.as_deref(),
+            sender_is_bot,
             )
             .await;
             if echo_message {
@@ -701,6 +712,7 @@ pub async fn handle_notice(
                     Some(&msgid),
                     Some(&msg.tags),
                     cfg.server.client_tag_deny.as_deref(),
+                    sender_is_bot,
                 );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
@@ -788,7 +800,7 @@ pub async fn deliver_multiline_batch(
         return Ok(());
     }
 
-    let (source, sender_account, echo_message) = {
+    let (source, sender_account, sender_is_bot, echo_message) = {
         let state_guard = state.read().await;
         let client = match state_guard.clients.get(client_id) {
             Some(c) => c.clone(),
@@ -797,8 +809,9 @@ pub async fn deliver_multiline_batch(
         let g = client.read().await;
         let source = g.source().unwrap_or_else(|| client_id.to_string());
         let account = g.account.clone();
+        let is_bot = g.bot;
         let echo = g.has_cap("echo-message");
-        (source, account, echo)
+        (source, account, is_bot, echo)
     };
 
     let msgid = generate_msgid();
@@ -910,6 +923,7 @@ pub async fn deliver_multiline_batch(
                     Some(&msgid),
                     None,
                     cfg.server.client_tag_deny.as_deref(),
+                    sender_is_bot,
                 );
                 send_to_client(&senders, mid, tagged).await;
             }
@@ -930,6 +944,7 @@ pub async fn deliver_multiline_batch(
                     Some(&msgid),
                     None,
                     cfg.server.client_tag_deny.as_deref(),
+                    sender_is_bot,
                 );
                 send_to_client(&senders, mid, tagged).await;
             }
@@ -979,6 +994,7 @@ pub async fn deliver_multiline_batch(
                     Some(&msgid),
                     None,
                     cfg.server.client_tag_deny.as_deref(),
+                    sender_is_bot,
                 );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
@@ -999,6 +1015,7 @@ pub async fn deliver_multiline_batch(
                     Some(&msgid),
                     None,
                     cfg.server.client_tag_deny.as_deref(),
+                    sender_is_bot,
                 );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
@@ -1062,6 +1079,7 @@ pub async fn handle_tagmsg(
         .source()
         .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
+    let sender_is_bot = sender_data.bot;
     let echo_message = sender_data.has_cap("echo-message");
     drop(sender_data);
     drop(state_guard);
@@ -1080,7 +1098,84 @@ pub async fn handle_tagmsg(
         let ch_store = channels.read().await;
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
-            if ch.is_member(client_id) {
+
+            // +n: reject non-members when no-external-messages is set
+            if !ch.is_member(client_id) && ch.modes.no_external {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "404",
+                        vec![target.into(), "Cannot send to channel (+n)".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+
+            // +q: sender is quieted
+            if ch.is_quieted(sender_account.as_deref(), &source) {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "404",
+                        vec![target.into(), "You are quieted in this channel (+q)".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+
+            // +R: registered users only for speaking
+            if ch.modes.registered_only && sender_account.is_none() {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "404",
+                        vec![
+                            target.into(),
+                            "You must be registered to speak here (+R)".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+
+            // +m: only voiced/halfop/op may send to moderated channels
+            if ch.modes.moderated
+                && !ch
+                    .members
+                    .get(client_id)
+                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .unwrap_or(false)
+            {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "404",
+                        vec![
+                            target.into(),
+                            "Cannot send to channel (+m)".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+
+            if ch.is_member(client_id) || !ch.modes.no_external {
                 for mid in ch.members.keys() {
                     let caps = match state_guard.clients.get(mid) {
                         Some(c) => c.read().await.capabilities.clone(),
@@ -1100,6 +1195,7 @@ pub async fn handle_tagmsg(
                             Some(&msgid),
                             Some(&msg.tags),
                             cfg.server.client_tag_deny.as_deref(),
+                            sender_is_bot,
                         );
                         reply_to_client(&senders, client_id, tagged, label).await;
                         continue;
@@ -1113,6 +1209,7 @@ pub async fn handle_tagmsg(
                         Some(&msgid),
                         Some(&msg.tags),
                         cfg.server.client_tag_deny.as_deref(),
+                        sender_is_bot,
                     )
                     .await;
                 }
@@ -1135,6 +1232,7 @@ pub async fn handle_tagmsg(
                     Some(&msgid),
                     Some(&msg.tags),
                     cfg.server.client_tag_deny.as_deref(),
+                    sender_is_bot,
                 )
                 .await;
             }
@@ -1151,6 +1249,7 @@ pub async fn handle_tagmsg(
                         Some(&msgid),
                         Some(&msg.tags),
                         cfg.server.client_tag_deny.as_deref(),
+                        sender_is_bot,
                     );
                     reply_to_client(&senders, client_id, tagged, label).await;
                 }
@@ -1599,6 +1698,7 @@ pub async fn handle_chathistory(
         }
     };
     let include_events = caps.contains("draft/event-playback");
+    tracing::debug!(client_id, subcommand = %subcommand, target, cursor, limit, "CHATHISTORY query");
 
     let entries = match (subcommand.as_str(), cursor) {
         ("AROUND", c) if c != "*" => {
@@ -1682,6 +1782,7 @@ pub async fn handle_chathistory(
             e.msgid.as_deref(),
             None,
             cfg.server.client_tag_deny.as_deref(),
+            false, // CHATHISTORY replay: bot status not available from DB
         );
         send_to_client(&senders, client_id, tagged).await;
     }
@@ -1781,6 +1882,7 @@ pub async fn handle_markread(
         } else {
             ts.to_string()
         };
+        tracing::debug!(client_id, target, timestamp = %ts, "MARKREAD set");
         let updated_ts = {
             let mut state_w = state.write().await;
             let entry = state_w.read_markers.entry(key.clone()).or_default();
@@ -1834,7 +1936,7 @@ pub async fn deliver_client_batch(
         return Ok(());
     }
 
-    let (source, sender_account) = {
+    let (source, sender_account, sender_is_bot) = {
         let state_r = state.read().await;
         let client = match state_r.clients.get(client_id) {
             Some(c) => c.clone(),
@@ -1843,7 +1945,8 @@ pub async fn deliver_client_batch(
         let g = client.read().await;
         let source = g.source().unwrap_or_else(|| client_id.to_string());
         let account = g.account.clone();
-        (source, account)
+        let is_bot = g.bot;
+        (source, account, is_bot)
     };
 
     let state_r = state.read().await;
@@ -1906,6 +2009,7 @@ pub async fn deliver_client_batch(
                     None,
                     None,
                     cfg.server.client_tag_deny.as_deref(),
+                    sender_is_bot,
                 );
                 send_to_client(&senders, mid, tagged).await;
             }
@@ -1923,6 +2027,7 @@ pub async fn deliver_client_batch(
                     None,
                     None,
                     cfg.server.client_tag_deny.as_deref(),
+                    sender_is_bot,
                 );
                 send_to_client(&senders, mid, tagged).await;
             }

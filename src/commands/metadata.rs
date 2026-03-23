@@ -257,6 +257,8 @@ pub async fn handle_metadata(
         .unwrap_or("")
         .to_uppercase();
 
+    tracing::debug!(client_id, target = %target_param, subcommand = %subcommand, "METADATA");
+
     if target_param.is_empty() || subcommand.is_empty() {
         reply_to_client(
             &senders,

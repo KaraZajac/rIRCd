@@ -117,6 +117,8 @@ pub struct ClientMessage {
     pub send_tx: mpsc::Sender<Message>,
     /// TLS client certificate SHA-256 fingerprint (hex), if available.
     pub certfp: Option<String>,
+    /// True if this connection is over TLS.
+    pub is_tls: bool,
 }
 
 pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> anyhow::Result<()> {
@@ -421,6 +423,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                                 st.server_name,
                                 None,
                                 st.keepalive,
+                                false, // WS (plaintext)
                             )
                         })
                     },
@@ -487,6 +490,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                                                                 client::handle_client_ws(
                                                                     socket, client_id, host, tx,
                                                                     sn, certfp, keepalive,
+                                                                    true, // WSS (TLS)
                                                                 )
                                                             })
                                                     }
@@ -537,6 +541,17 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                 if let Some(ref fp) = cm.certfp {
                     let mut state_w = state.write().await;
                     state_w.certfps.entry(client_id.clone()).or_insert_with(|| fp.clone());
+                }
+
+                // Store TLS status on pending connection (for STS and WHOIS)
+                if cm.is_tls {
+                    let mut state_w = state.write().await;
+                    if let Some(pending) = state_w.pending.get_mut(&client_id) {
+                        pending.is_tls = true;
+                    }
+                    if let Some(client) = state_w.clients.get(&client_id) {
+                        client.write().await.is_tls = true;
+                    }
                 }
 
                 let cmd = cm.msg.command.clone();

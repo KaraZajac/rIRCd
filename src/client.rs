@@ -25,7 +25,7 @@ pub async fn handle_client_tls(
 ) {
     let addr = host.clone();
     info!("Client connected (TLS): {} from {}", client_id, addr);
-    handle_client_stream(stream, client_id, host, tx, server_name, certfp, keepalive).await;
+    handle_client_stream(stream, client_id, host, tx, server_name, certfp, true, keepalive).await;
 }
 
 pub async fn handle_client(
@@ -41,7 +41,7 @@ pub async fn handle_client(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".into());
     info!("Client connected: {} from {}", client_id, addr);
-    handle_client_stream(stream, client_id, host, tx, server_name, None, keepalive).await;
+    handle_client_stream(stream, client_id, host, tx, server_name, None, false, keepalive).await;
 }
 
 async fn handle_client_stream<S>(
@@ -51,6 +51,7 @@ async fn handle_client_stream<S>(
     tx: mpsc::Sender<ClientMessage>,
     server_name: String,
     certfp: Option<String>,
+    is_tls: bool,
     keepalive: KeepaliveConfig,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -155,6 +156,7 @@ async fn handle_client_stream<S>(
                                 ];
                                 if !FLOOD_EXEMPT.contains(&msg.command.as_str()) {
                                     if flood_tokens < 1.0 {
+                                        tracing::warn!(client = %client_id, command = %msg.command, "Flood control triggered");
                                         let reply = Message::new(
                                             "NOTICE",
                                             vec![
@@ -177,6 +179,7 @@ async fn handle_client_stream<S>(
                                         msg,
                                         send_tx: send_tx.clone(),
                                         certfp: certfp.clone(),
+                                        is_tls,
                                     })
                                     .await
                                     .is_err()
@@ -256,6 +259,7 @@ async fn handle_client_stream<S>(
             msg: Message::new("QUIT", vec![quit_reason.into()]),
             send_tx,
             certfp,
+            is_tls,
         })
         .await;
 }
@@ -270,6 +274,7 @@ pub async fn handle_client_ws(
     server_name: String,
     certfp: Option<String>,
     keepalive: KeepaliveConfig,
+    is_tls: bool,
 ) {
     use axum::extract::ws;
 
@@ -342,6 +347,7 @@ pub async fn handle_client_ws(
                                 ];
                                 if !FLOOD_EXEMPT.contains(&msg.command.as_str()) {
                                     if flood_tokens < 1.0 {
+                                        tracing::warn!(client = %client_id, command = %msg.command, "Flood control triggered (WS)");
                                         let reply = Message::new(
                                             "NOTICE",
                                             vec!["*".into(), "Flood control: you are sending messages too fast".into()],
@@ -358,6 +364,7 @@ pub async fn handle_client_ws(
                                     msg,
                                     send_tx: send_tx.clone(),
                                     certfp: certfp.clone(),
+                                    is_tls,
                                 }).await.is_err() {
                                     break;
                                 }
@@ -436,6 +443,7 @@ pub async fn handle_client_ws(
                                     msg,
                                     send_tx: send_tx.clone(),
                                     certfp: certfp.clone(),
+                                    is_tls,
                                 }).await.is_err() {
                                     break;
                                 }
@@ -492,6 +500,7 @@ pub async fn handle_client_ws(
             msg: Message::new("QUIT", vec![quit_reason.into()]),
             send_tx,
             certfp,
+            is_tls,
         })
         .await;
 }

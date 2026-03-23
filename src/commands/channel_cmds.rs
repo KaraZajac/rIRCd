@@ -8,7 +8,16 @@ use crate::protocol::{add_batch_tag, generate_msgid, Message};
 use crate::user::ServerState;
 use std::collections::HashMap;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, RwLock};
+
+/// Constant-time byte comparison for secrets (channel keys, passwords).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
+}
 
 async fn send_to_client(
     senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
@@ -244,7 +253,8 @@ pub async fn handle_join(
         }
 
         if let Some(ref key) = ch.key {
-            if provided_key != key.as_str() {
+            // Constant-time comparison to prevent timing attacks on channel keys
+            if !ct_eq(provided_key.as_bytes(), key.as_bytes()) {
                 reply_to_client(
                     &senders,
                     client_id,
@@ -299,6 +309,7 @@ pub async fn handle_join(
                 modes: modes.clone(),
             },
         );
+        tracing::debug!(client_id, nick = %nick, channel = %ch_key, op = is_first, "JOIN");
 
         if let Some(client) = state.clients.get(client_id) {
             let mut c = client.write().await;
@@ -392,6 +403,28 @@ pub async fn handle_join(
             };
             if let Some(tx) = senders.read().await.get(mid) {
                 let _ = tx.send(join_msg).await;
+            }
+        }
+
+        // away-notify: if the joining user is away, send AWAY to channel members with the cap
+        let joining_away = match state.clients.get(client_id) {
+            Some(c) => c.read().await.away_message.clone(),
+            None => None,
+        };
+        if let Some(ref away_msg) = joining_away {
+            let away_notify =
+                Message::new("AWAY", vec![away_msg.clone()]).with_prefix(&source);
+            for mid in &member_ids {
+                if *mid == client_id {
+                    continue;
+                }
+                let has_cap = match state.clients.get(mid) {
+                    Some(c) => c.read().await.capabilities.contains("away-notify"),
+                    None => false,
+                };
+                if has_cap {
+                    send_to_client(&senders, mid, away_notify.clone()).await;
+                }
             }
         }
 
@@ -546,6 +579,26 @@ pub async fn handle_part(
 
         let mut ch_store = channels.write().await;
         let mut should_remove = false;
+        if !ch_store.channels.contains_key(&ch_key) {
+            let nick = client.read().await.nick_or_id().to_string();
+            drop(ch_store);
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "403",
+                    vec![
+                        nick,
+                        ch_name.to_string(),
+                        "No such channel".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            continue;
+        }
         if let Some(ch_rw) = ch_store.channels.get_mut(&ch_key) {
             let mut ch = ch_rw.write().await;
             if !ch.is_member(client_id) {
@@ -579,9 +632,11 @@ pub async fn handle_part(
             should_remove = ch.members.is_empty();
         }
         if should_remove {
+            tracing::debug!(channel = %ch_key, "Channel empty, removing");
             ch_store.channels.remove(&ch_key);
         }
         drop(ch_store);
+        tracing::debug!(client_id, channel = %ch_name, reason = %reason, "PART");
 
         // Record PART event for draft/event-playback
         if let Some(ref pool) = cfg.db {
@@ -729,23 +784,56 @@ async fn send_names_for_channel(
             .with_prefix(server),
             &batch_ref,
         );
+        // labeled-response: label goes only on the BATCH start, not inner messages
         reply_to_client(senders, client_id, batch_start, label).await;
-        reply_to_client(senders, client_id, msg, label).await;
-        reply_to_client(senders, client_id, end_msg, label).await;
-        reply_to_client(senders, client_id, batch_end, label).await;
+        reply_to_client(senders, client_id, msg, None).await;
+        reply_to_client(senders, client_id, end_msg, None).await;
+        reply_to_client(senders, client_id, batch_end, None).await;
+    } else if label.is_some() {
+        // labeled-response: wrap in labeled-response batch for multi-message reply
+        let lr_ref = crate::commands::start_labeled_batch(
+            senders,
+            client_id,
+            label.unwrap(),
+            server,
+        )
+        .await;
+        crate::commands::reply_in_batch(
+            senders,
+            client_id,
+            Message::new(
+                "353",
+                vec![nick.into(), chan_prefix.into(), ch_name.into(), names_str],
+            )
+            .with_prefix(server),
+            &lr_ref,
+        )
+        .await;
+        crate::commands::reply_in_batch(
+            senders,
+            client_id,
+            Message::new(
+                "366",
+                vec![nick.into(), ch_name.into(), "End of /NAMES list".into()],
+            )
+            .with_prefix(server),
+            &lr_ref,
+        )
+        .await;
+        crate::commands::end_labeled_batch(senders, client_id, &lr_ref, server).await;
     } else {
         let msg = Message::new(
             "353",
             vec![nick.into(), chan_prefix.into(), ch_name.into(), names_str],
         )
         .with_prefix(server);
-        reply_to_client(senders, client_id, msg, label).await;
+        reply_to_client(senders, client_id, msg, None).await;
         let end_msg = Message::new(
             "366",
             vec![nick.into(), ch_name.into(), "End of /NAMES list".into()],
         )
         .with_prefix(server);
-        reply_to_client(senders, client_id, end_msg, label).await;
+        reply_to_client(senders, client_id, end_msg, None).await;
     }
 }
 
@@ -785,6 +873,15 @@ pub async fn handle_list(
     };
     let nick = client.read().await.nick_or_id().to_string();
 
+    // labeled-response: LIST produces multiple messages, wrap in batch
+    let batch_ref = if let Some(l) = label {
+        Some(
+            crate::commands::start_labeled_batch(&senders, client_id, l, &cfg.server.name).await,
+        )
+    } else {
+        None
+    };
+
     let ch_store = channels.read().await;
     for (ch_name, ch) in &ch_store.channels {
         let ch = ch.read().await;
@@ -821,12 +918,21 @@ pub async fn handle_list(
             ],
         )
         .with_prefix(&cfg.server.name);
-        reply_to_client(&senders, client_id, m, label).await;
+        if let Some(ref br) = batch_ref {
+            crate::commands::reply_in_batch(&senders, client_id, m, br).await;
+        } else {
+            reply_to_client(&senders, client_id, m, None).await;
+        }
     }
 
     let end_msg =
         Message::new("323", vec![nick, "End of /LIST".into()]).with_prefix(&cfg.server.name);
-    reply_to_client(&senders, client_id, end_msg, label).await;
+    if let Some(ref br) = batch_ref {
+        crate::commands::reply_in_batch(&senders, client_id, end_msg, br).await;
+        crate::commands::end_labeled_batch(&senders, client_id, br, &cfg.server.name).await;
+    } else {
+        reply_to_client(&senders, client_id, end_msg, None).await;
+    }
 
     Ok(())
 }
@@ -1363,6 +1469,7 @@ pub async fn handle_mode(
             let mode_limit_val = ch.modes.user_limit;
             let member_ids_mode: Vec<String> = ch.members.keys().cloned().collect();
             let mode_msg = Message::new("MODE", msg.params.clone()).with_prefix(nick.as_str());
+            tracing::debug!(client_id, channel = %target, modes = %msg.params[1..].join(" "), "MODE change");
             drop(ch);
             drop(ch_store);
             for mid in &member_ids_mode {
@@ -1568,6 +1675,7 @@ pub async fn handle_topic(
         ch.topic_time = Some(topic_time_ts);
 
         let topic_text = new_topic.unwrap_or_default();
+        tracing::debug!(client_id, channel = %ch_name, topic = %topic_text, "TOPIC set");
         let topic_msg =
             Message::new("TOPIC", vec![ch_name.into(), topic_text.clone()]).with_prefix(&source);
         let member_ids_for_topic: Vec<String> = ch.members.keys().cloned().collect();
@@ -1718,6 +1826,7 @@ pub async fn handle_kick(
                 return Ok(());
             }
             if ch.members.remove(&tid).is_some() {
+                tracing::info!(client_id, channel = %ch_name, target = %target_nick, "KICK");
                 if let Some(target_client) = state.clients.get(&tid) {
                     target_client.write().await.channels.remove(&ch_key);
                 }
@@ -1836,6 +1945,7 @@ pub async fn handle_invite(
                 return Ok(());
             }
             ch.invite_list.insert(target_id.clone());
+            tracing::debug!(client_id, channel = %ch_name, target = %target_nick, "INVITE");
             let invite_msg = Message::new("INVITE", vec![target_nick.into(), ch_name.into()])
                 .with_prefix(&source);
             if let Some(tx) = senders.read().await.get(target_id) {
@@ -2071,6 +2181,7 @@ pub async fn handle_rename(
     }
 
     let case_only = old_key == new_key;
+    tracing::info!(client_id, old = %old_name, new = %new_name, case_only, "RENAME channel");
     let channel = ch_store.channels.remove(&old_key).expect("channel existed");
     let mut ch = channel.write().await;
     ch.name = new_key.clone();

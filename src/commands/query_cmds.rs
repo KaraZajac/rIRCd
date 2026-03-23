@@ -1,5 +1,7 @@
 use crate::channel::ChannelStore;
-use crate::commands::reply_to_client;
+use crate::commands::{
+    end_labeled_batch, reply_in_batch, reply_to_client, start_labeled_batch,
+};
 use crate::config::Config;
 use crate::protocol::Message;
 use crate::user::ServerState;
@@ -104,6 +106,22 @@ pub async fn handle_who(
     };
     let use_whox = use_whox && client_caps.contains("whox") && !whox_requested.is_empty();
 
+    // labeled-response: WHO produces multiple messages, wrap in batch
+    let batch_ref = if let Some(l) = label {
+        Some(start_labeled_batch(&senders, client_id, l, &cfg.server.name).await)
+    } else {
+        None
+    };
+    macro_rules! send_reply {
+        ($msg:expr) => {
+            if let Some(ref br) = batch_ref {
+                reply_in_batch(&senders, client_id, $msg, br).await;
+            } else {
+                reply_to_client(&senders, client_id, $msg, None).await;
+            }
+        };
+    }
+
     if target.starts_with('#') || target.starts_with('&') {
         let ch_store = channels.read().await;
         if let Some(ch) = ch_store.channels.get(target) {
@@ -139,33 +157,31 @@ pub async fn handle_who(
                             oplevel,
                             realname,
                         );
-                        let msg = Message::new("354", params).with_prefix(&cfg.server.name);
-                        reply_to_client(&senders, client_id, msg, label).await;
+                        send_reply!(Message::new("354", params).with_prefix(&cfg.server.name));
                     } else {
-                        // RPL_WHOREPLY: channel user host server nick flags :hopcount realname
                         let oper_flag = if c.oper { "*" } else { "" };
                         let flags_field = format!("{}{}{}", flags, oper_flag, prefix_str);
-                        let msg = Message::new(
-                            "352",
-                            vec![
-                                nick.clone(),
-                                target.to_string(),
-                                c.display_user().to_string(),
-                                c.display_host().to_string(),
-                                cfg.server.name.clone(),
-                                c.nick_or_id().to_string(),
-                                flags_field,
-                                format!(":{} {}", hopcount, realname),
-                            ],
-                        )
-                        .with_prefix(&cfg.server.name);
-                        reply_to_client(&senders, client_id, msg, label).await;
+                        send_reply!(
+                            Message::new(
+                                "352",
+                                vec![
+                                    nick.clone(),
+                                    target.to_string(),
+                                    c.display_user().to_string(),
+                                    c.display_host().to_string(),
+                                    cfg.server.name.clone(),
+                                    c.nick_or_id().to_string(),
+                                    flags_field,
+                                    format!(":{} {}", hopcount, realname),
+                                ],
+                            )
+                            .with_prefix(&cfg.server.name)
+                        );
                     }
                 }
             }
         }
     } else {
-        // Determine which clients share a channel with the requester (for invisible filtering)
         let requester_channels: std::collections::HashSet<String> =
             match state.clients.get(client_id) {
                 Some(c) => c.read().await.channels.keys().cloned().collect(),
@@ -174,9 +190,7 @@ pub async fn handle_who(
         let has_wildcards = target.contains('*') || target.contains('?');
         let target_upper = target.to_uppercase();
 
-        // Collect matching client IDs
         let matching_ids: Vec<String> = if !has_wildcards && target != "*" {
-            // Exact nick lookup
             state
                 .nick_to_id
                 .get(&target_upper)
@@ -184,7 +198,6 @@ pub async fn handle_who(
                 .into_iter()
                 .collect()
         } else {
-            // Glob or wildcard: iterate all clients
             let target_lower = target.to_lowercase();
             state
                 .clients
@@ -211,7 +224,6 @@ pub async fn handle_who(
         for target_id in &matching_ids {
             if let Some(c) = state.clients.get(target_id) {
                 let c = c.read().await;
-                // +i invisible: skip unless requester shares a channel or is the same user
                 if c.invisible && target_id != client_id {
                     let shares_channel =
                         c.channels.keys().any(|ch| requester_channels.contains(ch));
@@ -242,34 +254,39 @@ pub async fn handle_who(
                         "",
                         realname,
                     );
-                    let msg = Message::new("354", params).with_prefix(&cfg.server.name);
-                    reply_to_client(&senders, client_id, msg, label).await;
+                    send_reply!(Message::new("354", params).with_prefix(&cfg.server.name));
                 } else {
                     let oper_flag = if c.oper { "*" } else { "" };
                     let flags_field = format!("{}{}", flags, oper_flag);
-                    let msg = Message::new(
-                        "352",
-                        vec![
-                            nick.clone(),
-                            "*".to_string(),
-                            c.display_user().to_string(),
-                            c.display_host().to_string(),
-                            cfg.server.name.clone(),
-                            c.nick_or_id().to_string(),
-                            flags_field,
-                            format!(":{} {}", hopcount, realname),
-                        ],
-                    )
-                    .with_prefix(&cfg.server.name);
-                    reply_to_client(&senders, client_id, msg, label).await;
+                    send_reply!(
+                        Message::new(
+                            "352",
+                            vec![
+                                nick.clone(),
+                                "*".to_string(),
+                                c.display_user().to_string(),
+                                c.display_host().to_string(),
+                                cfg.server.name.clone(),
+                                c.nick_or_id().to_string(),
+                                flags_field,
+                                format!(":{} {}", hopcount, realname),
+                            ],
+                        )
+                        .with_prefix(&cfg.server.name)
+                    );
                 }
             }
         }
     }
 
-    let end_msg = Message::new("315", vec![nick, target.into(), "End of /WHO list".into()])
-        .with_prefix(&cfg.server.name);
-    reply_to_client(&senders, client_id, end_msg, label).await;
+    send_reply!(
+        Message::new("315", vec![nick, target.into(), "End of /WHO list".into()])
+            .with_prefix(&cfg.server.name)
+    );
+
+    if let Some(ref br) = batch_ref {
+        end_labeled_batch(&senders, client_id, br, &cfg.server.name).await;
+    }
 
     Ok(())
 }
@@ -278,7 +295,7 @@ pub async fn handle_whois(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    _channels: Arc<RwLock<ChannelStore>>,
+    channels: Arc<RwLock<ChannelStore>>,
     senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
     cfg: &Config,
     label: Option<&str>,
@@ -321,15 +338,60 @@ pub async fn handle_whois(
         )
         .await;
     }
+
+    // labeled-response: WHOIS produces multiple messages, wrap in batch
+    let batch_ref = if let Some(l) = label {
+        Some(start_labeled_batch(&senders, client_id, l, &cfg.server.name).await)
+    } else {
+        None
+    };
+
+    // Helper: send reply inside batch if active, or directly
+    macro_rules! send_reply {
+        ($msg:expr) => {
+            if let Some(ref br) = batch_ref {
+                reply_in_batch(&senders, client_id, $msg, br).await;
+            } else {
+                reply_to_client(&senders, client_id, $msg, None).await;
+            }
+        };
+    }
+
     if let Some(tid) = target_id {
         if let Some(c) = state.clients.get(&tid) {
             let c = c.read().await;
-            let ch_list: Vec<String> = c.channels.keys().cloned().collect();
+            // Filter channel list: hide secret (+s) and private (+p) channels
+            // from non-members
+            let requester_channels: std::collections::HashSet<String> =
+                match state.clients.get(client_id) {
+                    Some(rc) => rc.read().await.channels.keys().cloned().collect(),
+                    None => Default::default(),
+                };
+            let ch_store = channels.read().await;
+            let ch_list: Vec<String> = c
+                .channels
+                .keys()
+                .filter(|ch_name| {
+                    if requester_channels.contains(*ch_name) {
+                        return true; // querier is a member, always show
+                    }
+                    match ch_store.channels.get(*ch_name) {
+                        Some(ch) => {
+                            if let Ok(ch) = ch.try_read() {
+                                !ch.modes.secret && !ch.modes.private
+                            } else {
+                                true
+                            }
+                        }
+                        None => true,
+                    }
+                })
+                .cloned()
+                .collect();
+            drop(ch_store);
             let ch_str = ch_list.join(" ");
 
-            reply_to_client(
-                &senders,
-                client_id,
+            send_reply!(
                 Message::new(
                     "311",
                     vec![
@@ -341,25 +403,17 @@ pub async fn handle_whois(
                         c.realname.as_deref().unwrap_or("").into(),
                     ],
                 )
-                .with_prefix(&cfg.server.name),
-                label,
-            )
-            .await;
+                .with_prefix(&cfg.server.name)
+            );
 
             if !ch_list.is_empty() {
-                reply_to_client(
-                    &senders,
-                    client_id,
+                send_reply!(
                     Message::new("319", vec![nick.clone(), target_nick.into(), ch_str])
-                        .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
+                        .with_prefix(&cfg.server.name)
+                );
             }
             // 312 RPL_WHOISSERVER
-            reply_to_client(
-                &senders,
-                client_id,
+            send_reply!(
                 Message::new(
                     "312",
                     vec![
@@ -369,16 +423,12 @@ pub async fn handle_whois(
                         "rIRCd server".into(),
                     ],
                 )
-                .with_prefix(&cfg.server.name),
-                label,
-            )
-            .await;
+                .with_prefix(&cfg.server.name)
+            );
             // 317 RPL_WHOISIDLE: seconds idle, signon time
             {
                 let idle_secs = chrono::Utc::now().timestamp().saturating_sub(c.last_active);
-                reply_to_client(
-                    &senders,
-                    client_id,
+                send_reply!(
                     Message::new(
                         "317",
                         vec![
@@ -389,43 +439,31 @@ pub async fn handle_whois(
                             "seconds idle, signon time".into(),
                         ],
                     )
-                    .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
+                    .with_prefix(&cfg.server.name)
+                );
             }
             // 301 RPL_AWAY if target is away
             if let Some(ref away_msg) = c.away_message {
-                reply_to_client(
-                    &senders,
-                    client_id,
+                send_reply!(
                     Message::new(
                         "301",
                         vec![nick.clone(), target_nick.into(), away_msg.clone()],
                     )
-                    .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
+                    .with_prefix(&cfg.server.name)
+                );
             }
             if c.bot {
-                reply_to_client(
-                    &senders,
-                    client_id,
+                send_reply!(
                     Message::new(
                         "335",
                         vec![nick.clone(), target_nick.into(), "is a bot".into()],
                     )
-                    .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
+                    .with_prefix(&cfg.server.name)
+                );
             }
             // 330 RPL_WHOISACCOUNT — account name
             if let Some(ref account) = c.account {
-                reply_to_client(
-                    &senders,
-                    client_id,
+                send_reply!(
                     Message::new(
                         "330",
                         vec![
@@ -435,16 +473,26 @@ pub async fn handle_whois(
                             "is logged in as".into(),
                         ],
                     )
-                    .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
+                    .with_prefix(&cfg.server.name)
+                );
+            }
+            // 671 RPL_WHOISSECURE — secure connection indicator
+            if c.is_tls {
+                send_reply!(
+                    Message::new(
+                        "671",
+                        vec![
+                            nick.clone(),
+                            target_nick.into(),
+                            "is using a secure connection".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name)
+                );
             }
             // 276 RPL_WHOISCERTFP — TLS certificate fingerprint
             if let Some(ref fp) = state.certfps.get(&c.id) {
-                reply_to_client(
-                    &senders,
-                    client_id,
+                send_reply!(
                     Message::new(
                         "276",
                         vec![
@@ -453,15 +501,11 @@ pub async fn handle_whois(
                             format!("has client certificate fingerprint {}", fp),
                         ],
                     )
-                    .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
+                    .with_prefix(&cfg.server.name)
+                );
             }
             if c.oper {
-                reply_to_client(
-                    &senders,
-                    client_id,
+                send_reply!(
                     Message::new(
                         "313",
                         vec![
@@ -470,10 +514,8 @@ pub async fn handle_whois(
                             "is an IRC operator".into(),
                         ],
                     )
-                    .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
+                    .with_prefix(&cfg.server.name)
+                );
             }
             // 379 RPL_WHOISMODES — user modes
             {
@@ -493,9 +535,7 @@ pub async fn handle_whois(
                 if c.bot {
                     modes.push('B');
                 }
-                reply_to_client(
-                    &senders,
-                    client_id,
+                send_reply!(
                     Message::new(
                         "379",
                         vec![
@@ -504,20 +544,23 @@ pub async fn handle_whois(
                             format!("is using modes {}", modes),
                         ],
                     )
-                    .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
+                    .with_prefix(&cfg.server.name)
+                );
             }
         }
     }
 
-    let end_msg = Message::new(
-        "318",
-        vec![nick, target_nick.into(), "End of /WHOIS list".into()],
-    )
-    .with_prefix(&cfg.server.name);
-    reply_to_client(&senders, client_id, end_msg, label).await;
+    send_reply!(
+        Message::new(
+            "318",
+            vec![nick, target_nick.into(), "End of /WHOIS list".into()],
+        )
+        .with_prefix(&cfg.server.name)
+    );
+
+    if let Some(ref br) = batch_ref {
+        end_labeled_batch(&senders, client_id, br, &cfg.server.name).await;
+    }
 
     Ok(())
 }
