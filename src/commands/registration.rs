@@ -232,6 +232,63 @@ pub async fn complete_registration(
 
     send_motd(nick_str, server, &senders, cfg, label, client_id).await;
 
+    // draft/auto-join: send AUTOJOIN with configured channel list
+    {
+        let caps = client.read().await.capabilities.clone();
+        if caps.contains("draft/auto-join") {
+            if let Some(ref auto_join) = cfg.server.auto_join {
+                let channels: Vec<&str> = auto_join
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !channels.is_empty() {
+                    // Split across multiple messages if needed to stay under 512 bytes
+                    // Prefix: ":<server> AUTOJOIN " — reserve space for that + \r\n
+                    let prefix_len = server.len() + 12; // ": AUTOJOIN \r\n"
+                    let max_payload = 510 - prefix_len;
+                    let mut current = String::new();
+                    for ch in &channels {
+                        let needed = if current.is_empty() {
+                            ch.len()
+                        } else {
+                            ch.len() + 1 // comma
+                        };
+                        if !current.is_empty() && current.len() + needed > max_payload {
+                            reply_to_client(
+                                &senders,
+                                client_id,
+                                Message::new("AUTOJOIN", vec![current.clone()])
+                                    .with_prefix(server),
+                                label,
+                            )
+                            .await;
+                            current.clear();
+                        }
+                        if !current.is_empty() {
+                            current.push(',');
+                        }
+                        current.push_str(ch);
+                    }
+                    if !current.is_empty() {
+                        reply_to_client(
+                            &senders,
+                            client_id,
+                            Message::new("AUTOJOIN", vec![current]).with_prefix(server),
+                            label,
+                        )
+                        .await;
+                    }
+                    tracing::info!(
+                        nick = %nick_str,
+                        channels = %auto_join,
+                        "Sent AUTOJOIN list to client"
+                    );
+                }
+            }
+        }
+    }
+
     // monitor: notify clients monitoring this nick that they came online (730)
     let source = client
         .read()

@@ -144,6 +144,10 @@ pub struct ServerConfig {
     /// If set, connecting clients receive an HMAC-SHA256-based virtual host cloak.
     #[serde(default)]
     pub cloak_key: Option<String>,
+    /// Comma-separated list of channels to suggest to clients that enable draft/auto-join.
+    /// Example: "#general, #help, #dev"
+    #[serde(default)]
+    pub auto_join: Option<String>,
 }
 
 fn default_server_name() -> String {
@@ -179,6 +183,7 @@ impl Default for ServerConfig {
             disconnect_timeout_secs: default_disconnect_timeout(),
             client_tag_deny: None,
             cloak_key: None,
+            auto_join: None,
         }
     }
 }
