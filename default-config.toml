@@ -13,6 +13,9 @@ Welcome to rIRCd!
 An IRCv3 server written in Rust.
 """
 
+# Channels to suggest to clients that support draft/auto-join.
+# auto_join = "#general, #help, #dev"
+
 registration_timeout_secs = 60
 ping_timeout_secs = 90
 disconnect_timeout_secs = 150

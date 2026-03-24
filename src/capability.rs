@@ -44,6 +44,7 @@ pub const CAPS: &[&str] = &[
     "draft/channel-context",
     "draft/client-batch",
     "draft/event-playback",
+    "draft/auto-join",
     "sts",
 ];
 
