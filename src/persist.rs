@@ -204,6 +204,22 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
         .await
         .ok();
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS webpush_subscriptions (
+            id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+            account    VARCHAR(64)  NOT NULL,
+            endpoint   VARCHAR(512) NOT NULL,
+            p256dh     VARCHAR(255) NOT NULL,
+            auth       VARCHAR(64)  NOT NULL,
+            created_at BIGINT       NOT NULL,
+            failures   INT UNSIGNED NOT NULL DEFAULT 0,
+            UNIQUE KEY uniq_endpoint (endpoint),
+            INDEX idx_account (account)
+        ) CHARACTER SET utf8mb4",
+    )
+    .execute(pool)
+    .await?;
+
     // Migrate: add account verification columns (draft/account-registration VERIFY).
     // `verified` defaults to 1 so accounts registered before verification existed stay usable.
     for col_def in &[
@@ -752,6 +768,130 @@ pub async fn verify_user(pool: &sqlx::MySqlPool, account: &str, password: &str) 
             false
         }
     }
+}
+
+// ─── Web Push subscriptions ───────────────────────────────────────────────────
+
+/// One registered push endpoint (draft/webpush).
+#[derive(Debug, Clone)]
+pub struct WebpushSubscription {
+    pub endpoint: String,
+    /// Client's P-256 ECDH public key, URL-safe base64.
+    pub p256dh: String,
+    /// Client's 16-byte auth secret, URL-safe base64.
+    pub auth: String,
+}
+
+/// Store a subscription, replacing any existing one with the same endpoint as the
+/// spec requires. Returns false if the account is already at `max_subscriptions`.
+pub async fn save_webpush_subscription(
+    pool: &sqlx::MySqlPool,
+    account: &str,
+    sub: &WebpushSubscription,
+    max_subscriptions: usize,
+) -> Result<bool, String> {
+    let account_lower = account.to_lowercase();
+
+    // Re-registering an endpoint refreshes it and never counts against the limit.
+    let existing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM webpush_subscriptions WHERE account = ? AND endpoint <> ?",
+    )
+    .bind(&account_lower)
+    .bind(&sub.endpoint)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if existing as usize >= max_subscriptions {
+        return Ok(false);
+    }
+
+    sqlx::query(
+        "INSERT INTO webpush_subscriptions (account, endpoint, p256dh, auth, created_at, failures)
+         VALUES (?, ?, ?, ?, ?, 0)
+         ON DUPLICATE KEY UPDATE account = VALUES(account), p256dh = VALUES(p256dh),
+                                 auth = VALUES(auth), created_at = VALUES(created_at), failures = 0",
+    )
+    .bind(&account_lower)
+    .bind(&sub.endpoint)
+    .bind(&sub.p256dh)
+    .bind(&sub.auth)
+    .bind(chrono::Utc::now().timestamp())
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(true)
+}
+
+/// All push endpoints registered by an account.
+pub async fn load_webpush_subscriptions(
+    pool: &sqlx::MySqlPool,
+    account: &str,
+) -> Vec<WebpushSubscription> {
+    use sqlx::Row;
+    let rows =
+        sqlx::query("SELECT endpoint, p256dh, auth FROM webpush_subscriptions WHERE account = ?")
+            .bind(account.to_lowercase())
+            .fetch_all(pool)
+            .await;
+
+    match rows {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| WebpushSubscription {
+                endpoint: r.get("endpoint"),
+                p256dh: r.get("p256dh"),
+                auth: r.get("auth"),
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("Failed to load push subscriptions for {}: {}", account, e);
+            Vec::new()
+        }
+    }
+}
+
+/// Remove one subscription by endpoint. Returns the number of rows removed.
+pub async fn delete_webpush_subscription(pool: &sqlx::MySqlPool, endpoint: &str) -> u64 {
+    match sqlx::query("DELETE FROM webpush_subscriptions WHERE endpoint = ?")
+        .bind(endpoint)
+        .execute(pool)
+        .await
+    {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            tracing::warn!("Failed to delete push subscription: {}", e);
+            0
+        }
+    }
+}
+
+/// Count a failed delivery and return the new consecutive failure count.
+pub async fn record_webpush_failure(pool: &sqlx::MySqlPool, endpoint: &str) -> u32 {
+    let _ =
+        sqlx::query("UPDATE webpush_subscriptions SET failures = failures + 1 WHERE endpoint = ?")
+            .bind(endpoint)
+            .execute(pool)
+            .await;
+
+    sqlx::query_scalar::<_, u32>("SELECT failures FROM webpush_subscriptions WHERE endpoint = ?")
+        .bind(endpoint)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
+/// Clear the failure count after a successful delivery.
+pub async fn reset_webpush_failures(pool: &sqlx::MySqlPool, endpoint: &str) {
+    let _ = sqlx::query(
+        "UPDATE webpush_subscriptions SET failures = 0 WHERE endpoint = ? AND failures > 0",
+    )
+    .bind(endpoint)
+    .execute(pool)
+    .await;
 }
 
 // ─── Channel history ──────────────────────────────────────────────────────────

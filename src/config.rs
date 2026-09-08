@@ -29,6 +29,12 @@ pub struct Config {
     /// (draft/account-registration VERIFY). Present = verification required.
     #[serde(default)]
     pub email: Option<EmailConfig>,
+    /// Web Push notifications (draft/webpush).
+    #[serde(default)]
+    pub webpush: Option<WebpushConfig>,
+    /// VAPID key and HTTP client for draft/webpush — built at startup, not serialised.
+    #[serde(skip)]
+    pub webpush_runtime: Option<std::sync::Arc<crate::webpush::WebpushRuntime>>,
     /// MariaDB connection settings.
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -153,6 +159,47 @@ fn default_email_subject() -> String {
 }
 fn default_code_expiry() -> i64 {
     86_400
+}
+
+// ─── Web Push ─────────────────────────────────────────────────────────────────
+
+/// Web Push notifications (draft/webpush). Configuring this section lets clients
+/// register push endpoints with `WEBPUSH REGISTER` and receive direct messages and
+/// highlights while their app is asleep.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WebpushConfig {
+    /// VAPID contact, used as the JWT `sub` claim. Push services require a
+    /// `mailto:` or `https:` URL identifying the operator.
+    pub contact: String,
+    /// Where the VAPID private key lives; generated on first start if absent.
+    #[serde(default = "default_vapid_key_file")]
+    pub key_file: String,
+    /// Maximum push endpoints one account may have registered at a time.
+    #[serde(default = "default_max_subscriptions")]
+    pub max_subscriptions_per_account: usize,
+    /// TTL (seconds) asked of the push service for each notification.
+    #[serde(default = "default_push_ttl")]
+    pub ttl_secs: u32,
+    /// Consecutive delivery failures tolerated before a subscription is dropped.
+    #[serde(default = "default_max_failures")]
+    pub max_failures: u32,
+    /// Allow endpoints that resolve to loopback or private addresses. Off by
+    /// default; only turn it on to test against a push service on your own network.
+    #[serde(default)]
+    pub allow_private_endpoints: bool,
+}
+
+fn default_vapid_key_file() -> String {
+    "/etc/rIRCd/vapid.key".into()
+}
+fn default_max_subscriptions() -> usize {
+    5
+}
+fn default_push_ttl() -> u32 {
+    3600
+}
+fn default_max_failures() -> u32 {
+    5
 }
 
 // ─── Server ───────────────────────────────────────────────────────────────────

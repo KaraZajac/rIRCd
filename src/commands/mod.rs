@@ -5,6 +5,7 @@ mod query_cmds;
 mod registration;
 mod reply;
 mod server_cmds;
+mod webpush_cmds;
 
 pub use reply::{
     end_labeled_batch, reply_in_batch, reply_to_client, send_labeled_ack, start_labeled_batch,
@@ -674,6 +675,10 @@ pub async fn handle_message(
         }
         "WALLOPS" => {
             server_cmds::handle_wallops(&client_id, msg, state, senders, cfg, label.as_deref())
+                .await
+        }
+        "WEBPUSH" => {
+            webpush_cmds::handle_webpush(&client_id, msg, state, senders, cfg, label.as_deref())
                 .await
         }
         "ISON" => {

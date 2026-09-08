@@ -9,6 +9,7 @@ pub mod persist;
 pub mod protocol;
 pub mod server;
 pub mod user;
+pub mod webpush;
 
 use config::Config;
 use std::path::Path;
@@ -45,6 +46,26 @@ pub async fn run_server(mut cfg: Config, config_path: &Path) -> anyhow::Result<(
         let purged = persist::purge_expired_unverified(&pool, None).await;
         if purged > 0 {
             tracing::info!("Removed {} expired unverified account(s)", purged);
+        }
+    }
+
+    if let Some(ref wp) = cfg.webpush {
+        match webpush::WebpushRuntime::new(wp) {
+            Ok(runtime) => {
+                tracing::info!(
+                    "Web Push enabled: contact={}, VAPID public key {}",
+                    wp.contact,
+                    runtime.key.public_b64()
+                );
+                cfg.webpush_runtime = Some(std::sync::Arc::new(runtime));
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Web Push disabled: could not set up VAPID key from {}: {}",
+                    wp.key_file,
+                    e
+                );
+            }
         }
     }
 

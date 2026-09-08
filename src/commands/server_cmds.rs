@@ -646,6 +646,21 @@ pub async fn handle_help(
                 "MONITOR S          — show status of watched nicks",
             ],
         ),
+        Some("VERIFY") => (
+            "VERIFY",
+            &[
+                "VERIFY <account|*> <code>",
+                "  Confirm the code emailed to you when you registered.",
+            ],
+        ),
+        Some("WEBPUSH") => (
+            "WEBPUSH",
+            &[
+                "WEBPUSH REGISTER <endpoint> p256dh=<key>;auth=<secret>",
+                "WEBPUSH UNREGISTER <endpoint>",
+                "  Manage Web Push endpoints for notifications. Requires being logged in.",
+            ],
+        ),
         Some("CHATHISTORY") => (
             "CHATHISTORY",
             &[
@@ -661,7 +676,8 @@ pub async fn handle_help(
                 "Available commands (HELP <command> for details):",
                 "  JOIN PART PRIVMSG NOTICE NICK QUIT WHO WHOIS WHOWAS MODE",
                 "  KICK TOPIC INVITE KNOCK AWAY LIST NAMES OPER REGISTER",
-                "  MONITOR CHATHISTORY VERSION TIME INFO LINKS STATS LUSERS",
+                "  VERIFY WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS",
+                "  STATS LUSERS",
             ],
         ),
     };
@@ -1226,6 +1242,22 @@ pub async fn handle_rehash(
     let existing_db = cfg.read().await.db.clone();
     let mut new_cfg = new_cfg;
     new_cfg.db = existing_db;
+
+    // Keep the VAPID key and HTTP client. Rotating them would invalidate every
+    // push subscription registered under the old key.
+    if let Some(ref webpush_cfg) = new_cfg.webpush {
+        let existing_runtime = cfg.read().await.webpush_runtime.clone();
+        new_cfg.webpush_runtime = match existing_runtime {
+            Some(runtime) => Some(runtime),
+            None => match crate::webpush::WebpushRuntime::new(webpush_cfg) {
+                Ok(runtime) => Some(std::sync::Arc::new(runtime)),
+                Err(e) => {
+                    tracing::error!("REHASH: could not set up Web Push: {}", e);
+                    None
+                }
+            },
+        };
+    }
 
     let config_file = config_path.to_string_lossy().to_string();
     *cfg.write().await = new_cfg;

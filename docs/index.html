@@ -479,6 +479,7 @@
           <tr><td><code>draft/pre-away</code></td><td><span class="status-full">Full</span></td><td>AWAY during registration</td></tr>
           <tr><td><code>draft/network-icon</code></td><td><span class="status-full">Full</span></td><td>ICON= ISUPPORT token</td></tr>
           <tr><td><code>draft/filehost</code></td><td><span class="status-full">Full</span></td><td>HTTPS file uploads; HTTP Basic auth; MIME downloads</td></tr>
+          <tr><td><code>draft/webpush</code></td><td><span class="status-full">Full</span></td><td>WEBPUSH REGISTER/UNREGISTER; VAPID; DMs and highlights</td></tr>
           <tr><td><code>draft/account-registration</code></td><td><span class="status-full">Full</span></td><td>REGISTER logs the client in; optional email VERIFY</td></tr>
           <tr><td><code>draft/extended-isupport</code></td><td><span class="status-full">Full</span></td><td>ISUPPORT command</td></tr>
           <tr><td><code>WebSocket</code></td><td><span class="status-full">Full</span></td><td>WS + WSS transport; text.ircv3.net subprotocol</td></tr>
@@ -545,6 +546,17 @@
           <tr><td>from</td><td>From address for verification mail</td></tr>
           <tr><td>subject</td><td>Subject line</td></tr>
           <tr><td>code_expiry_secs</td><td>Code lifetime (default 86400)</td></tr>
+        </table>
+      </div>
+      <div class="config-block">
+        <h3>[webpush]</h3>
+        <table>
+          <tr><td>contact</td><td>VAPID sub claim (mailto:/https:)</td></tr>
+          <tr><td>key_file</td><td>VAPID key path (auto-generated)</td></tr>
+          <tr><td>max_subscriptions_per_account</td><td>Endpoints per account (default 5)</td></tr>
+          <tr><td>ttl_secs</td><td>Push TTL (default 3600)</td></tr>
+          <tr><td>max_failures</td><td>Failures before dropping (default 5)</td></tr>
+          <tr><td>allow_private_endpoints</td><td>Permit private IPs (testing)</td></tr>
         </table>
       </div>
       <div class="config-block">

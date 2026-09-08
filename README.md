@@ -227,6 +227,43 @@ smtp_password = "s3cr3t"
 code_expiry_secs = 86400
 ```
 
+### `[webpush]`
+
+Optional. Enables Web Push notifications (draft/webpush, [RFC 8030](https://www.rfc-editor.org/rfc/rfc8030)/[8291](https://www.rfc-editor.org/rfc/rfc8291)/[8292](https://www.rfc-editor.org/rfc/rfc8292)) so mobile and web clients can be woken for messages while their app is asleep. When configured, the `draft/webpush` capability is advertised and clients register endpoints with `WEBPUSH REGISTER`.
+
+A VAPID key pair is generated on first start and stored in `key_file` (mode 0600). Its public key is advertised to capable clients in the `VAPID=` ISUPPORT token and used to sign every push request — **back this file up**: replacing it invalidates every existing subscription.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `contact` | _(required)_ | VAPID `sub` claim — a `mailto:` or `https:` URL identifying the operator |
+| `key_file` | `/etc/rIRCd/vapid.key` | Where the VAPID private key is stored (created if missing) |
+| `max_subscriptions_per_account` | `5` | Endpoints one account may have registered at once |
+| `ttl_secs` | `3600` | TTL requested of the push service per notification |
+| `max_failures` | `5` | Consecutive delivery failures before a subscription is dropped |
+| `allow_private_endpoints` | `false` | Permit endpoints resolving to loopback/private addresses (testing only) |
+
+```toml
+[webpush]
+contact = "mailto:admin@example.com"
+key_file = "/etc/rIRCd/vapid.key"
+max_subscriptions_per_account = 5
+ttl_secs = 3600
+```
+
+Subscriptions belong to an **account**, so a client must be logged in (SASL or `REGISTER`) before `WEBPUSH REGISTER`; they are stored in MariaDB and survive restarts.
+
+```
+WEBPUSH REGISTER <endpoint> p256dh=<key>;auth=<secret>
+WEBPUSH UNREGISTER <endpoint>
+```
+
+Endpoints must use `https` and must not resolve to loopback, private, link-local or carrier-grade-NAT addresses. A notification carries exactly one IRC message (with `msgid`, `time` and `account` tags), encrypted with `aes128gcm` per RFC 8291, and is sent for:
+
+- direct `PRIVMSG`/`NOTICE` to the user, and
+- channel `PRIVMSG`/`NOTICE` that mention their nick.
+
+Endpoints the push service reports as gone (404/410), or that fail `max_failures` times in a row, are removed automatically. Clients should re-send an identical `WEBPUSH REGISTER` periodically (daily is typical) to keep a subscription fresh.
+
 ### `[webirc]`
 
 Optional. Enables WEBIRC gateway support so reverse proxies can pass the real client IP.
@@ -287,6 +324,10 @@ encryption = "starttls"
 from = "ExampleNet <noreply@example.com>"
 smtp_user = "noreply@example.com"
 smtp_password = "s3cr3t"
+
+[webpush]
+contact = "mailto:admin@example.com"
+key_file = "/etc/rIRCd/vapid.key"
 ```
 
 ---
@@ -426,6 +467,7 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **CLIENTTAGDENY** | Full | Optional 005 token; config `server.client_tag_deny` |
 | **WebIRC** | Full | WEBIRC password gateway hostname ip; config `[webirc]` |
 | **WebSocket** | Full | IRCv3 WebSocket transport; `listen_ws`/`listen_wss` config; subprotocol `text.ircv3.net` |
+| **draft/webpush** | Full | `WEBPUSH REGISTER`/`UNREGISTER`; VAPID-signed, aes128gcm-encrypted pushes for DMs and highlights; `VAPID=` ISUPPORT token; `[webpush]` config |
 | **draft/filehost** | Full | HTTPS file upload endpoint with HTTP Basic auth (same credentials as SASL PLAIN); reuses `[tls]` certs; `FILEHOST=` / `draft/FILEHOST=` ISUPPORT tokens; MIME-typed downloads; configurable max upload size |
 
 ---
@@ -436,7 +478,8 @@ Features under consideration for future releases:
 
 | Feature | Description |
 |---------|-------------|
-| **draft/webpush** | Web Push notifications (RFC 8291) via `WEBPUSH REGISTER`/`UNREGISTER` |
+| **Always-on clients** | Keep an account's channel membership while it is disconnected, so Web Push can notify users whose client is fully offline (today a push fires only for a message that reaches a connected session) |
+| **custom-account-name** | Let an account be named something other than the current nick; needs channel op/voice lists to stop treating nicks and account names as interchangeable first |
 
 ---
 

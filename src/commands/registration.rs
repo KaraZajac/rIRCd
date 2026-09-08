@@ -51,7 +51,9 @@ async fn send_to_client(
 const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 
 /// ISUPPORT (005) token list; used at registration and for extended-isupport.
-fn isupport_tokens(cfg: &Config) -> String {
+/// `client_has_webpush` adds the VAPID token, which draft/webpush says to send
+/// only to clients that enabled the capability.
+fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
     let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={} MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=U EXCEPTS INVEX UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1 METADATA=50{}", cfg.limits.max_line_length, network);
     let deny = cfg
@@ -76,7 +78,12 @@ fn isupport_tokens(cfg: &Config) -> String {
             )
         })
         .unwrap_or_default();
-    format!("{}{}{}{}", base, deny, icon, filehost)
+    // draft/webpush: public key clients use to verify notifications came from us.
+    let vapid = match (client_has_webpush, cfg.webpush_runtime.as_ref()) {
+        (true, Some(rt)) => format!(" VAPID={}", rt.key.public_b64()),
+        _ => String::new(),
+    };
+    format!("{}{}{}{}{}", base, deny, icon, filehost, vapid)
 }
 
 pub async fn complete_registration(
@@ -210,7 +217,7 @@ pub async fn complete_registration(
     )
     .await;
 
-    let isupport = isupport_tokens(cfg);
+    let isupport = isupport_tokens(cfg, client.read().await.has_cap("draft/webpush"));
     let tokens: Vec<&str> = isupport.split(' ').collect();
     for chunk in tokens.chunks(ISUPPORT_TOKENS_PER_LINE) {
         reply_to_client(
@@ -334,17 +341,21 @@ pub async fn handle_isupport(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let nick = {
+    let (nick, has_webpush) = {
         let state = state.read().await;
         if let Some(c) = state.clients.get(client_id) {
-            c.read().await.nick_or_id().to_string()
+            let g = c.read().await;
+            (g.nick_or_id().to_string(), g.has_cap("draft/webpush"))
         } else if let Some(p) = state.pending.get(client_id) {
-            p.nick.as_deref().unwrap_or("*").to_string()
+            (
+                p.nick.as_deref().unwrap_or("*").to_string(),
+                p.capabilities.contains("draft/webpush"),
+            )
         } else {
-            "*".to_string()
+            ("*".to_string(), false)
         }
     };
-    let isupport = isupport_tokens(cfg);
+    let isupport = isupport_tokens(cfg, has_webpush);
     let tokens: Vec<&str> = isupport.split(' ').collect();
     for chunk in tokens.chunks(ISUPPORT_TOKENS_PER_LINE) {
         reply_to_client(

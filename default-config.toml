@@ -58,3 +58,14 @@ max_line_length = 8191
 # smtp_password = "..."
 # subject = "Your IRC account verification code"
 # code_expiry_secs = 86400
+
+# Web Push notifications (draft/webpush). Lets clients register push endpoints
+# with WEBPUSH REGISTER and be woken for direct messages and highlights.
+# A VAPID key pair is generated in key_file on first start — back it up, since
+# replacing it invalidates every existing subscription.
+# [webpush]
+# contact = "mailto:admin@example.com"   # VAPID sub claim (mailto: or https:)
+# key_file = "/etc/rIRCd/vapid.key"
+# max_subscriptions_per_account = 5
+# ttl_secs = 3600
+# max_failures = 5

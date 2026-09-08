@@ -46,6 +46,7 @@ pub const CAPS: &[&str] = &[
     "draft/client-batch",
     "draft/event-playback",
     "draft/auto-join",
+    "draft/webpush",
     "sts",
 ];
 
@@ -76,6 +77,7 @@ pub fn build_cap_list(cfg: &Config, version_302: bool, client_is_tls: bool) -> V
         .copied()
         .filter(|c| *c != "capability-negotiation")
         .filter(|c| *c != "sts" || tls_port.is_some())
+        .filter(|c| *c != "draft/webpush" || cfg.webpush.is_some())
         .map(|c| match c {
             "sasl" if sasl_external => "sasl=PLAIN,SCRAM-SHA-256,EXTERNAL".to_string(),
             "sasl" => "sasl=PLAIN,SCRAM-SHA-256".to_string(),

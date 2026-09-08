@@ -89,6 +89,88 @@ async fn send_to_client_with_caps(
     send_to_client(senders, to_id, tagged).await;
 }
 
+/// Does `text` mention `nick`? Matched case-insensitively on word boundaries, so
+/// "kara: hi" and "hi kara!" count but "karaoke" does not.
+fn mentions_nick(text: &str, nick: &str) -> bool {
+    if nick.is_empty() {
+        return false;
+    }
+    let text_lower = text.to_lowercase();
+    let nick_lower = nick.to_lowercase();
+    let bytes = text_lower.as_bytes();
+
+    let mut from = 0;
+    while let Some(pos) = text_lower[from..].find(&nick_lower) {
+        let start = from + pos;
+        let end = start + nick_lower.len();
+        let before_ok = start == 0 || !is_nick_char(bytes[start - 1] as char);
+        let after_ok = end >= bytes.len() || !is_nick_char(bytes[end] as char);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Characters that can appear inside a nick, for mention boundary checks.
+fn is_nick_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "[]\\`_^{|}-".contains(c)
+}
+
+/// Queue a Web Push notification for a message just delivered to `recipient_id`.
+///
+/// Notifications are what push exists for, so only messages a user would want to be
+/// woken for qualify: direct messages, and channel messages that mention their nick.
+/// `channel_text` is `Some` for channel traffic and `None` for direct messages.
+#[allow(clippy::too_many_arguments)]
+async fn push_notify(
+    state: &ServerState,
+    cfg: &Config,
+    recipient_id: &str,
+    base_msg: &Message,
+    msgid: &str,
+    sender_account: Option<&str>,
+    sender_is_bot: bool,
+    channel_text: Option<&str>,
+) {
+    if cfg.webpush_runtime.is_none() {
+        return;
+    }
+    let Some(client) = state.clients.get(recipient_id) else {
+        return;
+    };
+    let (account, nick) = {
+        let g = client.read().await;
+        (g.account.clone(), g.nick.clone().unwrap_or_default())
+    };
+    let Some(account) = account else {
+        return; // Subscriptions are per account; anonymous clients have none.
+    };
+    if let Some(text) = channel_text {
+        if !mentions_nick(text, &nick) {
+            return;
+        }
+    }
+
+    // The payload is one IRC message. msgid must survive; server-time and account
+    // are cheap and let a woken client place the message.
+    let caps: std::collections::HashSet<String> = ["message-tags", "server-time", "account-tag"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let tagged = add_tags_for_recipient(
+        base_msg.clone(),
+        &caps,
+        sender_account,
+        Some(msgid),
+        None,
+        cfg.server.client_tag_deny.as_deref(),
+        sender_is_bot,
+    );
+    crate::webpush::notify(cfg, &account, &tagged);
+}
+
 pub async fn handle_privmsg(
     client_id: &str,
     msg: Message,
@@ -436,6 +518,17 @@ pub async fn handle_privmsg(
                     sender_is_bot,
                 )
                 .await;
+                push_notify(
+                    &state_guard,
+                    cfg,
+                    mid,
+                    &base_msg,
+                    &msgid,
+                    sender_account.as_deref(),
+                    sender_is_bot,
+                    Some(&text),
+                )
+                .await;
             }
             // Only append new history if this is NOT an edit (edits already updated in-place)
             if pending_edit_msgid.is_none() {
@@ -480,6 +573,17 @@ pub async fn handle_privmsg(
                 Some(&msg.tags),
                 cfg.server.client_tag_deny.as_deref(),
                 sender_is_bot,
+            )
+            .await;
+            push_notify(
+                &state_guard,
+                cfg,
+                &tid,
+                &privmsg,
+                &msgid,
+                sender_account.as_deref(),
+                sender_is_bot,
+                None,
             )
             .await;
             // 301 RPL_AWAY if target is away
@@ -663,6 +767,17 @@ pub async fn handle_notice(
                     sender_is_bot,
                 )
                 .await;
+                push_notify(
+                    &state_guard,
+                    cfg,
+                    mid,
+                    &base_msg,
+                    &msgid,
+                    sender_account.as_deref(),
+                    sender_is_bot,
+                    Some(&text),
+                )
+                .await;
             }
             if statusmsg_prefix.is_none() {
                 if let Some(ref pool) = cfg.db {
@@ -695,6 +810,17 @@ pub async fn handle_notice(
                 Some(&msg.tags),
                 cfg.server.client_tag_deny.as_deref(),
                 sender_is_bot,
+            )
+            .await;
+            push_notify(
+                &state_guard,
+                cfg,
+                &tid,
+                &base_msg,
+                &msgid,
+                sender_account.as_deref(),
+                sender_is_bot,
+                None,
             )
             .await;
             if echo_message {
@@ -2029,4 +2155,33 @@ pub async fn deliver_client_batch(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mentions_nick;
+
+    #[test]
+    fn highlights_match_whole_nicks_only() {
+        assert!(mentions_nick("kara: are you there?", "kara"));
+        assert!(mentions_nick("thanks kara!", "kara"));
+        assert!(mentions_nick("(kara)", "kara"));
+        assert!(mentions_nick("KARA, hello", "kara"));
+        assert!(mentions_nick("hello Kara", "kARa"));
+        assert!(mentions_nick("ping kara", "KARA"));
+
+        assert!(!mentions_nick("karaoke night", "kara"));
+        assert!(!mentions_nick("mkara", "kara"));
+        assert!(!mentions_nick("nothing to see", "kara"));
+        assert!(!mentions_nick("", "kara"));
+        assert!(!mentions_nick("anything", ""));
+    }
+
+    /// Nicks may contain []\`_^{|}- , so those must not act as word boundaries.
+    #[test]
+    fn nick_punctuation_is_part_of_the_nick() {
+        assert!(mentions_nick("hey |away|_ how are you", "|away|_"));
+        assert!(!mentions_nick("hey kara_ how are you", "kara"));
+        assert!(!mentions_nick("hey kara-work", "kara"));
+    }
 }
