@@ -1233,10 +1233,14 @@ pub async fn handle_rehash(
     let old_caps: std::collections::HashSet<String> =
         old_caps_raw[0].split(' ').map(|s| s.to_string()).collect();
 
-    // Preserve the live database pool — REHASH does not reconnect
-    let existing_db = cfg.read().await.db.clone();
+    // Preserve the live database pool and history writer — REHASH does not reconnect
+    let (existing_db, existing_history) = {
+        let c = cfg.read().await;
+        (c.db.clone(), c.history.clone())
+    };
     let mut new_cfg = new_cfg;
     new_cfg.db = existing_db;
+    new_cfg.history = existing_history;
 
     // Keep the VAPID key and HTTP client. Rotating them would invalidate every
     // push subscription registered under the old key.

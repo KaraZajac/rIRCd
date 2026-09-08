@@ -332,6 +332,8 @@ pub async fn handle_privmsg(
     }
     // If this is an edit, update the channel history entry in the DB.
     if let Some(ref orig_msgid) = pending_edit_msgid {
+        // The original may still be queued in the history writer.
+        cfg.flush_history().await;
         if let Some(ref pool) = cfg.db {
             let rows =
                 persist::update_channel_history_message(pool, orig_msgid, &text, &msgid).await;
@@ -528,17 +530,7 @@ pub async fn handle_privmsg(
             }
             // Only append new history if this is NOT an edit (edits already updated in-place)
             if pending_edit_msgid.is_none() {
-                if let Some(ref pool) = cfg.db {
-                    let _ = persist::append_channel_history(
-                        pool,
-                        &ch_key,
-                        &source,
-                        &text,
-                        Some(&msgid),
-                        "PRIVMSG",
-                    )
-                    .await;
-                }
+                cfg.record_history(&ch_key, &source, &text, Some(&msgid), "PRIVMSG");
             }
         } else {
             reply_to_client(
@@ -585,18 +577,8 @@ pub async fn handle_privmsg(
 
             // Keep direct conversations in history so CHATHISTORY can replay them.
             if pending_edit_msgid.is_none() {
-                if let Some(ref pool) = cfg.db {
-                    let key = persist::direct_message_key(&sender_nick, target);
-                    let _ = persist::append_channel_history(
-                        pool,
-                        &key,
-                        &source,
-                        &text,
-                        Some(&msgid),
-                        "PRIVMSG",
-                    )
-                    .await;
-                }
+                let key = persist::direct_message_key(&sender_nick, target);
+                cfg.record_history(&key, &source, &text, Some(&msgid), "PRIVMSG");
             }
             // 301 RPL_AWAY if target is away
             let target_away = match state_guard.clients.get(&tid) {
@@ -792,17 +774,7 @@ pub async fn handle_notice(
                 .await;
             }
             if statusmsg_prefix.is_none() {
-                if let Some(ref pool) = cfg.db {
-                    let _ = persist::append_channel_history(
-                        pool,
-                        &ch_key,
-                        &source,
-                        &text,
-                        Some(&msgid),
-                        "NOTICE",
-                    )
-                    .await;
-                }
+                cfg.record_history(&ch_key, &source, &text, Some(&msgid), "NOTICE");
             }
         }
     } else {
@@ -836,18 +808,10 @@ pub async fn handle_notice(
             )
             .await;
 
-            if let Some(ref pool) = cfg.db {
+            {
                 let sender_nick = source.split('!').next().unwrap_or(&source);
                 let key = persist::direct_message_key(sender_nick, target);
-                let _ = persist::append_channel_history(
-                    pool,
-                    &key,
-                    &source,
-                    &text,
-                    Some(&msgid),
-                    "NOTICE",
-                )
-                .await;
+                cfg.record_history(&key, &source, &text, Some(&msgid), "NOTICE");
             }
             if echo_message {
                 let sender_caps = match state_guard.clients.get(client_id) {
@@ -1177,24 +1141,14 @@ pub async fn deliver_multiline_batch(
         }
     }
 
-    if let Some(ref pool) = cfg.db {
-        if batch.target.starts_with('#') || batch.target.starts_with('&') {
-            let cmd = if batch.command == "NOTICE" {
-                "NOTICE"
-            } else {
-                "PRIVMSG"
-            };
-            for (_, text) in &batch.lines {
-                let _ = persist::append_channel_history(
-                    pool,
-                    &batch.target,
-                    &source,
-                    text,
-                    Some(&msgid),
-                    cmd,
-                )
-                .await;
-            }
+    if batch.target.starts_with('#') || batch.target.starts_with('&') {
+        let cmd = if batch.command == "NOTICE" {
+            "NOTICE"
+        } else {
+            "PRIVMSG"
+        };
+        for (_, text) in &batch.lines {
+            cfg.record_history(&batch.target, &source, text, Some(&msgid), cmd);
         }
     }
 
@@ -1475,6 +1429,8 @@ pub async fn handle_redact(
         (t, nick)
     } else {
         debug!("REDACT: msgid={} not in memory, querying DB", msgid);
+        // The row may still be queued in the history writer.
+        cfg.flush_history().await;
         let db_result = match cfg.db {
             Some(ref pool) => persist::lookup_channel_history_by_msgid(pool, msgid).await,
             None => None,
@@ -1582,7 +1538,8 @@ pub async fn handle_redact(
         state_w.msgid_store.take(msgid);
     }
 
-    // Delete from DB
+    // Delete from DB, once anything still queued has been written.
+    cfg.flush_history().await;
     if let Some(ref pool) = cfg.db {
         let deleted = persist::delete_channel_history_by_msgid(pool, msgid).await;
         tracing::info!(

@@ -830,17 +830,7 @@ pub async fn handle_nick(
                 }
 
                 // Record NICK event for draft/event-playback (one per channel)
-                if let Some(ref pool) = cfg.db {
-                    let _ = persist::append_channel_history(
-                        pool,
-                        ch_name,
-                        &old_source,
-                        &nick,
-                        None,
-                        "NICK",
-                    )
-                    .await;
-                }
+                cfg.record_history(ch_name, &old_source, &nick, None, "NICK");
             }
 
             return Ok(());
@@ -1144,10 +1134,7 @@ pub async fn handle_quit(
         drop(ch_store);
 
         // Record QUIT event for draft/event-playback (one per channel)
-        if let Some(ref pool) = cfg.db {
-            let _ = persist::append_channel_history(pool, ch_name, &source, &reason, None, "QUIT")
-                .await;
-        }
+        cfg.record_history(ch_name, &source, &reason, None, "QUIT");
     }
 
     // 901 RPL_LOGGEDOUT: notify the client they are no longer logged in

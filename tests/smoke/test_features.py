@@ -446,6 +446,58 @@ check("the server survives all of it", bool(alive.find(" 001 ")), alive.lines[-3
 alive.close()
 mb.close()
 
+section("history keeps up with a burst")
+# History used to be written inline, one database round-trip per message, inside
+# the loop that handles every command: 200 messages took over five seconds.
+burst_chan = f"#burst{RUN_ID}"
+reader = Client(f"burstread{RUN_ID}", caps=TAGS)
+reader.join(burst_chan)
+senders = [Client(f"bsend{RUN_ID}x{i}") for i in range(10)]
+for c in senders:
+    c.join(burst_chan)
+# JOIN spends a flood token; give the buckets a moment so the burst itself fits.
+time.sleep(1.5)
+reader.read(0.5)
+
+mark = reader.mark()
+started = time.time()
+for i, c in enumerate(senders):
+    for j in range(10):
+        c.send(f"PRIVMSG {burst_chan} :burst {i}-{j}")
+deadline = time.time() + 30
+delivered = 0
+while time.time() < deadline:
+    reader.read(0.05)
+    delivered = len(reader.find("burst ", lines=reader.since(mark)))
+    if delivered >= 100:
+        break
+elapsed = time.time() - started
+check("a 100-message burst is delivered", delivered == 100, f"delivered {delivered}")
+check("and delivered promptly", elapsed < 5.0, f"took {elapsed:.2f}s")
+burst_mark = mark
+
+# The rows must still be there, in order, once the writer has caught up.
+histclient = Client(f"bursthist{RUN_ID}", caps=TAGS + ["draft/chathistory"])
+histclient.join(burst_chan)
+time.sleep(1.5)
+mark = histclient.mark()
+histclient.send(f"CHATHISTORY LATEST {burst_chan} * 100")
+histclient.read(3.0)
+replayed = [l for l in histclient.since(mark) if "burst " in l]
+check("the burst reached history", len(replayed) >= 100, f"{len(replayed)} rows")
+# Ten senders interleave, so the order that matters is the one the server
+# actually processed them in — history must match what the channel saw.
+delivered_order = [l.split("burst ")[1].split()[0]
+                   for l in reader.find("burst ", lines=reader.since(burst_mark))]
+history_order = [l.split("burst ")[1].split()[0] for l in replayed]
+check("history preserves the order messages were delivered in",
+      history_order[: len(delivered_order)] == delivered_order,
+      f"delivered {delivered_order[:5]} vs history {history_order[:5]}")
+histclient.close()
+reader.close()
+for c in senders:
+    c.close()
+
 section("a client that stops reading must not stall the server")
 # Every command is handled by one loop, so awaiting a stalled client would freeze
 # the server for everyone. Regression test for exactly that.

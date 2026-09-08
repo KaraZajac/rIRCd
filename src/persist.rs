@@ -940,6 +940,136 @@ pub async fn reset_webpush_failures(pool: &sqlx::MySqlPool, endpoint: &str) {
 
 /// Append a message or event to channel history. Prunes oldest rows beyond the per-channel cap.
 /// `command` is the IRC command: "PRIVMSG", "NOTICE", "JOIN", "PART", "QUIT", "TOPIC", "NICK".
+/// One row queued for the history writer.
+#[derive(Debug, Clone)]
+pub struct HistoryWrite {
+    pub target: String,
+    pub source: String,
+    pub text: String,
+    pub msgid: Option<String>,
+    pub command: String,
+    /// Stamped when the message was handled, not when it reaches the database.
+    pub ts: String,
+}
+
+enum HistoryOp {
+    Append(Box<HistoryWrite>),
+    /// Wait until everything queued before this point has been written.
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Queues history rows for a background task.
+///
+/// Writing history inline cost a database round-trip — and a commit fsync — for
+/// every message, inside the single loop that handles all commands: a burst of
+/// 200 messages took 5.7 seconds to deliver. Rows are now written by one task,
+/// in order, batched into a single statement per drain.
+#[derive(Clone, Debug)]
+pub struct HistoryWriter {
+    tx: tokio::sync::mpsc::UnboundedSender<HistoryOp>,
+}
+
+/// Rows written in one statement.
+const HISTORY_BATCH: usize = 200;
+/// Appends to one target before its history is pruned again.
+const PRUNE_INTERVAL: u32 = 100;
+
+impl HistoryWriter {
+    pub fn spawn(pool: sqlx::MySqlPool) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<HistoryOp>();
+        tokio::spawn(async move {
+            let mut since_prune: std::collections::HashMap<String, u32> = Default::default();
+            while let Some(op) = rx.recv().await {
+                let mut batch: Vec<HistoryWrite> = Vec::new();
+                let mut flushes: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+                let mut queue = vec![op];
+                // Take whatever else is already waiting, so a burst becomes one
+                // statement instead of one per message.
+                while batch.len() + queue.len() < HISTORY_BATCH {
+                    match rx.try_recv() {
+                        Ok(next) => queue.push(next),
+                        Err(_) => break,
+                    }
+                }
+                for op in queue {
+                    match op {
+                        HistoryOp::Append(entry) => batch.push(*entry),
+                        HistoryOp::Flush(done) => flushes.push(done),
+                    }
+                }
+
+                if !batch.is_empty() {
+                    let placeholders = vec!["(?, ?, ?, ?, ?, ?)"; batch.len()].join(", ");
+                    let sql = format!(
+                        "INSERT INTO channel_history (channel, ts, source, text, msgid, command) VALUES {}",
+                        placeholders
+                    );
+                    let mut query = sqlx::query(&sql);
+                    for e in &batch {
+                        query = query
+                            .bind(&e.target)
+                            .bind(&e.ts)
+                            .bind(&e.source)
+                            .bind(&e.text)
+                            .bind(e.msgid.as_deref())
+                            .bind(&e.command);
+                    }
+                    if let Err(e) = query.execute(&pool).await {
+                        tracing::warn!("Failed to write channel history: {}", e);
+                    }
+
+                    for entry in &batch {
+                        let counter = since_prune.entry(entry.target.clone()).or_insert(0);
+                        *counter += 1;
+                        if *counter >= PRUNE_INTERVAL {
+                            *counter = 0;
+                            prune_channel_history(&pool, &entry.target).await;
+                        }
+                    }
+                }
+
+                for done in flushes {
+                    let _ = done.send(());
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    /// Queue a row. Returns immediately; the row is written in order.
+    pub fn append(&self, entry: HistoryWrite) {
+        let _ = self.tx.send(HistoryOp::Append(Box::new(entry)));
+    }
+
+    /// Wait for queued rows to reach the database. Used before operations that
+    /// read or modify history by msgid, so they cannot miss a pending row.
+    pub async fn flush(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(HistoryOp::Flush(tx)).is_ok() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+        }
+    }
+}
+
+/// Trim one target's history to the retention cap.
+async fn prune_channel_history(pool: &sqlx::MySqlPool, target: &str) {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_history WHERE channel = ?")
+        .bind(target)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+    if count > MAX_HISTORY_ENTRIES {
+        let excess = count - MAX_HISTORY_ENTRIES;
+        let _ =
+            sqlx::query("DELETE FROM channel_history WHERE channel = ? ORDER BY id ASC LIMIT ?")
+                .bind(target)
+                .bind(excess)
+                .execute(pool)
+                .await;
+    }
+}
+
 pub async fn append_channel_history(
     pool: &sqlx::MySqlPool,
     channel_name: &str,

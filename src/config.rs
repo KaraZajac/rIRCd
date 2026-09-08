@@ -41,6 +41,9 @@ pub struct Config {
     /// Live connection pool — populated after `load()`, not serialised.
     #[serde(skip)]
     pub db: Option<sqlx::MySqlPool>,
+    /// Background writer for channel and conversation history, not serialised.
+    #[serde(skip)]
+    pub history: Option<crate::persist::HistoryWriter>,
 }
 
 // ─── Database ─────────────────────────────────────────────────────────────────
@@ -359,6 +362,38 @@ pub struct OperConfig {
 // ─── Methods ──────────────────────────────────────────────────────────────────
 
 impl Config {
+    /// Queue a history row for `target` (a channel, or a direct-conversation key).
+    ///
+    /// Returns immediately: history is written by a background task, so a
+    /// database round-trip never delays delivering the message.
+    pub fn record_history(
+        &self,
+        target: &str,
+        source: &str,
+        text: &str,
+        msgid: Option<&str>,
+        command: &str,
+    ) {
+        if let Some(ref writer) = self.history {
+            writer.append(crate::persist::HistoryWrite {
+                target: target.to_string(),
+                source: source.to_string(),
+                text: text.to_string(),
+                msgid: msgid.map(String::from),
+                command: command.to_string(),
+                ts: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+    }
+
+    /// Wait for queued history to reach the database, before reading or changing
+    /// it by msgid.
+    pub async fn flush_history(&self) {
+        if let Some(ref writer) = self.history {
+            writer.flush().await;
+        }
+    }
+
     pub fn tls_enabled(&self) -> bool {
         self.tls.cert.is_some() && self.tls.key.is_some()
     }

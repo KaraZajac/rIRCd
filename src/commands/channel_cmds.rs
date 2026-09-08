@@ -3,7 +3,6 @@ use crate::channel::{
 };
 use crate::commands::reply_to_client;
 use crate::config::Config;
-use crate::persist;
 use crate::protocol::{add_batch_tag, generate_msgid, Message};
 use crate::user::{Senders, ServerState};
 use std::sync::Arc;
@@ -419,9 +418,7 @@ pub async fn handle_join(
         }
 
         // Record JOIN event for draft/event-playback
-        if let Some(ref pool) = cfg.db {
-            let _ = persist::append_channel_history(pool, &ch_key, &source, "", None, "JOIN").await;
-        }
+        cfg.record_history(&ch_key, &source, "", None, "JOIN");
 
         if let Some(ref topic_str) = topic {
             reply_to_client(
@@ -625,10 +622,7 @@ pub async fn handle_part(
         tracing::debug!(client_id, channel = %ch_name, reason = %reason, "PART");
 
         // Record PART event for draft/event-playback
-        if let Some(ref pool) = cfg.db {
-            let _ = persist::append_channel_history(pool, &ch_key, &source, &reason, None, "PART")
-                .await;
-        }
+        cfg.record_history(&ch_key, &source, &reason, None, "PART");
 
         if let Some(client) = state.clients.get(client_id) {
             let mut c = client.write().await;
@@ -1666,11 +1660,7 @@ pub async fn handle_topic(
         }
 
         // Record TOPIC event for draft/event-playback
-        if let Some(ref pool) = cfg.db {
-            let _ =
-                persist::append_channel_history(pool, &ch_key, &source, &topic_text, None, "TOPIC")
-                    .await;
-        }
+        cfg.record_history(&ch_key, &source, &topic_text, None, "TOPIC");
 
         // 333 RPL_TOPICWHOTIME to the setter
         reply_to_client(

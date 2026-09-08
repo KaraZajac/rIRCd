@@ -69,6 +69,7 @@ pub async fn run_server(mut cfg: Config, config_path: &Path) -> anyhow::Result<(
         }
     }
 
+    cfg.history = Some(persist::HistoryWriter::spawn(pool.clone()));
     cfg.db = Some(pool);
 
     if let Some(ref fh) = cfg.filehost {
