@@ -85,6 +85,25 @@ async fn send_to_client_with_caps(
     send_to_client(senders, to_id, tagged).await;
 }
 
+/// Identity used for a direct conversation: the account when the user has one,
+/// otherwise the nick.
+///
+/// Accounts outlive nicks, so keying on the account keeps a conversation
+/// together when someone changes nick. An unregistered user has only a nick,
+/// and rIRCd account names are nicks, so the two coincide for everyone else.
+async fn conversation_identity(state: &ServerState, nick: &str) -> String {
+    if let Some(id) = state.nick_to_id.get(&nick.to_uppercase()) {
+        if let Some(client) = state.clients.get(id) {
+            let g = client.read().await;
+            return g
+                .account
+                .clone()
+                .unwrap_or_else(|| g.nick_or_id().to_string());
+        }
+    }
+    nick.to_string()
+}
+
 /// Does `text` mention `nick`? Matched case-insensitively on word boundaries, so
 /// "kara: hi" and "hi kara!" count but "karaoke" does not.
 fn mentions_nick(text: &str, nick: &str) -> bool {
@@ -577,7 +596,11 @@ pub async fn handle_privmsg(
 
             // Keep direct conversations in history so CHATHISTORY can replay them.
             if pending_edit_msgid.is_none() {
-                let key = persist::direct_message_key(&sender_nick, target);
+                let me = sender_account
+                    .clone()
+                    .unwrap_or_else(|| sender_nick.clone());
+                let peer = conversation_identity(&state_guard, target).await;
+                let key = persist::direct_message_key(&me, &peer);
                 cfg.record_history(&key, &source, &text, Some(&msgid), "PRIVMSG");
             }
             // 301 RPL_AWAY if target is away
@@ -810,7 +833,11 @@ pub async fn handle_notice(
 
             {
                 let sender_nick = source.split('!').next().unwrap_or(&source);
-                let key = persist::direct_message_key(sender_nick, target);
+                let me = sender_account
+                    .clone()
+                    .unwrap_or_else(|| sender_nick.to_string());
+                let peer = conversation_identity(&state_guard, target).await;
+                let key = persist::direct_message_key(&me, &peer);
                 cfg.record_history(&key, &source, &text, Some(&msgid), "NOTICE");
             }
             if echo_message {
@@ -1625,10 +1652,15 @@ pub async fn handle_chathistory(
         None => return Ok(()),
     };
     let params = &msg.params;
-    let requester_nick = {
+    let (requester_nick, requester_identity) = {
         let state_r = state.read().await;
         match state_r.clients.get(client_id) {
-            Some(c) => c.read().await.nick_or_id().to_string(),
+            Some(c) => {
+                let g = c.read().await;
+                let nick = g.nick_or_id().to_string();
+                let identity = g.account.clone().unwrap_or_else(|| nick.clone());
+                (nick, identity)
+            }
             None => return Ok(()),
         }
     };
@@ -1666,7 +1698,7 @@ pub async fn handle_chathistory(
             return Ok(());
         }
         let targets =
-            persist::list_history_targets(pool, from_ts, to_ts, limit, &requester_nick).await;
+            persist::list_history_targets(pool, from_ts, to_ts, limit, &requester_identity).await;
         let caps = {
             let state_r = state.read().await;
             match state_r.clients.get(client_id) {
@@ -1813,7 +1845,11 @@ pub async fn handle_chathistory(
     let history_key = if is_channel_target {
         canonical_channel_key(target)
     } else {
-        persist::direct_message_key(&requester_nick, target)
+        let peer = {
+            let state_r = state.read().await;
+            conversation_identity(&state_r, target).await
+        };
+        persist::direct_message_key(&requester_identity, &peer)
     };
 
     // Channel history is for members; a direct conversation is addressed by a key

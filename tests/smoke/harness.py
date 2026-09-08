@@ -170,14 +170,23 @@ def db(query):
 
 
 def mails():
-    """Every message the SMTP sink has captured, oldest first."""
+    """Every message the SMTP sink has captured, oldest first.
+
+    A file that is still being written is skipped: the sink creates it before
+    filling it, so a reader can otherwise see an empty message.
+    """
     if not MAIL_DIR or not os.path.isdir(MAIL_DIR):
         return []
     names = sorted(
         (n for n in os.listdir(MAIL_DIR) if n.startswith("mail-")),
         key=lambda n: int(n.split("-")[1].split(".")[0]),
     )
-    return [open(os.path.join(MAIL_DIR, n)).read() for n in names]
+    out = []
+    for name in names:
+        body = open(os.path.join(MAIL_DIR, name)).read()
+        if "Subject:" in body:
+            out.append(body)
+    return out
 
 
 def wait_for_mail(count=1, seconds=15.0):

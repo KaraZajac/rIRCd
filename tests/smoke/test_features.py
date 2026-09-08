@@ -212,6 +212,60 @@ if len(msgids) == 5:
     check("BETWEEN returns the span",
           "message 1" in between and "message 3" in between, between[-120:])
 
+section("a conversation follows the account, not the nick")
+mover = Client(f"mover{RUN_ID}", caps=TAGS + ["draft/chathistory"])
+mark = mover.mark()
+mover.send(f"REGISTER * mover{RUN_ID}@example.org {PASSWORD}")
+mover.read(2.5)
+if mover.find("VERIFICATION_REQUIRED", lines=mover.since(mark)):
+    import re as _re
+
+    from harness import wait_for_mail as _wait
+
+    body = "".join(_wait(1, seconds=15)[-1:])
+    code = _re.search(rf"VERIFY mover{RUN_ID} ([A-Z0-9]{{8}})", body)
+    if code:
+        mover.send(f"VERIFY mover{RUN_ID} {code.group(1)}")
+        mover.read(2.0)
+check("the mover is logged in", bool(mover.find(" 900 ")), mover.lines[-3:])
+
+peer = Client(f"peer{RUN_ID}", caps=TAGS + ["draft/chathistory"])
+mover.send(f"PRIVMSG peer{RUN_ID} :before the rename")
+mover.read(1.0)
+peer.read(1.0)
+mover.send(f"NICK moved{RUN_ID}")
+mover.read(1.5)
+mover.send(f"PRIVMSG peer{RUN_ID} :after the rename")
+mover.read(1.0)
+peer.read(1.5)
+time.sleep(1.5)
+
+mark = mover.mark()
+mover.send(f"CHATHISTORY LATEST peer{RUN_ID} * 20")
+mover.read(2.5)
+replay = [l for l in mover.since(mark) if "the rename" in l]
+check("both sides of a nick change are in one conversation", len(replay) == 2,
+      [l[-40:] for l in replay])
+
+mark = peer.mark()
+peer.send(f"CHATHISTORY LATEST moved{RUN_ID} * 20")
+peer.read(2.5)
+replay = [l for l in peer.since(mark) if "the rename" in l and "batch=" in l]
+check("the partner finds it under the new nick", len(replay) == 2, [l[-40:] for l in replay])
+peer.close()
+mover.close()
+
+section("SASL chunk length")
+big = connect_negotiating(f"saslbig{RUN_ID}", caps=["sasl"])
+big.send("AUTHENTICATE PLAIN")
+big.read(1.0)
+mark = big.mark()
+big.send("AUTHENTICATE " + "A" * 450)
+big.read(1.5)
+check("a chunk over 400 bytes is answered with 905",
+      bool(big.find(" 905 ", lines=big.since(mark))), big.since(mark))
+big.close()
+
 section("CHATHISTORY for direct conversations")
 alice = Client(f"pma{RUN_ID}", caps=TAGS + ["draft/chathistory"])
 bob = Client(f"pmb{RUN_ID}", caps=TAGS + ["draft/chathistory"])

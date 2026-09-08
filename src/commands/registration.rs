@@ -1556,6 +1556,33 @@ pub async fn handle_authenticate(
         return Ok(());
     }
 
+    // SASL messages are sent in chunks of at most 400 bytes; a longer one is a
+    // client error the spec answers with 905, not a generic line-length reply.
+    if let Some(chunk) = msg.params.first() {
+        if chunk.len() > 400 {
+            let nick = {
+                let state_r = state.read().await;
+                match state_r.clients.get(client_id) {
+                    Some(c) => c.read().await.nick_or_id().to_string(),
+                    None => state_r
+                        .pending
+                        .get(client_id)
+                        .and_then(|p| p.nick.clone())
+                        .unwrap_or_else(|| "*".to_string()),
+                }
+            };
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("905", vec![nick, "SASL message too long".into()])
+                    .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
     // Token: first message is "AUTHENTICATE PLAIN" [optional first chunk]; continuation is "AUTHENTICATE <chunk>".
     // When client sends only "AUTHENTICATE PLAIN", params = ["PLAIN"] and trailing() returns the last param "PLAIN" —
     // we must not treat the mechanism name as a credential chunk.

@@ -36,8 +36,10 @@ class Handler(socketserver.StreamRequestHandler):
                     with _lock:
                         _counter += 1
                         path = os.path.join(_out_dir, f"mail-{_counter}.txt")
-                    with open(path, "w") as f:
+                    tmp = path + ".part"
+                    with open(tmp, "w") as f:
                         f.write("\n".join(body))
+                    os.rename(tmp, path)
                     body = []
                     self.wfile.write(b"250 2.0.0 Ok: queued\r\n")
                 else:
