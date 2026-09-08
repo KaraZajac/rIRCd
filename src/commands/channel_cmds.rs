@@ -5,11 +5,10 @@ use crate::commands::reply_to_client;
 use crate::config::Config;
 use crate::persist;
 use crate::protocol::{add_batch_tag, generate_msgid, Message};
-use crate::user::ServerState;
-use std::collections::HashMap;
+use crate::user::{Senders, ServerState};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 /// Constant-time byte comparison for secrets (channel keys, passwords).
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -19,13 +18,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
-async fn send_to_client(
-    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
-    client_id: &str,
-    msg: Message,
-) {
+async fn send_to_client(senders: &Senders, client_id: &str, msg: Message) {
     if let Some(tx) = senders.read().await.get(client_id) {
-        let _ = tx.send(msg).await;
+        tx.send(msg);
     }
 }
 
@@ -34,7 +29,7 @@ pub async fn handle_join(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -104,7 +99,7 @@ pub async fn handle_join(
             };
             for mid in &member_ids {
                 if let Some(tx) = senders.read().await.get(mid) {
-                    let _ = tx.send(part_msg.clone()).await;
+                    tx.send(part_msg.clone());
                 }
             }
         }
@@ -398,7 +393,7 @@ pub async fn handle_join(
                 Message::new("JOIN", vec![ch_key.clone()]).with_prefix(&source)
             };
             if let Some(tx) = senders.read().await.get(mid) {
-                let _ = tx.send(join_msg).await;
+                tx.send(join_msg);
             }
         }
 
@@ -545,7 +540,7 @@ pub async fn handle_part(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -616,7 +611,7 @@ pub async fn handle_part(
             }
             for mid in ch.members.clone().keys() {
                 if let Some(tx) = senders.read().await.get(mid) {
-                    let _ = tx.send(part_msg.clone()).await;
+                    tx.send(part_msg.clone());
                 }
             }
             ch.members.remove(client_id);
@@ -649,7 +644,7 @@ pub async fn handle_names(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -716,7 +711,7 @@ async fn send_names_for_channel(
     ch_name: &str,
     nick: &str,
     state: &ServerState,
-    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: &Senders,
     client_id: &str,
     server: &str,
     client_caps: &std::collections::HashSet<String>,
@@ -834,7 +829,7 @@ pub async fn handle_list(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -932,7 +927,7 @@ pub async fn handle_mode(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1464,7 +1459,7 @@ pub async fn handle_mode(
             drop(ch_store);
             for mid in &member_ids_mode {
                 if let Some(tx) = senders.read().await.get(mid) {
-                    let _ = tx.send(mode_msg.clone()).await;
+                    tx.send(mode_msg.clone());
                 }
             }
             // Persist channel modes to database
@@ -1560,7 +1555,7 @@ pub async fn handle_topic(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1672,7 +1667,7 @@ pub async fn handle_topic(
         drop(ch);
         for mid in &member_ids_for_topic {
             if let Some(tx) = senders.read().await.get(mid) {
-                let _ = tx.send(topic_msg.clone()).await;
+                tx.send(topic_msg.clone());
             }
         }
 
@@ -1722,7 +1717,7 @@ pub async fn handle_kick(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1822,11 +1817,11 @@ pub async fn handle_kick(
                         .with_prefix(&source);
                 for mid in ch.members.clone().keys() {
                     if let Some(tx) = senders.read().await.get(mid) {
-                        let _ = tx.send(kick_msg.clone()).await;
+                        tx.send(kick_msg.clone());
                     }
                 }
                 if let Some(tx) = senders.read().await.get(&tid) {
-                    let _ = tx.send(kick_msg).await;
+                    tx.send(kick_msg);
                 }
                 should_remove_channel = ch.members.is_empty();
             }
@@ -1845,7 +1840,7 @@ pub async fn handle_invite(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1937,7 +1932,7 @@ pub async fn handle_invite(
             let invite_msg = Message::new("INVITE", vec![target_nick.into(), ch_name.into()])
                 .with_prefix(&source);
             if let Some(tx) = senders.read().await.get(target_id) {
-                let _ = tx.send(invite_msg.clone()).await;
+                tx.send(invite_msg.clone());
             }
             reply_to_client(
                 &senders,
@@ -1995,7 +1990,7 @@ pub async fn handle_rename(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {

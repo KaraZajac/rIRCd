@@ -115,6 +115,9 @@ pub struct ClientMessage {
     pub host: String,
     pub msg: Message,
     pub send_tx: mpsc::Sender<Message>,
+    /// Raised when this connection's outbound queue overflows, so the server can
+    /// drop the client instead of waiting for it.
+    pub kill: Arc<tokio::sync::Notify>,
     /// TLS client certificate SHA-256 fingerprint (hex), if available.
     pub certfp: Option<String>,
     /// True if this connection is over TLS.
@@ -169,8 +172,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
     }
     // Store the config path so REHASH can reload from disk
     state.write().await.config_path = Some(config_path.to_path_buf());
-    let senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let senders: crate::user::Senders = Arc::new(RwLock::new(HashMap::new()));
 
     let (tx, mut rx) = mpsc::channel::<ClientMessage>(256);
 
@@ -549,7 +551,10 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                     None => break,
                 };
                 let client_id = cm.client_id.clone();
-                senders.write().await.insert(client_id.clone(), cm.send_tx.clone());
+                senders.write().await.insert(
+                    client_id.clone(),
+                    crate::user::ClientSink::new(cm.send_tx.clone(), cm.kill.clone()),
+                );
 
                 // Store TLS client certificate fingerprint for SASL EXTERNAL
                 if let Some(ref fp) = cm.certfp {

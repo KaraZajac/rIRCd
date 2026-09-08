@@ -368,6 +368,35 @@ check("it is stored against the account",
       "2026-05-05T05:05:05" in db(f"SELECT timestamp FROM read_markers WHERE account='{ACCOUNT}'"))
 again.close()
 
+section("a client that stops reading must not stall the server")
+# Every command is handled by one loop, so awaiting a stalled client would freeze
+# the server for everyone. Regression test for exactly that.
+import socket
+
+stalled = socket.create_connection(("127.0.0.1", 16667), timeout=10)
+stalled.sendall(f"NICK stalled{RUN_ID}\r\nUSER s 0 * :s\r\nJOIN #stall{RUN_ID}\r\n".encode())
+time.sleep(1.0)  # registers and joins, then never reads again
+
+talker = Client(f"talker{RUN_ID}", caps=TAGS)
+talker.join(f"#stall{RUN_ID}")
+for batch in range(8):
+    for i in range(10):
+        talker.send(f"PRIVMSG #stall{RUN_ID} :filler {batch}-{i} " + "x" * 300)
+    time.sleep(1.0)
+talker.read(1.0)
+
+canary = Client(f"canary{RUN_ID}")
+check("a new client is still served while another is stalled",
+      bool(canary.find(" 001 ")), canary.lines[-3:])
+mark = canary.mark()
+canary.send("PING stillalive")
+canary.read(3.0)
+check("the server still answers commands", bool(canary.find("PONG", lines=canary.since(mark))),
+      canary.since(mark))
+canary.close()
+talker.close()
+stalled.close()
+
 section("REHASH and cap-notify")
 oper_client = Client("rehasher", caps=["cap-notify"])
 from harness import OPER_NAME, OPER_PASSWORD

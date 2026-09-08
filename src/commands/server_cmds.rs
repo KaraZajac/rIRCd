@@ -4,19 +4,14 @@ use crate::channel::{canonical_channel_key, ChannelStore};
 use crate::commands::{end_labeled_batch, reply_in_batch, reply_to_client, start_labeled_batch};
 use crate::config::Config;
 use crate::protocol::Message;
-use crate::user::ServerState;
-use std::collections::HashMap;
+use crate::user::{Senders, ServerState};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tracing::info;
 
-async fn send_to_client(
-    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
-    client_id: &str,
-    msg: Message,
-) {
+async fn send_to_client(senders: &Senders, client_id: &str, msg: Message) {
     if let Some(tx) = senders.read().await.get(client_id) {
-        let _ = tx.send(msg).await;
+        tx.send(msg);
     }
 }
 
@@ -28,7 +23,7 @@ pub async fn handle_lusers(
     client_id: &str,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -152,7 +147,7 @@ pub async fn handle_lusers(
 pub async fn handle_version(
     client_id: &str,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -189,7 +184,7 @@ pub async fn handle_version(
 pub async fn handle_time(
     client_id: &str,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -221,7 +216,7 @@ pub async fn handle_time(
 pub async fn handle_info(
     client_id: &str,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -275,7 +270,7 @@ pub async fn handle_info(
 pub async fn handle_links(
     client_id: &str,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -320,7 +315,7 @@ pub async fn handle_stats(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -400,7 +395,7 @@ pub async fn handle_whowas(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -533,7 +528,7 @@ pub async fn handle_help(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     _label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -733,7 +728,7 @@ pub async fn handle_knock(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -912,7 +907,7 @@ pub async fn handle_kill(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1086,7 +1081,7 @@ pub async fn handle_wallops(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1154,7 +1149,7 @@ pub async fn handle_wallops(
 pub async fn handle_rehash(
     client_id: &str,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: Arc<RwLock<Config>>,
     label: Option<&str>,
 ) -> anyhow::Result<()> {

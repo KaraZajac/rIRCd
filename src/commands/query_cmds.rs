@@ -2,9 +2,9 @@ use crate::channel::ChannelStore;
 use crate::commands::{end_labeled_batch, reply_in_batch, reply_to_client, start_labeled_batch};
 use crate::config::Config;
 use crate::protocol::Message;
-use crate::user::ServerState;
+use crate::user::{Senders, ServerState};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 /// Parse WHOX type string "%<fields>[,<token>]". Returns (requested_fields, token).
 fn parse_whox_type(s: &str) -> (Vec<char>, Option<String>) {
@@ -74,7 +74,7 @@ pub async fn handle_who(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -288,7 +288,7 @@ pub async fn handle_whois(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -542,7 +542,7 @@ pub async fn handle_monitor(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -811,7 +811,7 @@ pub async fn handle_ison(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -845,7 +845,7 @@ pub async fn handle_userhost(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {

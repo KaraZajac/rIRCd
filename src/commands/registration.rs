@@ -4,14 +4,13 @@ use crate::commands::reply_to_client;
 use crate::config::Config;
 use crate::persist::{self, RegisterError};
 use crate::protocol::Message;
-use crate::user::{Client, ScramServerState, ServerState};
+use crate::user::{Client, ScramServerState, Senders, ServerState};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -34,13 +33,9 @@ fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Send a message to a client. Returns true if the client was in senders and the send was attempted.
-async fn send_to_client(
-    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
-    client_id: &str,
-    msg: Message,
-) -> bool {
+async fn send_to_client(senders: &Senders, client_id: &str, msg: Message) -> bool {
     if let Some(tx) = senders.read().await.get(client_id) {
-        let _ = tx.send(msg).await;
+        tx.send(msg);
         true
     } else {
         false
@@ -89,7 +84,7 @@ fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
 pub async fn complete_registration(
     client_id: &str,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -349,7 +344,7 @@ pub async fn complete_registration(
 pub async fn handle_isupport(
     client_id: &str,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -396,7 +391,7 @@ pub async fn handle_webirc(
     host: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     _label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -421,12 +416,10 @@ pub async fn handle_webirc(
         tracing::warn!(client_id, ip = %ip, "WEBIRC authentication failed");
         let tx = senders.read().await.get(client_id).cloned();
         if let Some(tx) = tx {
-            let _ = tx
-                .send(
-                    Message::new("ERROR", vec![":Invalid WebIRC password".into()])
-                        .with_prefix(&cfg.server.name),
-                )
-                .await;
+            tx.send(
+                Message::new("ERROR", vec!["Invalid WebIRC password".into()])
+                    .with_prefix(&cfg.server.name),
+            );
         }
         return Ok(());
     }
@@ -442,7 +435,7 @@ pub async fn handle_cap(
     host: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -673,7 +666,7 @@ pub async fn handle_nick(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -911,7 +904,7 @@ pub async fn handle_user(
     host: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -950,7 +943,7 @@ pub async fn handle_pass(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    _senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    _senders: Senders,
     _label: Option<&str>,
 ) -> anyhow::Result<()> {
     let pass = msg
@@ -970,7 +963,7 @@ pub async fn handle_pass(
 async fn send_motd(
     nick: &str,
     server: &str,
-    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: &Senders,
     cfg: &Config,
     label: Option<&str>,
     client_id: &str,
@@ -1034,7 +1027,7 @@ async fn send_motd(
 pub async fn handle_motd(
     client_id: &str,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1053,7 +1046,7 @@ pub async fn handle_ping(
     client_id: &str,
     msg: Message,
     _state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1077,7 +1070,7 @@ pub async fn handle_pong(
     _client_id: &str,
     _msg: Message,
     _state: Arc<RwLock<ServerState>>,
-    _senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    _senders: Senders,
     _cfg: &Config,
     _label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1089,7 +1082,7 @@ pub async fn handle_quit(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1139,7 +1132,7 @@ pub async fn handle_quit(
             for (member_id, _) in ch.members.clone().iter() {
                 if member_id != client_id {
                     if let Some(tx) = senders.read().await.get(member_id) {
-                        let _ = tx.send(quit_msg.clone()).await;
+                        tx.send(quit_msg.clone());
                     }
                 }
             }
@@ -1290,7 +1283,7 @@ pub async fn handle_authenticate(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<crate::channel::ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -2063,7 +2056,7 @@ pub async fn handle_authenticate(
 
 async fn sasl_fail(
     state: Arc<RwLock<ServerState>>,
-    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: &Senders,
     client_id: &str,
     cfg: &Config,
     label: Option<&str>,
@@ -2099,7 +2092,7 @@ async fn handle_authenticate_scram_step(
     token: &str,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<crate::channel::ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -2495,7 +2488,7 @@ pub async fn handle_oper(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -2573,7 +2566,7 @@ pub async fn login_client(
     account: &str,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<crate::channel::ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) {
@@ -2683,7 +2676,7 @@ pub async fn handle_register(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<crate::channel::ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -3033,7 +3026,7 @@ pub async fn handle_verify(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<crate::channel::ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -3221,7 +3214,7 @@ pub async fn handle_away(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<crate::channel::ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -3327,7 +3320,7 @@ pub async fn handle_setname(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<crate::channel::ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -3457,7 +3450,7 @@ pub async fn handle_sethost(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -3569,7 +3562,7 @@ pub async fn handle_setuser(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -3653,7 +3646,7 @@ pub async fn handle_setuser(
 pub async fn send_chghost_if_changed(
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     client_id: &str,
     old_source: &str,
     new_user: &str,
@@ -3753,7 +3746,7 @@ pub async fn send_chghost_if_changed(
 /// `already_notified` are client IDs already notified via channel membership (to avoid duplicates).
 async fn notify_extended_monitor_watchers(
     state: &ServerState,
-    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: &Senders,
     nick: &str,
     source: &str,
     msg: Message,

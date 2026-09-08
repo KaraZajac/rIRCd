@@ -4,18 +4,18 @@ use super::reply::reply_to_client;
 use crate::config::Config;
 use crate::persist::{self, WebpushSubscription};
 use crate::protocol::Message;
-use crate::user::ServerState;
+use crate::user::{Senders, ServerState};
 use crate::webpush::{self, EndpointError};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 /// `WEBPUSH REGISTER <endpoint> <keys>` / `WEBPUSH UNREGISTER <endpoint>`.
 pub async fn handle_webpush(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {

@@ -3,18 +3,14 @@ use crate::commands::reply_to_client;
 use crate::config::Config;
 use crate::persist;
 use crate::protocol::{add_tags_for_recipient, generate_msgid, Message, SenderTags};
-use crate::user::{PendingClientBatch, PendingMultilineBatch, ServerState};
+use crate::user::{PendingClientBatch, PendingMultilineBatch, Senders, ServerState};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tracing::debug;
 
-async fn send_to_client(
-    senders: &Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
-    client_id: &str,
-    msg: Message,
-) {
+async fn send_to_client(senders: &Senders, client_id: &str, msg: Message) {
     if let Some(tx) = senders.read().await.get(client_id) {
-        let _ = tx.send(msg).await;
+        tx.send(msg);
     }
 }
 
@@ -67,7 +63,7 @@ fn is_ctcp(text: &str) -> bool {
 /// Send message to a recipient, adding server-time/msgid/account tags and client-only (+prefix) tags.
 #[allow(clippy::too_many_arguments)]
 async fn send_to_client_with_caps(
-    senders: &Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: &Senders,
     to_id: &str,
     msg: Message,
     recipient_caps: &std::collections::HashSet<String>,
@@ -176,7 +172,7 @@ pub async fn handle_privmsg(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -638,7 +634,7 @@ pub async fn handle_notice(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -854,7 +850,7 @@ pub async fn deliver_multiline_batch(
     batch: PendingMultilineBatch,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1181,7 +1177,7 @@ pub async fn handle_tagmsg(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1391,7 +1387,7 @@ pub async fn handle_redact(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1633,7 +1629,7 @@ pub async fn handle_chathistory(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1973,7 +1969,7 @@ pub async fn handle_markread(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -2078,7 +2074,7 @@ pub async fn deliver_client_batch(
     batch: PendingClientBatch,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     _label: Option<&str>,
 ) -> anyhow::Result<()> {

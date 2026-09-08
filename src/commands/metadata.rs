@@ -4,10 +4,9 @@ use crate::channel::{canonical_channel_key, ChannelStore};
 use crate::commands::reply_to_client;
 use crate::config::Config;
 use crate::protocol::{generate_msgid, Message};
-use crate::user::ServerState;
-use std::collections::HashMap;
+use crate::user::{Senders, ServerState};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 /// Max metadata keys allowed per target
 const MAX_METADATA_KEYS: usize = 50;
@@ -77,7 +76,7 @@ async fn target_exists(
 /// Always ends with 762 RPL_METADATAEND.
 #[allow(clippy::too_many_arguments)]
 async fn send_metadata_batch(
-    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: &Senders,
     client_id: &str,
     nick: &str,
     target: &str,
@@ -155,7 +154,7 @@ async fn send_metadata_batch(
 async fn broadcast_metadata_event(
     state: &Arc<RwLock<ServerState>>,
     channels: &Arc<RwLock<ChannelStore>>,
-    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: &Senders,
     setter_source: &str,
     setter_id: &str,
     target: &str,
@@ -220,7 +219,7 @@ async fn broadcast_metadata_event(
 
     for id in notify_ids {
         if let Some(tx) = senders.read().await.get(&id) {
-            let _ = tx.send(event.clone()).await;
+            tx.send(event.clone());
         }
     }
 }
@@ -228,7 +227,7 @@ async fn broadcast_metadata_event(
 /// Called by the JOIN handler to push current channel metadata to a newly joined client.
 /// Pre-collected entries avoid re-acquiring the ServerState lock inside a read guard.
 pub async fn send_channel_metadata_on_join(
-    senders: &Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: &Senders,
     client_id: &str,
     channel: &str,
     nick: &str,
@@ -259,7 +258,7 @@ pub async fn handle_metadata(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {

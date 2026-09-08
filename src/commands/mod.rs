@@ -14,9 +14,9 @@ pub use reply::{
 use crate::channel::ChannelStore;
 use crate::config::Config;
 use crate::protocol::Message;
-use crate::user::{PendingClientBatch, PendingMultilineBatch, ServerState};
+use crate::user::{PendingClientBatch, PendingMultilineBatch, Senders, ServerState};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 pub async fn handle_message(
     client_id: String,
@@ -24,7 +24,7 @@ pub async fn handle_message(
     msg: Message,
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
-    senders: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>>,
+    senders: Senders,
     cfg: Arc<RwLock<Config>>,
 ) -> anyhow::Result<()> {
     // labeled-response: label values MUST NOT exceed 64 bytes

@@ -61,6 +61,9 @@ stop_everything() {
   if [ -f "$ETC_DIR/rircd.pid" ]; then
     kill "$(cat "$ETC_DIR/rircd.pid")" 2>/dev/null || true
   fi
+  # A wedged or orphaned server keeps the port, and the next run would silently
+  # attach to it instead of to the build under test.
+  pkill -f "rircd --config $ETC_DIR/config.toml" 2>/dev/null || true
   if [ -f "$RUN_DIR/smtp.pid" ]; then
     kill "$(cat "$RUN_DIR/smtp.pid")" 2>/dev/null || true
   fi
@@ -209,9 +212,28 @@ for _ in $(seq 1 30); do
   fi
   sleep 0.5
 done
-python3 -c "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('$BIND',$IRC_PORT))==0 else 1)" \
-  || { echo "rircd did not start; see $SERVER_LOG" >&2; tail -20 "$SERVER_LOG" >&2; exit 1; }
-say "Server up. Log: $SERVER_LOG"
+python3 - "$BIND" "$IRC_PORT" <<'PROBE' || { echo "rircd is not answering; see $SERVER_LOG" >&2; tail -20 "$SERVER_LOG" >&2; exit 1; }
+import socket, sys, time
+host, port = sys.argv[1], int(sys.argv[2])
+try:
+    s = socket.create_connection((host, port), timeout=5)
+    s.sendall(b"NICK smokeprobe\r\nUSER smokeprobe 0 * :probe\r\n")
+    s.settimeout(5)
+    got, end = b"", time.time() + 5
+    while time.time() < end:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        got += chunk
+        if b" 001 " in got:
+            break
+    s.sendall(b"QUIT :probe\r\n")
+    s.close()
+    sys.exit(0 if b" 001 " in got else 1)
+except OSError:
+    sys.exit(1)
+PROBE
+say "Server up and answering. Log: $SERVER_LOG"
 fi  # end of environment bring-up
 
 export SMOKE_IRC_HOST="$BIND"

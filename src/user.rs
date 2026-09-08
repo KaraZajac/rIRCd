@@ -3,7 +3,7 @@ use crate::protocol::Message;
 use chrono::Utc;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 // ─── WHOWAS ───────────────────────────────────────────────────────────────────
 
@@ -332,6 +332,42 @@ impl MonitorWatchers {
     }
 }
 
+/// The outbound side of one client connection.
+///
+/// Sends never wait. Every command in the server is handled by a single loop, so
+/// awaiting a client that has stopped draining its queue would stall the server
+/// for everyone; a client that falls that far behind is disconnected instead,
+/// which is what "SendQ exceeded" has always meant on IRC.
+#[derive(Clone, Debug)]
+pub struct ClientSink {
+    tx: mpsc::Sender<Message>,
+    kill: Arc<tokio::sync::Notify>,
+}
+
+impl ClientSink {
+    pub fn new(tx: mpsc::Sender<Message>, kill: Arc<tokio::sync::Notify>) -> Self {
+        Self { tx, kill }
+    }
+
+    /// Queue a message. Returns false if it could not be queued, in which case
+    /// the connection has been marked for disconnection.
+    pub fn send(&self, msg: Message) -> bool {
+        match self.tx.try_send(msg) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // notify_one leaves a permit, so the connection sees this even if
+                // it is not waiting on the signal at this instant.
+                self.kill.notify_one();
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+}
+
+/// Outbound channels for every connected client, keyed by client id.
+pub type Senders = Arc<RwLock<HashMap<String, ClientSink>>>;
+
 /// Shared server state: all clients and channels
 #[derive(Debug, Default)]
 pub struct ServerState {
@@ -472,5 +508,48 @@ impl ServerState {
 
     pub fn record_msgid(&mut self, msgid: String, target: String, sender_id: String) {
         self.msgid_store.record(msgid, target, sender_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn msg() -> Message {
+        Message::new("PRIVMSG", vec!["#chan".into(), "hi".into()])
+    }
+
+    /// The whole server is driven by one loop, so a send to a client that has
+    /// stopped reading must fail immediately and mark that client for
+    /// disconnection rather than wait for space.
+    #[tokio::test]
+    async fn sink_never_waits_on_a_full_queue() {
+        let (tx, _rx) = mpsc::channel(1);
+        let kill = Arc::new(tokio::sync::Notify::new());
+        let sink = ClientSink::new(tx, kill.clone());
+
+        assert!(sink.send(msg()), "first message fits");
+        assert!(!sink.send(msg()), "second message must not block");
+
+        tokio::time::timeout(Duration::from_secs(1), kill.notified())
+            .await
+            .expect("the connection is signalled to close");
+    }
+
+    #[tokio::test]
+    async fn sink_reports_a_closed_connection() {
+        let (tx, rx) = mpsc::channel(4);
+        let kill = Arc::new(tokio::sync::Notify::new());
+        let sink = ClientSink::new(tx, kill.clone());
+        drop(rx);
+
+        assert!(!sink.send(msg()), "a closed connection cannot be sent to");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), kill.notified())
+                .await
+                .is_err(),
+            "an already-closed connection needs no kill signal"
+        );
     }
 }

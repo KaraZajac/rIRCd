@@ -1,10 +1,15 @@
 use crate::protocol::{format_message, parse_message, Message, ParseError};
 use crate::server::ClientMessage;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 const BUF_SIZE: usize = 8192;
+
+/// Outbound queue depth per client. Large enough for legitimate bursts such as a
+/// NAMES reply on a busy channel; a client that lets it fill is not reading.
+const SEND_QUEUE: usize = 1024;
 
 /// Keepalive timeout values passed from config.
 #[derive(Clone, Copy)]
@@ -79,10 +84,10 @@ async fn handle_client_stream<S>(
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::with_capacity(BUF_SIZE, reader);
 
-    let (send_tx, mut send_rx) = mpsc::channel::<Message>(64);
+    let (send_tx, mut send_rx) = mpsc::channel::<Message>(SEND_QUEUE);
 
     let client_id_clone = client_id.clone();
-    tokio::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         while let Some(msg) = send_rx.recv().await {
             let line = format_message(&msg);
             if writer.write_all(line.as_bytes()).await.is_err() || writer.flush().await.is_err() {
@@ -91,6 +96,10 @@ async fn handle_client_stream<S>(
             }
         }
     });
+
+    // Raised when the outbound queue overflows: the peer is not reading, and the
+    // server must not wait for it.
+    let kill = Arc::new(tokio::sync::Notify::new());
 
     // Flood control: classic IRC token bucket
     const FLOOD_CAPACITY: f64 = 10.0;
@@ -121,6 +130,12 @@ async fn handle_client_stream<S>(
         };
 
         tokio::select! {
+            // The outbound queue overflowed: this peer is not reading.
+            _ = kill.notified() => {
+                warn!(client = %client_id, "SendQ exceeded, disconnecting client");
+                quit_reason = "SendQ exceeded";
+                break;
+            }
             result = reader.read_until(b'\n', &mut buf) => {
                 match result {
                     Ok(0) => break,
@@ -136,7 +151,7 @@ async fn handle_client_stream<S>(
                             Ok(s) => s,
                             Err(_) => {
                                 let _ = send_tx
-                                    .send(
+                        .try_send(
                                         Message::new(
                                             "FAIL",
                                             vec![
@@ -146,8 +161,7 @@ async fn handle_client_stream<S>(
                                             ],
                                         )
                                         .with_prefix(&server_name),
-                                    )
-                                    .await;
+                                    );
                                 buf.clear();
                                 continue;
                             }
@@ -185,7 +199,7 @@ async fn handle_client_stream<S>(
                                             ],
                                         )
                                         .with_prefix(&server_name);
-                                        let _ = send_tx.send(reply).await;
+                                        let _ = send_tx.try_send(reply);
                                         buf.clear();
                                         continue;
                                     }
@@ -198,6 +212,7 @@ async fn handle_client_stream<S>(
                                         host: host.clone(),
                                         msg,
                                         send_tx: send_tx.clone(),
+                                        kill: kill.clone(),
                                         certfp: certfp.clone(),
                                         is_tls,
                                     })
@@ -226,7 +241,7 @@ async fn handle_client_stream<S>(
                                     )
                                     .with_prefix(&server_name),
                                 };
-                                let _ = send_tx.send(reply).await;
+                                let _ = send_tx.try_send(reply);
                             }
                         }
                         buf.clear();
@@ -242,29 +257,26 @@ async fn handle_client_stream<S>(
                     // No PONG received within disconnect timeout — drop connection
                     info!("Ping timeout for {}", client_id);
                     let _ = send_tx
-                        .send(Message::new("ERROR", vec!["Closing link: Ping timeout".into()]))
-                        .await;
+                        .try_send(Message::new("ERROR", vec!["Closing link: Ping timeout".into()]));
                     quit_reason = "Ping timeout";
                     break;
                 } else if !registered {
                     // Registration timeout — client never completed registration
                     info!("Registration timeout for {}", client_id);
                     let _ = send_tx
-                        .send(Message::new(
+                        .try_send(Message::new(
                             "ERROR",
                             vec!["Closing link: Registration timeout".into()],
-                        ))
-                        .await;
+                        ));
                     quit_reason = "Registration timeout";
                     break;
                 } else {
                     // Send PING to check if client is alive
                     let _ = send_tx
-                        .send(
+                        .try_send(
                             Message::new("PING", vec![server_name.clone()])
                                 .with_prefix(&server_name),
-                        )
-                        .await;
+                        );
                     ping_sent = true;
                 }
             }
@@ -272,12 +284,14 @@ async fn handle_client_stream<S>(
     }
 
     info!("Client disconnected: {}", client_id);
+    writer_task.abort();
     let _ = tx
         .send(ClientMessage {
             client_id: client_id.clone(),
             host,
             msg: Message::new("QUIT", vec![quit_reason.into()]),
             send_tx,
+            kill,
             certfp,
             is_tls,
         })
@@ -300,7 +314,8 @@ pub async fn handle_client_ws(
 
     info!("Client connected (WebSocket): {} from {}", client_id, host);
 
-    let (send_tx, mut send_rx) = mpsc::channel::<Message>(64);
+    let (send_tx, mut send_rx) = mpsc::channel::<Message>(SEND_QUEUE);
+    let kill = Arc::new(tokio::sync::Notify::new());
 
     // Flood control
     const FLOOD_CAPACITY: f64 = 10.0;
@@ -328,6 +343,11 @@ pub async fn handle_client_ws(
         };
 
         tokio::select! {
+            _ = kill.notified() => {
+                warn!(client = %client_id, "SendQ exceeded, disconnecting WebSocket client");
+                quit_reason = "SendQ exceeded";
+                break;
+            }
             // Write outgoing IRC messages to WebSocket as text frames (no CRLF)
             Some(msg) = send_rx.recv() => {
                 let mut line = format_message(&msg);
@@ -372,7 +392,7 @@ pub async fn handle_client_ws(
                                             "NOTICE",
                                             vec!["*".into(), "Flood control: you are sending messages too fast".into()],
                                         ).with_prefix(&server_name);
-                                        let _ = send_tx.send(reply).await;
+                                        let _ = send_tx.try_send(reply);
                                         continue;
                                     }
                                     flood_tokens -= 1.0;
@@ -383,6 +403,7 @@ pub async fn handle_client_ws(
                                     host: host.clone(),
                                     msg,
                                     send_tx: send_tx.clone(),
+                                    kill: kill.clone(),
                                     certfp: certfp.clone(),
                                     is_tls,
                                 }).await.is_err() {
@@ -399,7 +420,7 @@ pub async fn handle_client_ws(
                                         "NOTICE", vec!["*".into(), format!("Parse error: {}", e)],
                                     ).with_prefix(&server_name),
                                 };
-                                let _ = send_tx.send(reply).await;
+                                let _ = send_tx.try_send(reply);
                             }
                         }
                     }
@@ -409,7 +430,7 @@ pub async fn handle_client_ws(
                             Ok(s) => s.trim(),
                             Err(_) => {
                                 let _ = send_tx
-                                    .send(
+                        .try_send(
                                         Message::new(
                                             "FAIL",
                                             vec![
@@ -419,8 +440,7 @@ pub async fn handle_client_ws(
                                             ],
                                         )
                                         .with_prefix(&server_name),
-                                    )
-                                    .await;
+                                    );
                                 continue;
                             }
                         };
@@ -451,7 +471,7 @@ pub async fn handle_client_ws(
                                             "NOTICE",
                                             vec!["*".into(), "Flood control: you are sending messages too fast".into()],
                                         ).with_prefix(&server_name);
-                                        let _ = send_tx.send(reply).await;
+                                        let _ = send_tx.try_send(reply);
                                         continue;
                                     }
                                     flood_tokens -= 1.0;
@@ -462,6 +482,7 @@ pub async fn handle_client_ws(
                                     host: host.clone(),
                                     msg,
                                     send_tx: send_tx.clone(),
+                                    kill: kill.clone(),
                                     certfp: certfp.clone(),
                                     is_tls,
                                 }).await.is_err() {
@@ -485,27 +506,24 @@ pub async fn handle_client_ws(
                 if ping_sent {
                     info!("Ping timeout for {} (ws)", client_id);
                     let _ = send_tx
-                        .send(Message::new("ERROR", vec!["Closing link: Ping timeout".into()]))
-                        .await;
+                        .try_send(Message::new("ERROR", vec!["Closing link: Ping timeout".into()]));
                     quit_reason = "Ping timeout";
                     break;
                 } else if !registered {
                     info!("Registration timeout for {} (ws)", client_id);
                     let _ = send_tx
-                        .send(Message::new(
+                        .try_send(Message::new(
                             "ERROR",
                             vec!["Closing link: Registration timeout".into()],
-                        ))
-                        .await;
+                        ));
                     quit_reason = "Registration timeout";
                     break;
                 } else {
                     let _ = send_tx
-                        .send(
+                        .try_send(
                             Message::new("PING", vec![server_name.clone()])
                                 .with_prefix(&server_name),
-                        )
-                        .await;
+                        );
                     ping_sent = true;
                 }
             }
@@ -519,6 +537,7 @@ pub async fn handle_client_ws(
             host,
             msg: Message::new("QUIT", vec![quit_reason.into()]),
             send_tx,
+            kill,
             certfp,
             is_tls,
         })
