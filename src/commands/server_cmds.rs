@@ -36,6 +36,7 @@ pub async fn handle_lusers(
     };
 
     let total_users = state.clients.len();
+    let peak_users = state.max_clients.max(total_users);
     let mut ops = 0usize;
     let mut invisible_users = 0usize;
     for c in state.clients.values() {
@@ -115,8 +116,8 @@ pub async fn handle_lusers(
         vec![
             nick.clone(),
             total_users.to_string(),
-            total_users.to_string(),
-            format!("Current local users {}, max {}", total_users, total_users),
+            peak_users.to_string(),
+            format!("Current local users {}, max {}", total_users, peak_users),
         ],
     )
     .with_prefix(s));
@@ -127,8 +128,8 @@ pub async fn handle_lusers(
         vec![
             nick.clone(),
             total_users.to_string(),
-            total_users.to_string(),
-            format!("Current global users {}, max {}", total_users, total_users),
+            peak_users.to_string(),
+            format!("Current global users {}, max {}", total_users, peak_users),
         ],
     )
     .with_prefix(s));

@@ -424,6 +424,10 @@ pub struct ServerState {
     /// Server bans, matched on connection. Kept in memory so a connection never
     /// waits on the database.
     pub server_bans: Vec<crate::persist::ServerBan>,
+    /// Most clients connected at once since start, for the `max` field of
+    /// RPL_LOCALUSERS/RPL_GLOBALUSERS. Clients come and go, so the current
+    /// count is not a high-water mark.
+    pub max_clients: usize,
 }
 
 /// In-flight draft/multiline batch for one client
@@ -508,6 +512,7 @@ impl ServerState {
         let id = client.id.clone();
         let client = Arc::new(RwLock::new(client));
         self.clients.insert(id.clone(), client.clone());
+        self.max_clients = self.max_clients.max(self.clients.len());
         if let Some(ref nick) = client.read().await.nick {
             self.nick_to_id.insert(nick.to_uppercase(), id);
         }
