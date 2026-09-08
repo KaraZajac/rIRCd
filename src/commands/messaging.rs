@@ -2,7 +2,7 @@ use crate::channel::{canonical_channel_key, ChannelStore};
 use crate::commands::reply_to_client;
 use crate::config::Config;
 use crate::persist;
-use crate::protocol::{add_tags_for_recipient, generate_msgid, Message};
+use crate::protocol::{add_tags_for_recipient, generate_msgid, Message, SenderTags};
 use crate::user::{PendingClientBatch, PendingMultilineBatch, ServerState};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -75,7 +75,7 @@ async fn send_to_client_with_caps(
     msgid: Option<&str>,
     client_only_tags: Option<&std::collections::HashMap<String, Option<String>>>,
     client_tag_deny: Option<&[String]>,
-    sender_is_bot: bool,
+    sender: &SenderTags,
 ) {
     let tagged = add_tags_for_recipient(
         msg,
@@ -84,7 +84,7 @@ async fn send_to_client_with_caps(
         msgid,
         client_only_tags,
         client_tag_deny,
-        sender_is_bot,
+        sender,
     );
     send_to_client(senders, to_id, tagged).await;
 }
@@ -131,7 +131,7 @@ async fn push_notify(
     base_msg: &Message,
     msgid: &str,
     sender_account: Option<&str>,
-    sender_is_bot: bool,
+    sender: &SenderTags,
     channel_text: Option<&str>,
 ) {
     if cfg.webpush_runtime.is_none() {
@@ -166,7 +166,7 @@ async fn push_notify(
         Some(msgid),
         None,
         cfg.server.client_tag_deny.as_deref(),
-        sender_is_bot,
+        sender,
     );
     crate::webpush::notify(cfg, &account, &tagged);
 }
@@ -239,7 +239,7 @@ pub async fn handle_privmsg(
         .unwrap_or_else(|| client_id.to_string());
     let sender_nick = sender_data.nick_or_id().to_string();
     let sender_account = sender_data.account.clone();
-    let sender_is_bot = sender_data.bot;
+    let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
     let echo_message = sender_data.has_cap("echo-message");
     drop(sender_data);
     drop(state_guard);
@@ -496,7 +496,7 @@ pub async fn handle_privmsg(
                             Some(&msgid),
                             Some(&msg.tags),
                             cfg.server.client_tag_deny.as_deref(),
-                            sender_is_bot,
+                            &sender_tags,
                         );
                         reply_to_client(&senders, client_id, tagged, label).await;
                     }
@@ -515,7 +515,7 @@ pub async fn handle_privmsg(
                     Some(&msgid),
                     Some(&msg.tags),
                     cfg.server.client_tag_deny.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                 )
                 .await;
                 push_notify(
@@ -525,7 +525,7 @@ pub async fn handle_privmsg(
                     &base_msg,
                     &msgid,
                     sender_account.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                     Some(&text),
                 )
                 .await;
@@ -572,7 +572,7 @@ pub async fn handle_privmsg(
                 Some(&msgid),
                 Some(&msg.tags),
                 cfg.server.client_tag_deny.as_deref(),
-                sender_is_bot,
+                &sender_tags,
             )
             .await;
             push_notify(
@@ -582,7 +582,7 @@ pub async fn handle_privmsg(
                 &privmsg,
                 &msgid,
                 sender_account.as_deref(),
-                sender_is_bot,
+                &sender_tags,
                 None,
             )
             .await;
@@ -614,7 +614,7 @@ pub async fn handle_privmsg(
                     Some(&msgid),
                     Some(&msg.tags),
                     cfg.server.client_tag_deny.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                 );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
@@ -664,7 +664,7 @@ pub async fn handle_notice(
         .source()
         .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
-    let sender_is_bot = sender_data.bot;
+    let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
     let echo_message = sender_data.has_cap("echo-message");
     drop(sender_data);
     drop(state_guard);
@@ -745,7 +745,7 @@ pub async fn handle_notice(
                             Some(&msgid),
                             Some(&msg.tags),
                             cfg.server.client_tag_deny.as_deref(),
-                            sender_is_bot,
+                            &sender_tags,
                         );
                         reply_to_client(&senders, client_id, tagged, label).await;
                     }
@@ -764,7 +764,7 @@ pub async fn handle_notice(
                     Some(&msgid),
                     Some(&msg.tags),
                     cfg.server.client_tag_deny.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                 )
                 .await;
                 push_notify(
@@ -774,7 +774,7 @@ pub async fn handle_notice(
                     &base_msg,
                     &msgid,
                     sender_account.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                     Some(&text),
                 )
                 .await;
@@ -809,7 +809,7 @@ pub async fn handle_notice(
                 Some(&msgid),
                 Some(&msg.tags),
                 cfg.server.client_tag_deny.as_deref(),
-                sender_is_bot,
+                &sender_tags,
             )
             .await;
             push_notify(
@@ -819,7 +819,7 @@ pub async fn handle_notice(
                 &base_msg,
                 &msgid,
                 sender_account.as_deref(),
-                sender_is_bot,
+                &sender_tags,
                 None,
             )
             .await;
@@ -835,7 +835,7 @@ pub async fn handle_notice(
                     Some(&msgid),
                     Some(&msg.tags),
                     cfg.server.client_tag_deny.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                 );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
@@ -923,7 +923,7 @@ pub async fn deliver_multiline_batch(
         return Ok(());
     }
 
-    let (source, sender_account, sender_is_bot, echo_message) = {
+    let (source, sender_account, sender_tags, echo_message) = {
         let state_guard = state.read().await;
         let client = match state_guard.clients.get(client_id) {
             Some(c) => c.clone(),
@@ -932,9 +932,9 @@ pub async fn deliver_multiline_batch(
         let g = client.read().await;
         let source = g.source().unwrap_or_else(|| client_id.to_string());
         let account = g.account.clone();
-        let is_bot = g.bot;
+        let tags = SenderTags::new(g.bot, g.oper_name.clone());
         let echo = g.has_cap("echo-message");
-        (source, account, is_bot, echo)
+        (source, account, tags, echo)
     };
 
     let msgid = generate_msgid();
@@ -1046,7 +1046,7 @@ pub async fn deliver_multiline_batch(
                     Some(&msgid),
                     None,
                     cfg.server.client_tag_deny.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                 );
                 send_to_client(&senders, mid, tagged).await;
             }
@@ -1067,7 +1067,7 @@ pub async fn deliver_multiline_batch(
                     Some(&msgid),
                     None,
                     cfg.server.client_tag_deny.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                 );
                 send_to_client(&senders, mid, tagged).await;
             }
@@ -1117,7 +1117,7 @@ pub async fn deliver_multiline_batch(
                     Some(&msgid),
                     None,
                     cfg.server.client_tag_deny.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                 );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
@@ -1138,7 +1138,7 @@ pub async fn deliver_multiline_batch(
                     Some(&msgid),
                     None,
                     cfg.server.client_tag_deny.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                 );
                 reply_to_client(&senders, client_id, tagged, label).await;
             }
@@ -1202,7 +1202,7 @@ pub async fn handle_tagmsg(
         .source()
         .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
-    let sender_is_bot = sender_data.bot;
+    let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
     let echo_message = sender_data.has_cap("echo-message");
     drop(sender_data);
     drop(state_guard);
@@ -1315,7 +1315,7 @@ pub async fn handle_tagmsg(
                             Some(&msgid),
                             Some(&msg.tags),
                             cfg.server.client_tag_deny.as_deref(),
-                            sender_is_bot,
+                            &sender_tags,
                         );
                         reply_to_client(&senders, client_id, tagged, label).await;
                         continue;
@@ -1329,7 +1329,7 @@ pub async fn handle_tagmsg(
                         Some(&msgid),
                         Some(&msg.tags),
                         cfg.server.client_tag_deny.as_deref(),
-                        sender_is_bot,
+                        &sender_tags,
                     )
                     .await;
                 }
@@ -1352,7 +1352,7 @@ pub async fn handle_tagmsg(
                     Some(&msgid),
                     Some(&msg.tags),
                     cfg.server.client_tag_deny.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                 )
                 .await;
             }
@@ -1369,7 +1369,7 @@ pub async fn handle_tagmsg(
                         Some(&msgid),
                         Some(&msg.tags),
                         cfg.server.client_tag_deny.as_deref(),
-                        sender_is_bot,
+                        &sender_tags,
                     );
                     reply_to_client(&senders, client_id, tagged, label).await;
                 }
@@ -1922,7 +1922,7 @@ pub async fn handle_chathistory(
             e.msgid.as_deref(),
             None,
             cfg.server.client_tag_deny.as_deref(),
-            false, // CHATHISTORY replay: bot status not available from DB
+            &SenderTags::default(), // replayed history carries no live sender state
         );
         send_to_client(&senders, client_id, tagged).await;
     }
@@ -2076,7 +2076,7 @@ pub async fn deliver_client_batch(
         return Ok(());
     }
 
-    let (source, sender_account, sender_is_bot) = {
+    let (source, sender_account, sender_tags) = {
         let state_r = state.read().await;
         let client = match state_r.clients.get(client_id) {
             Some(c) => c.clone(),
@@ -2085,8 +2085,8 @@ pub async fn deliver_client_batch(
         let g = client.read().await;
         let source = g.source().unwrap_or_else(|| client_id.to_string());
         let account = g.account.clone();
-        let is_bot = g.bot;
-        (source, account, is_bot)
+        let tags = SenderTags::new(g.bot, g.oper_name.clone());
+        (source, account, tags)
     };
 
     let state_r = state.read().await;
@@ -2149,7 +2149,7 @@ pub async fn deliver_client_batch(
                     None,
                     None,
                     cfg.server.client_tag_deny.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                 );
                 send_to_client(&senders, mid, tagged).await;
             }
@@ -2167,7 +2167,7 @@ pub async fn deliver_client_batch(
                     None,
                     None,
                     cfg.server.client_tag_deny.as_deref(),
-                    sender_is_bot,
+                    &sender_tags,
                 );
                 send_to_client(&senders, mid, tagged).await;
             }

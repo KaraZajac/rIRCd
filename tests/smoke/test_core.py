@@ -27,6 +27,7 @@ for cap in [
     "draft/chathistory",
     "draft/account-registration=",
     "draft/webpush",
+    "draft/oper-tag",
 ]:
     check(f"advertises {cap.rstrip('=')}", cap in cap_ls, cap_ls[:300])
 

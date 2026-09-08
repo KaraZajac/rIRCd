@@ -443,6 +443,7 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **draft/extended-isupport** | Full | ISUPPORT command; 005 before registration |
 | **whox** | Full | WHO with %fields; 354 RPL_WHOSPCRPL |
 | **bot** | Full | Umode +B; RPL_WHOISBOT (335) in WHOIS |
+| **draft/oper-tag** | Full | `draft/oper=<name>` tag on messages from IRC operators, for clients with the cap |
 | **message-redaction** | Full | REDACT command; soft-delete in DB; CHATHISTORY replays REDACT events for client sync |
 | **draft/message-edit** | Full | PRIVMSG with `+draft/edit=<msgid>` tag; DB-backed ownership check; edit history replayed in CHATHISTORY |
 | **draft/react** | Full | TAGMSG with `+draft/react=<emoji>`; forwarded via client-only tag relay |

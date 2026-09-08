@@ -483,6 +483,35 @@ check("KILL disconnects the target",
       victim.since(mark))
 victim.close()
 
+section("draft/oper-tag")
+watcher_oper = Client("opwatch", caps=TAGS + ["message-tags", "draft/oper-tag"])
+watcher_plain = Client("opplain", caps=TAGS + ["message-tags"])
+watcher_oper.join("#opers")
+watcher_plain.join("#opers")
+oper.join("#opers")
+
+mark_o, mark_p = watcher_oper.mark(), watcher_plain.mark()
+oper.send("PRIVMSG #opers :speaking as an operator")
+watcher_oper.read(1.5)
+watcher_plain.read(1.5)
+tagged_line = watcher_oper.find("speaking as an operator", lines=watcher_oper.since(mark_o))
+plain_line = watcher_plain.find("speaking as an operator", lines=watcher_plain.since(mark_p))
+check("draft/oper tag added for capable clients",
+      bool(tagged_line) and "draft/oper=" in tagged_line[0], watcher_oper.since(mark_o))
+check("the tag names the operator",
+      bool(tagged_line) and f"draft/oper={OPER_NAME}" in tagged_line[0], tagged_line)
+check("clients without the cap see no oper tag",
+      bool(plain_line) and "draft/oper" not in plain_line[0], plain_line)
+
+mark_o = watcher_oper.mark()
+watcher_plain.send("PRIVMSG #opers :just a regular user")
+watcher_oper.read(1.5)
+regular = watcher_oper.find("just a regular user", lines=watcher_oper.since(mark_o))
+check("non-operators are not tagged",
+      bool(regular) and "draft/oper" not in regular[0], regular)
+watcher_oper.close()
+watcher_plain.close()
+
 section("STATS, WHOWAS, ISON, USERHOST")
 mark = oper.mark()
 oper.send("STATS u")

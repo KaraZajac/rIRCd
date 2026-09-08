@@ -52,6 +52,8 @@ pub struct Client {
     pub monitor_list: std::collections::HashSet<String>,
     /// True after successful OPER
     pub oper: bool,
+    /// Operator name from the successful OPER, used as the draft/oper tag value
+    pub oper_name: Option<String>,
     /// Virtual host (cloak) shown to others; used in source() when set
     pub vhost: Option<String>,
     /// Virtual username shown to others; used in source() when set
@@ -86,6 +88,7 @@ impl Client {
             bot: false,
             monitor_list: std::collections::HashSet::new(),
             oper: false,
+            oper_name: None,
             vhost: None,
             vuser: None,
             invisible: false,

@@ -47,6 +47,7 @@ pub const CAPS: &[&str] = &[
     "draft/event-playback",
     "draft/auto-join",
     "draft/webpush",
+    "draft/oper-tag",
     "sts",
 ];
 

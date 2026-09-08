@@ -70,6 +70,21 @@ pub fn add_server_time(tags: &mut HashMap<String, Option<String>>) {
 /// Add IRCv3 tags for a recipient: server-time, msgid, account, bot; then client-only tags (+prefix).
 /// Server tags are added first per spec; client_only_tags (e.g. +typing, +react) are relayed as-is.
 /// If client_tag_deny is set, listed tags (or "*" for all) are not added.
+/// Attributes of the message's sender that become tags on the recipient's copy.
+#[derive(Debug, Clone, Default)]
+pub struct SenderTags {
+    /// Sender has umode +B (bot).
+    pub is_bot: bool,
+    /// Operator name when the sender is an IRC operator (draft/oper-tag).
+    pub oper: Option<String>,
+}
+
+impl SenderTags {
+    pub fn new(is_bot: bool, oper: Option<String>) -> Self {
+        Self { is_bot, oper }
+    }
+}
+
 pub fn add_tags_for_recipient(
     mut msg: Message,
     recipient_caps: &HashSet<String>,
@@ -77,7 +92,7 @@ pub fn add_tags_for_recipient(
     msgid: Option<&str>,
     client_only_tags: Option<&HashMap<String, Option<String>>>,
     client_tag_deny: Option<&[String]>,
-    sender_is_bot: bool,
+    sender: &SenderTags,
 ) -> Message {
     if !recipient_caps.is_empty() {
         if recipient_caps.contains("server-time") {
@@ -96,8 +111,15 @@ pub fn add_tags_for_recipient(
             }
         }
         // bot tag: SHOULD be added to messages from bots, only to clients with message-tags
-        if sender_is_bot && recipient_caps.contains("message-tags") {
+        if sender.is_bot && recipient_caps.contains("message-tags") {
             msg.tags.insert("bot".to_string(), None);
+        }
+        // draft/oper-tag: mark messages from an IRC operator for clients that asked.
+        if recipient_caps.contains("draft/oper-tag") && recipient_caps.contains("message-tags") {
+            if let Some(ref oper_name) = sender.oper {
+                msg.tags
+                    .insert("draft/oper".to_string(), Some(oper_name.clone()));
+            }
         }
     }
     let deny_all = client_tag_deny
