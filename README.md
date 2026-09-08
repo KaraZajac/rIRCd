@@ -307,11 +307,13 @@ The PID file is written to the same directory as `config.toml` (e.g. `/etc/rIRCd
 
 ## User Accounts
 
-User registration is handled via the IRC `REGISTER` command (draft/account-registration) from any connected client:
+User registration is handled via the IRC `REGISTER` command (draft/account-registration):
 
 ```
 REGISTER * [email|*] <password>
 ```
+
+The account name must be `*` or your current nick — the server advertises `before-connect` (so registering during connection negotiation, before `CAP END`, works) but not `custom-account-name`.
 
 This stores a bcrypt hash of the password (for SASL PLAIN) and full SCRAM credentials (for SASL SCRAM-SHA-256) in MariaDB. Passwords must be at least 6 characters. On success the client is logged in immediately, exactly as if it had authenticated with SASL.
 

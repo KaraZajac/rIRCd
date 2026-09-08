@@ -2672,31 +2672,20 @@ pub async fn handle_register(
             return Ok(());
         }
     };
-    let (_nick, account) = {
-        let state_guard = state.read().await;
-        let client = match state_guard.clients.get(client_id) {
-            Some(c) => c.clone(),
-            None => {
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    Message::new(
-                        "FAIL",
-                        vec![
-                            "REGISTER".into(),
-                            "COMPLETE_CONNECTION_REQUIRED".into(),
-                            "Complete connection registration first".into(),
-                        ],
-                    )
-                    .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
-                return Ok(());
+    let account = {
+        // before-connect: a client may register before it finishes connecting, so
+        // read the nick and account from the pending connection in that case.
+        let (nick, current_account) = {
+            let state_r = state.read().await;
+            if let Some(c) = state_r.clients.get(client_id) {
+                let g = c.read().await;
+                (g.nick.clone().unwrap_or_default(), g.account.clone())
+            } else if let Some(conn) = state_r.pending.get(client_id) {
+                (conn.nick.clone().unwrap_or_default(), conn.account.clone())
+            } else {
+                (String::new(), None)
             }
         };
-        let g = client.read().await;
-        let nick = g.nick.as_deref().unwrap_or("").to_string();
         if nick.is_empty() {
             reply_to_client(
                 &senders,
@@ -2716,8 +2705,7 @@ pub async fn handle_register(
             .await;
             return Ok(());
         }
-        if g.account.is_some() {
-            let acc = g.account.as_deref().unwrap_or("*");
+        if let Some(acc) = current_account {
             reply_to_client(
                 &senders,
                 client_id,
@@ -2726,7 +2714,7 @@ pub async fn handle_register(
                     vec![
                         "REGISTER".into(),
                         "ALREADY_AUTHENTICATED".into(),
-                        acc.into(),
+                        acc,
                         "Already logged in".into(),
                     ],
                 )
@@ -2738,8 +2726,8 @@ pub async fn handle_register(
         }
         let account_param = msg.params.first().map(|s| s.as_str()).unwrap_or("*");
         // Accept "*" (use current nick) or the nick itself; anything else is rejected.
-        let account = if account_param == "*" || account_param.eq_ignore_ascii_case(&nick) {
-            nick.clone()
+        if account_param == "*" || account_param.eq_ignore_ascii_case(&nick) {
+            nick
         } else {
             reply_to_client(
                 &senders,
@@ -2758,8 +2746,7 @@ pub async fn handle_register(
             )
             .await;
             return Ok(());
-        };
-        (nick, account)
+        }
     };
     let email = msg
         .params
@@ -2852,6 +2839,17 @@ pub async fn handle_register(
                 )
                 .await;
                 tracing::info!(client_id, account = %account, "Account registered and logged in");
+
+                // before-connect: a client that registered mid-handshake can now proceed.
+                let ready = state
+                    .read()
+                    .await
+                    .pending
+                    .get(client_id)
+                    .is_some_and(|p| p.ready_to_register());
+                if ready {
+                    complete_registration(client_id, state, senders, cfg, label).await?;
+                }
                 return Ok(());
             };
 

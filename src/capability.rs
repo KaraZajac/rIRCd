@@ -61,11 +61,14 @@ pub const TAGS_DEPENDENT: &[&str] = &["server-time", "batch", "account-tag"];
 pub fn build_cap_list(cfg: &Config, version_302: bool, client_is_tls: bool) -> Vec<String> {
     let tls_port = cfg.tls_port();
     let sasl_external = cfg.tls.client_certs && cfg.tls_enabled();
+    // No custom-account-name: REGISTER still requires the account name to match the
+    // current nick, because channel op/voice lists match a nick or an account name
+    // interchangeably, so a freely chosen account name could inherit someone else's ops.
     // email-required: [email] is configured, so REGISTER needs a mailable address.
     let account_registration = if cfg.email.is_some() {
-        "draft/account-registration=before-connect,custom-account-name,email-required,min-password-length=6"
+        "draft/account-registration=before-connect,email-required,min-password-length=6"
     } else {
-        "draft/account-registration=before-connect,custom-account-name,min-password-length=6"
+        "draft/account-registration=before-connect,min-password-length=6"
     };
 
     let caps: Vec<String> = CAPS

@@ -45,6 +45,17 @@ fn email_required_is_advertised_only_when_mail_is_configured() {
     assert!(value.contains("email-required"), "got {value}");
 }
 
+/// Only tokens the server actually honours may be advertised: REGISTER works
+/// before the connection is complete, but the account name must still be the nick.
+#[test]
+fn advertised_tokens_match_behaviour() {
+    let value =
+        cap_value(&config_from(""), "draft/account-registration").expect("cap is advertised");
+
+    assert!(value.contains("before-connect"), "got {value}");
+    assert!(!value.contains("custom-account-name"), "got {value}");
+}
+
 #[test]
 fn email_config_defaults() {
     let cfg = config_from(
