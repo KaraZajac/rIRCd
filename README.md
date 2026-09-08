@@ -547,6 +547,23 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 
 ---
 
+## Testing
+
+`cargo test` runs the unit and integration tests (message formatting, RFC 8291
+encryption vectors, capability gating, verification-code rules).
+
+For end-to-end checks against a real server there is a smoke harness that brings
+up a throwaway MariaDB, an SMTP sink and `rircd` itself:
+
+```bash
+tests/smoke/run.sh          # run every suite, then tear down
+tests/smoke/run.sh --keep   # leave the server up for manual poking
+```
+
+See [tests/smoke/README.md](tests/smoke/README.md).
+
+---
+
 ## License
 
 See [LICENSE](LICENSE).

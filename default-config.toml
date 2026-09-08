@@ -27,7 +27,7 @@ name = "rIRCd"
 host = "localhost"
 port = 3306
 user = "rirc"
-password = "Sunny1-Void8-Twilight0"
+password = "CHANGE-ME"
 database = "rircdb"
 
 [tls]

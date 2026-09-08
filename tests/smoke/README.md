@@ -1,0 +1,68 @@
+# Smoke tests
+
+End-to-end checks that talk raw IRC to a real `rircd` process, backed by a
+throwaway MariaDB and a local SMTP sink. `cargo test` covers pure logic (message
+formatting, RFC 8291 encryption vectors, capability gating); these cover the parts
+that only show up when a server is actually running: registration flows, mail
+delivery, push triggers, numerics on the wire.
+
+## Running
+
+```bash
+tests/smoke/run.sh                  # bring everything up, run every suite, tear down
+tests/smoke/run.sh --keep           # ... and leave the server running afterwards
+tests/smoke/run.sh --serve-only     # just bring a server up, no tests
+tests/smoke/run.sh --reuse          # run suites against an environment already up
+tests/smoke/run.sh test_core.py     # one suite
+tests/smoke/run.sh --stop           # stop a --keep/--serve-only environment
+```
+
+Requires `mariadbd`, `mariadb`, `mariadb-install-db` and `python3` on PATH — no
+Python packages, no running database service, no root. Everything lands in
+`target/smoke/` and is wiped at the start of each non-`--reuse` run.
+
+Override ports and paths with `SMOKE_IRC_PORT`, `SMOKE_WS_PORT`, `SMOKE_DB_PORT`,
+`SMOKE_SMTP_PORT`, `SMOKE_BIND` and `SMOKE_DIR`. `SMOKE_BIND` defaults to
+`127.0.0.1`; point it at `0.0.0.0` only if you want clients on other machines to
+reach the test server.
+
+## What's here
+
+| File | |
+|---|---|
+| `run.sh` | Brings up MariaDB, the SMTP sink and `rircd`, then runs the suites |
+| `harness.py` | `Client` (raw IRC socket), `check()`/`summary()`, database and mail helpers |
+| `smtpsink.py` | Minimal SMTP server that writes each message to `target/smoke/mail/` |
+| `test_core.py` | Capability negotiation, ISUPPORT, channels, messaging, queries, numerics |
+| `test_account.py` | `REGISTER`, email verification, `VERIFY`, SASL gating on unverified accounts |
+| `test_webpush.py` | `WEBPUSH` subscription handling and which messages trigger a push |
+
+## Notes
+
+The generated config turns on every optional subsystem so the suites can reach
+them: `[email]` points at the sink with `encryption = "none"`, and `[webpush]`
+sets `allow_private_endpoints = true` so a subscription can name a closed local
+port. Neither belongs in a real deployment.
+
+There is no push service in the loop, so `test_webpush.py` reads the server log
+and counts delivery *attempts*. A delivery that fails at connect still proves the
+trigger fired, the subscription was loaded and the payload encrypted — the parts
+this project owns. The encryption itself is checked against the RFC 8291 test
+vector in `cargo test`.
+
+## Writing a new suite
+
+```python
+from harness import Client, check, section, summary
+
+section("what this group covers")
+c = Client("nick")                  # connects and completes registration
+mark = c.mark()
+c.send("SOMETHING")
+c.read(1.0)
+check("the server said something useful", bool(c.find(" 001 ", lines=c.since(mark))), c.since(mark))
+c.close()
+summary("my suite")                 # prints totals, exits non-zero on failure
+```
+
+Add the filename to the default list in `run.sh`.
