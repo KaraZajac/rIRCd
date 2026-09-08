@@ -7,6 +7,95 @@ use tracing::{debug, error, info, warn};
 
 const BUF_SIZE: usize = 8192;
 
+/// Tell a connection why it is being refused, then close it.
+async fn refuse_connection(mut stream: tokio::net::TcpStream, server_name: &str, reason: &str) {
+    let line = format!(":{} ERROR :Closing link: {}\r\n", server_name, reason);
+    let _ = stream.write_all(line.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+async fn refuse_connection_tls(
+    mut stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    server_name: &str,
+    reason: &str,
+) {
+    let line = format!(":{} ERROR :Closing link: {}\r\n", server_name, reason);
+    let _ = stream.write_all(line.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+/// Tracks how many connections each address has open, so one host cannot exhaust
+/// the server by opening sockets.
+#[derive(Clone, Debug, Default)]
+pub struct ConnectionLimits {
+    pub max_per_ip: usize,
+    pub max_total: usize,
+    counts: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    total: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Releases a connection's slot when the connection ends.
+pub struct ConnectionSlot {
+    limits: ConnectionLimits,
+    host: String,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.limits.counts.lock() {
+            if let Some(n) = counts.get_mut(&self.host) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    counts.remove(&self.host);
+                }
+            }
+        }
+        self.limits
+            .total
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl ConnectionLimits {
+    pub fn new(max_per_ip: usize, max_total: usize) -> Self {
+        Self {
+            max_per_ip,
+            max_total,
+            ..Default::default()
+        }
+    }
+
+    /// Claim a slot for `host`, or report why it was refused.
+    pub fn claim(&self, host: &str) -> Result<ConnectionSlot, &'static str> {
+        let total = self
+            .total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if self.max_total > 0 && total > self.max_total {
+            self.total
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return Err("Server is full");
+        }
+        {
+            let mut counts = match self.counts.lock() {
+                Ok(c) => c,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let entry = counts.entry(host.to_string()).or_insert(0);
+            if self.max_per_ip > 0 && *entry >= self.max_per_ip {
+                self.total
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                return Err("Too many connections from your address");
+            }
+            *entry += 1;
+        }
+        Ok(ConnectionSlot {
+            limits: self.clone(),
+            host: host.to_string(),
+        })
+    }
+}
+
 /// Outbound queue depth per client. Large enough for legitimate bursts such as a
 /// NAMES reply on a busy channel; a client that lets it fill is not reading.
 const SEND_QUEUE: usize = 1024;
@@ -27,9 +116,18 @@ pub async fn handle_client_tls(
     server_name: String,
     certfp: Option<String>,
     keepalive: KeepaliveConfig,
+    limits: ConnectionLimits,
 ) {
     let addr = host.clone();
     info!("Client connected (TLS): {} from {}", client_id, addr);
+    let _slot = match limits.claim(&host) {
+        Ok(slot) => slot,
+        Err(reason) => {
+            refuse_connection_tls(stream, &server_name, reason).await;
+            info!("Refused TLS connection from {}: {}", host, reason);
+            return;
+        }
+    };
     handle_client_stream(
         stream,
         client_id,
@@ -50,12 +148,21 @@ pub async fn handle_client(
     tx: mpsc::Sender<ClientMessage>,
     server_name: String,
     keepalive: KeepaliveConfig,
+    limits: ConnectionLimits,
 ) {
     let addr = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".into());
     info!("Client connected: {} from {}", client_id, addr);
+    let _slot = match limits.claim(&host) {
+        Ok(slot) => slot,
+        Err(reason) => {
+            refuse_connection(stream, &server_name, reason).await;
+            info!("Refused connection from {}: {}", host, reason);
+            return;
+        }
+    };
     handle_client_stream(
         stream,
         client_id,
@@ -87,7 +194,7 @@ async fn handle_client_stream<S>(
     let (send_tx, mut send_rx) = mpsc::channel::<Message>(SEND_QUEUE);
 
     let client_id_clone = client_id.clone();
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         while let Some(msg) = send_rx.recv().await {
             let line = format_message(&msg);
             if writer.write_all(line.as_bytes()).await.is_err() || writer.flush().await.is_err() {
@@ -305,13 +412,23 @@ async fn handle_client_stream<S>(
     }
 
     info!("Client disconnected: {}", client_id);
-    writer_task.abort();
+    // Give the writer a moment to flush anything queued — a client being killed
+    // or banned is owed the ERROR explaining why — then stop it, since it may be
+    // blocked writing to a peer that has gone away.
+    let quit_tx = send_tx.clone();
+    drop(send_tx);
+    if tokio::time::timeout(std::time::Duration::from_millis(250), &mut writer_task)
+        .await
+        .is_err()
+    {
+        writer_task.abort();
+    }
     let _ = tx
         .send(ClientMessage {
             client_id: client_id.clone(),
             host,
             msg: Message::new("QUIT", vec![quit_reason.into()]),
-            send_tx,
+            send_tx: quit_tx,
             kill,
             certfp,
             is_tls,
@@ -330,10 +447,23 @@ pub async fn handle_client_ws(
     certfp: Option<String>,
     keepalive: KeepaliveConfig,
     is_tls: bool,
+    limits: ConnectionLimits,
 ) {
     use axum::extract::ws;
 
     info!("Client connected (WebSocket): {} from {}", client_id, host);
+    let _slot = match limits.claim(&host) {
+        Ok(slot) => slot,
+        Err(reason) => {
+            info!("Refused WebSocket connection from {}: {}", host, reason);
+            let _ = socket
+                .send(axum::extract::ws::Message::Text(
+                    format!(":{} ERROR :Closing link: {}", server_name, reason).into(),
+                ))
+                .await;
+            return;
+        }
+    };
 
     let (send_tx, mut send_rx) = mpsc::channel::<Message>(SEND_QUEUE);
     let kill = Arc::new(tokio::sync::Notify::new());
@@ -603,4 +733,50 @@ pub async fn handle_client_ws(
             is_tls,
         })
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_address_limit_is_enforced_and_released() {
+        let limits = ConnectionLimits::new(2, 0);
+
+        let first = limits.claim("198.51.100.7").expect("first connection");
+        let second = limits.claim("198.51.100.7").expect("second connection");
+        assert_eq!(
+            limits.claim("198.51.100.7").err(),
+            Some("Too many connections from your address")
+        );
+        // A different address is unaffected.
+        let other = limits.claim("203.0.113.9").expect("another address");
+
+        drop(second);
+        let third = limits.claim("198.51.100.7").expect("a slot was released");
+
+        drop(first);
+        drop(third);
+        drop(other);
+        assert!(limits.claim("198.51.100.7").is_ok(), "all slots released");
+    }
+
+    #[test]
+    fn total_limit_is_enforced() {
+        let limits = ConnectionLimits::new(0, 2);
+        let a = limits.claim("198.51.100.1").expect("first");
+        let _b = limits.claim("198.51.100.2").expect("second");
+        assert_eq!(limits.claim("198.51.100.3").err(), Some("Server is full"));
+        drop(a);
+        assert!(limits.claim("198.51.100.3").is_ok(), "a slot was released");
+    }
+
+    #[test]
+    fn zero_means_unlimited() {
+        let limits = ConnectionLimits::new(0, 0);
+        let mut held = Vec::new();
+        for _ in 0..100 {
+            held.push(limits.claim("198.51.100.5").expect("no limit"));
+        }
+    }
 }

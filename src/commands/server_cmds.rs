@@ -1009,14 +1009,14 @@ pub async fn handle_kill(
         }
     };
 
-    // Send ERROR to target
+    // Send ERROR to the target and close its connection.
     let error_msg = Message::new(
         "ERROR",
         vec![format!("Killed ({} ({}))", killer_source, reason)],
     );
-    send_to_client(&senders, &tid, error_msg).await;
-
-    // Remove from senders (causes write task to close the connection)
+    if let Some(sink) = senders.read().await.get(&tid) {
+        sink.close(error_msg);
+    }
     senders.write().await.remove(&tid);
 
     // Broadcast QUIT to channel members
@@ -1351,5 +1351,319 @@ pub async fn handle_rehash(
     )
     .await;
 
+    Ok(())
+}
+
+// ─── ADMIN ────────────────────────────────────────────────────────────────────
+
+/// `ADMIN [<target>]` — who is responsible for this server.
+/// Replies: 256 RPL_ADMINME, 257/258 RPL_ADMINLOC1/2, 259 RPL_ADMINEMAIL.
+pub async fn handle_admin(
+    client_id: &str,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let s = cfg.server.name.as_str();
+    let nick = match state.read().await.clients.get(client_id) {
+        Some(c) => c.read().await.nick_or_id().to_string(),
+        None => return Ok(()),
+    };
+
+    let name = cfg
+        .server
+        .admin_name
+        .clone()
+        .unwrap_or_else(|| format!("Administrator of {}", cfg.network.name));
+    let location = cfg
+        .server
+        .admin_location
+        .clone()
+        .unwrap_or_else(|| cfg.server.name.clone());
+    let email = cfg
+        .server
+        .admin_email
+        .clone()
+        .unwrap_or_else(|| "not configured".to_string());
+
+    for (numeric, text) in [
+        ("256", format!("Administrative info about {}", s)),
+        ("257", name),
+        ("258", location),
+        ("259", email),
+    ] {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(numeric, vec![nick.clone(), text]).with_prefix(s),
+            label,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// `DIE` — shut the server down. Operators only.
+pub async fn handle_die(
+    client_id: &str,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let (nick, is_oper) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.nick_or_id().to_string(), g.oper)
+            }
+            None => return Ok(()),
+        }
+    };
+    if !is_oper {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "481",
+                vec![nick, "Permission Denied- You're not an IRC operator".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    tracing::warn!(oper = %nick, "DIE: shutting down on operator request");
+    let notice = Message::new(
+        "NOTICE",
+        vec![
+            "*".into(),
+            format!("Server shutting down (requested by {})", nick),
+        ],
+    )
+    .with_prefix(&cfg.server.name);
+    for (_, sink) in senders.read().await.iter() {
+        sink.send(notice.clone());
+    }
+
+    // Take the same path as a signal, so the shutdown is the ordinary one.
+    #[cfg(unix)]
+    {
+        let _ = nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM);
+    }
+    Ok(())
+}
+
+// ─── Server bans ──────────────────────────────────────────────────────────────
+
+/// Normalise a ban mask to `nick!user@host`, the form connections are matched in.
+fn normalize_ban_mask(mask: &str) -> String {
+    if mask.contains('!') {
+        mask.to_string()
+    } else if mask.contains('@') {
+        format!("*!{}", mask)
+    } else {
+        format!("*!*@{}", mask)
+    }
+}
+
+/// `KLINE [<duration>] <mask> :<reason>` — refuse connections matching a mask.
+///
+/// Duration is in seconds; omit it, or pass 0, for a ban with no end. Existing
+/// connections that match are closed.
+pub async fn handle_kline(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let (nick, is_oper) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.nick_or_id().to_string(), g.oper)
+            }
+            None => return Ok(()),
+        }
+    };
+    if !is_oper {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "481",
+                vec![nick, "Permission Denied- You're not an IRC operator".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let params: Vec<&str> = msg.params.iter().map(|p| p.as_str()).collect();
+    let (duration, mask) = match params.first().and_then(|p| p.parse::<i64>().ok()) {
+        Some(secs) => (secs, params.get(1).copied().unwrap_or("")),
+        None => (0, params.first().copied().unwrap_or("")),
+    };
+    let reason = msg
+        .trailing()
+        .filter(|t| *t != mask)
+        .unwrap_or("No reason given")
+        .to_string();
+
+    if mask.is_empty() {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec!["KLINE".into(), "Not enough parameters".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let ban = crate::persist::ServerBan {
+        mask: normalize_ban_mask(mask),
+        reason,
+        set_by: nick.clone(),
+        set_at: chrono::Utc::now().timestamp(),
+        expires_at: if duration > 0 {
+            Some(chrono::Utc::now().timestamp() + duration)
+        } else {
+            None
+        },
+    };
+
+    if let Some(ref pool) = cfg.db {
+        if let Err(e) = crate::persist::save_server_ban(pool, &ban).await {
+            tracing::error!(client_id, error = %e, "KLINE: could not store ban");
+        }
+    }
+    tracing::warn!(
+        oper = %nick, mask = %ban.mask, expires = ?ban.expires_at, "Server ban added"
+    );
+
+    // Close any connection the new ban covers.
+    let mut hits: Vec<(String, String)> = Vec::new();
+    {
+        let mut state_w = state.write().await;
+        state_w.server_bans.retain(|b| b.mask != ban.mask);
+        state_w.server_bans.push(ban.clone());
+        for (id, client) in state_w.clients.iter() {
+            let g = client.read().await;
+            let source = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
+            if crate::user::glob_match(&ban.mask.to_lowercase(), &source.to_lowercase())
+                || crate::user::glob_match(
+                    &ban.mask.to_lowercase(),
+                    &format!("*!*@{}", g.host.to_lowercase()),
+                )
+            {
+                hits.push((id.clone(), g.nick_or_id().to_string()));
+            }
+        }
+    }
+    for (id, hit_nick) in &hits {
+        if let Some(sink) = senders.read().await.get(id) {
+            sink.close(
+                Message::new(
+                    "ERROR",
+                    vec![format!("Closing link: banned ({})", ban.reason)],
+                )
+                .with_prefix(&cfg.server.name),
+            );
+        }
+        tracing::info!(nick = %hit_nick, mask = %ban.mask, "Disconnecting banned user");
+    }
+
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTICE",
+            vec![
+                nick,
+                format!(
+                    "Ban on {} added ({} connection(s) closed)",
+                    ban.mask,
+                    hits.len()
+                ),
+            ],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    Ok(())
+}
+
+/// `UNKLINE <mask>` — remove a ban.
+pub async fn handle_unkline(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let (nick, is_oper) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.nick_or_id().to_string(), g.oper)
+            }
+            None => return Ok(()),
+        }
+    };
+    if !is_oper {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "481",
+                vec![nick, "Permission Denied- You're not an IRC operator".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let mask = normalize_ban_mask(msg.params.first().map(|s| s.as_str()).unwrap_or(""));
+    let removed = match cfg.db {
+        Some(ref pool) => crate::persist::delete_server_ban(pool, &mask).await,
+        None => false,
+    };
+    state.write().await.server_bans.retain(|b| b.mask != mask);
+    tracing::warn!(oper = %nick, %mask, removed, "Server ban removed");
+
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTICE",
+            vec![
+                nick,
+                if removed {
+                    format!("Ban on {} removed", mask)
+                } else {
+                    format!("No ban on {}", mask)
+                },
+            ],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
     Ok(())
 }

@@ -140,6 +140,30 @@ pub async fn complete_registration(
         client.vhost = Some(format!("{}.IP", &hex[..8]));
     }
 
+    // Server bans are checked against the real host, before the connection is
+    // admitted and given a nick anyone can see.
+    let real_source = format!(
+        "{}!{}@{}",
+        client.nick.as_deref().unwrap_or("*"),
+        client.user.as_deref().unwrap_or("*"),
+        client.host
+    );
+    if let Some(ban) = state_guard.matching_ban(&real_source, &client.host) {
+        let reason = ban.reason.clone();
+        let mask = ban.mask.clone();
+        drop(state_guard);
+        tracing::info!(client_id, %mask, "Refusing banned connection");
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("ERROR", vec![format!("Closing link: banned ({})", reason)])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
     let client = state_guard.add_client(client).await;
 
     drop(state_guard);
@@ -685,6 +709,54 @@ pub async fn handle_nick(
             return Ok(());
         }
     };
+
+    // A registered nick belongs to its account: refuse it to anyone else, unless
+    // the operator has turned that off.
+    if cfg.server.nick_protection {
+        // Who is asking, and are they already logged in to this account?
+        let (current_nick, current_account) = match state_guard.clients.get(client_id) {
+            Some(client) => {
+                let g = client.read().await;
+                (g.nick_or_id().to_string(), g.account.clone())
+            }
+            None => match state_guard.pending.get(client_id) {
+                Some(p) => (
+                    p.nick.clone().unwrap_or_else(|| "*".to_string()),
+                    p.account.clone(),
+                ),
+                None => ("*".to_string(), None),
+            },
+        };
+        let owns_it = current_account
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(&nick));
+
+        if !owns_it {
+            let registered = match cfg.db {
+                Some(ref pool) => crate::persist::nick_is_registered(pool, &nick).await,
+                None => false,
+            };
+            if registered {
+                drop(state_guard);
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "433",
+                        vec![
+                            current_nick,
+                            nick.clone(),
+                            "Nickname is registered to another account".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    }
 
     if let Some(client) = state_guard.clients.get(client_id) {
         let client_guard = client.write().await;

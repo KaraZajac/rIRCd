@@ -74,6 +74,7 @@ pub async fn handle_join(
 
     // Collected while the state read guard is held, applied once it is released.
     let mut remembered_memberships: Vec<(String, String)> = Vec::new();
+    let mut new_founder: Option<String> = None;
 
     // JOIN 0: part all channels the client is currently in
     if ch_names.trim() == "0" {
@@ -291,6 +292,21 @@ pub async fn handle_join(
 
         let is_first = ch.members.is_empty();
         let (persisted_op, persisted_voice) = ch.persisted_modes_for(&nick, account.as_deref());
+        // Whoever creates a channel while logged in becomes its founder, and is
+        // opped whenever they return.
+        if is_first && ch.founder.is_empty() {
+            if let Some(ref acct) = account {
+                ch.founder = acct.clone();
+                new_founder = Some(acct.clone());
+                if !ch.persisted_operators.iter().any(|o| o == acct) {
+                    ch.persisted_operators.push(acct.clone());
+                }
+            }
+        }
+        let persisted_op = persisted_op
+            || account
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(&ch.founder));
         let modes = ChannelMemberModeSet {
             op: is_first || persisted_op,
             voice: persisted_voice,
@@ -554,6 +570,14 @@ pub async fn handle_join(
         if let Some(ref pool) = cfg.db {
             for (ch_key, account) in &remembered_memberships {
                 crate::persist::record_account_channel(pool, account, ch_key).await;
+            }
+        }
+    }
+    if let Some(founder) = new_founder {
+        if let Some(ref pool) = cfg.db {
+            for (ch_key, _) in &remembered_memberships {
+                crate::persist::set_channel_founder(pool, ch_key, &founder).await;
+                crate::persist::set_channel_access(pool, ch_key, &founder, true, true).await;
             }
         }
     }
@@ -1091,6 +1115,8 @@ pub async fn handle_mode(
             }
 
             let mut plus = true;
+            // (who, is_op, granted) — persisted once the channel lock is released.
+            let mut access_changes: Vec<(String, bool, bool)> = Vec::new();
             // param_idx starts at 2: params[0]=target, params[1]=mode_str, params[2+]=mode args
             let mut param_idx: usize = 2;
             for c in mode_str.chars() {
@@ -1128,6 +1154,24 @@ pub async fn handle_mode(
                             {
                                 if let Some(memb) = ch.members.get_mut(target_id) {
                                     memb.modes.op = plus;
+                                    // Remember it, so the user keeps the status
+                                    // next time they join — in memory for this
+                                    // run, and in the database for the next one.
+                                    if let Some(c) = state.clients.get(target_id) {
+                                        let g = c.read().await;
+                                        let who = g
+                                            .account
+                                            .clone()
+                                            .unwrap_or_else(|| g.nick_or_id().to_string());
+                                        if plus {
+                                            if !ch.persisted_operators.contains(&who) {
+                                                ch.persisted_operators.push(who.clone());
+                                            }
+                                        } else {
+                                            ch.persisted_operators.retain(|o| o != &who);
+                                        }
+                                        access_changes.push((who, true, plus));
+                                    }
                                 } else {
                                     let _ = reply_to_client(
                                         &senders,
@@ -1287,6 +1331,21 @@ pub async fn handle_mode(
                             {
                                 if let Some(memb) = ch.members.get_mut(target_id) {
                                     memb.modes.voice = plus;
+                                    if let Some(c) = state.clients.get(target_id) {
+                                        let g = c.read().await;
+                                        let who = g
+                                            .account
+                                            .clone()
+                                            .unwrap_or_else(|| g.nick_or_id().to_string());
+                                        if plus {
+                                            if !ch.persisted_voice.contains(&who) {
+                                                ch.persisted_voice.push(who.clone());
+                                            }
+                                        } else {
+                                            ch.persisted_voice.retain(|v| v != &who);
+                                        }
+                                        access_changes.push((who, false, plus));
+                                    }
                                 } else {
                                     let _ = reply_to_client(
                                         &senders,
@@ -1525,6 +1584,11 @@ pub async fn handle_mode(
                     mode_limit_val,
                 )
                 .await;
+                // ... and the operator and voice lists, so status survives a part
+                // or a restart the way a services bot would keep it.
+                for (who, is_op, granted) in &access_changes {
+                    crate::persist::set_channel_access(pool, &ch_key, who, *is_op, *granted).await;
+                }
             }
         }
     } else if target.eq_ignore_ascii_case(&nick) {

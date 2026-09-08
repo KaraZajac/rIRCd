@@ -242,12 +242,28 @@ pub struct ServerConfig {
     /// If set, connecting clients receive an HMAC-SHA256-based virtual host cloak.
     #[serde(default)]
     pub cloak_key: Option<String>,
+    /// Contact shown by the ADMIN command; who runs this server.
+    #[serde(default)]
+    pub admin_name: Option<String>,
+    /// Location or description shown by ADMIN.
+    #[serde(default)]
+    pub admin_location: Option<String>,
+    /// Contact address shown by ADMIN.
+    #[serde(default)]
+    pub admin_email: Option<String>,
+    /// Reserve registered nicks for the account that owns them. On by default:
+    /// registering an account is what claims the nick.
+    #[serde(default = "default_nick_protection")]
+    pub nick_protection: bool,
     /// Comma-separated list of channels to suggest to clients that enable draft/auto-join.
     /// Example: "#general, #help, #dev"
     #[serde(default)]
     pub auto_join: Option<String>,
 }
 
+fn default_nick_protection() -> bool {
+    true
+}
 fn default_server_name() -> String {
     "rIRCd.local".into()
 }
@@ -281,6 +297,10 @@ impl Default for ServerConfig {
             disconnect_timeout_secs: default_disconnect_timeout(),
             client_tag_deny: None,
             cloak_key: None,
+            admin_name: None,
+            admin_location: None,
+            admin_email: None,
+            nick_protection: default_nick_protection(),
             auto_join: None,
         }
     }
@@ -327,6 +347,12 @@ pub struct TlsConfig {
 pub struct LimitsConfig {
     #[serde(default = "default_max_channels")]
     pub max_channels_per_client: usize,
+    /// Connections allowed from one address at a time; 0 for no limit.
+    #[serde(default = "default_max_per_ip")]
+    pub max_connections_per_ip: usize,
+    /// Connections allowed in total; 0 for no limit.
+    #[serde(default)]
+    pub max_clients: usize,
     /// Accepted for compatibility with older configs; the protocol fixes the
     /// message body at 512 bytes (8191 including tags), which is what the server
     /// enforces and advertises as LINELEN.
@@ -337,6 +363,9 @@ pub struct LimitsConfig {
 fn default_max_channels() -> usize {
     50
 }
+fn default_max_per_ip() -> usize {
+    16
+}
 fn default_max_line_length() -> usize {
     8191
 }
@@ -345,6 +374,8 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_channels_per_client: default_max_channels(),
+            max_connections_per_ip: default_max_per_ip(),
+            max_clients: 0,
             max_line_length: default_max_line_length(),
         }
     }

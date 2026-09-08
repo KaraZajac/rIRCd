@@ -119,6 +119,8 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 | `registration_timeout_secs` | `60` | Time allowed to complete NICK/USER before disconnect |
 | `ping_timeout_secs` | `90` | How long to wait for PONG before sending next PING |
 | `disconnect_timeout_secs` | `150` | Time after missed PONG before disconnecting client |
+| `nick_protection` | `true` | Reserve a registered nick for its account; others get 433 |
+| `admin_name` / `admin_location` / `admin_email` | _(unset)_ | Shown by `ADMIN` (256–259) |
 | `client_tag_deny` | _(unset)_ | List of client-only tags to drop (e.g. `["+typing"]` or `["*"]` to drop all) |
 | `cloak_key` | _(unset)_ | If set, connecting clients receive an HMAC-SHA256-based virtual host cloak (e.g. `"mysecret"`) |
 
@@ -165,6 +167,8 @@ key  = "/etc/rIRCd/key.pem"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `max_channels_per_client` | `50` | Max channels a single client may join |
+| `max_connections_per_ip` | `16` | Connections allowed from one address; 0 for no limit |
+| `max_clients` | `0` | Connections allowed in total; 0 for no limit |
 
 ### `[[opers]]`
 
@@ -404,6 +408,25 @@ Accounts are keyed by nick (lowercase). There is no separate admin interface for
 
 ---
 
+## Accounts, Channels and Moderation
+
+rIRCd has no separate services package: what NickServ and ChanServ do on a
+traditional network is done by the server itself, against MariaDB.
+
+| Traditional services feature | rIRCd |
+|---|---|
+| Nick registration | `REGISTER` / `VERIFY` (draft/account-registration), with optional email verification |
+| Identify | SASL PLAIN, SCRAM-SHA-256 or EXTERNAL — no `/msg NickServ` |
+| Nick protection | Registered nicks are reserved for their account (`nick_protection`) |
+| Channel founder | The account that creates a channel; always opped on join |
+| Channel access lists | `MODE +o` / `+v` by an operator is remembered and restored on the next join |
+| Channel modes, topic, key | Persisted and restored on startup |
+| Network bans | `KLINE` / `UNKLINE`, persisted and enforced on connect |
+| Vhosts | `SETHOST` (oper), plus automatic cloaking via `cloak_key` |
+
+Still absent: nick recovery (`GHOST`/`RELEASE`), per-channel access *levels*
+beyond op and voice, `AKICK`, and memos.
+
 ## Channel Persistence
 
 Channels, topics, modes, operator lists, voice lists, and message history are all stored in MariaDB automatically:
@@ -514,6 +537,10 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `HELP` | 704/705/706 | Per-command help text |
 | `KNOCK` | 710/711 | Request invite to an invite-only channel; notifies ops |
 | `KILL` | — | Oper-only: forcibly disconnect a user; broadcasts QUIT to their channels |
+| `KLINE` | — | Oper-only: `KLINE [<seconds>] <mask> :<reason>` — refuse connections matching a mask; existing ones are closed. Persisted in MariaDB |
+| `UNKLINE` | — | Oper-only: remove a ban |
+| `DIE` | — | Oper-only: shut the server down |
+| `ADMIN` | 256/257/258/259 | Who runs this server (`[server] admin_*`) |
 | `WALLOPS` | — | Oper-only: broadcast a message to all users with `+w` |
 | `MOTD` | 375/372/376 | Send the message of the day |
 | `ISON` | 303 | Check which nicks in a list are currently online |

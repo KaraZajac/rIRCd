@@ -37,6 +37,8 @@ pub struct ChannelEntry {
     pub mode_limit: Option<u32>,
     /// Channel creation Unix timestamp
     pub created_at: i64,
+    /// Account that created the channel, if any.
+    pub founder: String,
 }
 
 /// One line of channel history from the database.
@@ -102,6 +104,7 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
 
     // Migrate existing channels table
     for col_def in &[
+        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS founder VARCHAR(64) NOT NULL DEFAULT ''",
         "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_flags VARCHAR(32) NOT NULL DEFAULT ''",
         "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_key VARCHAR(64) NULL",
         "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_limit INT UNSIGNED NULL",
@@ -210,6 +213,18 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
         .await
         .ok();
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS server_bans (
+            mask       VARCHAR(255) NOT NULL PRIMARY KEY,
+            reason     TEXT         NOT NULL,
+            set_by     VARCHAR(64)  NOT NULL,
+            set_at     BIGINT       NOT NULL,
+            expires_at BIGINT       NULL
+        ) CHARACTER SET utf8mb4",
+    )
+    .execute(pool)
+    .await?;
+
     // Which channels an account is in, remembered across disconnects so a user
     // with a push subscription can be notified while they are away.
     sqlx::query(
@@ -298,6 +313,75 @@ pub async fn set_certfp(pool: &sqlx::MySqlPool, account: &str, certfp: &str) {
         .await;
 }
 
+/// Persist or drop a channel access entry (`+o`/`+v`), so it is restored the next
+/// time that user joins — the "channel operator list" a services bot would keep.
+///
+/// `who` is an account name where the user has one, otherwise their nick, which
+/// is how membership is matched on join.
+pub async fn set_channel_access(
+    pool: &sqlx::MySqlPool,
+    channel_name: &str,
+    who: &str,
+    op: bool,
+    grant: bool,
+) {
+    let table = if op {
+        "channel_operators"
+    } else {
+        "channel_voice"
+    };
+
+    // The access tables key on the channel row, so make sure it exists.
+    let _ = sqlx::query("INSERT IGNORE INTO channels (name) VALUES (?)")
+        .bind(channel_name)
+        .execute(pool)
+        .await;
+    let id: Option<i64> = sqlx::query_scalar("SELECT id FROM channels WHERE name = ?")
+        .bind(channel_name)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    let Some(id) = id else {
+        return;
+    };
+
+    let result = if grant {
+        sqlx::query(&format!(
+            "INSERT IGNORE INTO {} (channel_id, nick_or_account) VALUES (?, ?)",
+            table
+        ))
+        .bind(id)
+        .bind(who)
+        .execute(pool)
+        .await
+    } else {
+        sqlx::query(&format!(
+            "DELETE FROM {} WHERE channel_id = ? AND nick_or_account = ?",
+            table
+        ))
+        .bind(id)
+        .bind(who)
+        .execute(pool)
+        .await
+    };
+    if let Err(e) = result {
+        tracing::warn!(channel = %channel_name, who, "Failed to store channel access: {}", e);
+    }
+}
+
+/// Record the account that created a channel, if it has no founder yet.
+pub async fn set_channel_founder(pool: &sqlx::MySqlPool, channel_name: &str, account: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO channels (name, founder) VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE founder = COALESCE(NULLIF(founder, ''), VALUES(founder))",
+    )
+    .bind(channel_name)
+    .bind(account)
+    .execute(pool)
+    .await;
+}
+
 // ─── Channels ─────────────────────────────────────────────────────────────────
 
 /// Load all channel configs from the database.
@@ -305,7 +389,7 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
     use sqlx::Row;
 
     let rows = match sqlx::query(
-        "SELECT id, name, topic, mode_flags, mode_key, mode_limit, UNIX_TIMESTAMP(created_at) AS created_ts FROM channels",
+        "SELECT id, name, topic, mode_flags, mode_key, mode_limit, founder, UNIX_TIMESTAMP(created_at) AS created_ts FROM channels",
     )
     .fetch_all(pool)
     .await
@@ -326,6 +410,7 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
         let mode_key: Option<String> = row.try_get("mode_key").unwrap_or(None);
         let mode_limit: Option<u32> = row.try_get("mode_limit").unwrap_or(None);
         let created_at: i64 = row.try_get("created_ts").unwrap_or(0);
+        let founder: String = row.try_get("founder").unwrap_or_default();
 
         let ops: Vec<String> =
             sqlx::query("SELECT nick_or_account FROM channel_operators WHERE channel_id = ?")
@@ -356,6 +441,7 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
             mode_key,
             mode_limit,
             created_at,
+            founder,
         });
     }
     entries
@@ -749,6 +835,21 @@ pub async fn delete_account(pool: &sqlx::MySqlPool, account: &str) {
     }
 }
 
+/// Is this nick a registered account someone else owns?
+///
+/// Registration reserves the nick: without this, anyone could sit on a
+/// registered nick while its owner is away, which is the job a NickServ does on
+/// a traditional network.
+pub async fn nick_is_registered(pool: &sqlx::MySqlPool, nick: &str) -> bool {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE nick_lower = ? AND verified = 1")
+            .bind(nick.to_lowercase())
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+    count > 0
+}
+
 /// Verify an account's password against the stored bcrypt hash.
 /// An account awaiting email verification cannot authenticate.
 pub async fn verify_user(pool: &sqlx::MySqlPool, account: &str, password: &str) -> bool {
@@ -822,6 +923,78 @@ pub fn direct_message_peer(key: &str, viewer: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+// ─── Server bans ──────────────────────────────────────────────────────────────
+
+/// A ban on connecting, matched against `nick!user@host` and against the IP.
+#[derive(Debug, Clone)]
+pub struct ServerBan {
+    pub mask: String,
+    pub reason: String,
+    pub set_by: String,
+    pub set_at: i64,
+    /// Unix timestamp, or None for a ban with no end.
+    pub expires_at: Option<i64>,
+}
+
+impl ServerBan {
+    pub fn is_expired(&self, now: i64) -> bool {
+        self.expires_at.is_some_and(|e| e <= now)
+    }
+}
+
+/// Store a ban, replacing any existing one for the same mask.
+pub async fn save_server_ban(pool: &sqlx::MySqlPool, ban: &ServerBan) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO server_bans (mask, reason, set_by, set_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE reason = VALUES(reason), set_by = VALUES(set_by),
+                                 set_at = VALUES(set_at), expires_at = VALUES(expires_at)",
+    )
+    .bind(&ban.mask)
+    .bind(&ban.reason)
+    .bind(&ban.set_by)
+    .bind(ban.set_at)
+    .bind(ban.expires_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// Remove a ban. Returns true if one was removed.
+pub async fn delete_server_ban(pool: &sqlx::MySqlPool, mask: &str) -> bool {
+    sqlx::query("DELETE FROM server_bans WHERE mask = ?")
+        .bind(mask)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false)
+}
+
+/// Every stored ban, expired ones removed on the way.
+pub async fn load_server_bans(pool: &sqlx::MySqlPool) -> Vec<ServerBan> {
+    use sqlx::Row;
+    let now = chrono::Utc::now().timestamp();
+    let _ = sqlx::query("DELETE FROM server_bans WHERE expires_at IS NOT NULL AND expires_at <= ?")
+        .bind(now)
+        .execute(pool)
+        .await;
+
+    sqlx::query("SELECT mask, reason, set_by, set_at, expires_at FROM server_bans")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| ServerBan {
+            mask: r.get("mask"),
+            reason: r.get("reason"),
+            set_by: r.get("set_by"),
+            set_at: r.get("set_at"),
+            expires_at: r.get("expires_at"),
+        })
+        .collect()
 }
 
 // ─── Account channel membership ───────────────────────────────────────────────

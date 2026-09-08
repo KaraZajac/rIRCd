@@ -68,6 +68,8 @@ pub struct Channel {
     pub persisted_voice: Vec<String>,
     /// Channel creation time (Unix timestamp); sent as 329 RPL_CREATIONTIME
     pub created_at: i64,
+    /// Account that created the channel; always opped on join.
+    pub founder: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -102,6 +104,7 @@ impl Channel {
             persisted_operators: Vec::new(),
             persisted_voice: Vec::new(),
             created_at: chrono::Utc::now().timestamp(),
+            founder: String::new(),
         }
     }
 

@@ -142,6 +142,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                 ch_guard.topic = Some(e.topic.clone());
             }
             ch_guard.persisted_operators = e.operators;
+            ch_guard.founder = e.founder;
             ch_guard.persisted_voice = e.voice;
             // Restore channel modes
             for c in e.mode_flags.chars() {
@@ -167,9 +168,14 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
         let markers = crate::persist::load_read_markers(pool).await;
         let meta = crate::persist::load_all_metadata(pool).await;
         let memberships = crate::persist::load_account_channels(pool).await;
+        let bans = crate::persist::load_server_bans(pool).await;
+        if !bans.is_empty() {
+            info!("Loaded {} server ban(s)", bans.len());
+        }
         let mut state_w = state.write().await;
         state_w.read_markers = markers;
         state_w.metadata = meta;
+        state_w.server_bans = bans;
         for (channel, account) in memberships {
             state_w
                 .channel_accounts
@@ -292,6 +298,23 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
     }
 
     let server_name = cfg.server.name.clone();
+    let limits =
+        client::ConnectionLimits::new(cfg.limits.max_connections_per_ip, cfg.limits.max_clients);
+    if limits.max_per_ip > 0 || limits.max_total > 0 {
+        info!(
+            "Connection limits: {} per address, {} in total",
+            if limits.max_per_ip > 0 {
+                limits.max_per_ip.to_string()
+            } else {
+                "unlimited".into()
+            },
+            if limits.max_total > 0 {
+                limits.max_total.to_string()
+            } else {
+                "unlimited".into()
+            },
+        );
+    }
     let keepalive = client::KeepaliveConfig {
         ping_secs: cfg.server.ping_timeout_secs,
         disconnect_secs: cfg.server.disconnect_timeout_secs,
@@ -310,6 +333,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
 
         let tx = tx.clone();
         let server_name = server_name.clone();
+        let limits = limits.clone();
         let mut client_counter = 0u64;
         tokio::spawn(async move {
             loop {
@@ -320,6 +344,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                         let host = addr.ip().to_string();
                         let tx = tx.clone();
                         let server_name = server_name.clone();
+                        let limits = limits.clone();
                         tokio::spawn(async move {
                             client::handle_client(
                                 stream,
@@ -328,6 +353,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                                 tx,
                                 server_name,
                                 keepalive,
+                                limits,
                             )
                             .await;
                         });
@@ -353,6 +379,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
             let tx = tx.clone();
             let tls_acc = acceptor.clone();
             let server_name = server_name_tls.clone();
+            let limits = limits.clone();
             let mut client_counter = 0u64;
             tokio::spawn(async move {
                 loop {
@@ -364,6 +391,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                             let tx = tx.clone();
                             let acc = tls_acc.clone();
                             let server_name = server_name.clone();
+                            let limits = limits.clone();
                             tokio::spawn(async move {
                                 match acc.accept(stream).await {
                                     Ok(tls_stream) => {
@@ -376,6 +404,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                                             server_name,
                                             certfp,
                                             keepalive,
+                                            limits,
                                         )
                                         .await
                                     }
@@ -409,6 +438,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
             server_name: String,
             counter: Arc<std::sync::atomic::AtomicU64>,
             keepalive: client::KeepaliveConfig,
+            limits: client::ConnectionLimits,
         }
 
         let ws_state = WsState {
@@ -416,6 +446,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
             server_name: server_name_ws,
             counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             keepalive,
+            limits: limits.clone(),
         };
 
         let app = axum::Router::new()
@@ -445,6 +476,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                                     None,
                                     st.keepalive,
                                     false, // WS (plaintext)
+                                    st.limits,
                                 )
                             })
                     },
@@ -474,6 +506,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
             let tls_acc = acceptor.clone();
             let tx_wss = tx.clone();
             let server_name_wss = server_name.clone();
+            let limits_wss = limits.clone();
             tokio::spawn(async move {
                 let mut counter = 0u64;
                 loop {
@@ -485,6 +518,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                             let acc = tls_acc.clone();
                             let tx = tx_wss.clone();
                             let sn = server_name_wss.clone();
+                            let limits = limits_wss.clone();
                             tokio::spawn(async move {
                                 match acc.accept(stream).await {
                                     Ok(tls_stream) => {
@@ -515,6 +549,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                                                                 socket, client_id, host, tx, sn,
                                                                 certfp, keepalive,
                                                                 true, // WSS (TLS)
+                                                                limits,
                                                             )
                                                         })
                                                     }

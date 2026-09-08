@@ -738,6 +738,17 @@ pub async fn handle_message(
             webpush_cmds::handle_webpush(&client_id, msg, state, senders, cfg, label.as_deref())
                 .await
         }
+        "ADMIN" => {
+            server_cmds::handle_admin(&client_id, state, senders, cfg, label.as_deref()).await
+        }
+        "DIE" => server_cmds::handle_die(&client_id, state, senders, cfg, label.as_deref()).await,
+        "KLINE" => {
+            server_cmds::handle_kline(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "UNKLINE" => {
+            server_cmds::handle_unkline(&client_id, msg, state, senders, cfg, label.as_deref())
+                .await
+        }
         "ISON" => {
             query_cmds::handle_ison(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }

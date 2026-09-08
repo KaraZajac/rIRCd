@@ -349,6 +349,14 @@ impl ClientSink {
         Self { tx, kill }
     }
 
+    /// Send a last message and close the connection — how a server drops a client
+    /// it has killed or banned, rather than leaving the socket open until the
+    /// ping timeout notices.
+    pub fn close(&self, msg: Message) {
+        let _ = self.tx.try_send(msg);
+        self.kill.notify_one();
+    }
+
     /// Queue a message. Returns false if it could not be queued, in which case
     /// the connection has been marked for disconnection.
     pub fn send(&self, msg: Message) -> bool {
@@ -395,6 +403,9 @@ pub struct ServerState {
     /// Accounts known to be in each channel, including ones that are not
     /// connected right now. Used to notify absent users of mentions.
     pub channel_accounts: HashMap<String, HashSet<String>>,
+    /// Server bans, matched on connection. Kept in memory so a connection never
+    /// waits on the database.
+    pub server_bans: Vec<crate::persist::ServerBan>,
 }
 
 /// In-flight draft/multiline batch for one client
@@ -507,6 +518,20 @@ impl ServerState {
         self.pending
             .entry(client_id.to_string())
             .or_insert_with(|| PendingConnection::new(host.to_string()))
+    }
+
+    /// The ban matching this user, if any. Expired entries are ignored.
+    pub fn matching_ban(&self, source: &str, ip: &str) -> Option<&crate::persist::ServerBan> {
+        let now = Utc::now().timestamp();
+        let source_lower = source.to_lowercase();
+        let ip_forms = [format!("*!*@{}", ip.to_lowercase()), ip.to_lowercase()];
+        self.server_bans.iter().find(|ban| {
+            if ban.is_expired(now) {
+                return false;
+            }
+            let mask = ban.mask.to_lowercase();
+            glob_match(&mask, &source_lower) || ip_forms.iter().any(|f| glob_match(&mask, f))
+        })
     }
 
     pub fn record_msgid(&mut self, msgid: String, target: String, sender_id: String) {

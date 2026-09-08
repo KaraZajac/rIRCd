@@ -7,7 +7,19 @@ import hashlib
 import hmac
 import time
 
-from harness import RUN_ID, Client, check, connect_negotiating, db, section, summary
+from harness import (
+    IRC_HOST,
+    IRC_PORT,
+    OPER_NAME,
+    OPER_PASSWORD,
+    RUN_ID,
+    Client,
+    check,
+    connect_negotiating,
+    db,
+    section,
+    summary,
+)
 
 PASSWORD = "hunter2secret"
 ACCOUNT = f"scram{RUN_ID}"
@@ -580,6 +592,144 @@ check("the server still answers commands", bool(canary.find("PONG", lines=canary
 canary.close()
 talker.close()
 stalled.close()
+
+section("channel ownership and access lists")
+# The founder is the account that created the channel; operator and voice status
+# granted by an operator is remembered, the way a services bot would keep it.
+owner_chan = f"#owned{RUN_ID}"
+founder = Client(f"founder{RUN_ID}", caps=TAGS)
+mark = founder.mark()
+founder.send(f"REGISTER * founder{RUN_ID}@example.org {PASSWORD}")
+founder.read(2.5)
+if founder.find("VERIFICATION_REQUIRED", lines=founder.since(mark)):
+    import re as _re2
+
+    from harness import wait_for_mail as _wait2
+
+    body = "".join(_wait2(1, seconds=15)[-1:])
+    code = _re2.search(rf"VERIFY founder{RUN_ID} ([A-Z0-9]{{8}})", body)
+    if code:
+        founder.send(f"VERIFY founder{RUN_ID} {code.group(1)}")
+        founder.read(2.0)
+founder.join(owner_chan)
+
+regular = Client(f"regular{RUN_ID}", caps=TAGS)
+regular.join(owner_chan)
+founder.send(f"MODE {owner_chan} +o regular{RUN_ID}")
+founder.read(1.5)
+founder.send(f"MODE {owner_chan} +v regular{RUN_ID}")
+founder.read(1.5)
+time.sleep(1.0)
+
+check("the founder is recorded",
+      db(f"SELECT founder FROM channels WHERE name='{owner_chan}'") == f"founder{RUN_ID}")
+ops = db(
+    "SELECT nick_or_account FROM channel_operators o JOIN channels c ON c.id = o.channel_id "
+    f"WHERE c.name = '{owner_chan}'"
+).split("\n")
+check("granting +o is remembered", f"regular{RUN_ID}" in ops, ops)
+voice = db(
+    "SELECT nick_or_account FROM channel_voice v JOIN channels c ON c.id = v.channel_id "
+    f"WHERE c.name = '{owner_chan}'"
+).split("\n")
+check("granting +v is remembered", f"regular{RUN_ID}" in voice, voice)
+
+regular.close()
+time.sleep(0.5)
+returning = Client(f"regular{RUN_ID}", caps=TAGS)
+mark = returning.mark()
+returning.join(owner_chan)
+names = " ".join(returning.find(" 353 ", lines=returning.since(mark)))
+check("status is restored on the next join", f"@regular{RUN_ID}" in names, names)
+
+mark = founder.mark()
+founder.send(f"MODE {owner_chan} -o regular{RUN_ID}")
+founder.read(1.5)
+time.sleep(1.0)
+ops = db(
+    "SELECT nick_or_account FROM channel_operators o JOIN channels c ON c.id = o.channel_id "
+    f"WHERE c.name = '{owner_chan}'"
+)
+check("taking it away is remembered too", f"regular{RUN_ID}" not in ops.split("\n"), ops)
+returning.close()
+founder.close()
+
+section("registered nicks are reserved")
+imposter = connect_negotiating(f"imposter{RUN_ID}")
+imposter.send("CAP END")
+imposter.wait_for(" 376 ", " 422 ", seconds=5)
+mark = imposter.mark()
+imposter.send(f"NICK founder{RUN_ID}")
+imposter.read(1.5)
+check("someone else cannot take a registered nick",
+      bool(imposter.find(" 433 ", lines=imposter.since(mark))), imposter.since(mark))
+imposter.close()
+
+owner_back = connect_negotiating(f"backagain{RUN_ID}", caps=["sasl"])
+owner_back.sasl_plain(f"founder{RUN_ID}", PASSWORD)
+owner_back.send("CAP END")
+owner_back.wait_for(" 376 ", " 422 ", seconds=5)
+mark = owner_back.mark()
+owner_back.send(f"NICK founder{RUN_ID}")
+owner_back.read(1.5)
+check("the account holder can take their own nick",
+      bool(owner_back.find("NICK", lines=owner_back.since(mark)))
+      and not owner_back.find(" 433 ", lines=owner_back.since(mark)),
+      owner_back.since(mark))
+owner_back.close()
+
+section("server bans")
+oper = Client(f"banoper{RUN_ID}", caps=TAGS)
+oper.send(f"OPER {OPER_NAME} {OPER_PASSWORD}")
+oper.read(2.0)
+target = Client(f"banned{RUN_ID}")
+mark = oper.mark()
+oper.send(f"KLINE banned{RUN_ID}!*@* :smoke test ban")
+oper.read(2.0)
+check("the ban is accepted", bool(oper.find("NOTICE", "added", lines=oper.since(mark))),
+      oper.since(mark))
+target.read(2.0)
+check("the banned user is told why", bool(target.find("ERROR", "banned")), target.lines[-2:])
+
+import socket as _socket
+
+def try_connect(nick):
+    c = _socket.create_connection((IRC_HOST, IRC_PORT), timeout=6)
+    c.sendall(f"NICK {nick}\r\nUSER b 0 * :b\r\n".encode())
+    c.settimeout(5)
+    got, end = b"", time.time() + 5
+    while time.time() < end:
+        try:
+            chunk = c.recv(65536)
+        except _socket.timeout:
+            break
+        if not chunk:
+            break
+        got += chunk
+        if b" 001 " in got or b"ERROR" in got:
+            break
+    c.close()
+    return got.decode(errors="replace")
+
+check("they cannot reconnect", "ERROR" in try_connect(f"banned{RUN_ID}"))
+check("everyone else still can", " 001 " in try_connect(f"unbanned{RUN_ID}"))
+
+mark = oper.mark()
+oper.send(f"UNKLINE banned{RUN_ID}!*@*")
+oper.read(2.0)
+check("the ban can be lifted", bool(oper.find("removed", lines=oper.since(mark))), oper.since(mark))
+check("and they can connect again", " 001 " in try_connect(f"banned{RUN_ID}"))
+target.close()
+
+section("ADMIN")
+adm = Client(f"admin{RUN_ID}")
+mark = adm.mark()
+adm.send("ADMIN")
+adm.read(1.5)
+for numeric in (" 256 ", " 257 ", " 258 ", " 259 "):
+    check(f"ADMIN replies {numeric.strip()}", bool(adm.find(numeric, lines=adm.since(mark))),
+          adm.since(mark))
+adm.close()
 
 section("REHASH and cap-notify")
 oper_client = Client("rehasher", caps=["cap-notify"])
