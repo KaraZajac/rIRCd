@@ -166,9 +166,17 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
         // Load read markers and metadata into server state
         let markers = crate::persist::load_read_markers(pool).await;
         let meta = crate::persist::load_all_metadata(pool).await;
+        let memberships = crate::persist::load_account_channels(pool).await;
         let mut state_w = state.write().await;
         state_w.read_markers = markers;
         state_w.metadata = meta;
+        for (channel, account) in memberships {
+            state_w
+                .channel_accounts
+                .entry(channel)
+                .or_default()
+                .insert(account);
+        }
     }
     // Store the config path so REHASH can reload from disk
     state.write().await.config_path = Some(config_path.to_path_buf());

@@ -11,6 +11,7 @@ import time
 
 from harness import (
     AUTH_SECRET,
+    RUN_ID,
     Client,
     P256DH,
     check,
@@ -21,7 +22,8 @@ from harness import (
 )
 
 LOG = os.environ.get("SMOKE_SERVER_LOG", "")
-ENDPOINT = "https://127.0.0.1:19443/push/erin"
+ACCOUNT = f"erin{RUN_ID}"
+ENDPOINT = f"https://127.0.0.1:19443/push/{RUN_ID}"
 PASSWORD = "hunter2secret"
 
 
@@ -60,21 +62,21 @@ check("refused without an account", bool(anon.find("FAIL WEBPUSH ACCOUNT_REQUIRE
 anon.close()
 
 section("register an account to push to")
-erin = Client("erin")
+erin = Client(ACCOUNT)
 mark = erin.mark()
-erin.send(f"REGISTER * erin@example.org {PASSWORD}")
+erin.send(f"REGISTER * {ACCOUNT}@example.org {PASSWORD}")
 erin.read(2.5)
 registered = bool(erin.find("REGISTER SUCCESS", lines=erin.since(mark)))
-if not registered:
+if not registered and not erin.find("ACCOUNT_EXISTS", lines=erin.since(mark)):
     # Email verification is on in the full run: confirm the code from the sink.
     import re
     from harness import wait_for_mail
 
     body = "".join(wait_for_mail(1, seconds=15)[-1:])
-    match = re.search(r"VERIFY erin ([A-Z0-9]{8})", body)
+    match = re.search(rf"VERIFY {ACCOUNT} ([A-Z0-9]{{8}})", body)
     check("verification code mailed", bool(match), body[:200])
     if match:
-        erin.send(f"VERIFY erin {match.group(1)}")
+        erin.send(f"VERIFY {ACCOUNT} {match.group(1)}")
         erin.read(2.0)
 check("logged in", bool(erin.find(" 900 ")), erin.lines[-4:])
 
@@ -112,7 +114,7 @@ mark = erin.mark()
 erin.send(f"WEBPUSH REGISTER {ENDPOINT} p256dh={P256DH};auth={AUTH_SECRET}")
 erin.read(2.5)
 check("subscription accepted", bool(erin.find("WEBPUSH REGISTER", ENDPOINT, lines=erin.since(mark))), erin.since(mark))
-check("stored against the account", db(f"SELECT account FROM webpush_subscriptions WHERE endpoint='{ENDPOINT}'") == "erin")
+check("stored against the account", db(f"SELECT account FROM webpush_subscriptions WHERE endpoint='{ENDPOINT}'") == ACCOUNT.lower())
 
 mark = erin.mark()
 erin.send(f"WEBPUSH REGISTER {ENDPOINT} p256dh={P256DH};auth={AUTH_SECRET}")
@@ -128,36 +130,58 @@ check("unregistering an unknown endpoint is not an error",
       erin.since(mark))
 
 section("what triggers a push")
-erin.join("#push")
-frank = Client("frank")
-frank.join("#push")
+erin.join(f"#push{RUN_ID}")
+frank = Client(f"frank{RUN_ID}")
+frank.join(f"#push{RUN_ID}")
 
 before = push_attempts()
-frank.send("PRIVMSG erin :are you awake?")
+frank.send(f"PRIVMSG {ACCOUNT} :are you awake?")
 check("direct message pushes", wait_for_attempts(before + 1), f"attempts stayed at {push_attempts()}")
 
 before = push_attempts()
-frank.send("NOTICE erin :and a notice")
+frank.send(f"NOTICE {ACCOUNT} :and a notice")
 check("direct notice pushes", wait_for_attempts(before + 1), f"attempts stayed at {push_attempts()}")
 
 before = push_attempts()
-frank.send("PRIVMSG #push :erin: standup in five")
+frank.send(f"PRIVMSG #push{RUN_ID} :{ACCOUNT}: standup in five")
 check("channel highlight pushes", wait_for_attempts(before + 1), f"attempts stayed at {push_attempts()}")
 
 before = push_attempts()
-frank.send("PRIVMSG #push :anyone been to the karaoke bar")
-frank.send("PRIVMSG #push :just thinking out loud")
+frank.send(f"PRIVMSG #push{RUN_ID} :anyone been to the karaoke bar")
+frank.send(f"PRIVMSG #push{RUN_ID} :just thinking out loud")
 time.sleep(5)
 check("ordinary channel chatter does not push", push_attempts() == before,
       f"attempts {before} -> {push_attempts()}")
 
 before = push_attempts()
-erin.send("PRIVMSG #push :erin talking about erin")
+erin.send(f"PRIVMSG #push{RUN_ID} :{ACCOUNT} talking about themselves")
 time.sleep(5)
 check("a user is not pushed for their own message", push_attempts() == before,
       f"attempts {before} -> {push_attempts()}")
 
 check("payloads encrypted without error", encrypt_errors() == 0)
+
+section("a mention reaches someone who is offline")
+# A push is the only way a mention reaches a user who has disconnected; the
+# message itself waits for them in channel history.
+away_chan = f"#away{int(time.time()) % 100000}"
+erin.join(away_chan)
+frank.join(away_chan)
+erin.send(f"WEBPUSH REGISTER {ENDPOINT} p256dh={P256DH};auth={AUTH_SECRET}")
+erin.read(2.0)
+erin.close()
+time.sleep(2.0)
+
+before = push_attempts()
+frank.send(f"PRIVMSG {away_chan} :{ACCOUNT}: ping while you are away")
+check("a mention of an absent member pushes", wait_for_attempts(before + 1),
+      f"attempts stayed at {push_attempts()}")
+
+before = push_attempts()
+frank.send(f"PRIVMSG {away_chan} :just talking to myself")
+time.sleep(5)
+check("ordinary traffic does not push an absent member", push_attempts() == before,
+      f"attempts {before} -> {push_attempts()}")
 
 section("failures are tracked")
 failures = db(f"SELECT failures FROM webpush_subscriptions WHERE endpoint='{ENDPOINT}'")
@@ -165,17 +189,24 @@ check("failure counter advanced for the unreachable endpoint",
       failures.isdigit() and int(failures) >= 1, f"failures={failures}")
 
 section("unregister")
-mark = erin.mark()
-erin.send(f"WEBPUSH UNREGISTER {ENDPOINT}")
-erin.read(1.5)
-check("UNREGISTER echoed", bool(erin.find("WEBPUSH UNREGISTER", ENDPOINT, lines=erin.since(mark))), erin.since(mark))
+# The subscription belongs to the account, so log back in to manage it.
+back = connect_negotiating(f"back{RUN_ID}", caps=["sasl"])
+back.sasl_plain(ACCOUNT, PASSWORD)
+back.send("CAP END")
+back.wait_for(" 376 ", " 422 ", seconds=5)
+check("logged back in", bool(back.find(" 900 ")), back.lines[-3:])
+mark = back.mark()
+back.send(f"WEBPUSH UNREGISTER {ENDPOINT}")
+back.read(1.5)
+check("UNREGISTER echoed", bool(back.find("WEBPUSH UNREGISTER", ENDPOINT, lines=back.since(mark))),
+      back.since(mark))
 check("row removed", db(f"SELECT COUNT(*) FROM webpush_subscriptions WHERE endpoint='{ENDPOINT}'") == "0")
 
 before = push_attempts()
-frank.send("PRIVMSG erin :still there?")
+frank.send(f"PRIVMSG {away_chan} :{ACCOUNT}: anything now?")
 time.sleep(5)
 check("no push after unregistering", push_attempts() == before, f"attempts {before} -> {push_attempts()}")
 
-erin.close()
+back.close()
 frank.close()
 summary("webpush")

@@ -133,6 +133,64 @@ fn is_nick_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "[]\\`_^{|}-".contains(c)
 }
 
+/// Notify accounts that belong to `channel` but have no connection right now.
+///
+/// A push is the only way a mention reaches someone who is away, and the message
+/// itself is waiting for them in the channel's history when they return.
+async fn push_absent_members(
+    state: &ServerState,
+    cfg: &Config,
+    channel_key: &str,
+    base_msg: &Message,
+    msgid: &str,
+    sender_account: Option<&str>,
+    sender_tags: &SenderTags,
+    text: &str,
+) {
+    if cfg.webpush_runtime.is_none() {
+        return;
+    }
+    let Some(accounts) = state.channel_accounts.get(channel_key) else {
+        return;
+    };
+
+    let caps: std::collections::HashSet<String> = ["message-tags", "server-time", "account-tag"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    for account in accounts {
+        // An absent user is known by their account name, which is their nick.
+        if !mentions_nick(text, account) {
+            continue;
+        }
+        // Connected users are served by the per-recipient path.
+        let connected = match state.nick_to_id.get(&account.to_uppercase()) {
+            Some(id) => match state.clients.get(id) {
+                Some(c) => c
+                    .try_read()
+                    .map(|g| g.account.as_deref() == Some(account.as_str()))
+                    .unwrap_or(true),
+                None => false,
+            },
+            None => false,
+        };
+        if connected {
+            continue;
+        }
+        let tagged = add_tags_for_recipient(
+            base_msg.clone(),
+            &caps,
+            sender_account,
+            Some(msgid),
+            None,
+            cfg.server.client_tag_deny.as_deref(),
+            sender_tags,
+        );
+        crate::webpush::notify(cfg, account, &tagged);
+    }
+}
+
 /// Queue a Web Push notification for a message just delivered to `recipient_id`.
 ///
 /// Notifications are what push exists for, so only messages a user would want to be
@@ -551,6 +609,17 @@ pub async fn handle_privmsg(
             if pending_edit_msgid.is_none() {
                 cfg.record_history(&ch_key, &source, &text, Some(&msgid), "PRIVMSG");
             }
+            push_absent_members(
+                &state_guard,
+                cfg,
+                &ch_key,
+                &base_msg,
+                &msgid,
+                sender_account.as_deref(),
+                &sender_tags,
+                &text,
+            )
+            .await;
         } else {
             reply_to_client(
                 &senders,

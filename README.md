@@ -261,6 +261,11 @@ Endpoints must use `https` and must not resolve to loopback, private, link-local
 - direct `PRIVMSG`/`NOTICE` to the user, and
 - channel `PRIVMSG`/`NOTICE` that mention their nick.
 
+Notifications also reach users who are **not connected**: when a registered user
+joins a channel, that membership is remembered, so a mention still pushes to them
+while they are away — and the message itself is waiting in channel history when
+they return. Leaving the channel, or being kicked from it, ends that.
+
 Endpoints the push service reports as gone (404/410), or that fail `max_failures` times in a row, are removed automatically. Clients should re-send an identical `WEBPUSH REGISTER` periodically (daily is typical) to keep a subscription fresh.
 
 ### `[webirc]`
@@ -485,7 +490,7 @@ Features under consideration for future releases:
 
 | Feature | Description |
 |---------|-------------|
-| **Always-on clients** | Keep an account's channel membership while it is disconnected, so Web Push can notify users whose client is fully offline (today a push fires only for a message that reaches a connected session) |
+| **Offline direct messages** | Accept a `PRIVMSG` to a registered user who is not connected, store it, and push it — today an offline nick still answers 401, and only channel mentions reach absent users |
 | **custom-account-name** | Let an account be named something other than the current nick; needs channel op/voice lists to stop treating nicks and account names as interchangeable first |
 
 ---

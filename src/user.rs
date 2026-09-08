@@ -392,6 +392,9 @@ pub struct ServerState {
     pub config_path: Option<std::path::PathBuf>,
     /// TLS client certificate fingerprints: client_id → SHA-256 hex (for SASL EXTERNAL)
     pub certfps: HashMap<String, String>,
+    /// Accounts known to be in each channel, including ones that are not
+    /// connected right now. Used to notify absent users of mentions.
+    pub channel_accounts: HashMap<String, HashSet<String>>,
 }
 
 /// In-flight draft/multiline batch for one client

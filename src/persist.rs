@@ -210,6 +210,18 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
         .await
         .ok();
 
+    // Which channels an account is in, remembered across disconnects so a user
+    // with a push subscription can be notified while they are away.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS account_channels (
+            account VARCHAR(64)  NOT NULL,
+            channel VARCHAR(160) NOT NULL,
+            PRIMARY KEY (account, channel)
+        ) CHARACTER SET utf8mb4",
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS webpush_subscriptions (
             id         BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -810,6 +822,52 @@ pub fn direct_message_peer(key: &str, viewer: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+// ─── Account channel membership ───────────────────────────────────────────────
+
+/// Remember that an account is in a channel.
+pub async fn record_account_channel(pool: &sqlx::MySqlPool, account: &str, channel: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO account_channels (account, channel) VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE account = account",
+    )
+    .bind(account.to_lowercase())
+    .bind(channel)
+    .execute(pool)
+    .await;
+}
+
+/// Forget one membership, or every membership when `channel` is None.
+pub async fn forget_account_channel(pool: &sqlx::MySqlPool, account: &str, channel: Option<&str>) {
+    let account = account.to_lowercase();
+    let _ = match channel {
+        Some(ch) => {
+            sqlx::query("DELETE FROM account_channels WHERE account = ? AND channel = ?")
+                .bind(&account)
+                .bind(ch)
+                .execute(pool)
+                .await
+        }
+        None => {
+            sqlx::query("DELETE FROM account_channels WHERE account = ?")
+                .bind(&account)
+                .execute(pool)
+                .await
+        }
+    };
+}
+
+/// Every remembered membership, as (channel, account).
+pub async fn load_account_channels(pool: &sqlx::MySqlPool) -> Vec<(String, String)> {
+    use sqlx::Row;
+    sqlx::query("SELECT account, channel FROM account_channels")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.get::<String, _>("channel"), r.get::<String, _>("account")))
+        .collect()
 }
 
 // ─── Web Push subscriptions ───────────────────────────────────────────────────

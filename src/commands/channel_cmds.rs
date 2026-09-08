@@ -32,6 +32,7 @@ pub async fn handle_join(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
+    let state_arc = state.clone();
     let state = state.read().await;
     let client = match state.clients.get(client_id) {
         Some(c) => c.clone(),
@@ -70,6 +71,9 @@ pub async fn handle_join(
     let client_caps = client_data.capabilities.clone();
     let account = client_data.account.clone();
     drop(client_data);
+
+    // Collected while the state read guard is held, applied once it is released.
+    let mut remembered_memberships: Vec<(String, String)> = Vec::new();
 
     // JOIN 0: part all channels the client is currently in
     if ch_names.trim() == "0" {
@@ -420,6 +424,12 @@ pub async fn handle_join(
         // Record JOIN event for draft/event-playback
         cfg.record_history(&ch_key, &source, "", None, "JOIN");
 
+        // Remember the membership for this account, so a mention can still reach
+        // them by push once they disconnect.
+        if let Some(ref account) = account {
+            remembered_memberships.push((ch_key.clone(), account.clone()));
+        }
+
         if let Some(ref topic_str) = topic {
             reply_to_client(
                 &senders,
@@ -529,6 +539,25 @@ pub async fn handle_join(
         }
     }
 
+    drop(state);
+    if !remembered_memberships.is_empty() {
+        {
+            let mut state_w = state_arc.write().await;
+            for (ch_key, account) in &remembered_memberships {
+                state_w
+                    .channel_accounts
+                    .entry(ch_key.clone())
+                    .or_default()
+                    .insert(account.to_lowercase());
+            }
+        }
+        if let Some(ref pool) = cfg.db {
+            for (ch_key, account) in &remembered_memberships {
+                crate::persist::record_account_channel(pool, account, ch_key).await;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -541,6 +570,7 @@ pub async fn handle_part(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
+    let state_arc = state.clone();
     let state = state.read().await;
     let client = match state.clients.get(client_id) {
         Some(c) => c.clone(),
@@ -552,6 +582,13 @@ pub async fn handle_part(
         .source()
         .unwrap_or_else(|| client_id.to_string());
     let ch_names = msg.params.first().map(|s| s.as_str()).unwrap_or("");
+
+    let parting_account = match state.clients.get(client_id) {
+        Some(c) => c.read().await.account.clone(),
+        None => None,
+    };
+    // Collected while the state read guard is held, applied once it is released.
+    let mut forgotten_memberships: Vec<(String, String)> = Vec::new();
     let reason = msg.trailing().unwrap_or("Leaving").to_string();
 
     for ch_name in ch_names.split(',') {
@@ -624,9 +661,31 @@ pub async fn handle_part(
         // Record PART event for draft/event-playback
         cfg.record_history(&ch_key, &source, &reason, None, "PART");
 
+        // Leaving a channel means no more notifications from it.
+        if let Some(ref account) = parting_account {
+            forgotten_memberships.push((ch_key.clone(), account.clone()));
+        }
+
         if let Some(client) = state.clients.get(client_id) {
             let mut c = client.write().await;
             c.channels.remove(&ch_key);
+        }
+    }
+
+    drop(state);
+    if !forgotten_memberships.is_empty() {
+        {
+            let mut state_w = state_arc.write().await;
+            for (ch_key, account) in &forgotten_memberships {
+                if let Some(set) = state_w.channel_accounts.get_mut(ch_key) {
+                    set.remove(&account.to_lowercase());
+                }
+            }
+        }
+        if let Some(ref pool) = cfg.db {
+            for (ch_key, account) in &forgotten_memberships {
+                crate::persist::forget_account_channel(pool, account, Some(ch_key)).await;
+            }
         }
     }
 
@@ -1719,7 +1778,9 @@ pub async fn handle_kick(
         return Ok(());
     }
 
+    let state_arc = state.clone();
     let state = state.read().await;
+    let mut kicked_account: Option<String> = None;
     let client = match state.clients.get(client_id) {
         Some(c) => c.clone(),
         None => return Ok(()),
@@ -1794,7 +1855,11 @@ pub async fn handle_kick(
             if ch.members.remove(&tid).is_some() {
                 tracing::info!(client_id, channel = %ch_name, target = %target_nick, "KICK");
                 if let Some(target_client) = state.clients.get(&tid) {
-                    target_client.write().await.channels.remove(&ch_key);
+                    let mut g = target_client.write().await;
+                    g.channels.remove(&ch_key);
+                    // Being kicked ends the membership, so it must not keep
+                    // producing notifications while they are away.
+                    kicked_account = g.account.clone();
                 }
                 let kick_msg =
                     Message::new("KICK", vec![ch_name.into(), target_nick.into(), reason])
@@ -1813,6 +1878,26 @@ pub async fn handle_kick(
         drop(ch);
         if should_remove_channel {
             ch_store.channels.remove(&ch_key);
+        }
+    }
+
+    drop(state);
+    if let Some(account) = kicked_account {
+        if let Some(set) = state_arc
+            .write()
+            .await
+            .channel_accounts
+            .get_mut(&canonical_channel_key(ch_name))
+        {
+            set.remove(&account.to_lowercase());
+        }
+        if let Some(ref pool) = cfg.db {
+            crate::persist::forget_account_channel(
+                pool,
+                &account,
+                Some(&canonical_channel_key(ch_name)),
+            )
+            .await;
         }
     }
 
