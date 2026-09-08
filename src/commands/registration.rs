@@ -301,7 +301,7 @@ pub async fn complete_registration(
         .await
         .source()
         .unwrap_or_else(|| nick_str.clone());
-    let watchers: Vec<String> = state
+    let mut watchers: Vec<String> = state
         .read()
         .await
         .monitor_watchers
@@ -309,6 +309,18 @@ pub async fn complete_registration(
         .get(&nick_str.to_lowercase())
         .map(|s: &std::collections::HashSet<String>| s.iter().cloned().collect())
         .unwrap_or_default();
+    // extended-monitor: mask watchers (nick!user@host globs) also want to know.
+    {
+        let state_r = state.read().await;
+        for w in state_r
+            .monitor_watchers
+            .pattern_watchers_for(&source.to_lowercase())
+        {
+            if !watchers.contains(&w) {
+                watchers.push(w);
+            }
+        }
+    }
     if !watchers.is_empty() {
         tracing::info!(
             nick = %nick_str,
@@ -1191,7 +1203,7 @@ pub async fn handle_quit(
     }
 
     // monitor: notify clients monitoring this nick that they went offline (731), then clean watchers
-    let watchers_731: Vec<String> = state
+    let mut watchers_731: Vec<String> = state
         .read()
         .await
         .monitor_watchers
@@ -1199,6 +1211,18 @@ pub async fn handle_quit(
         .get(&quit_nick.to_lowercase())
         .map(|s| s.iter().cloned().collect())
         .unwrap_or_default();
+    // extended-monitor: mask watchers get the offline notification too.
+    {
+        let state_r = state.read().await;
+        for w in state_r
+            .monitor_watchers
+            .pattern_watchers_for(&source.to_lowercase())
+        {
+            if !watchers_731.contains(&w) && w != client_id {
+                watchers_731.push(w);
+            }
+        }
+    }
     if !watchers_731.is_empty() {
         tracing::info!(
             nick = %quit_nick,

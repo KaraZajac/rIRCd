@@ -106,6 +106,8 @@ impl Channel {
     }
 
     /// Check if a source (nick!user@host) or account is on the quiet list.
+    /// Masks are globs, exactly like the ban list — an exact-match check here
+    /// would silence nobody, since quiets are almost always written nick!*@*.
     pub fn is_quieted(&self, account: Option<&str>, source: &str) -> bool {
         for mask in &self.quiet_list {
             if let Some(account_mask) = mask.strip_prefix("~a:") {
@@ -115,7 +117,7 @@ impl Channel {
                 {
                     return true;
                 }
-            } else if mask == source {
+            } else if crate::user::glob_match(mask, source) {
                 return true;
             }
         }

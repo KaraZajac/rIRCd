@@ -155,8 +155,16 @@ rIRCd smoke test server.
 Everything here is throwaway.
 """
 
+# Channels suggested to draft/auto-join clients.
+auto_join = "#lobby, #help"
+# Cloak connecting clients so the cloaking path is exercised.
+cloak_key = "smoke-cloak-key"
+
 [network]
 name = "SmokeNet"
+
+[webirc]
+password = "smoke-gateway-secret"
 
 [database]
 host = "127.0.0.1"
@@ -218,7 +226,7 @@ export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 status=0
 if [ "$SERVE_ONLY" = 0 ]; then
   if [ ${#SUITES[@]} -eq 0 ]; then
-    SUITES=(test_core.py test_ircv3.py test_account.py test_webpush.py)
+    SUITES=(test_core.py test_ircv3.py test_features.py test_websocket.py test_account.py test_webpush.py)
   fi
   for suite in "${SUITES[@]}"; do
     say "Running $suite"

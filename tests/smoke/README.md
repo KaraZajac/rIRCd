@@ -17,6 +17,9 @@ tests/smoke/run.sh test_core.py     # one suite
 tests/smoke/run.sh --stop           # stop a --keep/--serve-only environment
 ```
 
+Suites use per-run names for accounts and channels, so `--reuse` can re-run them
+against a live server without tripping over what an earlier run created.
+
 Requires `mariadbd`, `mariadb`, `mariadb-install-db` and `python3` on PATH — no
 Python packages, no running database service, no root. Everything lands in
 `target/smoke/` and is wiped at the start of each non-`--reuse` run.
@@ -33,7 +36,11 @@ reach the test server.
 | `run.sh` | Brings up MariaDB, the SMTP sink and `rircd`, then runs the suites |
 | `harness.py` | `Client` (raw IRC socket), `check()`/`summary()`, database and mail helpers |
 | `smtpsink.py` | Minimal SMTP server that writes each message to `target/smoke/mail/` |
+| `wsclient.py` | Minimal WebSocket client (handshake and framing) for the transport suite |
 | `test_core.py` | Capability negotiation, ISUPPORT, channels, messaging, queries, numerics |
+| `test_ircv3.py` | Every advertised capability on the wire: SASL 3.2, client-only tags, multiline, redaction and edits, chathistory, MONITOR, metadata, channel-rename, STATUSMSG, oper-tag, channel modes, utf8only |
+| `test_features.py` | SCRAM-SHA-256, cloaking, auto-join, WEBIRC, history cursors, event playback, client batches, bans/exceptions/quiets, monitor masks, read-marker persistence, REHASH |
+| `test_websocket.py` | The IRCv3 WebSocket transport, including messaging between ws and tcp clients |
 | `test_account.py` | `REGISTER`, email verification, `VERIFY`, SASL gating on unverified accounts |
 | `test_webpush.py` | `WEBPUSH` subscription handling and which messages trigger a push |
 

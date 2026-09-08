@@ -453,7 +453,7 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **account-extban** | Full | MODE +b ~a:account; JOIN 474 when banned by account |
 | **sasl** | Full | AUTHENTICATE PLAIN, SCRAM-SHA-256, and EXTERNAL (TLS client cert); 903/904; certfp auto-associated on PLAIN/SCRAM login |
 | **monitor** | Full | MONITOR +/−/C/L/S; 730/731/732/733/734; on join/quit/nick |
-| **extended-monitor** | Full | MONITOR patterns with `nick!user@host` globs (`*`/`?` wildcards) |
+| **extended-monitor** | Full | AWAY/ACCOUNT/CHGHOST/SETNAME forwarded for monitored nicks; `nick!user@host` masks (`*`/`?`) may be monitored as well as plain nicks |
 | **sts** | Full | Strict Transport Security; advertised in CAP LS only when TLS is configured; `duration=2592000` |
 | **draft/channel-rename** | Full | RENAME old new [reason]; op-only; fallback PART+JOIN for clients without cap |
 | **draft/chathistory** | Full | CHATHISTORY LATEST/BEFORE/AFTER/AROUND/BETWEEN/TARGETS; BATCH chathistory; DB-backed; limit 200 |

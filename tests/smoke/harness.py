@@ -15,6 +15,9 @@ IRC_HOST = os.environ.get("SMOKE_IRC_HOST", "127.0.0.1")
 IRC_PORT = int(os.environ.get("SMOKE_IRC_PORT", "16667"))
 DB_SOCKET = os.environ.get("SMOKE_DB_SOCKET", "")
 MAIL_DIR = os.environ.get("SMOKE_MAIL_DIR", "")
+# Distinct per run, so suites can be re-run against a live server (--reuse)
+# without tripping over accounts and channels they created last time.
+RUN_ID = os.environ.get("SMOKE_RUN_ID") or format(int(time.time()) % 100000, "05d")
 OPER_NAME = os.environ.get("SMOKE_OPER_NAME", "smokeoper")
 OPER_PASSWORD = os.environ.get("SMOKE_OPER_PASSWORD", "smoke-oper-password")
 
