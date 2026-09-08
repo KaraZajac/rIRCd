@@ -254,6 +254,23 @@ check("client batch is relayed", bool(receiver.find("BATCH", lines=received)), r
 check("both messages arrive",
       bool(receiver.find("part one", lines=received)) and bool(receiver.find("part two", lines=received)),
       received)
+quiet_sender = Client("batchquiet", caps=["message-tags", "server-time", "batch", "draft/client-batch"])
+quiet_sender.join(BATCHING)
+mark = quiet_sender.mark()
+quiet_sender.send(f"BATCH +cb2 draft/client-batch {BATCHING}")
+quiet_sender.send(f"@batch=cb2 PRIVMSG {BATCHING} :sender should not see this")
+quiet_sender.send("BATCH -cb2")
+quiet_sender.read(2.0)
+check("a client batch is not echoed to a sender without echo-message",
+      not quiet_sender.find("sender should not see this", lines=quiet_sender.since(mark)),
+      quiet_sender.since(mark))
+mark = receiver.mark()
+receiver.read(2.0)
+check("but it still reaches the other members",
+      bool(receiver.find("sender should not see this", lines=receiver.since(mark))),
+      receiver.since(mark))
+quiet_sender.close()
+
 sender.close()
 receiver.close()
 

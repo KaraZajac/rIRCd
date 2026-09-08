@@ -417,6 +417,11 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 
 ## IRCv3 Support
 
+Capability names follow the registry: features the specifications advertise with
+an ISUPPORT token (WHOX, UTF8ONLY, BOT, ACCOUNTEXTBAN) are **not** advertised as
+capabilities, and work for every client. Names rIRCd advertised before 1.4 are
+still accepted in `CAP REQ` so older clients keep working.
+
 | Capability / feature | Status | Notes |
 |----------------------|--------|--------|
 | **capability-negotiation** | Full | CAP LS/REQ/ACK/NAK/END, 302 multi-line |
@@ -438,19 +443,19 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **standard-replies** | Full | FAIL for SETNAME, REDACT, UTF-8 errors |
 | **no-implicit-names** | Full | No NAMES burst on JOIN when client has cap |
 | **userhost-in-names** | Full | NAMES (353) with full `nick!user@host` when client has cap |
-| **utf8only** | Full | Non-UTF-8 rejected with FAIL when client has standard-replies |
+| **UTF8ONLY** | Full | ISUPPORT token (not a capability); non-UTF-8 rejected with `FAIL … INVALID_UTF8` |
 | **cap-notify** | Full | CAP NOTIFY with current cap list on REQ/ACK and END; dynamic `CAP NEW`/`CAP DEL` on REHASH |
 | **draft/extended-isupport** | Full | ISUPPORT command; 005 before registration |
-| **whox** | Full | WHO with %fields; 354 RPL_WHOSPCRPL |
-| **bot** | Full | Umode +B; RPL_WHOISBOT (335) in WHOIS |
+| **WHOX** | Full | ISUPPORT token (not a capability); `WHO <target> %fields[,token]` answered with 354 RPL_WHOSPCRPL for any client |
+| **bot-mode** | Full | `BOT=B` ISUPPORT token (not a capability); umode +B, `bot` tag, RPL_WHOISBOT (335) |
 | **draft/oper-tag** | Full | `draft/oper=<name>` tag on messages from IRC operators, for clients with the cap |
-| **message-redaction** | Full | REDACT command; soft-delete in DB; CHATHISTORY replays REDACT events for client sync |
+| **draft/message-redaction** | Full | REDACT command; soft-delete in DB; CHATHISTORY replays REDACT events for client sync |
 | **draft/message-edit** | Full | PRIVMSG with `+draft/edit=<msgid>` tag; DB-backed ownership check; edit history replayed in CHATHISTORY |
 | **draft/react** | Full | TAGMSG with `+draft/react=<emoji>`; forwarded via client-only tag relay |
 | **draft/unreact** | Full | TAGMSG with `+draft/unreact=<emoji>`; forwarded via client-only tag relay |
 | **typing** | Full | TAGMSG with `+typing=active/paused/done`; forwarded via client-only tag relay |
 | **reply** | Full | Messages with `+reply=<msgid>` tag forwarded as-is |
-| **account-extban** | Full | MODE +b ~a:account; JOIN 474 when banned by account |
+| **ACCOUNTEXTBAN** | Full | ISUPPORT token (not a capability); MODE +b ~a:account, JOIN 474 when banned by account |
 | **sasl** | Full | AUTHENTICATE PLAIN, SCRAM-SHA-256, and EXTERNAL (TLS client cert); 903/904; certfp auto-associated on PLAIN/SCRAM login |
 | **monitor** | Full | MONITOR +/−/C/L/S; 730/731/732/733/734; on join/quit/nick |
 | **extended-monitor** | Full | AWAY/ACCOUNT/CHGHOST/SETNAME forwarded for monitored nicks; `nick!user@host` masks (`*`/`?`) may be monitored as well as plain nicks |

@@ -93,12 +93,14 @@ pub async fn handle_who(
         None => Default::default(),
     };
     let use_multi_prefix = client_caps.contains("multi-prefix");
-    let (whox_requested, whox_token) = if use_whox && client_caps.contains("whox") {
+    // WHOX has no capability: support is advertised with the WHOX ISUPPORT token,
+    // so any client that sends %fields gets the extended reply.
+    let (whox_requested, whox_token) = if use_whox {
         whox_type.map(parse_whox_type).unwrap_or((vec![], None))
     } else {
         (vec![], None)
     };
-    let use_whox = use_whox && client_caps.contains("whox") && !whox_requested.is_empty();
+    let use_whox = use_whox && !whox_requested.is_empty();
 
     // labeled-response: WHO produces multiple messages, wrap in batch
     let batch_ref = if let Some(l) = label {

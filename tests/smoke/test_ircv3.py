@@ -29,6 +29,47 @@ s.read(1.0)
 check("906 on aborted authentication", bool(s.find(" 906 ")), s.lines[-3:])
 s.close()
 
+section("capability names")
+names = Client()
+names.send("CAP LS 302")
+names.read(1.0)
+advertised = set()
+for line in names.find("CAP", "LS"):
+    advertised.update(t.split("=")[0] for t in line.split(":", 2)[-1].split())
+
+check("redaction is advertised with the draft/ prefix the spec requires",
+      "draft/message-redaction" in advertised and "message-redaction" not in advertised,
+      sorted(advertised))
+for token_only in ["whox", "utf8only", "bot", "account-extban"]:
+    check(f"{token_only} is not advertised as a capability (it is an ISUPPORT token)",
+          token_only not in advertised, sorted(advertised))
+
+# Clients written against an earlier release must not be left worse off.
+mark = names.mark()
+names.send("CAP REQ :message-redaction whox utf8only bot account-extban")
+names.read(1.5)
+reply = names.find("CAP", lines=names.since(mark))
+check("legacy capability names are still ACKed, not NAKed",
+      bool(reply) and " ACK " in reply[0] and " NAK " not in " ".join(reply), reply)
+check("the legacy redaction name maps to the current one",
+      bool(reply) and "draft/message-redaction" in reply[0], reply)
+names.close()
+
+section("WHOX without a capability")
+# WHOX is signalled by the WHOX ISUPPORT token; there is no capability for it.
+whox = Client("whoxuser")
+whox.join("#whoxroom")
+mark = whox.mark()
+whox.send("WHO #whoxroom %tcuhsnfar,742")
+whox.read(1.5)
+replies = whox.find(" 354 ", lines=whox.since(mark))
+check("354 RPL_WHOSPCRPL for a client that negotiated nothing", bool(replies), whox.since(mark))
+check("the requested token comes back",
+      bool(replies) and "742" in replies[0], replies)
+check("the requested fields are populated",
+      bool(replies) and "whoxuser" in replies[0] and "#whoxroom" in replies[0], replies)
+whox.close()
+
 section("no-implicit-names")
 quiet = Client("quietjoin", caps=["no-implicit-names"])
 mark = quiet.mark()
@@ -168,6 +209,23 @@ check("both lines delivered inside the batch",
       and len(ml_reader.find("PRIVMSG", "line two", lines=received)) == 1, received)
 check("multiline batch closed", bool(ml_reader.find("BATCH -", lines=received)), received)
 
+ml_sender.read(2.0)  # collect the sender's own echo before counting it
+check("the sender receives its own batch exactly once",
+      len(ml_sender.find("BATCH +", "draft/multiline")) == 1
+      and len(ml_sender.find("PRIVMSG", "line one")) == 1,
+      [l for l in ml_sender.lines if "draft/multiline" in l or "line one" in l])
+
+no_echo = Client("mlnoecho", caps=["message-tags", "server-time", "batch", "draft/multiline"])
+no_echo.join("#multi")
+mark = no_echo.mark()
+no_echo.send("BATCH +ne draft/multiline #multi")
+no_echo.send("@batch=ne PRIVMSG #multi :quiet please")
+no_echo.send("BATCH -ne")
+no_echo.read(2.0)
+check("a sender without echo-message gets no copy of its own batch",
+      not no_echo.find("quiet please", lines=no_echo.since(mark)), no_echo.since(mark))
+no_echo.close()
+
 plain_reader = Client("mlplain", caps=TAGS)
 plain_reader.join("#multi")
 mark = plain_reader.mark()
@@ -182,8 +240,8 @@ check("clients without the cap get plain PRIVMSGs",
       and not plain_reader.find("BATCH", lines=received), received)
 
 section("message-redaction and draft/message-edit")
-red = Client("redactor", caps=TAGS + ["message-redaction", "draft/message-edit"])
-red_peer = Client("redpeer", caps=TAGS + ["message-redaction", "draft/message-edit"])
+red = Client("redactor", caps=TAGS + ["draft/message-redaction", "draft/message-edit"])
+red_peer = Client("redpeer", caps=TAGS + ["draft/message-redaction", "draft/message-edit"])
 red.join("#redact")
 red_peer.join("#redact")
 red.read(1.0)

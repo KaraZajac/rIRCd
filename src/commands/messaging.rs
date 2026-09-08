@@ -1012,6 +1012,12 @@ pub async fn deliver_multiline_batch(
     drop(state_guard);
 
     for mid in &recipient_ids {
+        // The sender's own copy is the echo-message block below: sending it here
+        // too would deliver the whole batch twice, and would reach senders that
+        // never asked for an echo.
+        if mid == client_id {
+            continue;
+        }
         let caps = {
             let state_r = state.read().await;
             let client_arc = state_r.clients.get(mid).cloned();
@@ -1575,7 +1581,11 @@ pub async fn handle_redact(
             let state_r = state.read().await;
             for mid in &member_ids {
                 let has_cap = match state_r.clients.get(mid) {
-                    Some(c) => c.read().await.capabilities.contains("message-redaction"),
+                    Some(c) => c
+                        .read()
+                        .await
+                        .capabilities
+                        .contains("draft/message-redaction"),
                     None => false,
                 };
                 if has_cap {
@@ -1591,13 +1601,13 @@ pub async fn handle_redact(
             .clients
             .get(client_id)
             .and_then(|c| c.try_read().ok())
-            .map(|g| g.capabilities.contains("message-redaction"))
+            .map(|g| g.capabilities.contains("draft/message-redaction"))
             .unwrap_or(false);
         let recipient_has_cap = tid_opt
             .as_deref()
             .and_then(|tid| state_r.clients.get(tid))
             .and_then(|c| c.try_read().ok())
-            .map(|g| g.capabilities.contains("message-redaction"))
+            .map(|g| g.capabilities.contains("draft/message-redaction"))
             .unwrap_or(false);
         drop(state_r);
 
@@ -1930,7 +1940,7 @@ pub async fn handle_chathistory(
     // If the client supports message-redaction, include REDACT events for any messages
     // that were soft-deleted within the returned time range, so the client can update
     // its local buffer on reconnect.
-    if !entries.is_empty() && caps.contains("message-redaction") {
+    if !entries.is_empty() && caps.contains("draft/message-redaction") {
         let redacted = persist::read_redacted_in_range(pool, target, &oldest_ts, &newest_ts).await;
         for (msgid, source) in redacted {
             let mut redact_msg = Message::new(
@@ -2076,7 +2086,7 @@ pub async fn deliver_client_batch(
         return Ok(());
     }
 
-    let (source, sender_account, sender_tags) = {
+    let (source, sender_account, sender_tags, echo_message) = {
         let state_r = state.read().await;
         let client = match state_r.clients.get(client_id) {
             Some(c) => c.clone(),
@@ -2086,7 +2096,8 @@ pub async fn deliver_client_batch(
         let source = g.source().unwrap_or_else(|| client_id.to_string());
         let account = g.account.clone();
         let tags = SenderTags::new(g.bot, g.oper_name.clone());
-        (source, account, tags)
+        let echo = g.has_cap("echo-message");
+        (source, account, tags, echo)
     };
 
     let state_r = state.read().await;
@@ -2116,6 +2127,10 @@ pub async fn deliver_client_batch(
     let server_ref = generate_msgid();
 
     for mid in &recipient_ids {
+        // Senders only get their own batch back if they asked for echo-message.
+        if mid == client_id && !echo_message {
+            continue;
+        }
         let caps = {
             let state_r = state.read().await;
             match state_r.clients.get(mid).cloned() {

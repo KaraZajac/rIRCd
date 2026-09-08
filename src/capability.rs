@@ -1,7 +1,11 @@
 use crate::config::Config;
 use std::collections::HashSet;
 
-/// All IRCv3 capabilities we support
+/// All IRCv3 capabilities we support.
+///
+/// Every name here is either registered or carries the `draft/` prefix the
+/// work-in-progress specification asks for. Features advertised through an
+/// ISUPPORT token instead — WHOX, UTF8ONLY, BOT, ACCOUNTEXTBAN — do not belong here.
 pub const CAPS: &[&str] = &[
     "capability-negotiation", // Implicit
     "message-tags",
@@ -20,14 +24,10 @@ pub const CAPS: &[&str] = &[
     "standard-replies",
     "no-implicit-names",
     "userhost-in-names",
-    "utf8only",
     "sasl",
     "cap-notify",
     "draft/extended-isupport",
-    "whox",
-    "bot",
-    "message-redaction",
-    "account-extban",
+    "draft/message-redaction",
     "monitor",
     "extended-monitor",
     "draft/channel-rename",
@@ -49,6 +49,21 @@ pub const CAPS: &[&str] = &[
     "draft/webpush",
     "draft/oper-tag",
     "sts",
+];
+
+/// Names rIRCd used to advertise, still accepted in CAP REQ so clients written
+/// against an earlier release keep working. Each maps to what it means now, or
+/// to itself when the feature no longer needs a capability at all.
+const LEGACY_CAP_ALIASES: &[(&str, Option<&str>)] = &[
+    // Renamed: the specification requires the draft/ prefix while it is WIP.
+    ("message-redaction", Some("draft/message-redaction")),
+    // Never capabilities: these features are advertised with an ISUPPORT token
+    // (WHOX, UTF8ONLY, BOT=B, ACCOUNTEXTBAN=~a) and work for every client
+    // regardless of what it negotiated.
+    ("whox", None),
+    ("utf8only", None),
+    ("bot", None),
+    ("account-extban", None),
 ];
 
 /// Capabilities that depend on message-tags
@@ -106,7 +121,9 @@ pub fn build_cap_list(cfg: &Config, version_302: bool, client_is_tls: bool) -> V
     }
 }
 
-/// Filter requested caps to only those we support. Requested cap may include =value (e.g. draft/multiline=max-lines=10).
+/// Filter requested caps to only those we support. A requested cap may include a
+/// value (e.g. draft/multiline=max-lines=10). Returns (acked, naked); acked names
+/// are the canonical ones, so a legacy request is enabled under its current name.
 pub fn filter_requested(
     requested: &[String],
     enabled_in_config: &HashSet<String>,
@@ -120,10 +137,16 @@ pub fn filter_requested(
             continue;
         }
         let base = cap.split('=').next().unwrap_or(cap);
-        if CAPS.contains(&base)
-            && (enabled_in_config.is_empty() || enabled_in_config.contains(base))
-        {
-            ack.push(base.to_string());
+        // A name we no longer advertise is still honoured: ACK it, mapped to the
+        // capability it became, so an older client is not left worse off.
+        let resolved = match LEGACY_CAP_ALIASES.iter().find(|(old, _)| *old == base) {
+            Some((old, replacement)) => replacement.unwrap_or(old),
+            None => base,
+        };
+        let known =
+            CAPS.contains(&resolved) || LEGACY_CAP_ALIASES.iter().any(|(old, _)| *old == base);
+        if known && (enabled_in_config.is_empty() || enabled_in_config.contains(resolved)) {
+            ack.push(resolved.to_string());
         } else {
             nak.push(cap.to_string());
         }
