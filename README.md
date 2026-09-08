@@ -337,10 +337,12 @@ key_file = "/etc/rIRCd/vapid.key"
 | Command | Description |
 |---------|-------------|
 | `rircd init [--dir /etc/rIRCd]` | Create config directory with a default `config.toml` |
-| `rircd run [--config /etc/rIRCd/config.toml]` | Start the server; connects to DB, inits schema, writes PID file |
-| `rircd stop [--config /etc/rIRCd/config.toml]` | Send SIGTERM to the running server (Unix only) |
-| `rircd status [--config /etc/rIRCd/config.toml]` | Check if the server is running via PID file |
+| `rircd [--config /etc/rIRCd/config.toml] run` | Start the server; connects to DB, inits schema, writes PID file |
+| `rircd [--config /etc/rIRCd/config.toml] stop` | Send SIGTERM to the running server (Unix only) |
+| `rircd [--config /etc/rIRCd/config.toml] status` | Check if the server is running via PID file |
 | `rircd genpasswd` | Interactively hash a password for use in `[[opers]]` |
+
+`--config` is a global flag, so it goes **before** the subcommand.
 
 The PID file is written to the same directory as `config.toml` (e.g. `/etc/rIRCd/rircd.pid`) and is removed on clean shutdown. `rircd stop` and `rircd status` use it to find the process.
 
