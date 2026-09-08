@@ -25,7 +25,17 @@ pub async fn handle_client_tls(
 ) {
     let addr = host.clone();
     info!("Client connected (TLS): {} from {}", client_id, addr);
-    handle_client_stream(stream, client_id, host, tx, server_name, certfp, true, keepalive).await;
+    handle_client_stream(
+        stream,
+        client_id,
+        host,
+        tx,
+        server_name,
+        certfp,
+        true,
+        keepalive,
+    )
+    .await;
 }
 
 pub async fn handle_client(
@@ -41,7 +51,17 @@ pub async fn handle_client(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".into());
     info!("Client connected: {} from {}", client_id, addr);
-    handle_client_stream(stream, client_id, host, tx, server_name, None, false, keepalive).await;
+    handle_client_stream(
+        stream,
+        client_id,
+        host,
+        tx,
+        server_name,
+        None,
+        false,
+        keepalive,
+    )
+    .await;
 }
 
 async fn handle_client_stream<S>(

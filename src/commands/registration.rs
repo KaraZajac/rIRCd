@@ -258,8 +258,7 @@ pub async fn complete_registration(
                             reply_to_client(
                                 &senders,
                                 client_id,
-                                Message::new("AUTOJOIN", vec![current.clone()])
-                                    .with_prefix(server),
+                                Message::new("AUTOJOIN", vec![current.clone()]).with_prefix(server),
                                 label,
                             )
                             .await;
@@ -454,7 +453,10 @@ pub async fn handle_cap(
                 }
             } else if version_302 {
                 if let Some(c) = state_guard.clients.get(client_id) {
-                    c.write().await.capabilities.insert("cap-notify".to_string());
+                    c.write()
+                        .await
+                        .capabilities
+                        .insert("cap-notify".to_string());
                 }
             }
             let tls_port: Option<u16> = if cfg.tls_enabled() {
@@ -514,8 +516,7 @@ pub async fn handle_cap(
                     .collect::<Vec<_>>()
                     .join(" ")
             };
-            let mut reply =
-                Message::new("CAP", vec![cap_nick.clone(), "LIST".into(), cap_line]);
+            let mut reply = Message::new("CAP", vec![cap_nick.clone(), "LIST".into(), cap_line]);
             reply.prefix = Some(cfg.server.name.clone());
             reply_to_client(&senders, client_id, reply, label).await;
         }
@@ -538,8 +539,7 @@ pub async fn handle_cap(
                 }
             }
 
-            let (ack_enable, nak) =
-                filter_requested(&to_enable, &std::collections::HashSet::new());
+            let (ack_enable, nak) = filter_requested(&to_enable, &std::collections::HashSet::new());
             // Gather current client caps to check cap-notify protection
             let client_caps: std::collections::HashSet<String> = if is_registered {
                 match state_guard.clients.get(client_id) {
@@ -974,11 +974,8 @@ async fn send_motd(
         reply_to_client(
             senders,
             client_id,
-            Message::new(
-                "422",
-                vec![nick.to_string(), "MOTD File is missing".into()],
-            )
-            .with_prefix(server),
+            Message::new("422", vec![nick.to_string(), "MOTD File is missing".into()])
+                .with_prefix(server),
             label,
         )
         .await;
@@ -1003,8 +1000,7 @@ async fn send_motd(
         reply_to_client(
             senders,
             client_id,
-            Message::new("372", vec![nick.to_string(), format!("- {}", line)])
-                .with_prefix(server),
+            Message::new("372", vec![nick.to_string(), format!("- {}", line)]).with_prefix(server),
             label,
         )
         .await;
@@ -1367,11 +1363,8 @@ pub async fn handle_authenticate(
         reply_to_client(
             &senders,
             client_id,
-            Message::new(
-                "906",
-                vec![nick, "SASL authentication aborted".into()],
-            )
-            .with_prefix(&cfg.server.name),
+            Message::new("906", vec![nick, "SASL authentication aborted".into()])
+                .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1479,7 +1472,13 @@ pub async fn handle_authenticate(
         let source = format!(
             "{}!{}@{}",
             &nick,
-            state.read().await.pending.get(client_id).and_then(|c| c.user.as_deref()).unwrap_or("*"),
+            state
+                .read()
+                .await
+                .pending
+                .get(client_id)
+                .and_then(|c| c.user.as_deref())
+                .unwrap_or("*"),
             host
         );
         reply_to_client(
@@ -1501,11 +1500,8 @@ pub async fn handle_authenticate(
         reply_to_client(
             &senders,
             client_id,
-            Message::new(
-                "903",
-                vec![nick, "SASL authentication successful".into()],
-            )
-            .with_prefix(&cfg.server.name),
+            Message::new("903", vec![nick, "SASL authentication successful".into()])
+                .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1547,11 +1543,7 @@ pub async fn handle_authenticate(
             client_id,
             Message::new(
                 "908",
-                vec![
-                    nick,
-                    mechs.into(),
-                    "are available SASL mechanisms".into(),
-                ],
+                vec![nick, mechs.into(), "are available SASL mechanisms".into()],
             )
             .with_prefix(&cfg.server.name),
             label,
@@ -1669,11 +1661,8 @@ pub async fn handle_authenticate(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new(
-                        "905",
-                        vec![nick, "SASL message too long".into()],
-                    )
-                    .with_prefix(&cfg.server.name),
+                    Message::new("905", vec![nick, "SASL message too long".into()])
+                        .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -2865,7 +2854,8 @@ pub async fn handle_away(
     reply_to_client(
         &senders,
         client_id,
-        Message::new(reply_code, vec![nick.clone(), reply_text.into()]).with_prefix(&cfg.server.name),
+        Message::new(reply_code, vec![nick.clone(), reply_text.into()])
+            .with_prefix(&cfg.server.name),
         label,
     )
     .await;
@@ -3258,12 +3248,7 @@ pub async fn send_chghost_if_changed(
                 let cg = c.read().await;
                 let channels: Vec<String> = cg.channels.keys().cloned().collect();
                 let nick = cg.nick.clone().unwrap_or_default();
-                let new_src = format!(
-                    "{}!{}@{}",
-                    nick,
-                    new_user,
-                    new_host
-                );
+                let new_src = format!("{}!{}@{}", nick, new_user, new_host);
                 (channels, nick, new_src)
             }
             None => return,
@@ -3271,8 +3256,7 @@ pub async fn send_chghost_if_changed(
     };
     let chghost_msg =
         Message::new("CHGHOST", vec![new_user.into(), new_host.into()]).with_prefix(old_source);
-    let quit_msg =
-        Message::new("QUIT", vec!["Changing host".into()]).with_prefix(old_source);
+    let quit_msg = Message::new("QUIT", vec!["Changing host".into()]).with_prefix(old_source);
     let mut already_notified = std::collections::HashSet::new();
     for ch_name in channel_names {
         let (member_ids, member_modes) = {
@@ -3317,13 +3301,9 @@ pub async fn send_chghost_if_changed(
                             mode_args.push(nick.clone());
                         }
                         if !mode_chars.is_empty() {
-                            let mut params = vec![
-                                ch_name.clone(),
-                                format!("+{}", mode_chars),
-                            ];
+                            let mut params = vec![ch_name.clone(), format!("+{}", mode_chars)];
                             params.extend(mode_args);
-                            let mode_msg = Message::new("MODE", params)
-                                .with_prefix(&new_source);
+                            let mode_msg = Message::new("MODE", params).with_prefix(&new_source);
                             send_to_client(&senders, &mid, mode_msg).await;
                         }
                     }

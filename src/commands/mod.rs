@@ -289,7 +289,15 @@ pub async fn handle_message(
             registration::handle_ping(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
         "PONG" => {
-            let result = registration::handle_pong(&client_id, msg, state, senders.clone(), cfg, label.as_deref()).await;
+            let result = registration::handle_pong(
+                &client_id,
+                msg,
+                state,
+                senders.clone(),
+                cfg,
+                label.as_deref(),
+            )
+            .await;
             // labeled-response: PONG produces no reply, so send ACK if labeled
             if let Some(ref l) = label {
                 reply::send_labeled_ack(&senders, &client_id, l, &cfg.server.name).await;

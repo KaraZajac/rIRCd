@@ -1,7 +1,5 @@
 use crate::channel::ChannelStore;
-use crate::commands::{
-    end_labeled_batch, reply_in_batch, reply_to_client, start_labeled_batch,
-};
+use crate::commands::{end_labeled_batch, reply_in_batch, reply_to_client, start_labeled_batch};
 use crate::config::Config;
 use crate::protocol::Message;
 use crate::user::ServerState;
@@ -161,22 +159,20 @@ pub async fn handle_who(
                     } else {
                         let oper_flag = if c.oper { "*" } else { "" };
                         let flags_field = format!("{}{}{}", flags, oper_flag, prefix_str);
-                        send_reply!(
-                            Message::new(
-                                "352",
-                                vec![
-                                    nick.clone(),
-                                    target.to_string(),
-                                    c.display_user().to_string(),
-                                    c.display_host().to_string(),
-                                    cfg.server.name.clone(),
-                                    c.nick_or_id().to_string(),
-                                    flags_field,
-                                    format!(":{} {}", hopcount, realname),
-                                ],
-                            )
-                            .with_prefix(&cfg.server.name)
-                        );
+                        send_reply!(Message::new(
+                            "352",
+                            vec![
+                                nick.clone(),
+                                target.to_string(),
+                                c.display_user().to_string(),
+                                c.display_host().to_string(),
+                                cfg.server.name.clone(),
+                                c.nick_or_id().to_string(),
+                                flags_field,
+                                format!(":{} {}", hopcount, realname),
+                            ],
+                        )
+                        .with_prefix(&cfg.server.name));
                     }
                 }
             }
@@ -258,22 +254,20 @@ pub async fn handle_who(
                 } else {
                     let oper_flag = if c.oper { "*" } else { "" };
                     let flags_field = format!("{}{}", flags, oper_flag);
-                    send_reply!(
-                        Message::new(
-                            "352",
-                            vec![
-                                nick.clone(),
-                                "*".to_string(),
-                                c.display_user().to_string(),
-                                c.display_host().to_string(),
-                                cfg.server.name.clone(),
-                                c.nick_or_id().to_string(),
-                                flags_field,
-                                format!(":{} {}", hopcount, realname),
-                            ],
-                        )
-                        .with_prefix(&cfg.server.name)
-                    );
+                    send_reply!(Message::new(
+                        "352",
+                        vec![
+                            nick.clone(),
+                            "*".to_string(),
+                            c.display_user().to_string(),
+                            c.display_host().to_string(),
+                            cfg.server.name.clone(),
+                            c.nick_or_id().to_string(),
+                            flags_field,
+                            format!(":{} {}", hopcount, realname),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name));
                 }
             }
         }
@@ -391,20 +385,18 @@ pub async fn handle_whois(
             drop(ch_store);
             let ch_str = ch_list.join(" ");
 
-            send_reply!(
-                Message::new(
-                    "311",
-                    vec![
-                        nick.clone(),
-                        target_nick.into(),
-                        c.display_user().into(),
-                        c.display_host().into(),
-                        "*".into(),
-                        c.realname.as_deref().unwrap_or("").into(),
-                    ],
-                )
-                .with_prefix(&cfg.server.name)
-            );
+            send_reply!(Message::new(
+                "311",
+                vec![
+                    nick.clone(),
+                    target_nick.into(),
+                    c.display_user().into(),
+                    c.display_host().into(),
+                    "*".into(),
+                    c.realname.as_deref().unwrap_or("").into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name));
 
             if !ch_list.is_empty() {
                 send_reply!(
@@ -413,109 +405,93 @@ pub async fn handle_whois(
                 );
             }
             // 312 RPL_WHOISSERVER
-            send_reply!(
-                Message::new(
-                    "312",
-                    vec![
-                        nick.clone(),
-                        target_nick.into(),
-                        cfg.server.name.clone(),
-                        "rIRCd server".into(),
-                    ],
-                )
-                .with_prefix(&cfg.server.name)
-            );
+            send_reply!(Message::new(
+                "312",
+                vec![
+                    nick.clone(),
+                    target_nick.into(),
+                    cfg.server.name.clone(),
+                    "rIRCd server".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name));
             // 317 RPL_WHOISIDLE: seconds idle, signon time
             {
                 let idle_secs = chrono::Utc::now().timestamp().saturating_sub(c.last_active);
-                send_reply!(
-                    Message::new(
-                        "317",
-                        vec![
-                            nick.clone(),
-                            target_nick.into(),
-                            idle_secs.to_string(),
-                            c.signon_at.to_string(),
-                            "seconds idle, signon time".into(),
-                        ],
-                    )
-                    .with_prefix(&cfg.server.name)
-                );
+                send_reply!(Message::new(
+                    "317",
+                    vec![
+                        nick.clone(),
+                        target_nick.into(),
+                        idle_secs.to_string(),
+                        c.signon_at.to_string(),
+                        "seconds idle, signon time".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name));
             }
             // 301 RPL_AWAY if target is away
             if let Some(ref away_msg) = c.away_message {
-                send_reply!(
-                    Message::new(
-                        "301",
-                        vec![nick.clone(), target_nick.into(), away_msg.clone()],
-                    )
-                    .with_prefix(&cfg.server.name)
-                );
+                send_reply!(Message::new(
+                    "301",
+                    vec![nick.clone(), target_nick.into(), away_msg.clone()],
+                )
+                .with_prefix(&cfg.server.name));
             }
             if c.bot {
-                send_reply!(
-                    Message::new(
-                        "335",
-                        vec![nick.clone(), target_nick.into(), "is a bot".into()],
-                    )
-                    .with_prefix(&cfg.server.name)
-                );
+                send_reply!(Message::new(
+                    "335",
+                    vec![nick.clone(), target_nick.into(), "is a bot".into()],
+                )
+                .with_prefix(&cfg.server.name));
             }
             // 330 RPL_WHOISACCOUNT — account name
             if let Some(ref account) = c.account {
-                send_reply!(
-                    Message::new(
-                        "330",
-                        vec![
-                            nick.clone(),
-                            target_nick.into(),
-                            account.clone(),
-                            "is logged in as".into(),
-                        ],
-                    )
-                    .with_prefix(&cfg.server.name)
-                );
+                send_reply!(Message::new(
+                    "330",
+                    vec![
+                        nick.clone(),
+                        target_nick.into(),
+                        account.clone(),
+                        "is logged in as".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name));
             }
             // 671 RPL_WHOISSECURE — secure connection indicator
             if c.is_tls {
-                send_reply!(
-                    Message::new(
-                        "671",
-                        vec![
-                            nick.clone(),
-                            target_nick.into(),
-                            "is using a secure connection".into(),
-                        ],
-                    )
-                    .with_prefix(&cfg.server.name)
-                );
+                send_reply!(Message::new(
+                    "671",
+                    vec![
+                        nick.clone(),
+                        target_nick.into(),
+                        "is using a secure connection".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name));
             }
             // 276 RPL_WHOISCERTFP — TLS certificate fingerprint
             if let Some(ref fp) = state.certfps.get(&c.id) {
-                send_reply!(
-                    Message::new(
-                        "276",
-                        vec![
-                            nick.clone(),
-                            target_nick.into(),
-                            format!("has client certificate fingerprint {}", fp),
-                        ],
-                    )
-                    .with_prefix(&cfg.server.name)
-                );
+                send_reply!(Message::new(
+                    "276",
+                    vec![
+                        nick.clone(),
+                        target_nick.into(),
+                        format!("has client certificate fingerprint {}", fp),
+                    ],
+                )
+                .with_prefix(&cfg.server.name));
             }
             if c.oper {
-                send_reply!(
-                    Message::new(
-                        "313",
-                        vec![
-                            nick.clone(),
-                            target_nick.into(),
-                            "is an IRC operator".into(),
-                        ],
-                    )
-                    .with_prefix(&cfg.server.name)
-                );
+                send_reply!(Message::new(
+                    "313",
+                    vec![
+                        nick.clone(),
+                        target_nick.into(),
+                        "is an IRC operator".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name));
             }
             // 379 RPL_WHOISMODES — user modes
             {
@@ -535,28 +511,24 @@ pub async fn handle_whois(
                 if c.bot {
                     modes.push('B');
                 }
-                send_reply!(
-                    Message::new(
-                        "379",
-                        vec![
-                            nick.clone(),
-                            target_nick.into(),
-                            format!("is using modes {}", modes),
-                        ],
-                    )
-                    .with_prefix(&cfg.server.name)
-                );
+                send_reply!(Message::new(
+                    "379",
+                    vec![
+                        nick.clone(),
+                        target_nick.into(),
+                        format!("is using modes {}", modes),
+                    ],
+                )
+                .with_prefix(&cfg.server.name));
             }
         }
     }
 
-    send_reply!(
-        Message::new(
-            "318",
-            vec![nick, target_nick.into(), "End of /WHOIS list".into()],
-        )
-        .with_prefix(&cfg.server.name)
-    );
+    send_reply!(Message::new(
+        "318",
+        vec![nick, target_nick.into(), "End of /WHOIS list".into()],
+    )
+    .with_prefix(&cfg.server.name));
 
     if let Some(ref br) = batch_ref {
         end_labeled_batch(&senders, client_id, br, &cfg.server.name).await;

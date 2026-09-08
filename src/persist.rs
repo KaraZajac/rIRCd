@@ -199,19 +199,15 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
     .await?;
 
     // Migrate: add certfp column for SASL EXTERNAL (TLS client certificate fingerprint)
-    sqlx::query(
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS certfp VARCHAR(128) DEFAULT NULL",
-    )
-    .execute(pool)
-    .await
-    .ok();
+    sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS certfp VARCHAR(128) DEFAULT NULL")
+        .execute(pool)
+        .await
+        .ok();
 
-    sqlx::query(
-        "ALTER TABLE users ADD INDEX IF NOT EXISTS idx_certfp (certfp)",
-    )
-    .execute(pool)
-    .await
-    .ok();
+    sqlx::query("ALTER TABLE users ADD INDEX IF NOT EXISTS idx_certfp (certfp)")
+        .execute(pool)
+        .await
+        .ok();
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS whowas (

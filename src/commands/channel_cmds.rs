@@ -135,11 +135,7 @@ pub async fn handle_join(
                 client_id,
                 Message::new(
                     "403",
-                    vec![
-                        nick.clone(),
-                        ch_name.to_string(),
-                        "No such channel".into(),
-                    ],
+                    vec![nick.clone(), ch_name.to_string(), "No such channel".into()],
                 )
                 .with_prefix(&cfg.server.name),
                 label,
@@ -412,8 +408,7 @@ pub async fn handle_join(
             None => None,
         };
         if let Some(ref away_msg) = joining_away {
-            let away_notify =
-                Message::new("AWAY", vec![away_msg.clone()]).with_prefix(&source);
+            let away_notify = Message::new("AWAY", vec![away_msg.clone()]).with_prefix(&source);
             for mid in &member_ids {
                 if *mid == client_id {
                     continue;
@@ -587,11 +582,7 @@ pub async fn handle_part(
                 client_id,
                 Message::new(
                     "403",
-                    vec![
-                        nick,
-                        ch_name.to_string(),
-                        "No such channel".into(),
-                    ],
+                    vec![nick, ch_name.to_string(), "No such channel".into()],
                 )
                 .with_prefix(&cfg.server.name),
                 label,
@@ -791,13 +782,8 @@ async fn send_names_for_channel(
         reply_to_client(senders, client_id, batch_end, None).await;
     } else if label.is_some() {
         // labeled-response: wrap in labeled-response batch for multi-message reply
-        let lr_ref = crate::commands::start_labeled_batch(
-            senders,
-            client_id,
-            label.unwrap(),
-            server,
-        )
-        .await;
+        let lr_ref =
+            crate::commands::start_labeled_batch(senders, client_id, label.unwrap(), server).await;
         crate::commands::reply_in_batch(
             senders,
             client_id,
@@ -875,9 +861,7 @@ pub async fn handle_list(
 
     // labeled-response: LIST produces multiple messages, wrap in batch
     let batch_ref = if let Some(l) = label {
-        Some(
-            crate::commands::start_labeled_batch(&senders, client_id, l, &cfg.server.name).await,
-        )
+        Some(crate::commands::start_labeled_batch(&senders, client_id, l, &cfg.server.name).await)
     } else {
         None
     };
@@ -967,11 +951,8 @@ pub async fn handle_mode(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new(
-                        "403",
-                        vec![nick, target.into(), "No such channel".into()],
-                    )
-                    .with_prefix(&cfg.server.name),
+                    Message::new("403", vec![nick, target.into(), "No such channel".into()])
+                        .with_prefix(&cfg.server.name),
                     label,
                 )
                 .await;
@@ -1074,10 +1055,13 @@ pub async fn handle_mode(
                     'k' => {
                         if plus {
                             // Enforce KEYLEN=64
-                            ch.key = msg
-                                .params
-                                .get(param_idx)
-                                .map(|k| if k.len() > 64 { k[..64].to_string() } else { k.clone() });
+                            ch.key = msg.params.get(param_idx).map(|k| {
+                                if k.len() > 64 {
+                                    k[..64].to_string()
+                                } else {
+                                    k.clone()
+                                }
+                            });
                         } else {
                             ch.key = None;
                         }
@@ -1770,11 +1754,8 @@ pub async fn handle_kick(
         reply_to_client(
             &senders,
             client_id,
-            Message::new(
-                "403",
-                vec![nick, ch_name.into(), "No such channel".into()],
-            )
-            .with_prefix(&cfg.server.name),
+            Message::new("403", vec![nick, ch_name.into(), "No such channel".into()])
+                .with_prefix(&cfg.server.name),
             label,
         )
         .await;

@@ -356,10 +356,7 @@ pub async fn handle_privmsg(
                     client_id,
                     Message::new(
                         "404",
-                        vec![
-                            target.into(),
-                            "Cannot send to channel (+m)".into(),
-                        ],
+                        vec![target.into(), "Cannot send to channel (+m)".into()],
                     )
                     .with_prefix(&cfg.server.name),
                     label,
@@ -482,7 +479,7 @@ pub async fn handle_privmsg(
                 Some(&msgid),
                 Some(&msg.tags),
                 cfg.server.client_tag_deny.as_deref(),
-            sender_is_bot,
+                sender_is_bot,
             )
             .await;
             // 301 RPL_AWAY if target is away
@@ -697,7 +694,7 @@ pub async fn handle_notice(
                 Some(&msgid),
                 Some(&msg.tags),
                 cfg.server.client_tag_deny.as_deref(),
-            sender_is_bot,
+                sender_is_bot,
             )
             .await;
             if echo_message {
@@ -1163,10 +1160,7 @@ pub async fn handle_tagmsg(
                     client_id,
                     Message::new(
                         "404",
-                        vec![
-                            target.into(),
-                            "Cannot send to channel (+m)".into(),
-                        ],
+                        vec![target.into(), "Cannot send to channel (+m)".into()],
                     )
                     .with_prefix(&cfg.server.name),
                     label,

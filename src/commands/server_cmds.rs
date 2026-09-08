@@ -1,9 +1,7 @@
 //! Standard IRC server information commands: LUSERS, VERSION, TIME, INFO, LINKS, STATS, WHOWAS, HELP, KNOCK.
 
 use crate::channel::{canonical_channel_key, ChannelStore};
-use crate::commands::{
-    end_labeled_batch, reply_in_batch, reply_to_client, start_labeled_batch,
-};
+use crate::commands::{end_labeled_batch, reply_in_batch, reply_to_client, start_labeled_batch};
 use crate::config::Config;
 use crate::protocol::Message;
 use crate::user::ServerState;
@@ -74,83 +72,71 @@ pub async fn handle_lusers(
     }
 
     // 251 RPL_LUSERCLIENT
-    send_reply!(
-        Message::new(
-            "251",
-            vec![
-                nick.clone(),
-                format!(
-                    "There are {} users and {} invisible on 1 servers",
-                    visible_users, invisible_users
-                ),
-            ],
-        )
-        .with_prefix(s)
-    );
+    send_reply!(Message::new(
+        "251",
+        vec![
+            nick.clone(),
+            format!(
+                "There are {} users and {} invisible on 1 servers",
+                visible_users, invisible_users
+            ),
+        ],
+    )
+    .with_prefix(s));
 
     if ops > 0 {
         // 252 RPL_LUSEROP
-        send_reply!(
-            Message::new(
-                "252",
-                vec![nick.clone(), ops.to_string(), "IRC Operators online".into()],
-            )
-            .with_prefix(s)
-        );
+        send_reply!(Message::new(
+            "252",
+            vec![nick.clone(), ops.to_string(), "IRC Operators online".into()],
+        )
+        .with_prefix(s));
     }
 
     // 254 RPL_LUSERCHANNELS
-    send_reply!(
-        Message::new(
-            "254",
-            vec![
-                nick.clone(),
-                channels_count.to_string(),
-                "channels formed".into(),
-            ],
-        )
-        .with_prefix(s)
-    );
+    send_reply!(Message::new(
+        "254",
+        vec![
+            nick.clone(),
+            channels_count.to_string(),
+            "channels formed".into(),
+        ],
+    )
+    .with_prefix(s));
 
     // 255 RPL_LUSERME
-    send_reply!(
-        Message::new(
-            "255",
-            vec![
-                nick.clone(),
-                format!("I have {} clients and 1 servers", total_users),
-            ],
-        )
-        .with_prefix(s)
-    );
+    send_reply!(Message::new(
+        "255",
+        vec![
+            nick.clone(),
+            format!("I have {} clients and 1 servers", total_users),
+        ],
+    )
+    .with_prefix(s));
 
     // 265 RPL_LOCALUSERS
-    send_reply!(
-        Message::new(
-            "265",
-            vec![
-                nick.clone(),
-                total_users.to_string(),
-                total_users.to_string(),
-                format!("Current local users {}, max {}", total_users, total_users),
-            ],
-        )
-        .with_prefix(s)
-    );
+    send_reply!(Message::new(
+        "265",
+        vec![
+            nick.clone(),
+            total_users.to_string(),
+            total_users.to_string(),
+            format!("Current local users {}, max {}", total_users, total_users),
+        ],
+    )
+    .with_prefix(s));
 
     // 266 RPL_GLOBALUSERS
-    send_reply!(
-        Message::new(
-            "266",
-            vec![
-                nick.clone(),
-                total_users.to_string(),
-                total_users.to_string(),
-                format!("Current global users {}, max {}", total_users, total_users),
-            ],
-        )
-        .with_prefix(s)
-    );
+    send_reply!(Message::new(
+        "266",
+        vec![
+            nick.clone(),
+            total_users.to_string(),
+            total_users.to_string(),
+            format!("Current global users {}, max {}", total_users, total_users),
+        ],
+    )
+    .with_prefix(s));
 
     if let Some(ref br) = batch_ref {
         end_labeled_batch(&senders, client_id, br, s).await;
@@ -465,8 +451,7 @@ pub async fn handle_whowas(
     // Fall back to database if no in-memory entries
     if entries.is_empty() {
         if let Some(ref pool) = cfg.db {
-            entries =
-                crate::persist::load_whowas(pool, target_nick, count as i64).await;
+            entries = crate::persist::load_whowas(pool, target_nick, count as i64).await;
         }
     }
 
@@ -1248,11 +1233,10 @@ pub async fn handle_rehash(
         let c = cfg.read().await;
         c.tls.client_certs && c.tls_enabled()
     };
-    let old_caps_raw = crate::capability::build_cap_list(false, old_tls_port, old_sasl_external, false);
-    let old_caps: std::collections::HashSet<String> = old_caps_raw[0]
-        .split(' ')
-        .map(|s| s.to_string())
-        .collect();
+    let old_caps_raw =
+        crate::capability::build_cap_list(false, old_tls_port, old_sasl_external, false);
+    let old_caps: std::collections::HashSet<String> =
+        old_caps_raw[0].split(' ').map(|s| s.to_string()).collect();
 
     // Preserve the live database pool — REHASH does not reconnect
     let existing_db = cfg.read().await.db.clone();
@@ -1278,11 +1262,10 @@ pub async fn handle_rehash(
         let c = cfg.read().await;
         c.tls.client_certs && c.tls_enabled()
     };
-    let new_caps_raw = crate::capability::build_cap_list(false, new_tls_port, new_sasl_external, false);
-    let new_caps: std::collections::HashSet<String> = new_caps_raw[0]
-        .split(' ')
-        .map(|s| s.to_string())
-        .collect();
+    let new_caps_raw =
+        crate::capability::build_cap_list(false, new_tls_port, new_sasl_external, false);
+    let new_caps: std::collections::HashSet<String> =
+        new_caps_raw[0].split(' ').map(|s| s.to_string()).collect();
 
     // Extract just cap names (strip =value) for comparison
     let old_names: std::collections::HashSet<String> = old_caps
@@ -1300,7 +1283,10 @@ pub async fn handle_rehash(
 
     for name in new_names.difference(&old_names) {
         // Newly added cap — include with value from new_caps
-        if let Some(full) = new_caps.iter().find(|s| s.split('=').next().unwrap_or(s) == name) {
+        if let Some(full) = new_caps
+            .iter()
+            .find(|s| s.split('=').next().unwrap_or(s) == name)
+        {
             cap_new.push(full.clone());
         }
     }

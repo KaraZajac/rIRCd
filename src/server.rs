@@ -311,7 +311,15 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                         let tx = tx.clone();
                         let server_name = server_name.clone();
                         tokio::spawn(async move {
-                            client::handle_client(stream, client_id, host, tx, server_name, keepalive).await;
+                            client::handle_client(
+                                stream,
+                                client_id,
+                                host,
+                                tx,
+                                server_name,
+                                keepalive,
+                            )
+                            .await;
                         });
                     }
                     Err(e) => error!("Accept error: {}", e),
@@ -407,25 +415,28 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                     |ws: axum::extract::ws::WebSocketUpgrade,
                      headers: axum::http::HeaderMap,
                      axum::extract::State(st): axum::extract::State<WsState>| async move {
-                        let id = st.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let id = st
+                            .counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let client_id = format!("ws-{}", id);
                         let host = headers
                             .get("x-forwarded-for")
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("unknown")
                             .to_string();
-                        ws.protocols(["text.ircv3.net", "binary.ircv3.net"]).on_upgrade(move |socket| {
-                            client::handle_client_ws(
-                                socket,
-                                client_id,
-                                host,
-                                st.tx,
-                                st.server_name,
-                                None,
-                                st.keepalive,
-                                false, // WS (plaintext)
-                            )
-                        })
+                        ws.protocols(["text.ircv3.net", "binary.ircv3.net"])
+                            .on_upgrade(move |socket| {
+                                client::handle_client_ws(
+                                    socket,
+                                    client_id,
+                                    host,
+                                    st.tx,
+                                    st.server_name,
+                                    None,
+                                    st.keepalive,
+                                    false, // WS (plaintext)
+                                )
+                            })
                     },
                 ),
             )
@@ -485,14 +496,17 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                                                     let client_id = cid;
                                                     let certfp = cfp;
                                                     async move {
-                                                        ws.protocols(["text.ircv3.net", "binary.ircv3.net"])
-                                                            .on_upgrade(move |socket| {
-                                                                client::handle_client_ws(
-                                                                    socket, client_id, host, tx,
-                                                                    sn, certfp, keepalive,
-                                                                    true, // WSS (TLS)
-                                                                )
-                                                            })
+                                                        ws.protocols([
+                                                            "text.ircv3.net",
+                                                            "binary.ircv3.net",
+                                                        ])
+                                                        .on_upgrade(move |socket| {
+                                                            client::handle_client_ws(
+                                                                socket, client_id, host, tx, sn,
+                                                                certfp, keepalive,
+                                                                true, // WSS (TLS)
+                                                            )
+                                                        })
                                                     }
                                                 },
                                             ),
