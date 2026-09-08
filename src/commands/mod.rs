@@ -501,8 +501,16 @@ pub async fn handle_message(
             registration::handle_oper(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
         "REGISTER" => {
-            registration::handle_register(&client_id, msg, state, senders, cfg, label.as_deref())
-                .await
+            registration::handle_register(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
         }
         "VERIFY" => {
             registration::handle_verify(&client_id, msg, state, senders, cfg, label.as_deref())

@@ -2533,11 +2533,129 @@ pub async fn handle_oper(
     Ok(())
 }
 
+/// Log a connection into `account` and apply every side effect a successful
+/// authentication implies: set the account (on the registered client, or on the
+/// pending connection for clients still negotiating), associate the TLS client
+/// certificate fingerprint with the account, send 900 RPL_LOGGEDIN, and announce
+/// the change to channel peers with account-notify and to extended-monitor watchers.
+///
+/// Callers send their own mechanism-specific success reply afterwards (SASL 903,
+/// REGISTER SUCCESS, VERIFY SUCCESS).
+pub async fn login_client(
+    client_id: &str,
+    account: &str,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    cfg: &Config,
+    label: Option<&str>,
+) {
+    // Set the account first so a concurrent authentication attempt is a no-op.
+    {
+        let mut state_w = state.write().await;
+        if let Some(client) = state_w.clients.get(client_id) {
+            client.write().await.account = Some(account.to_string());
+        } else if let Some(conn) = state_w.pending.get_mut(client_id) {
+            conn.account = Some(account.to_string());
+        }
+    }
+
+    // Auto-associate the TLS client certificate fingerprint so SASL EXTERNAL works next time.
+    if let Some(ref pool) = cfg.db {
+        let certfp = state.read().await.certfps.get(client_id).cloned();
+        if let Some(fp) = certfp {
+            tracing::info!(client_id, account = %account, "Auto-associating certfp with account");
+            crate::persist::set_certfp(pool, account, &fp).await;
+        }
+    }
+
+    let (nick, source, channel_list) = {
+        let state_r = state.read().await;
+        if let Some(client) = state_r.clients.get(client_id) {
+            let g = client.read().await;
+            (
+                g.nick_or_id().to_string(),
+                g.source().unwrap_or_else(|| client_id.to_string()),
+                g.channels.keys().cloned().collect::<Vec<_>>(),
+            )
+        } else if let Some(conn) = state_r.pending.get(client_id) {
+            let nick = conn.nick.clone().unwrap_or_else(|| "*".to_string());
+            let source = conn
+                .user
+                .as_ref()
+                .map(|u| format!("{}!{}@{}", nick, u, conn.host))
+                .unwrap_or_else(|| nick.clone());
+            (nick, source, Vec::new())
+        } else {
+            ("*".to_string(), client_id.to_string(), Vec::new())
+        }
+    };
+
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "900",
+            vec![
+                nick.clone(),
+                source.clone(),
+                account.to_string(),
+                format!("You are now logged in as {}", account),
+            ],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+
+    // account-notify: tell channel peers that have the cap (prefix = user whose account changed)
+    let account_msg = Message::new("ACCOUNT", vec![account.to_string()]).with_prefix(&source);
+    let mut already_notified = std::collections::HashSet::new();
+    for ch_name in &channel_list {
+        let member_ids: Vec<String> = {
+            let ch_store = channels.read().await;
+            match ch_store.channels.get(ch_name) {
+                Some(ch) => ch.read().await.members.keys().cloned().collect(),
+                None => continue,
+            }
+        };
+        let state_r = state.read().await;
+        for mid in &member_ids {
+            if mid == client_id {
+                continue;
+            }
+            let has_cap = match state_r.clients.get(mid) {
+                Some(c) => c.read().await.has_cap("account-notify"),
+                None => continue,
+            };
+            if has_cap {
+                send_to_client(&senders, mid, account_msg.clone()).await;
+                already_notified.insert(mid.clone());
+            }
+        }
+    }
+
+    // extended-monitor: notify watchers that have account-notify + extended-monitor
+    let state_r = state.read().await;
+    notify_extended_monitor_watchers(
+        &state_r,
+        &senders,
+        &nick,
+        &source,
+        account_msg,
+        "account-notify",
+        &already_notified,
+        client_id,
+    )
+    .await;
+}
+
 /// REGISTER <account> {<email>|*} <password> — draft/account-registration. Account must be * (current nick).
 pub async fn handle_register(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<crate::channel::ChannelStore>>,
     senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
     cfg: &Config,
     label: Option<&str>,
@@ -2554,7 +2672,7 @@ pub async fn handle_register(
                         "REGISTER".into(),
                         "TEMPORARILY_UNAVAILABLE".into(),
                         "*".into(),
-                        " :Registration unavailable".into(),
+                        "Registration unavailable".into(),
                     ],
                 )
                 .with_prefix(&cfg.server.name),
@@ -2577,7 +2695,7 @@ pub async fn handle_register(
                         vec![
                             "REGISTER".into(),
                             "COMPLETE_CONNECTION_REQUIRED".into(),
-                            " :Complete connection registration first".into(),
+                            "Complete connection registration first".into(),
                         ],
                     )
                     .with_prefix(&cfg.server.name),
@@ -2599,7 +2717,7 @@ pub async fn handle_register(
                         "REGISTER".into(),
                         "NEED_NICK".into(),
                         "*".into(),
-                        " :Send NICK first".into(),
+                        "Send NICK first".into(),
                     ],
                 )
                 .with_prefix(&cfg.server.name),
@@ -2619,7 +2737,7 @@ pub async fn handle_register(
                         "REGISTER".into(),
                         "ALREADY_AUTHENTICATED".into(),
                         acc.into(),
-                        " :Already logged in".into(),
+                        "Already logged in".into(),
                     ],
                 )
                 .with_prefix(&cfg.server.name),
@@ -2642,7 +2760,7 @@ pub async fn handle_register(
                         "REGISTER".into(),
                         "ACCOUNT_NAME_MUST_BE_NICK".into(),
                         account_param.into(),
-                        " :Account name must match your current nick".into(),
+                        "Account name must match your current nick".into(),
                     ],
                 )
                 .with_prefix(&cfg.server.name),
@@ -2671,7 +2789,7 @@ pub async fn handle_register(
                     "REGISTER".into(),
                     "UNACCEPTABLE_PASSWORD".into(),
                     account.clone(),
-                    " :Password required".into(),
+                    "Password required".into(),
                 ],
             )
             .with_prefix(&cfg.server.name),
@@ -2682,6 +2800,17 @@ pub async fn handle_register(
     }
     match persist::register_user(pool, &account, password, email).await {
         Ok(()) => {
+            // The spec requires the client to be authenticated as if it had used SASL.
+            login_client(
+                client_id,
+                &account,
+                state.clone(),
+                channels,
+                senders.clone(),
+                cfg,
+                label,
+            )
+            .await;
             reply_to_client(
                 &senders,
                 client_id,
@@ -2690,14 +2819,14 @@ pub async fn handle_register(
                     vec![
                         "SUCCESS".into(),
                         account.clone(),
-                        " :Account successfully registered".into(),
+                        "Account successfully registered".into(),
                     ],
                 )
                 .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
-            tracing::info!(client_id, account = %account, "Account registered");
+            tracing::info!(client_id, account = %account, "Account registered and logged in");
         }
         Err(RegisterError::AccountExists) => {
             reply_to_client(
@@ -2709,7 +2838,7 @@ pub async fn handle_register(
                         "REGISTER".into(),
                         "ACCOUNT_EXISTS".into(),
                         account.clone(),
-                        " :Account already exists".into(),
+                        "Account already exists".into(),
                     ],
                 )
                 .with_prefix(&cfg.server.name),
@@ -2727,7 +2856,7 @@ pub async fn handle_register(
                         "REGISTER".into(),
                         "WEAK_PASSWORD".into(),
                         account.clone(),
-                        " :Password too weak".into(),
+                        "Password too weak".into(),
                     ],
                 )
                 .with_prefix(&cfg.server.name),
@@ -2746,7 +2875,7 @@ pub async fn handle_register(
                         "REGISTER".into(),
                         "TEMPORARILY_UNAVAILABLE".into(),
                         account.clone(),
-                        " :Registration temporarily unavailable".into(),
+                        "Registration temporarily unavailable".into(),
                     ],
                 )
                 .with_prefix(&cfg.server.name),
@@ -2782,7 +2911,7 @@ pub async fn handle_verify(
                         "VERIFY".into(),
                         "ALREADY_AUTHENTICATED".into(),
                         acc.clone(),
-                        " :Already logged in".into(),
+                        "Already logged in".into(),
                     ],
                 )
                 .with_prefix(&cfg.server.name),
@@ -2802,7 +2931,7 @@ pub async fn handle_verify(
                 "VERIFY".into(),
                 "INVALID_CODE".into(),
                 account_str,
-                " :Verification not required or code invalid".into(),
+                "Verification not required or code invalid".into(),
             ],
         )
         .with_prefix(&cfg.server.name),

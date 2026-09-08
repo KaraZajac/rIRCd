@@ -46,9 +46,9 @@ pub fn parse_message(line: &str) -> Result<Message, ParseError> {
 
     // Parse optional prefix
     let mut prefix = None;
-    if remaining.starts_with(':') {
-        let (p, rest) = match remaining[1..].find(' ') {
-            Some(pos) => (&remaining[1..pos], remaining[pos + 1..].trim_start()),
+    if let Some(after_colon) = remaining.strip_prefix(':') {
+        let (p, rest) = match after_colon.split_once(' ') {
+            Some((p, rest)) => (p, rest.trim_start()),
             None => return Err(ParseError::Malformed),
         };
         prefix = Some(p.to_string());
