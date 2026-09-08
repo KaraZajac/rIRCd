@@ -1117,6 +1117,8 @@ pub async fn handle_mode(
             let mut plus = true;
             // (who, is_op, granted) — persisted once the channel lock is released.
             let mut access_changes: Vec<(String, bool, bool)> = Vec::new();
+            // (list, mask, added) — likewise, so bans survive a restart.
+            let mut list_changes: Vec<(char, String, bool)> = Vec::new();
             // param_idx starts at 2: params[0]=target, params[1]=mode_str, params[2+]=mode args
             let mut param_idx: usize = 2;
             for c in mode_str.chars() {
@@ -1216,9 +1218,11 @@ pub async fn handle_mode(
                                     .await;
                                 } else if !ch.bans.contains(mask) {
                                     ch.bans.push(mask.clone());
+                                    list_changes.push(('b', mask.clone(), true));
                                 }
                             } else {
                                 ch.bans.retain(|b| b != mask);
+                                list_changes.push(('b', mask.clone(), false));
                             }
                             param_idx += 1;
                         } else {
@@ -1275,9 +1279,11 @@ pub async fn handle_mode(
                                     .await;
                                 } else if !ch.quiet_list.contains(mask) {
                                     ch.quiet_list.push(mask.clone());
+                                    list_changes.push(('q', mask.clone(), true));
                                 }
                             } else {
                                 ch.quiet_list.retain(|q| q != mask);
+                                list_changes.push(('q', mask.clone(), false));
                             }
                             param_idx += 1;
                         } else {
@@ -1429,9 +1435,11 @@ pub async fn handle_mode(
                                     .await;
                                 } else if !ch.ban_exceptions.contains(mask) {
                                     ch.ban_exceptions.push(mask.clone());
+                                    list_changes.push(('e', mask.clone(), true));
                                 }
                             } else {
                                 ch.ban_exceptions.retain(|b| b != mask);
+                                list_changes.push(('e', mask.clone(), false));
                             }
                             param_idx += 1;
                         } else {
@@ -1492,9 +1500,11 @@ pub async fn handle_mode(
                                     .await;
                                 } else if !ch.invite_exceptions.contains(mask) {
                                     ch.invite_exceptions.push(mask.clone());
+                                    list_changes.push(('I', mask.clone(), true));
                                 }
                             } else {
                                 ch.invite_exceptions.retain(|b| b != mask);
+                                list_changes.push(('I', mask.clone(), false));
                             }
                             param_idx += 1;
                         } else {
@@ -1588,6 +1598,10 @@ pub async fn handle_mode(
                 // or a restart the way a services bot would keep it.
                 for (who, is_op, granted) in &access_changes {
                     crate::persist::set_channel_access(pool, &ch_key, who, *is_op, *granted).await;
+                }
+                for (list_type, mask, added) in &list_changes {
+                    crate::persist::set_channel_list_entry(pool, &ch_key, *list_type, mask, *added)
+                        .await;
                 }
             }
         }

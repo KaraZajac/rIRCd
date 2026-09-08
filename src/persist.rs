@@ -39,6 +39,14 @@ pub struct ChannelEntry {
     pub created_at: i64,
     /// Account that created the channel, if any.
     pub founder: String,
+    /// Ban masks (+b).
+    pub bans: Vec<String>,
+    /// Ban exceptions (+e).
+    pub ban_exceptions: Vec<String>,
+    /// Invite exceptions (+I).
+    pub invite_exceptions: Vec<String>,
+    /// Quiet masks (+q).
+    pub quiets: Vec<String>,
 }
 
 /// One line of channel history from the database.
@@ -258,6 +266,20 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
         .await
         .ok();
 
+    // Channel ban, exception, invite-exception and quiet lists. Without these a
+    // restart forgets every ban a channel operator has set.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS channel_lists (
+            channel_id BIGINT      NOT NULL,
+            list_type  CHAR(1)     NOT NULL,
+            mask       VARCHAR(255) NOT NULL,
+            PRIMARY KEY (channel_id, list_type, mask),
+            FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+        ) CHARACTER SET utf8mb4",
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS server_bans (
             mask       VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -415,6 +437,50 @@ pub async fn set_channel_access(
     }
 }
 
+/// Add or remove a mask on one of a channel's lists (`b`, `e`, `I` or `q`).
+pub async fn set_channel_list_entry(
+    pool: &sqlx::MySqlPool,
+    channel_name: &str,
+    list_type: char,
+    mask: &str,
+    add: bool,
+) {
+    let _ = sqlx::query("INSERT IGNORE INTO channels (name) VALUES (?)")
+        .bind(channel_name)
+        .execute(pool)
+        .await;
+    let id: Option<i64> = sqlx::query_scalar("SELECT id FROM channels WHERE name = ?")
+        .bind(channel_name)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    let Some(id) = id else {
+        return;
+    };
+
+    let result = if add {
+        sqlx::query(
+            "INSERT IGNORE INTO channel_lists (channel_id, list_type, mask) VALUES (?, ?, ?)",
+        )
+        .bind(id)
+        .bind(list_type.to_string())
+        .bind(mask)
+        .execute(pool)
+        .await
+    } else {
+        sqlx::query("DELETE FROM channel_lists WHERE channel_id = ? AND list_type = ? AND mask = ?")
+            .bind(id)
+            .bind(list_type.to_string())
+            .bind(mask)
+            .execute(pool)
+            .await
+    };
+    if let Err(e) = result {
+        tracing::warn!(channel = %channel_name, list_type = %list_type, "Failed to store channel list entry: {}", e);
+    }
+}
+
 /// Record the account that created a channel, if it has no founder yet.
 pub async fn set_channel_founder(pool: &sqlx::MySqlPool, channel_name: &str, account: &str) {
     let _ = sqlx::query(
@@ -457,6 +523,27 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
         let created_at: i64 = row.try_get("created_ts").unwrap_or(0);
         let founder: String = row.try_get("founder").unwrap_or_default();
 
+        let list_rows =
+            sqlx::query("SELECT list_type, mask FROM channel_lists WHERE channel_id = ?")
+                .bind(id)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+        let mut bans = Vec::new();
+        let mut ban_exceptions = Vec::new();
+        let mut invite_exceptions = Vec::new();
+        let mut quiets = Vec::new();
+        for r in &list_rows {
+            let list_type: String = r.get("list_type");
+            let mask: String = r.get("mask");
+            match list_type.chars().next() {
+                Some('e') => ban_exceptions.push(mask),
+                Some('I') => invite_exceptions.push(mask),
+                Some('q') => quiets.push(mask),
+                _ => bans.push(mask),
+            }
+        }
+
         let ops: Vec<String> =
             sqlx::query("SELECT nick_or_account FROM channel_operators WHERE channel_id = ?")
                 .bind(id)
@@ -487,6 +574,10 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
             mode_limit,
             created_at,
             founder,
+            bans,
+            ban_exceptions,
+            invite_exceptions,
+            quiets,
         });
     }
     entries

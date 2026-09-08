@@ -654,6 +654,40 @@ check("taking it away is remembered too", f"regular{RUN_ID}" not in ops.split("\
 returning.close()
 founder.close()
 
+section("channel lists survive a restart")
+# A ban a channel operator sets must still be there after the server restarts —
+# it used to live only in memory.
+list_chan = f"#lists{RUN_ID}"
+lister = Client(f"lister{RUN_ID}", caps=TAGS)
+lister.join(list_chan)
+lister.send(f"MODE {list_chan} +b nuisance{RUN_ID}!*@*")
+lister.read(1.0)
+lister.send(f"MODE {list_chan} +e friend{RUN_ID}!*@*")
+lister.read(1.0)
+lister.send(f"MODE {list_chan} +I invited{RUN_ID}!*@*")
+lister.read(1.0)
+lister.send(f"MODE {list_chan} +q quiet{RUN_ID}!*@*")
+lister.read(1.0)
+time.sleep(1.0)
+
+stored = db(
+    "SELECT list_type, mask FROM channel_lists l JOIN channels c ON c.id = l.channel_id "
+    f"WHERE c.name = '{list_chan}' ORDER BY list_type"
+)
+for kind, who in [("b", "nuisance"), ("e", "friend"), ("I", "invited"), ("q", "quiet")]:
+    check(f"+{kind} is stored", f"{who}{RUN_ID}" in stored, stored)
+
+mark = lister.mark()
+lister.send(f"MODE {list_chan} -b nuisance{RUN_ID}!*@*")
+lister.read(1.0)
+time.sleep(1.0)
+stored = db(
+    "SELECT mask FROM channel_lists l JOIN channels c ON c.id = l.channel_id "
+    f"WHERE c.name = '{list_chan}' AND list_type = 'b'"
+)
+check("removing a ban removes it from storage", f"nuisance{RUN_ID}" not in stored, stored)
+lister.close()
+
 section("registered nicks are reserved")
 imposter = connect_negotiating(f"imposter{RUN_ID}")
 imposter.send("CAP END")

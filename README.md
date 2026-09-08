@@ -432,6 +432,7 @@ traditional network is done by the server itself, against MariaDB.
 | Channel founder | The account that creates a channel; always opped on join |
 | Channel access lists | `MODE +o` / `+v` by an operator is remembered and restored on the next join |
 | Channel modes, topic, key | Persisted and restored on startup |
+| Ban lists (`AKICK`-ish) | `+b`, `+e`, `+I` and `+q` masks are persisted and restored |
 | Network bans | `KLINE` / `UNKLINE`, persisted and enforced on connect |
 | Vhosts | `SETHOST` (oper), plus automatic cloaking via `cloak_key` |
 
@@ -444,6 +445,7 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 
 - **Topic** — persisted whenever a channel topic is set; 333 RPL_TOPICWHOTIME and 329 RPL_CREATIONTIME sent on JOIN.
 - **Channel modes** — mode flags (`+imnstRcC`), key (`+k`), and user limit (`+l`) are saved to the database on every MODE change and restored on startup.
+- **Ban and exception lists** — `+b`, `+e`, `+I` and `+q` masks are saved per channel and restored, so a restart does not forget who was banned.
 - **Operators / Voice** — stored per channel; users in these lists receive `@`/`+` automatically when they join.
 - **Direct messages** — private conversations are stored per nick pair and replayed by `CHATHISTORY <nick>`; `CHATHISTORY TARGETS` lists only the requesting user's own conversations.
 - **Message history** — PRIVMSG, NOTICE, and channel events (JOIN, PART, QUIT, TOPIC, NICK) are appended (up to 1,000 entries per channel, oldest pruned). Clients with `draft/chathistory` can request history via `CHATHISTORY LATEST/BEFORE/AFTER/AROUND/BETWEEN #channel <cursor> <limit>` or list active conversations with `CHATHISTORY TARGETS timestamp=<from> timestamp=<to> <limit>`. Clients with `draft/event-playback` receive the full event timeline; otherwise only messages are returned.

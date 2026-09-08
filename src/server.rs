@@ -182,6 +182,10 @@ pub async fn run(
             }
             ch_guard.persisted_operators = e.operators;
             ch_guard.founder = e.founder;
+            ch_guard.bans = e.bans;
+            ch_guard.ban_exceptions = e.ban_exceptions;
+            ch_guard.invite_exceptions = e.invite_exceptions;
+            ch_guard.quiet_list = e.quiets;
             ch_guard.persisted_voice = e.voice;
             // Restore channel modes
             for c in e.mode_flags.chars() {
