@@ -1234,13 +1234,30 @@ pub async fn handle_rehash(
         old_caps_raw[0].split(' ').map(|s| s.to_string()).collect();
 
     // Preserve the live database pool and history writer — REHASH does not reconnect
-    let (existing_db, existing_history) = {
+    let (existing_db, existing_history, existing_tls) = {
         let c = cfg.read().await;
-        (c.db.clone(), c.history.clone())
+        (c.db.clone(), c.history.clone(), c.tls_acceptor.clone())
     };
     let mut new_cfg = new_cfg;
     new_cfg.db = existing_db;
     new_cfg.history = existing_history;
+    new_cfg.tls_acceptor = existing_tls.clone();
+
+    // Reload the certificate: renewals happen on a schedule, and restarting to
+    // pick one up would drop every connection.
+    if let Some(ref shared) = existing_tls {
+        if new_cfg.tls_enabled() {
+            match crate::server::build_tls_acceptor(&new_cfg) {
+                Ok(acceptor) => {
+                    *shared.write().await = acceptor;
+                    tracing::info!("REHASH: TLS certificate reloaded");
+                }
+                Err(e) => {
+                    tracing::error!("REHASH: keeping the current certificate: {}", e);
+                }
+            }
+        }
+    }
 
     // Keep the VAPID key and HTTP client. Rotating them would invalidate every
     // push subscription registered under the old key.

@@ -3104,6 +3104,131 @@ pub async fn handle_register(
     Ok(())
 }
 
+/// `GHOST <nick>` — disconnect a stale session holding a nick you own.
+///
+/// With registered nicks reserved, the only thing that can be sitting on your
+/// nick is one of your own connections that has not timed out yet; this is how
+/// you take it back without waiting.
+pub async fn handle_ghost(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let (nick, account) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.nick_or_id().to_string(), g.account.clone())
+            }
+            None => return Ok(()),
+        }
+    };
+
+    let target = msg.params.first().cloned().unwrap_or_default();
+    if target.is_empty() {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec!["GHOST".into(), "Not enough parameters".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let Some(account) = account else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "GHOST".into(),
+                    "ACCOUNT_REQUIRED".into(),
+                    target,
+                    "Log in to the account that owns the nick first".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+
+    // Only the account that owns the nick may reclaim it.
+    if !target.eq_ignore_ascii_case(&account) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "GHOST".into(),
+                    "NOT_YOUR_NICK".into(),
+                    target,
+                    "That nick belongs to another account".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let ghost_id = state
+        .read()
+        .await
+        .nick_to_id
+        .get(&target.to_uppercase())
+        .cloned();
+    let Some(ghost_id) = ghost_id.filter(|id| id != client_id) else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "GHOST".into(),
+                    "NO_SUCH_SESSION".into(),
+                    target,
+                    "Nobody else is using that nick".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+
+    tracing::info!(client_id, %account, ghost = %ghost_id, "GHOST: closing stale session");
+    if let Some(sink) = senders.read().await.get(&ghost_id) {
+        sink.close(
+            Message::new("ERROR", vec![format!("Closing link: replaced by {}", nick)])
+                .with_prefix(&cfg.server.name),
+        );
+    }
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTICE",
+            vec![nick, format!("Session using {} has been closed", target)],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    Ok(())
+}
+
 /// VERIFY {<account>|*} <code> — draft/account-registration. Confirms an account
 /// registered while `[email]` verification is enabled, then logs the client in.
 pub async fn handle_verify(

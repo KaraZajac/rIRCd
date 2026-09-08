@@ -8,7 +8,7 @@ pub const DEFAULT_CONFIG_DIR: &str = "/etc/rIRCd";
 
 // ─── Top-level Config ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -44,6 +44,28 @@ pub struct Config {
     /// Background writer for channel and conversation history, not serialised.
     #[serde(skip)]
     pub history: Option<crate::persist::HistoryWriter>,
+    /// The TLS acceptor the listeners consult per connection, so REHASH can swap
+    /// in a renewed certificate without dropping anyone.
+    #[serde(skip)]
+    pub tls_acceptor: Option<std::sync::Arc<tokio::sync::RwLock<tokio_rustls::TlsAcceptor>>>,
+}
+
+impl std::fmt::Debug for Config {
+    /// Hand-written because the TLS acceptor has no Debug, and because printing a
+    /// configuration should not print its passwords.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("server", &self.server)
+            .field("network", &self.network)
+            .field("limits", &self.limits)
+            .field("opers", &self.opers.len())
+            .field("tls_enabled", &self.tls_enabled())
+            .field("filehost", &self.filehost.is_some())
+            .field("email", &self.email.is_some())
+            .field("webpush", &self.webpush.is_some())
+            .field("database", &self.database.database)
+            .finish()
+    }
 }
 
 // ─── Database ─────────────────────────────────────────────────────────────────

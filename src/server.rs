@@ -124,7 +124,46 @@ pub struct ClientMessage {
     pub is_tls: bool,
 }
 
-pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> anyhow::Result<()> {
+/// Build a TLS acceptor from the certificate and key named in the configuration.
+///
+/// Separate so it can be called again on REHASH: certificates are renewed on a
+/// schedule, and restarting the server to pick one up drops every connection.
+pub fn build_tls_acceptor(cfg: &Config) -> anyhow::Result<TlsAcceptor> {
+    let cert_path = cfg
+        .tls
+        .cert
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no TLS certificate configured"))?;
+    let key_path = cfg
+        .tls
+        .key
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no TLS key configured"))?;
+    let mut cert_file = std::io::BufReader::new(fs::File::open(cert_path)?);
+    let mut key_file = std::io::BufReader::new(fs::File::open(key_path)?);
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_file)
+        .filter_map(|r| r.ok())
+        .collect();
+    let key = rustls_pemfile::private_key(&mut key_file)?
+        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+    let cfg_tls = if cfg.tls.client_certs {
+        info!("TLS client certificates enabled (SASL EXTERNAL available)");
+        tokio_rustls::rustls::ServerConfig::builder()
+            .with_client_cert_verifier(Arc::new(OptionalClientCertVerifier::new()))
+            .with_single_cert(certs, key)?
+    } else {
+        tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?
+    };
+    Ok(TlsAcceptor::from(Arc::new(cfg_tls)))
+}
+
+pub async fn run(
+    mut cfg: Config,
+    config_path: &Path,
+    pidfile: Option<&Path>,
+) -> anyhow::Result<()> {
     let _pidfile = pidfile.map(PidfileGuard::new).transpose()?;
 
     let state = ServerState::new();
@@ -191,26 +230,9 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
     let (tx, mut rx) = mpsc::channel::<ClientMessage>(256);
 
     let tls_acceptor = if cfg.tls_enabled() {
-        let cert_path = cfg.tls.cert.as_ref().unwrap();
-        let key_path = cfg.tls.key.as_ref().unwrap();
-        let mut cert_file = std::io::BufReader::new(fs::File::open(cert_path)?);
-        let mut key_file = std::io::BufReader::new(fs::File::open(key_path)?);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_file)
-            .filter_map(|r| r.ok())
-            .collect();
-        let key = rustls_pemfile::private_key(&mut key_file)?
-            .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
-        let cfg_tls = if cfg.tls.client_certs {
-            info!("TLS client certificates enabled (SASL EXTERNAL available)");
-            tokio_rustls::rustls::ServerConfig::builder()
-                .with_client_cert_verifier(Arc::new(OptionalClientCertVerifier::new()))
-                .with_single_cert(certs, key)?
-        } else {
-            tokio_rustls::rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)?
-        };
-        Some(TlsAcceptor::from(Arc::new(cfg_tls)))
+        let shared = Arc::new(RwLock::new(build_tls_acceptor(&cfg)?));
+        cfg.tls_acceptor = Some(shared.clone());
+        Some(shared)
     } else {
         None
     };
@@ -248,6 +270,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                                 let acceptor = acceptor.clone();
                                 let app = app.clone();
                                 tokio::spawn(async move {
+                                    let acceptor = acceptor.read().await.clone();
                                     match acceptor.accept(stream).await {
                                         Ok(tls_stream) => {
                                             let io = hyper_util::rt::TokioIo::new(tls_stream);
@@ -393,6 +416,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                             let server_name = server_name.clone();
                             let limits = limits.clone();
                             tokio::spawn(async move {
+                                let acc = acc.read().await.clone();
                                 match acc.accept(stream).await {
                                     Ok(tls_stream) => {
                                         let certfp = extract_certfp(&tls_stream);
@@ -520,6 +544,7 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
                             let sn = server_name_wss.clone();
                             let limits = limits_wss.clone();
                             tokio::spawn(async move {
+                                let acc = acc.read().await.clone();
                                 match acc.accept(stream).await {
                                     Ok(tls_stream) => {
                                         let certfp = extract_certfp(&tls_stream);

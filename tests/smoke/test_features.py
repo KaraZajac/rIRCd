@@ -721,6 +721,54 @@ check("the ban can be lifted", bool(oper.find("removed", lines=oper.since(mark))
 check("and they can connect again", " 001 " in try_connect(f"banned{RUN_ID}"))
 target.close()
 
+section("reclaiming your own nick")
+# With registered nicks reserved, a stale session of your own is the only thing
+# that can be holding one — GHOST is how you take it back.
+ghost_acct = f"ghost{RUN_ID}"
+first = Client(ghost_acct, caps=TAGS)
+mark = first.mark()
+first.send(f"REGISTER * {ghost_acct}@example.org {PASSWORD}")
+first.read(2.5)
+if first.find("VERIFICATION_REQUIRED", lines=first.since(mark)):
+    import re as _re3
+
+    from harness import wait_for_mail as _wait3
+
+    body = "".join(_wait3(1, seconds=15)[-1:])
+    code = _re3.search(rf"VERIFY {ghost_acct} ([A-Z0-9]{{8}})", body)
+    if code:
+        first.send(f"VERIFY {ghost_acct} {code.group(1)}")
+        first.read(2.0)
+
+second = connect_negotiating(f"ghosting{RUN_ID}", caps=["sasl"])
+second.sasl_plain(ghost_acct, PASSWORD)
+second.send("CAP END")
+second.wait_for(" 376 ", " 422 ", seconds=5)
+
+mark = second.mark()
+second.send(f"GHOST {ghost_acct}")
+second.read(2.0)
+check("GHOST reports success", bool(second.find("NOTICE", "closed", lines=second.since(mark))),
+      second.since(mark))
+first.read(2.0)
+check("the stale session is told why", bool(first.find("ERROR", "replaced")), first.lines[-2:])
+
+mark = second.mark()
+second.send(f"NICK {ghost_acct}")
+second.read(2.0)
+check("the nick is free to take", bool(second.find("NICK", lines=second.since(mark)))
+      and not second.find(" 433 ", lines=second.since(mark)), second.since(mark))
+
+stranger = Client(f"stranger{RUN_ID}")
+mark = stranger.mark()
+stranger.send(f"GHOST {ghost_acct}")
+stranger.read(1.5)
+check("a stranger cannot ghost someone else's nick",
+      bool(stranger.find("FAIL GHOST", lines=stranger.since(mark))), stranger.since(mark))
+stranger.close()
+second.close()
+first.close()
+
 section("ADMIN")
 adm = Client(f"admin{RUN_ID}")
 mark = adm.mark()

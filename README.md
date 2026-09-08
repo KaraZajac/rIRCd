@@ -143,7 +143,8 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 
 ### `[tls]`
 
-Optional. Both fields must be set to enable TLS listeners.
+Optional. Both fields must be set to enable TLS listeners. `REHASH` reloads the
+certificate in place, so a renewal does not need a restart.
 
 | Key | Description |
 |-----|-------------|
@@ -418,14 +419,15 @@ traditional network is done by the server itself, against MariaDB.
 | Nick registration | `REGISTER` / `VERIFY` (draft/account-registration), with optional email verification |
 | Identify | SASL PLAIN, SCRAM-SHA-256 or EXTERNAL — no `/msg NickServ` |
 | Nick protection | Registered nicks are reserved for their account (`nick_protection`) |
+| Nick recovery | `GHOST <nick>` closes a stale session of your own that is holding it |
 | Channel founder | The account that creates a channel; always opped on join |
 | Channel access lists | `MODE +o` / `+v` by an operator is remembered and restored on the next join |
 | Channel modes, topic, key | Persisted and restored on startup |
 | Network bans | `KLINE` / `UNKLINE`, persisted and enforced on connect |
 | Vhosts | `SETHOST` (oper), plus automatic cloaking via `cloak_key` |
 
-Still absent: nick recovery (`GHOST`/`RELEASE`), per-channel access *levels*
-beyond op and voice, `AKICK`, and memos.
+Still absent: per-channel access *levels* beyond operator and voice, `AKICK`,
+and memos.
 
 ## Channel Persistence
 
@@ -541,6 +543,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `UNKLINE` | — | Oper-only: remove a ban |
 | `DIE` | — | Oper-only: shut the server down |
 | `ADMIN` | 256/257/258/259 | Who runs this server (`[server] admin_*`) |
+| `GHOST` | — | Close a stale session holding a nick your account owns |
 | `WALLOPS` | — | Oper-only: broadcast a message to all users with `+w` |
 | `MOTD` | 375/372/376 | Send the message of the day |
 | `ISON` | 303 | Check which nicks in a list are currently online |

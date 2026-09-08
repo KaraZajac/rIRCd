@@ -738,6 +738,9 @@ pub async fn handle_message(
             webpush_cmds::handle_webpush(&client_id, msg, state, senders, cfg, label.as_deref())
                 .await
         }
+        "GHOST" => {
+            registration::handle_ghost(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
         "ADMIN" => {
             server_cmds::handle_admin(&client_id, state, senders, cfg, label.as_deref()).await
         }
