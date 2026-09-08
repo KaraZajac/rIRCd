@@ -37,7 +37,6 @@ database = "rircdb"
 
 [limits]
 max_channels_per_client = 50
-max_line_length = 8191
 
 # IRC operators — use: rircd genpasswd   to generate password hashes
 # [[opers]]

@@ -204,6 +204,12 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
         .await
         .ok();
 
+    // Conversation keys are longer than a channel name.
+    sqlx::query("ALTER TABLE channel_history MODIFY channel VARCHAR(160) NOT NULL")
+        .execute(pool)
+        .await
+        .ok();
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS webpush_subscriptions (
             id         BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -778,6 +784,34 @@ pub async fn verify_user(pool: &sqlx::MySqlPool, account: &str, password: &str) 
     }
 }
 
+/// History key for a direct conversation between two nicks.
+///
+/// Sorted and case-folded so both participants derive the same key, and prefixed
+/// so it can never collide with a channel name (channels start with # or &).
+/// The conversation follows the nick, like the rest of this server's account model.
+pub fn direct_message_key(a: &str, b: &str) -> String {
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    if a <= b {
+        format!("pm:{}|{}", a, b)
+    } else {
+        format!("pm:{}|{}", b, a)
+    }
+}
+
+/// The other participant in a conversation key, as seen by `viewer`.
+pub fn direct_message_peer(key: &str, viewer: &str) -> Option<String> {
+    let pair = key.strip_prefix("pm:")?;
+    let (a, b) = pair.split_once('|')?;
+    let viewer = viewer.to_lowercase();
+    if a == viewer {
+        Some(b.to_string())
+    } else if b == viewer {
+        Some(a.to_string())
+    } else {
+        None
+    }
+}
+
 // ─── Web Push subscriptions ───────────────────────────────────────────────────
 
 /// One registered push endpoint (draft/webpush).
@@ -1163,30 +1197,42 @@ pub async fn read_channel_history_around(
 
 /// List channels that have history between two timestamps, paired with their latest message timestamp.
 /// Returns at most `limit` results, ordered by most-recently-active first.
+/// Conversations with recent activity. Channels are listed as themselves; direct
+/// conversations are listed only for `viewer`, and only the other party's nick.
 pub async fn list_history_targets(
     pool: &sqlx::MySqlPool,
     from_ts: &str,
     to_ts: &str,
     limit: usize,
+    viewer: &str,
 ) -> Vec<(String, String)> {
     use sqlx::Row;
 
+    let viewer_lower = viewer.to_lowercase();
     let rows = sqlx::query(
-        "SELECT channel, MAX(ts) AS latest_ts FROM channel_history WHERE ts >= ? AND ts <= ? GROUP BY channel ORDER BY latest_ts DESC LIMIT ?",
+        "SELECT channel, MAX(ts) AS latest_ts FROM channel_history
+         WHERE ts >= ? AND ts <= ?
+           AND (channel NOT LIKE 'pm:%' OR channel LIKE ? OR channel LIKE ?)
+         GROUP BY channel ORDER BY latest_ts DESC LIMIT ?",
     )
     .bind(from_ts)
     .bind(to_ts)
+    .bind(format!("pm:{}|%", viewer_lower))
+    .bind(format!("pm:%|{}", viewer_lower))
     .bind(limit as i64)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
 
     rows.into_iter()
-        .map(|r| {
-            (
-                r.get::<String, _>("channel"),
-                r.get::<String, _>("latest_ts"),
-            )
+        .filter_map(|r| {
+            let key: String = r.get("channel");
+            let ts: String = r.get("latest_ts");
+            if key.starts_with("pm:") {
+                direct_message_peer(&key, viewer).map(|peer| (peer, ts))
+            } else {
+                Some((key, ts))
+            }
         })
         .collect()
 }

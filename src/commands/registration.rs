@@ -50,7 +50,7 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// only to clients that enabled the capability.
 fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={} MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=U EXCEPTS INVEX UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1 METADATA=50{}", cfg.limits.max_line_length, network);
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN=512 MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=U EXCEPTS INVEX UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1 METADATA=50{}", network);
     let deny = cfg
         .server
         .client_tag_deny
@@ -606,12 +606,11 @@ pub async fn handle_cap(
                 reply.prefix = Some(cfg.server.name.clone());
                 reply_to_client(&senders, client_id, reply, label).await;
             } else {
-                let mut all_nak: Vec<String> = nak;
-                all_nak.extend(nak_disable);
-                let mut reply = Message::new(
-                    "CAP",
-                    vec![cap_nick.clone(), "NAK".into(), all_nak.join(" ")],
-                );
+                // The request is rejected as a whole, so the NAK echoes everything
+                // that was asked for — a client matches the reply against what it
+                // sent, not against the subset the server happened to dislike.
+                let mut reply =
+                    Message::new("CAP", vec![cap_nick.clone(), "NAK".into(), raw.join(" ")]);
                 reply.prefix = Some(cfg.server.name.clone());
                 reply_to_client(&senders, client_id, reply, label).await;
             }
@@ -3221,7 +3220,7 @@ pub async fn handle_away(
     // AWAYLEN=307 (matches ISUPPORT)
     let away_msg = msg
         .trailing()
-        .map(|s| if s.len() > 307 { &s[..307] } else { s })
+        .map(|s| crate::protocol::truncate_bytes(s, 307))
         .map(String::from);
     let (source, nick, channel_list) = {
         let mut state = state.write().await;

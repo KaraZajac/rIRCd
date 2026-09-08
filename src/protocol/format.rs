@@ -2,6 +2,22 @@ use super::message::Message;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 
+/// Truncate `s` to at most `max_bytes`, never splitting a character.
+///
+/// IRC length limits are counted in bytes, but slicing a `str` at a byte index
+/// that lands inside a multi-byte character panics — and every one of these
+/// limits is applied to text a client chose.
+pub fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Format an IRC message for sending (with CRLF).
 pub fn format_message(msg: &Message) -> String {
     let mut out = String::new();

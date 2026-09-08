@@ -575,7 +575,17 @@ pub async fn run(cfg: Config, config_path: &Path, pidfile: Option<&Path>) -> any
 
                 let cmd = cm.msg.command.clone();
                 let params_preview = cm.msg.params.iter().take(2).cloned().collect::<Vec<_>>().join(" ");
-                let trailing_preview = cm.msg.trailing().map(|t| if t.len() > 40 { format!("{}...", &t[..40]) } else { t.to_string() }).unwrap_or_default();
+                let trailing_preview = cm
+                    .msg
+                    .trailing()
+                    .map(|t| {
+                        if t.len() > 40 {
+                            format!("{}...", crate::protocol::truncate_bytes(t, 40))
+                        } else {
+                            t.to_string()
+                        }
+                    })
+                    .unwrap_or_default();
 
                 debug!(client = %client_id, command = %cmd, "handling message");
                 let result = commands::handle_message(

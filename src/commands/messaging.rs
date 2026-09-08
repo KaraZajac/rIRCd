@@ -582,6 +582,22 @@ pub async fn handle_privmsg(
                 None,
             )
             .await;
+
+            // Keep direct conversations in history so CHATHISTORY can replay them.
+            if pending_edit_msgid.is_none() {
+                if let Some(ref pool) = cfg.db {
+                    let key = persist::direct_message_key(&sender_nick, target);
+                    let _ = persist::append_channel_history(
+                        pool,
+                        &key,
+                        &source,
+                        &text,
+                        Some(&msgid),
+                        "PRIVMSG",
+                    )
+                    .await;
+                }
+            }
             // 301 RPL_AWAY if target is away
             let target_away = match state_guard.clients.get(&tid) {
                 Some(c) => c.read().await.away_message.clone(),
@@ -819,6 +835,20 @@ pub async fn handle_notice(
                 None,
             )
             .await;
+
+            if let Some(ref pool) = cfg.db {
+                let sender_nick = source.split('!').next().unwrap_or(&source);
+                let key = persist::direct_message_key(sender_nick, target);
+                let _ = persist::append_channel_history(
+                    pool,
+                    &key,
+                    &source,
+                    &text,
+                    Some(&msgid),
+                    "NOTICE",
+                )
+                .await;
+            }
             if echo_message {
                 let sender_caps = match state_guard.clients.get(client_id) {
                     Some(c) => c.read().await.capabilities.clone(),
@@ -841,8 +871,8 @@ pub async fn handle_notice(
     Ok(())
 }
 
-const MULTILINE_MAX_BYTES: usize = 4096;
-const MULTILINE_MAX_LINES: usize = 20;
+pub(crate) const MULTILINE_MAX_BYTES: usize = 4096;
+pub(crate) const MULTILINE_MAX_LINES: usize = 20;
 
 /// Deliver a completed draft/multiline batch: validate, then send as batch to capable clients or as separate lines to others.
 pub async fn deliver_multiline_batch(
@@ -1638,6 +1668,13 @@ pub async fn handle_chathistory(
         None => return Ok(()),
     };
     let params = &msg.params;
+    let requester_nick = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => return Ok(()),
+        }
+    };
     let subcommand = params.first().map(|s| s.to_uppercase()).unwrap_or_default();
 
     // TARGETS is a special subcommand that returns a list of conversations, not messages.
@@ -1671,7 +1708,8 @@ pub async fn handle_chathistory(
             .await;
             return Ok(());
         }
-        let targets = persist::list_history_targets(pool, from_ts, to_ts, limit).await;
+        let targets =
+            persist::list_history_targets(pool, from_ts, to_ts, limit, &requester_nick).await;
         let caps = {
             let state_r = state.read().await;
             match state_r.clients.get(client_id) {
@@ -1792,13 +1830,18 @@ pub async fn handle_chathistory(
         return Ok(());
     };
 
-    if target.is_empty() || (!target.starts_with('#') && !target.starts_with('&')) {
+    if target.is_empty() {
         reply_to_client(
             &senders,
             client_id,
             Message::new(
-                "461",
-                vec!["CHATHISTORY".into(), "Channel name required".into()],
+                "FAIL",
+                vec![
+                    "CHATHISTORY".into(),
+                    "INVALID_PARAMS".into(),
+                    subcommand.clone(),
+                    "A target is required".into(),
+                ],
             )
             .with_prefix(&cfg.server.name),
             label,
@@ -1807,13 +1850,25 @@ pub async fn handle_chathistory(
         return Ok(());
     }
 
-    let is_member = {
-        let ch_key = canonical_channel_key(target);
+    // Direct conversations are stored under a key derived from both nicks, so a
+    // client can only ever address a conversation it is part of.
+    let is_channel_target = target.starts_with('#') || target.starts_with('&');
+    let history_key = if is_channel_target {
+        canonical_channel_key(target)
+    } else {
+        persist::direct_message_key(&requester_nick, target)
+    };
+
+    // Channel history is for members; a direct conversation is addressed by a key
+    // built from the requester's own nick, so membership is implicit.
+    let is_member = if is_channel_target {
         let ch_store = channels.read().await;
-        match ch_store.channels.get(&ch_key) {
+        match ch_store.channels.get(&history_key) {
             Some(ch) => ch.read().await.members.contains_key(client_id),
             None => false,
         }
+    } else {
+        true
     };
     if !is_member {
         reply_to_client(
@@ -1848,24 +1903,31 @@ pub async fn handle_chathistory(
 
     let entries = match (subcommand.as_str(), cursor) {
         ("AROUND", c) if c != "*" => {
-            persist::read_channel_history_around(pool, target, c, limit, include_events).await
+            persist::read_channel_history_around(pool, &history_key, c, limit, include_events).await
         }
         ("BEFORE", c) if c != "*" => {
-            persist::read_channel_history_before(pool, target, c, limit, include_events).await
+            persist::read_channel_history_before(pool, &history_key, c, limit, include_events).await
         }
         ("AFTER", c) if c != "*" => {
-            persist::read_channel_history_after(pool, target, c, limit, include_events).await
+            persist::read_channel_history_after(pool, &history_key, c, limit, include_events).await
         }
         ("BETWEEN", c) if c != "*" => {
             let end = cursor2.unwrap_or("*");
             if end == "*" {
-                persist::read_channel_history(pool, target, limit, include_events).await
+                persist::read_channel_history(pool, &history_key, limit, include_events).await
             } else {
-                persist::read_channel_history_between(pool, target, c, end, limit, include_events)
-                    .await
+                persist::read_channel_history_between(
+                    pool,
+                    &history_key,
+                    c,
+                    end,
+                    limit,
+                    include_events,
+                )
+                .await
             }
         }
-        _ => persist::read_channel_history(pool, target, limit, include_events).await,
+        _ => persist::read_channel_history(pool, &history_key, limit, include_events).await,
     };
     let use_batch = caps.contains("batch") && caps.contains("message-tags");
     let batch_ref = if use_batch {
@@ -1890,6 +1952,20 @@ pub async fn handle_chathistory(
     let newest_ts = entries.last().map(|e| e.ts.clone()).unwrap_or_default();
 
     for e in &entries {
+        // In a direct conversation each side sees its own copy: a message the
+        // requester sent was addressed to the other party, and vice versa.
+        let reply_target = if is_channel_target {
+            target.to_string()
+        } else {
+            let author = e.source.split('!').next().unwrap_or(&e.source);
+            if author.eq_ignore_ascii_case(&requester_nick) {
+                target.to_string()
+            } else {
+                requester_nick.clone()
+            }
+        };
+        let target: &str = &reply_target;
+
         // Build the correct IRC message based on the stored command type
         let mut m = match e.command.as_str() {
             "JOIN" => Message::new("JOIN", vec![target.into()]),
@@ -1937,7 +2013,8 @@ pub async fn handle_chathistory(
     // that were soft-deleted within the returned time range, so the client can update
     // its local buffer on reconnect.
     if !entries.is_empty() && caps.contains("draft/message-redaction") {
-        let redacted = persist::read_redacted_in_range(pool, target, &oldest_ts, &newest_ts).await;
+        let redacted =
+            persist::read_redacted_in_range(pool, &history_key, &oldest_ts, &newest_ts).await;
         for (msgid, source) in redacted {
             let mut redact_msg = Message::new(
                 "REDACT",

@@ -324,6 +324,9 @@ pub struct TlsConfig {
 pub struct LimitsConfig {
     #[serde(default = "default_max_channels")]
     pub max_channels_per_client: usize,
+    /// Accepted for compatibility with older configs; the protocol fixes the
+    /// message body at 512 bytes (8191 including tags), which is what the server
+    /// enforces and advertises as LINELEN.
     #[serde(default = "default_max_line_length")]
     pub max_line_length: usize,
 }

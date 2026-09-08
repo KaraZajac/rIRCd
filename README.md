@@ -165,7 +165,6 @@ key  = "/etc/rIRCd/key.pem"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `max_channels_per_client` | `50` | Max channels a single client may join |
-| `max_line_length` | `8191` | Max IRC line length in bytes |
 
 ### `[[opers]]`
 
@@ -304,7 +303,6 @@ key  = "/etc/rIRCd/key.pem"
 
 [limits]
 max_channels_per_client = 50
-max_line_length = 8191
 
 [[opers]]
 name = "admin"
@@ -408,6 +406,7 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 - **Topic** — persisted whenever a channel topic is set; 333 RPL_TOPICWHOTIME and 329 RPL_CREATIONTIME sent on JOIN.
 - **Channel modes** — mode flags (`+imnstRcC`), key (`+k`), and user limit (`+l`) are saved to the database on every MODE change and restored on startup.
 - **Operators / Voice** — stored per channel; users in these lists receive `@`/`+` automatically when they join.
+- **Direct messages** — private conversations are stored per nick pair and replayed by `CHATHISTORY <nick>`; `CHATHISTORY TARGETS` lists only the requesting user's own conversations.
 - **Message history** — PRIVMSG, NOTICE, and channel events (JOIN, PART, QUIT, TOPIC, NICK) are appended (up to 1,000 entries per channel, oldest pruned). Clients with `draft/chathistory` can request history via `CHATHISTORY LATEST/BEFORE/AFTER/AROUND/BETWEEN #channel <cursor> <limit>` or list active conversations with `CHATHISTORY TARGETS timestamp=<from> timestamp=<to> <limit>`. Clients with `draft/event-playback` receive the full event timeline; otherwise only messages are returned.
 - **Edit history** — Edited messages retain a pointer to their original msgid. On CHATHISTORY replay, clients with `draft/message-edit` receive the `+draft/edit` tag so they can update their local buffer.
 - **Read markers** — `MARKREAD` timestamps are persisted per account in MariaDB and survive server restarts.
@@ -461,7 +460,7 @@ still accepted in `CAP REQ` so older clients keep working.
 | **extended-monitor** | Full | AWAY/ACCOUNT/CHGHOST/SETNAME forwarded for monitored nicks; `nick!user@host` masks (`*`/`?`) may be monitored as well as plain nicks |
 | **sts** | Full | Strict Transport Security; advertised in CAP LS only when TLS is configured; `duration=2592000` |
 | **draft/channel-rename** | Full | RENAME old new [reason]; op-only; fallback PART+JOIN for clients without cap |
-| **draft/chathistory** | Full | CHATHISTORY LATEST/BEFORE/AFTER/AROUND/BETWEEN/TARGETS; BATCH chathistory; DB-backed; limit 200 |
+| **draft/chathistory** | Full | CHATHISTORY LATEST/BEFORE/AFTER/AROUND/BETWEEN/TARGETS for channels **and direct conversations**; BATCH chathistory; DB-backed; limit 200 |
 | **draft/event-playback** | Full | JOIN/PART/QUIT/TOPIC/NICK events stored in DB and replayed in CHATHISTORY |
 | **draft/network-icon** | Full | Optional `ICON=` ISUPPORT token; config `network.icon` |
 | **draft/read-marker** | Full | MARKREAD target [timestamp]; per-account, persisted in MariaDB |

@@ -1058,7 +1058,7 @@ pub async fn handle_mode(
                             // Enforce KEYLEN=64
                             ch.key = msg.params.get(param_idx).map(|k| {
                                 if k.len() > 64 {
-                                    k[..64].to_string()
+                                    crate::protocol::truncate_bytes(k, 64).to_string()
                                 } else {
                                     k.clone()
                                 }
@@ -1646,13 +1646,7 @@ pub async fn handle_topic(
         }
 
         // Enforce TOPICLEN=307
-        let new_topic = new_topic.map(|t| {
-            if t.len() > 307 {
-                t[..307].to_string()
-            } else {
-                t
-            }
-        });
+        let new_topic = new_topic.map(|t| crate::protocol::truncate_bytes(&t, 307).to_string());
 
         let topic_time_ts = chrono::Utc::now().timestamp();
         ch.topic = new_topic.clone();

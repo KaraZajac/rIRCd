@@ -323,6 +323,39 @@ hist.read(1.5)
 check("invalid subcommand gets a FAIL",
       bool(hist.find("FAIL", "CHATHISTORY", lines=hist.since(mark))), hist.since(mark))
 
+section("capability negotiation details")
+cn2 = Client()
+cn2.send("CAP LS 302")
+cn2.read(1.0)
+mark = cn2.mark()
+cn2.send("CAP REQ :message-tags server-time no-such-capability")
+cn2.read(1.5)
+reply = cn2.find("CAP", lines=cn2.since(mark))
+check("a request containing an unknown capability is NAKed whole",
+      bool(reply) and " NAK " in reply[0], reply)
+check("the NAK echoes everything that was requested",
+      bool(reply) and all(c in reply[0] for c in
+                          ["message-tags", "server-time", "no-such-capability"]), reply)
+mark = cn2.mark()
+cn2.send("CAP LIST")
+cn2.read(1.0)
+check("and none of the request took effect",
+      not cn2.find("message-tags", lines=cn2.since(mark)), cn2.since(mark))
+cn2.close()
+
+section("advertised limits match what is enforced")
+lim = Client("limituser", caps=TAGS)
+isupport = " ".join(lim.find(" 005 "))
+linelen = next((t.split("=")[1] for t in isupport.split() if t.startswith("LINELEN=")), None)
+check("LINELEN reports the enforced line limit", linelen == "512", linelen)
+lim.join("#limits")
+mark = lim.mark()
+lim.send("PRIVMSG #limits :" + "y" * (int(linelen or 512) - 30))
+lim.read(1.5)
+check("a message at the advertised limit is accepted",
+      not lim.find(" 417 ", lines=lim.since(mark)), lim.since(mark))
+lim.close()
+
 section("MONITOR")
 bare = Client("monbare")
 mark = bare.mark()

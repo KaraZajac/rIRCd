@@ -93,3 +93,26 @@ fn parses_tags_and_unescapes_values() {
     );
     assert_eq!(msg.trailing(), Some("hi"));
 }
+
+/// Length limits are counted in bytes, but the text is whatever a client sent.
+/// Slicing at a raw byte index panicked when it landed inside a character —
+/// `TOPIC #chan :🎉…` over the limit took the whole server down.
+#[test]
+fn truncation_never_splits_a_character() {
+    use rircd::protocol::truncate_bytes;
+
+    let party = "🎉".repeat(120); // 480 bytes, boundaries only every 4
+    let cut = truncate_bytes(&party, 307);
+    assert!(cut.len() <= 307);
+    assert_eq!(cut.len() % 4, 0, "cut on a character boundary");
+    assert!(party.starts_with(cut));
+
+    // Three-byte characters: no boundary at 40 either.
+    let cjk = "字".repeat(50);
+    assert_eq!(truncate_bytes(&cjk, 40).len(), 39);
+
+    // Untouched when it already fits, and safe at the edges.
+    assert_eq!(truncate_bytes("short", 307), "short");
+    assert_eq!(truncate_bytes("🎉", 2), "");
+    assert_eq!(truncate_bytes("", 10), "");
+}

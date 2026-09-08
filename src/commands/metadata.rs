@@ -886,11 +886,8 @@ pub async fn handle_metadata(
                         reply_to_client(
                             &senders,
                             client_id,
-                            Message::new(
-                                "770",
-                                vec![self_nick.clone(), key.clone(), "Subscribed".to_string()],
-                            )
-                            .with_prefix(s),
+                            Message::new("770", vec![self_nick.clone(), key.clone()])
+                                .with_prefix(s),
                             label,
                         )
                         .await;
@@ -932,11 +929,7 @@ pub async fn handle_metadata(
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new(
-                        "771",
-                        vec![self_nick.clone(), key.clone(), "Unsubscribed".to_string()],
-                    )
-                    .with_prefix(s),
+                    Message::new("771", vec![self_nick.clone(), key.clone()]).with_prefix(s),
                     label,
                 )
                 .await;

@@ -212,6 +212,56 @@ if len(msgids) == 5:
     check("BETWEEN returns the span",
           "message 1" in between and "message 3" in between, between[-120:])
 
+section("CHATHISTORY for direct conversations")
+alice = Client(f"pma{RUN_ID}", caps=TAGS + ["draft/chathistory"])
+bob = Client(f"pmb{RUN_ID}", caps=TAGS + ["draft/chathistory"])
+for i in range(3):
+    alice.send(f"PRIVMSG pmb{RUN_ID} :from alice {i}")
+    time.sleep(0.2)
+    bob.send(f"PRIVMSG pma{RUN_ID} :from bob {i}")
+    time.sleep(0.2)
+alice.read(1.5)
+bob.read(1.5)
+
+mark = alice.mark()
+alice.send(f"CHATHISTORY LATEST pmb{RUN_ID} * 20")
+alice.read(2.5)
+replay = alice.find("PRIVMSG", lines=alice.since(mark))
+check("a direct conversation has history", len(replay) == 6, [l[-40:] for l in replay])
+check("both sides of the conversation are replayed",
+      any("from alice" in l for l in replay) and any("from bob" in l for l in replay), replay[:2])
+check("the requester's own messages are addressed to the other party",
+      all(f"PRIVMSG pmb{RUN_ID}" in l for l in replay if "from alice" in l), replay)
+check("incoming messages are addressed to the requester",
+      all(f"PRIVMSG pma{RUN_ID}" in l for l in replay if "from bob" in l), replay)
+
+mark = bob.mark()
+bob.send(f"CHATHISTORY LATEST PMA{RUN_ID} * 20")  # different case
+bob.read(2.5)
+check("the target nick is matched case-insensitively",
+      len(bob.find("PRIVMSG", lines=bob.since(mark))) == 6, bob.since(mark)[:3])
+
+mark = alice.mark()
+alice.send("CHATHISTORY TARGETS timestamp=2020-01-01T00:00:00.000Z timestamp=2038-01-01T00:00:00.000Z 30")
+alice.read(2.5)
+targets = [l.split("TARGETS ")[1].split()[0] for l in alice.since(mark) if "TARGETS " in l]
+check("TARGETS lists the conversation partner", f"pmb{RUN_ID}" in targets, targets[:6])
+
+eve = Client(f"pme{RUN_ID}", caps=TAGS + ["draft/chathistory"])
+mark = eve.mark()
+eve.send(f"CHATHISTORY LATEST pmb{RUN_ID} * 20")
+eve.read(2.5)
+check("someone else cannot read that conversation",
+      not [l for l in eve.since(mark) if "from alice" in l or "from bob" in l], eve.since(mark)[:3])
+mark = eve.mark()
+eve.send("CHATHISTORY TARGETS timestamp=2020-01-01T00:00:00.000Z timestamp=2038-01-01T00:00:00.000Z 30")
+eve.read(2.5)
+eve_targets = [l.split("TARGETS ")[1].split()[0] for l in eve.since(mark) if "TARGETS " in l]
+check("nor see it in TARGETS", not [t for t in eve_targets if not t.startswith("#")], eve_targets[:6])
+eve.close()
+alice.close()
+bob.close()
+
 section("draft/event-playback")
 joiner = Client("eventjoiner", caps=TAGS)
 joiner.join(HISTORY)
@@ -367,6 +417,34 @@ check("a read marker survives reconnection",
 check("it is stored against the account",
       "2026-05-05T05:05:05" in db(f"SELECT timestamp FROM read_markers WHERE account='{ACCOUNT}'"))
 again.close()
+
+section("multi-byte text at length limits")
+# Length limits are counted in bytes; truncating at a raw byte index used to
+# panic and take the whole server down.
+mb = Client(f"mb{RUN_ID}", caps=TAGS)
+mb.join(f"#mb{RUN_ID}")
+mark = mb.mark()
+mb.send(f"TOPIC #mb{RUN_ID} :" + "🎉" * 120)
+mb.read(2.0)
+check("an over-long emoji topic is accepted and truncated",
+      bool(mb.find("TOPIC", lines=mb.since(mark))), mb.since(mark))
+
+mark = mb.mark()
+mb.send("AWAY :" + "字" * 120)  # 360 bytes: over AWAYLEN, inside the line limit
+mb.read(2.0)
+check("an over-long CJK away message is accepted", bool(mb.find(" 306 ", lines=mb.since(mark))),
+      mb.since(mark))
+
+mark = mb.mark()
+mb.send(f"MODE #mb{RUN_ID} +k " + "🔑" * 40)
+mb.read(2.0)
+mb.send(f"PRIVMSG #mb{RUN_ID} :" + "字" * 100)
+mb.read(2.0)
+
+alive = Client(f"mbalive{RUN_ID}")
+check("the server survives all of it", bool(alive.find(" 001 ")), alive.lines[-3:])
+alive.close()
+mb.close()
 
 section("a client that stops reading must not stall the server")
 # Every command is handled by one loop, so awaiting a stalled client would freeze

@@ -106,6 +106,8 @@ async fn handle_client_stream<S>(
     const FLOOD_REFILL_RATE: f64 = 1.0;
     let mut flood_tokens: f64 = FLOOD_CAPACITY;
     let mut flood_last_refill = tokio::time::Instant::now();
+    // Reference tag of the batch this client currently has open, if any.
+    let mut open_batch: Option<String> = None;
 
     // PING/PONG keepalive state
     let ping_timeout = tokio::time::Duration::from_secs(keepalive.ping_secs);
@@ -178,6 +180,16 @@ async fn handle_client_stream<S>(
                                     ping_sent = false;
                                 }
 
+                                if msg.command == "BATCH" {
+                                    match msg.params.first().map(|p| p.as_str()) {
+                                        Some(p) if p.starts_with('+') => {
+                                            open_batch = Some(p[1..].to_string())
+                                        }
+                                        Some(p) if p.starts_with('-') => open_batch = None,
+                                        _ => {}
+                                    }
+                                }
+
                                 // Flood control
                                 let now = tokio::time::Instant::now();
                                 let elapsed = now.duration_since(flood_last_refill).as_secs_f64();
@@ -187,8 +199,17 @@ async fn handle_client_stream<S>(
 
                                 const FLOOD_EXEMPT: &[&str] = &[
                                     "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PONG", "QUIT",
+                                    "BATCH",
                                 ];
-                                if !FLOOD_EXEMPT.contains(&msg.command.as_str()) {
+                                // Lines inside an open batch form one logical message.
+                                // Charging a token each makes the advertised multiline
+                                // limits unusable, because max-lines is twice the bucket.
+                                // The server bounds batch size itself, so this is not a
+                                // way to flood.
+                                let in_open_batch = open_batch.is_some()
+                                    && msg.tags.get("batch").and_then(|v| v.as_deref())
+                                        == open_batch.as_deref();
+                                if !FLOOD_EXEMPT.contains(&msg.command.as_str()) && !in_open_batch {
                                     if flood_tokens < 1.0 {
                                         tracing::warn!(client = %client_id, command = %msg.command, "Flood control triggered");
                                         let reply = Message::new(
@@ -224,7 +245,7 @@ async fn handle_client_stream<S>(
                             }
                             Err(e) => {
                                 let line_preview = if line.len() > 80 {
-                                    format!("{}...", &line[..80])
+                                    format!("{}...", crate::protocol::truncate_bytes(line, 80))
                                 } else {
                                     line.to_string()
                                 };
@@ -322,6 +343,8 @@ pub async fn handle_client_ws(
     const FLOOD_REFILL_RATE: f64 = 1.0;
     let mut flood_tokens: f64 = FLOOD_CAPACITY;
     let mut flood_last_refill = tokio::time::Instant::now();
+    // Reference tag of the batch this client currently has open, if any.
+    let mut open_batch: Option<String> = None;
     let tx_clone = tx.clone();
 
     // PING/PONG keepalive state
@@ -377,6 +400,16 @@ pub async fn handle_client_ws(
                                     ping_sent = false;
                                 }
 
+                                if msg.command == "BATCH" {
+                                    match msg.params.first().map(|p| p.as_str()) {
+                                        Some(p) if p.starts_with('+') => {
+                                            open_batch = Some(p[1..].to_string())
+                                        }
+                                        Some(p) if p.starts_with('-') => open_batch = None,
+                                        _ => {}
+                                    }
+                                }
+
                                 let now = tokio::time::Instant::now();
                                 let elapsed = now.duration_since(flood_last_refill).as_secs_f64();
                                 flood_tokens = (flood_tokens + elapsed * FLOOD_REFILL_RATE).min(FLOOD_CAPACITY);
@@ -384,8 +417,17 @@ pub async fn handle_client_ws(
 
                                 const FLOOD_EXEMPT: &[&str] = &[
                                     "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PONG", "QUIT",
+                                    "BATCH",
                                 ];
-                                if !FLOOD_EXEMPT.contains(&msg.command.as_str()) {
+                                // Lines inside an open batch form one logical message.
+                                // Charging a token each makes the advertised multiline
+                                // limits unusable, because max-lines is twice the bucket.
+                                // The server bounds batch size itself, so this is not a
+                                // way to flood.
+                                let in_open_batch = open_batch.is_some()
+                                    && msg.tags.get("batch").and_then(|v| v.as_deref())
+                                        == open_batch.as_deref();
+                                if !FLOOD_EXEMPT.contains(&msg.command.as_str()) && !in_open_batch {
                                     if flood_tokens < 1.0 {
                                         tracing::warn!(client = %client_id, command = %msg.command, "Flood control triggered (WS)");
                                         let reply = Message::new(
@@ -457,6 +499,16 @@ pub async fn handle_client_ws(
                                     ping_sent = false;
                                 }
 
+                                if msg.command == "BATCH" {
+                                    match msg.params.first().map(|p| p.as_str()) {
+                                        Some(p) if p.starts_with('+') => {
+                                            open_batch = Some(p[1..].to_string())
+                                        }
+                                        Some(p) if p.starts_with('-') => open_batch = None,
+                                        _ => {}
+                                    }
+                                }
+
                                 let now = tokio::time::Instant::now();
                                 let elapsed = now.duration_since(flood_last_refill).as_secs_f64();
                                 flood_tokens = (flood_tokens + elapsed * FLOOD_REFILL_RATE).min(FLOOD_CAPACITY);
@@ -464,8 +516,17 @@ pub async fn handle_client_ws(
 
                                 const FLOOD_EXEMPT_B: &[&str] = &[
                                     "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PONG", "QUIT",
+                                    "BATCH",
                                 ];
-                                if !FLOOD_EXEMPT_B.contains(&msg.command.as_str()) {
+                                // Lines inside an open batch form one logical message.
+                                // Charging a token each makes the advertised multiline
+                                // limits unusable, because max-lines is twice the bucket.
+                                // The server bounds batch size itself, so this is not a
+                                // way to flood.
+                                let in_open_batch = open_batch.is_some()
+                                    && msg.tags.get("batch").and_then(|v| v.as_deref())
+                                        == open_batch.as_deref();
+                                if !FLOOD_EXEMPT_B.contains(&msg.command.as_str()) && !in_open_batch {
                                     if flood_tokens < 1.0 {
                                         let reply = Message::new(
                                             "NOTICE",

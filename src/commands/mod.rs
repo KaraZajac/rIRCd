@@ -18,6 +18,9 @@ use crate::user::{PendingClientBatch, PendingMultilineBatch, Senders, ServerStat
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Messages one client-initiated batch may carry before the server gives up on it.
+const CLIENT_BATCH_MAX_MESSAGES: usize = 100;
+
 pub async fn handle_message(
     client_id: String,
     host: String,
@@ -196,6 +199,38 @@ pub async fn handle_message(
                         let _ = state.write().await.pending_multiline.remove(&client_id);
                         return Ok(());
                     }
+                    // Enforce the advertised limits while collecting, not only at
+                    // delivery: an unclosed batch would otherwise grow forever.
+                    let over_lines = pending.lines.len() >= messaging::MULTILINE_MAX_LINES;
+                    let over_bytes = pending.lines.iter().map(|(_, l)| l.len()).sum::<usize>()
+                        + text.len()
+                        > messaging::MULTILINE_MAX_BYTES;
+                    if over_lines || over_bytes {
+                        let (code, limit) = if over_lines {
+                            ("MULTILINE_MAX_LINES", messaging::MULTILINE_MAX_LINES)
+                        } else {
+                            ("MULTILINE_MAX_BYTES", messaging::MULTILINE_MAX_BYTES)
+                        };
+                        drop(state_w);
+                        crate::commands::reply_to_client(
+                            &senders,
+                            &client_id,
+                            Message::new(
+                                "FAIL",
+                                vec![
+                                    "BATCH".into(),
+                                    code.into(),
+                                    limit.to_string(),
+                                    "Multiline batch is too large".into(),
+                                ],
+                            )
+                            .with_prefix(&cfg.server.name),
+                            label.as_deref(),
+                        )
+                        .await;
+                        let _ = state.write().await.pending_multiline.remove(&client_id);
+                        return Ok(());
+                    }
                     pending.lines.push((concat, text));
                     return Ok(());
                 }
@@ -211,6 +246,28 @@ pub async fn handle_message(
                 let mut state_w = state.write().await;
                 if let Some(pending) = state_w.pending_client_batches.get_mut(&client_id) {
                     if pending.ref_tag == *ref_val {
+                        // Bounded for the same reason as multiline batches.
+                        if pending.messages.len() >= CLIENT_BATCH_MAX_MESSAGES {
+                            state_w.pending_client_batches.remove(&client_id);
+                            drop(state_w);
+                            crate::commands::reply_to_client(
+                                &senders,
+                                &client_id,
+                                Message::new(
+                                    "FAIL",
+                                    vec![
+                                        "BATCH".into(),
+                                        "MAX_MESSAGES".into(),
+                                        CLIENT_BATCH_MAX_MESSAGES.to_string(),
+                                        "Too many messages in one batch".into(),
+                                    ],
+                                )
+                                .with_prefix(&cfg.server.name),
+                                label.as_deref(),
+                            )
+                            .await;
+                            return Ok(());
+                        }
                         pending.messages.push(msg.clone());
                         true
                     } else {
