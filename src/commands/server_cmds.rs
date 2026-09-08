@@ -311,6 +311,64 @@ pub async fn handle_links(
 // ─── STATS ────────────────────────────────────────────────────────────────────
 
 /// STATS — server statistics. Implements 'u' (uptime) and 'o' (opers); stubs others.
+/// Rows for `STATS k`: the server bans in force.
+async fn stats_bans(state: &Arc<RwLock<ServerState>>, nick: &str, server: &str) -> Vec<Message> {
+    let now = chrono::Utc::now().timestamp();
+    state
+        .read()
+        .await
+        .server_bans
+        .iter()
+        .filter(|b| !b.is_expired(now))
+        .map(|b| {
+            let remaining = match b.expires_at {
+                Some(e) => format!("{}s", (e - now).max(0)),
+                None => "permanent".to_string(),
+            };
+            // 216 RPL_STATSKLINE
+            Message::new(
+                "216",
+                vec![
+                    nick.to_string(),
+                    "K".into(),
+                    b.mask.clone(),
+                    remaining,
+                    b.set_by.clone(),
+                    b.reason.clone(),
+                ],
+            )
+            .with_prefix(server)
+        })
+        .collect()
+}
+
+/// Rows for `STATS m`: how often each command has been used.
+async fn stats_commands(
+    state: &Arc<RwLock<ServerState>>,
+    nick: &str,
+    server: &str,
+) -> Vec<Message> {
+    let state_r = state.read().await;
+    let mut counts: Vec<(&String, &u64)> = state_r.command_counts.iter().collect();
+    counts.sort_by(|a, b| b.1.cmp(a.1));
+    counts
+        .into_iter()
+        .map(|(command, count)| {
+            // 212 RPL_STATSCOMMANDS
+            Message::new(
+                "212",
+                vec![
+                    nick.to_string(),
+                    command.clone(),
+                    count.to_string(),
+                    "0".into(),
+                ],
+            )
+            .with_prefix(server)
+        })
+        .collect()
+}
+
 pub async fn handle_stats(
     client_id: &str,
     msg: Message,
@@ -371,6 +429,16 @@ pub async fn handle_stats(
                     label,
                 )
                 .await;
+            }
+        }
+        "k" | "K" => {
+            for m in stats_bans(&state, &nick, &cfg.server.name).await {
+                reply_to_client(&senders, client_id, m, label).await;
+            }
+        }
+        "m" | "M" => {
+            for m in stats_commands(&state, &nick, &cfg.server.name).await {
+                reply_to_client(&senders, client_id, m, label).await;
             }
         }
         _ => {}
@@ -919,7 +987,7 @@ pub async fn handle_kill(
             Some(c) => {
                 let g = c.read().await;
                 (
-                    g.oper,
+                    g.may(crate::config::OperPrivilege::Kill),
                     g.nick_or_id().to_string(),
                     g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
                 )
@@ -1094,7 +1162,7 @@ pub async fn handle_wallops(
                 let g = c.read().await;
                 let src = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
                 let n = g.nick_or_id().to_string();
-                (g.oper, src, n)
+                (g.may(crate::config::OperPrivilege::Wallops), src, n)
             }
             None => return Ok(()),
         }
@@ -1160,7 +1228,10 @@ pub async fn handle_rehash(
         match state_r.clients.get(client_id) {
             Some(c) => {
                 let g = c.read().await;
-                (g.oper, g.nick_or_id().to_string())
+                (
+                    g.may(crate::config::OperPrivilege::Rehash),
+                    g.nick_or_id().to_string(),
+                )
             }
             None => return Ok(()),
         }
@@ -1429,17 +1500,18 @@ pub async fn handle_die(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (nick, is_oper) = {
+    const PRIVILEGE: crate::config::OperPrivilege = crate::config::OperPrivilege::Die;
+    let (nick, allowed) = {
         let state_r = state.read().await;
         match state_r.clients.get(client_id) {
             Some(c) => {
                 let g = c.read().await;
-                (g.nick_or_id().to_string(), g.oper)
+                (g.nick_or_id().to_string(), g.may(PRIVILEGE))
             }
             None => return Ok(()),
         }
     };
-    if !is_oper {
+    if !allowed {
         reply_to_client(
             &senders,
             client_id,
@@ -1500,17 +1572,18 @@ pub async fn handle_kline(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (nick, is_oper) = {
+    const PRIVILEGE: crate::config::OperPrivilege = crate::config::OperPrivilege::Ban;
+    let (nick, allowed) = {
         let state_r = state.read().await;
         match state_r.clients.get(client_id) {
             Some(c) => {
                 let g = c.read().await;
-                (g.nick_or_id().to_string(), g.oper)
+                (g.nick_or_id().to_string(), g.may(PRIVILEGE))
             }
             None => return Ok(()),
         }
     };
-    if !is_oper {
+    if !allowed {
         reply_to_client(
             &senders,
             client_id,
@@ -1631,17 +1704,18 @@ pub async fn handle_unkline(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (nick, is_oper) = {
+    const PRIVILEGE: crate::config::OperPrivilege = crate::config::OperPrivilege::Ban;
+    let (nick, allowed) = {
         let state_r = state.read().await;
         match state_r.clients.get(client_id) {
             Some(c) => {
                 let g = c.read().await;
-                (g.nick_or_id().to_string(), g.oper)
+                (g.nick_or_id().to_string(), g.may(PRIVILEGE))
             }
             None => return Ok(()),
         }
     };
-    if !is_oper {
+    if !allowed {
         reply_to_client(
             &senders,
             client_id,

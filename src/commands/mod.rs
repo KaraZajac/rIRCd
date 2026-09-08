@@ -283,6 +283,14 @@ pub async fn handle_message(
         }
     }
 
+    state
+        .write()
+        .await
+        .command_counts
+        .entry(msg.command.clone())
+        .and_modify(|n| *n += 1)
+        .or_insert(1);
+
     tracing::trace!(
         client = %client_id,
         command = %msg.command,

@@ -13,7 +13,7 @@ import time
 
 IRC_HOST = os.environ.get("SMOKE_IRC_HOST", "127.0.0.1")
 IRC_PORT = int(os.environ.get("SMOKE_IRC_PORT", "16667"))
-DB_SOCKET = os.environ.get("SMOKE_DB_SOCKET", "")
+DB_SOCKET = os.environ.get("SMOKE_DB_SOCKET", "")  # also used to stop/start it in the outage suite
 MAIL_DIR = os.environ.get("SMOKE_MAIL_DIR", "")
 # Distinct per run, so suites can be re-run against a live server (--reuse)
 # without tripping over accounts and channels they created last time.

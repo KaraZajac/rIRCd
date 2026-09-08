@@ -43,6 +43,7 @@ reach the test server.
 | `test_websocket.py` | The IRCv3 WebSocket transport, including messaging between ws and tcp clients |
 | `test_account.py` | `REGISTER`, email verification, `VERIFY`, SASL gating on unverified accounts |
 | `test_webpush.py` | `WEBPUSH` subscription handling and which messages trigger a push |
+| `test_db_outage.py` | What the server does while MariaDB is stopped — **not** in the default run, since it takes the database down |
 
 ## Notes
 

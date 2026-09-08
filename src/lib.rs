@@ -27,13 +27,22 @@ pub async fn run_server(mut cfg: Config, config_path: &Path) -> anyhow::Result<(
         cfg.database.port,
         cfg.database.database
     );
-    let pool = sqlx::MySqlPool::connect(&url).await.map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to connect to MariaDB ({}): {}",
-            url.replace(&cfg.database.password, "***"),
-            e
-        )
-    })?;
+    // Every command is handled by one loop, and handlers await the database
+    // inline: with the default 30-second acquire timeout, a database outage
+    // stalls the whole server behind each query. Fail fast instead.
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .idle_timeout(std::time::Duration::from_secs(600))
+        .max_lifetime(std::time::Duration::from_secs(1800))
+        .connect(&url)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to connect to MariaDB ({}): {}",
+                url.replace(&cfg.database.password, "***"),
+                e
+            )
+        })?;
     persist::init_schema(&pool).await?;
 
     if let Some(ref email) = cfg.email {
@@ -69,7 +78,10 @@ pub async fn run_server(mut cfg: Config, config_path: &Path) -> anyhow::Result<(
         }
     }
 
-    cfg.history = Some(persist::HistoryWriter::spawn(pool.clone()));
+    cfg.history = Some(persist::HistoryWriter::spawn(
+        pool.clone(),
+        cfg.db_health.clone(),
+    ));
     cfg.db = Some(pool);
 
     if let Some(ref fh) = cfg.filehost {

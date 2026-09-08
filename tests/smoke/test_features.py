@@ -769,6 +769,60 @@ stranger.close()
 second.close()
 first.close()
 
+section("operator privileges")
+# An operator whose config lists privileges may only do those things.
+limited = Client(f"limitedop{RUN_ID}", caps=TAGS)
+limited.send(f"OPER smokehelper {OPER_PASSWORD}")
+limited.read(2.0)
+check("the limited operator logs in", bool(limited.find(" 381 ")), limited.lines[-3:])
+
+mark = limited.mark()
+limited.send(f"KLINE nobody{RUN_ID}!*@* :not allowed")
+limited.read(2.0)
+check("without the ban privilege, KLINE is refused",
+      bool(limited.find(" 481 ", lines=limited.since(mark))), limited.since(mark))
+
+mark = limited.mark()
+limited.send("REHASH")
+limited.read(2.0)
+check("REHASH is refused too", bool(limited.find(" 481 ", lines=limited.since(mark))),
+      limited.since(mark))
+
+victim = Client(f"killme{RUN_ID}")
+mark = victim.mark()
+limited.send(f"KILL killme{RUN_ID} :allowed")
+victim.read(2.0)
+check("but the privilege it does have works",
+      bool(victim.find("ERROR", lines=victim.since(mark))), victim.since(mark))
+victim.close()
+limited.close()
+
+section("STATS")
+statop = Client(f"statop{RUN_ID}", caps=TAGS)
+statop.send(f"OPER {OPER_NAME} {OPER_PASSWORD}")
+statop.read(2.0)
+statop.send(f"KLINE statban{RUN_ID}!*@* :listed in stats")
+statop.read(2.0)
+
+mark = statop.mark()
+statop.send("STATS k")
+statop.read(2.0)
+check("STATS k lists the bans",
+      bool(statop.find(" 216 ", f"statban{RUN_ID}", lines=statop.since(mark))), statop.since(mark))
+
+mark = statop.mark()
+statop.send("STATS m")
+statop.read(2.0)
+check("STATS m counts commands", bool(statop.find(" 212 ", lines=statop.since(mark))),
+      statop.since(mark)[:3])
+check("and the counts look real",
+      any("PRIVMSG" in l or "JOIN" in l for l in statop.find(" 212 ", lines=statop.since(mark))),
+      statop.find(" 212 ", lines=statop.since(mark))[:3])
+
+statop.send(f"UNKLINE statban{RUN_ID}!*@*")
+statop.read(1.5)
+statop.close()
+
 section("ADMIN")
 adm = Client(f"admin{RUN_ID}")
 mark = adm.mark()

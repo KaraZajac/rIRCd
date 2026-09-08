@@ -54,6 +54,51 @@ pub struct HistoryEntry {
     pub original_msgid: Option<String>,
 }
 
+/// Tracks whether the database is answering.
+///
+/// Handlers await the database on the one loop that serves every client, so an
+/// outage would otherwise cost each command the pool's acquire timeout. After a
+/// failure the database is treated as down for a short while and calls fail
+/// immediately, with an occasional probe to notice when it returns.
+#[derive(Clone, Debug, Default)]
+pub struct DbHealth {
+    down_until: std::sync::Arc<std::sync::atomic::AtomicI64>,
+}
+
+/// How long to skip the database after a failure.
+const DB_BACKOFF_SECS: i64 = 10;
+
+impl DbHealth {
+    pub fn is_down(&self) -> bool {
+        let until = self.down_until.load(std::sync::atomic::Ordering::Relaxed);
+        until > chrono::Utc::now().timestamp()
+    }
+
+    /// Record the outcome of a database call.
+    pub fn note(&self, ok: bool) {
+        if ok {
+            self.down_until
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            let until = chrono::Utc::now().timestamp() + DB_BACKOFF_SECS;
+            let previous = self
+                .down_until
+                .swap(until, std::sync::atomic::Ordering::Relaxed);
+            if previous <= chrono::Utc::now().timestamp() {
+                tracing::warn!(
+                    "Database is not answering; skipping database work for {}s",
+                    DB_BACKOFF_SECS
+                );
+            }
+        }
+    }
+}
+
+/// A history read failed — the caller answers with a standard reply rather than
+/// pretending the conversation is empty.
+#[derive(Debug)]
+pub struct HistoryUnavailable(pub String);
+
 /// Maximum number of history rows retained per channel.
 const MAX_HISTORY_ENTRIES: i64 = 1000;
 
@@ -840,14 +885,19 @@ pub async fn delete_account(pool: &sqlx::MySqlPool, account: &str) {
 /// Registration reserves the nick: without this, anyone could sit on a
 /// registered nick while its owner is away, which is the job a NickServ does on
 /// a traditional network.
-pub async fn nick_is_registered(pool: &sqlx::MySqlPool, nick: &str) -> bool {
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE nick_lower = ? AND verified = 1")
-            .bind(nick.to_lowercase())
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
-    count > 0
+pub async fn nick_is_registered(pool: &sqlx::MySqlPool, health: &DbHealth, nick: &str) -> bool {
+    if health.is_down() {
+        // Fail open: allowing a nick beats stalling every connection.
+        return false;
+    }
+    let result = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM users WHERE nick_lower = ? AND verified = 1",
+    )
+    .bind(nick.to_lowercase())
+    .fetch_one(pool)
+    .await;
+    health.note(result.is_ok());
+    result.unwrap_or(0) > 0
 }
 
 /// Verify an account's password against the stored bcrypt hash.
@@ -1206,7 +1256,10 @@ const HISTORY_BATCH: usize = 200;
 const PRUNE_INTERVAL: u32 = 100;
 
 impl HistoryWriter {
-    pub fn spawn(pool: sqlx::MySqlPool) -> Self {
+    /// `health` is shared with the command handlers: the writer is usually the
+    /// first to notice the database has gone, and marking it down there saves
+    /// every later command from waiting on it.
+    pub fn spawn(pool: sqlx::MySqlPool, health: DbHealth) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<HistoryOp>();
         tokio::spawn(async move {
             let mut since_prune: std::collections::HashMap<String, u32> = Default::default();
@@ -1245,8 +1298,30 @@ impl HistoryWriter {
                             .bind(e.msgid.as_deref())
                             .bind(&e.command);
                     }
-                    if let Err(e) = query.execute(&pool).await {
-                        tracing::warn!("Failed to write channel history: {}", e);
+                    // One retry covers a brief blip — a database restart, a
+                    // dropped connection — without holding rows forever.
+                    let mut attempt = query.execute(&pool).await;
+                    if attempt.is_err() {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let mut retry = sqlx::query(&sql);
+                        for e in &batch {
+                            retry = retry
+                                .bind(&e.target)
+                                .bind(&e.ts)
+                                .bind(&e.source)
+                                .bind(&e.text)
+                                .bind(e.msgid.as_deref())
+                                .bind(&e.command);
+                        }
+                        attempt = retry.execute(&pool).await;
+                    }
+                    health.note(attempt.is_ok());
+                    if let Err(e) = attempt {
+                        tracing::warn!(
+                            rows = batch.len(),
+                            "Dropping history rows, database unavailable: {}",
+                            e
+                        );
                     }
 
                     for entry in &batch {
@@ -1364,7 +1439,7 @@ pub async fn read_channel_history(
     channel_name: &str,
     limit: usize,
     include_events: bool,
-) -> Vec<HistoryEntry> {
+) -> Result<Vec<HistoryEntry>, HistoryUnavailable> {
     let event_filter = if include_events {
         ""
     } else {
@@ -1388,14 +1463,14 @@ pub async fn read_channel_history(
         .await;
 
     match rows {
-        Ok(rows) => rows.iter().map(row_to_entry).collect(),
+        Ok(rows) => Ok(rows.iter().map(row_to_entry).collect()),
         Err(e) => {
             tracing::warn!(
                 "Failed to read channel history for '{}': {}",
                 channel_name,
                 e
             );
-            Vec::new()
+            Err(HistoryUnavailable(e.to_string()))
         }
     }
 }
@@ -1437,10 +1512,10 @@ pub async fn read_channel_history_before(
     cursor: &str,
     limit: usize,
     include_events: bool,
-) -> Vec<HistoryEntry> {
+) -> Result<Vec<HistoryEntry>, HistoryUnavailable> {
     let pivot = match resolve_cursor(pool, channel_name, cursor).await {
         Some(id) => id,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let event_filter = if include_events {
         ""
@@ -1464,10 +1539,11 @@ pub async fn read_channel_history_before(
         .bind(limit as i64)
         .fetch_all(pool)
         .await
-        .unwrap_or_default()
-        .iter()
-        .map(row_to_entry)
-        .collect()
+        .map(|rows| rows.iter().map(row_to_entry).collect())
+        .map_err(|e| {
+            tracing::warn!("Failed to read history for '{}': {}", channel_name, e);
+            HistoryUnavailable(e.to_string())
+        })
 }
 
 /// Read up to `limit` entries strictly AFTER the cursor, returned oldest-first.
@@ -1477,10 +1553,10 @@ pub async fn read_channel_history_after(
     cursor: &str,
     limit: usize,
     include_events: bool,
-) -> Vec<HistoryEntry> {
+) -> Result<Vec<HistoryEntry>, HistoryUnavailable> {
     let pivot = match resolve_cursor(pool, channel_name, cursor).await {
         Some(id) => id,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let event_filter = if include_events {
         ""
@@ -1500,10 +1576,11 @@ pub async fn read_channel_history_after(
         .bind(limit as i64)
         .fetch_all(pool)
         .await
-        .unwrap_or_default()
-        .iter()
-        .map(row_to_entry)
-        .collect()
+        .map(|rows| rows.iter().map(row_to_entry).collect())
+        .map_err(|e| {
+            tracing::warn!("Failed to read history for '{}': {}", channel_name, e);
+            HistoryUnavailable(e.to_string())
+        })
 }
 
 /// Read entries centered around a reference point (`msgid=xxx` or `timestamp=xxx`), oldest-first.
@@ -1513,11 +1590,11 @@ pub async fn read_channel_history_around(
     cursor: &str,
     limit: usize,
     include_events: bool,
-) -> Vec<HistoryEntry> {
+) -> Result<Vec<HistoryEntry>, HistoryUnavailable> {
     let half = limit.div_ceil(2).max(1) as i64;
     let pivot_id = match resolve_cursor(pool, channel_name, cursor).await {
         Some(id) => id,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
 
     let event_filter = if include_events {
@@ -1548,12 +1625,12 @@ pub async fn read_channel_history_around(
         .await
         .unwrap_or_default();
 
-    before
+    Ok(before
         .iter()
         .rev()
         .chain(after.iter())
         .map(row_to_entry)
-        .collect()
+        .collect())
 }
 
 /// List channels that have history between two timestamps, paired with their latest message timestamp.
@@ -1607,14 +1684,14 @@ pub async fn read_channel_history_between(
     end_cursor: &str,
     limit: usize,
     include_events: bool,
-) -> Vec<HistoryEntry> {
+) -> Result<Vec<HistoryEntry>, HistoryUnavailable> {
     let start_id = match resolve_cursor(pool, channel_name, start_cursor).await {
         Some(id) => id,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let end_id = match resolve_cursor(pool, channel_name, end_cursor).await {
         Some(id) => id,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let event_filter = if include_events {
         ""
@@ -1635,10 +1712,11 @@ pub async fn read_channel_history_between(
         .bind(limit as i64)
         .fetch_all(pool)
         .await
-        .unwrap_or_default()
-        .iter()
-        .map(row_to_entry)
-        .collect()
+        .map(|rows| rows.iter().map(row_to_entry).collect())
+        .map_err(|e| {
+            tracing::warn!("Failed to read history for '{}': {}", channel_name, e);
+            HistoryUnavailable(e.to_string())
+        })
 }
 
 /// Fetch redacted (soft-deleted) messages for a channel within a time range.

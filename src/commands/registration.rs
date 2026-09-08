@@ -733,7 +733,9 @@ pub async fn handle_nick(
 
         if !owns_it {
             let registered = match cfg.db {
-                Some(ref pool) => crate::persist::nick_is_registered(pool, &nick).await,
+                Some(ref pool) => {
+                    crate::persist::nick_is_registered(pool, &cfg.db_health, &nick).await
+                }
                 None => false,
             };
             if registered {
@@ -2596,6 +2598,7 @@ pub async fn handle_oper(
                 let mut g = c.write().await;
                 g.oper = true;
                 g.oper_name = Some(oper.name.clone());
+                g.oper_privileges = oper.privileges.clone();
                 true
             } else {
                 false
@@ -2923,7 +2926,31 @@ pub async fn handle_register(
         None => None,
     };
 
-    match persist::register_user(pool, &account, password, email, verification.as_ref()).await {
+    if cfg.db_health.is_down() {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "REGISTER".into(),
+                    "TEMPORARILY_UNAVAILABLE".into(),
+                    account.clone(),
+                    "Registration is temporarily unavailable".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let outcome =
+        persist::register_user(pool, &account, password, email, verification.as_ref()).await;
+    cfg.db_health
+        .note(!matches!(outcome, Err(RegisterError::Io(_))));
+    match outcome {
         Ok(()) => {
             let Some(pending) = verification else {
                 // No verification configured: the spec requires the client to be
@@ -3347,7 +3374,23 @@ pub async fn handle_verify(
         return Ok(());
     }
 
-    match persist::verify_account(pool, &account, &code).await {
+    if cfg.db_health.is_down() {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(
+                "TEMPORARILY_UNAVAILABLE",
+                "Verification temporarily unavailable",
+            ),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let outcome = persist::verify_account(pool, &account, &code).await;
+    cfg.db_health
+        .note(!matches!(outcome, persist::VerifyOutcome::Io(_)));
+    match outcome {
         persist::VerifyOutcome::Verified => {
             reply_to_client(
                 &senders,
@@ -3715,7 +3758,7 @@ pub async fn handle_sethost(
             }
         };
         let mut guard = client.write().await;
-        if !guard.oper {
+        if !guard.may(crate::config::OperPrivilege::SetHost) {
             reply_to_client(
                 &senders,
                 client_id,
@@ -3812,7 +3855,7 @@ pub async fn handle_setuser(
             }
         };
         let mut guard = client.write().await;
-        if !guard.oper {
+        if !guard.may(crate::config::OperPrivilege::SetHost) {
             reply_to_client(
                 &senders,
                 client_id,

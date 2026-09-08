@@ -41,6 +41,10 @@ pub struct Config {
     /// Live connection pool — populated after `load()`, not serialised.
     #[serde(skip)]
     pub db: Option<sqlx::MySqlPool>,
+    /// Whether the database is answering; consulted before work that would
+    /// otherwise stall the command loop. Not serialised.
+    #[serde(skip)]
+    pub db_health: crate::persist::DbHealth,
     /// Background writer for channel and conversation history, not serialised.
     #[serde(skip)]
     pub history: Option<crate::persist::HistoryWriter>,
@@ -410,6 +414,47 @@ pub struct OperConfig {
     pub name: String,
     pub hostmask: Option<String>,
     pub password_hash: String,
+    /// What this operator may do: any of "kill", "ban", "rehash", "die",
+    /// "sethost", "wallops". Omit for all of them.
+    #[serde(default)]
+    pub privileges: Option<Vec<String>>,
+}
+
+/// One thing an operator may be allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperPrivilege {
+    Kill,
+    Ban,
+    Rehash,
+    Die,
+    SetHost,
+    Wallops,
+}
+
+impl OperPrivilege {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Kill => "kill",
+            Self::Ban => "ban",
+            Self::Rehash => "rehash",
+            Self::Die => "die",
+            Self::SetHost => "sethost",
+            Self::Wallops => "wallops",
+        }
+    }
+}
+
+impl OperConfig {
+    /// An operator with no `privileges` list may do everything, which is how
+    /// every operator behaved before the list existed.
+    pub fn may(&self, privilege: OperPrivilege) -> bool {
+        match self.privileges {
+            None => true,
+            Some(ref list) => list
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(privilege.name())),
+        }
+    }
 }
 
 // ─── Methods ──────────────────────────────────────────────────────────────────

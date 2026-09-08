@@ -1720,6 +1720,25 @@ pub async fn handle_chathistory(
         Some(p) => p,
         None => return Ok(()),
     };
+    if cfg.db_health.is_down() {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "CHATHISTORY".into(),
+                    "MESSAGE_ERROR".into(),
+                    msg.params.first().cloned().unwrap_or_else(|| "*".into()),
+                    "History is temporarily unavailable".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
     let params = &msg.params;
     let (requester_nick, requester_identity) = {
         let state_r = state.read().await;
@@ -1990,6 +2009,33 @@ pub async fn handle_chathistory(
             }
         }
         _ => persist::read_channel_history(pool, &history_key, limit, include_events).await,
+    };
+
+    // "No history" and "history could not be read" are different answers.
+    cfg.db_health.note(entries.is_ok());
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(client_id, target, error = %e.0, "CHATHISTORY: history unavailable");
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "CHATHISTORY".into(),
+                        "MESSAGE_ERROR".into(),
+                        subcommand.clone(),
+                        target.to_string(),
+                        "Messages could not be retrieved".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
     };
     let use_batch = caps.contains("batch") && caps.contains("message-tags");
     let batch_ref = if use_batch {

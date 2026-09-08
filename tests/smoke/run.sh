@@ -195,6 +195,13 @@ name = "smokeoper"
 hostmask = "*"
 password_hash = "$OPER_HASH"
 
+# A deliberately limited operator, to check that privileges are enforced.
+[[opers]]
+name = "smokehelper"
+hostmask = "*"
+password_hash = "$OPER_HASH"
+privileges = ["kill"]
+
 [webpush]
 contact = "mailto:admin@smoke.test"
 key_file = "$ETC_DIR/vapid.key"

@@ -54,6 +54,8 @@ pub struct Client {
     pub oper: bool,
     /// Operator name from the successful OPER, used as the draft/oper tag value
     pub oper_name: Option<String>,
+    /// What this operator may do; None means everything.
+    pub oper_privileges: Option<Vec<String>>,
     /// Virtual host (cloak) shown to others; used in source() when set
     pub vhost: Option<String>,
     /// Virtual username shown to others; used in source() when set
@@ -89,6 +91,7 @@ impl Client {
             monitor_list: std::collections::HashSet::new(),
             oper: false,
             oper_name: None,
+            oper_privileges: None,
             vhost: None,
             vuser: None,
             invisible: false,
@@ -126,6 +129,19 @@ impl Client {
         self.vuser
             .as_deref()
             .unwrap_or_else(|| self.user.as_deref().unwrap_or("user"))
+    }
+
+    /// May this operator do `privilege`? Non-operators may not.
+    pub fn may(&self, privilege: crate::config::OperPrivilege) -> bool {
+        if !self.oper {
+            return false;
+        }
+        match self.oper_privileges {
+            None => true,
+            Some(ref list) => list
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(privilege.name())),
+        }
     }
 
     pub fn has_cap(&self, cap: &str) -> bool {
@@ -403,6 +419,8 @@ pub struct ServerState {
     /// Accounts known to be in each channel, including ones that are not
     /// connected right now. Used to notify absent users of mentions.
     pub channel_accounts: HashMap<String, HashSet<String>>,
+    /// How many times each command has been handled, for STATS m.
+    pub command_counts: HashMap<String, u64>,
     /// Server bans, matched on connection. Kept in memory so a connection never
     /// waits on the database.
     pub server_bans: Vec<crate::persist::ServerBan>,

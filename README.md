@@ -178,9 +178,18 @@ Define IRC operators. Multiple `[[opers]]` blocks are allowed.
 ```toml
 [[opers]]
 name = "admin"
-hostmask = "*"           # optional; restrict by host
+hostmask = "*"            # optional; restrict by host
 password_hash = "$2a$..." # generate with: rircd genpasswd
+
+[[opers]]
+name = "helper"
+password_hash = "$2a$..."
+privileges = ["kill", "ban"]   # omit for all privileges
 ```
+
+`privileges` limits what an operator may do: `kill`, `ban` (KLINE/UNKLINE),
+`rehash`, `die`, `sethost`, `wallops`. Omitting the key keeps the previous
+behaviour, where every operator may do everything.
 
 ### `[filehost]`
 
@@ -534,6 +543,8 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `LINKS` | 364/365 | Linked servers (single-server: lists self) |
 | `STATS u` | 242/219 | Server uptime |
 | `STATS o` | 243/219 | IRC operator list |
+| `STATS k` | 216/219 | Server bans in force, with time remaining |
+| `STATS m` | 212/219 | How often each command has been used |
 | `WHOWAS` | 314/312/369 | Historical nick info; up to 5 entries per nick, in-memory |
 | `WHO` mask | 352/315 | Supports glob masks (`*`, `?`) against nick!user@host; respects +i invisible mode |
 | `HELP` | 704/705/706 | Per-command help text |
