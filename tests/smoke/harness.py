@@ -15,6 +15,8 @@ IRC_HOST = os.environ.get("SMOKE_IRC_HOST", "127.0.0.1")
 IRC_PORT = int(os.environ.get("SMOKE_IRC_PORT", "16667"))
 DB_SOCKET = os.environ.get("SMOKE_DB_SOCKET", "")
 MAIL_DIR = os.environ.get("SMOKE_MAIL_DIR", "")
+OPER_NAME = os.environ.get("SMOKE_OPER_NAME", "smokeoper")
+OPER_PASSWORD = os.environ.get("SMOKE_OPER_PASSWORD", "smoke-oper-password")
 
 # A valid P-256 subscription key pair, from the RFC 8291 section 5 example.
 P256DH = "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
@@ -51,6 +53,16 @@ class Client:
         self.wait_for(" 376 ", " 422 ", " 001 ", seconds=5)
         return self
 
+    def join(self, channel, key=None, seconds=5.0):
+        """JOIN and wait for the server to confirm, so join order is deterministic.
+
+        Two clients joining a new channel without waiting race for who creates it —
+        and therefore who gets +o.
+        """
+        self.send(f"JOIN {channel} {key}" if key else f"JOIN {channel}")
+        self.wait_for(f"JOIN {channel}", f"JOIN :{channel}", " 366 ", " 473 ", " 475 ", seconds=seconds)
+        return self
+
     def read(self, seconds=1.0):
         """Collect lines for a while. Answers PING so the connection stays up."""
         self.sock.settimeout(seconds)
@@ -73,14 +85,19 @@ class Client:
         return self.lines
 
     def wait_for(self, *needles, seconds=5.0):
-        """Read until a line contains any of `needles`, or the deadline passes."""
+        """Read until a *new* line contains any of `needles`, or the deadline passes.
+
+        Only lines that arrive after this call count: an earlier 473 from a
+        previous attempt must not satisfy a wait for the next one.
+        """
+        start = len(self.lines)
         end = time.time() + seconds
         while time.time() < end:
-            for line in self.lines:
+            for line in self.lines[start:]:
                 if any(n in line for n in needles):
                     return line
             self.read(0.3)
-        for line in self.lines:
+        for line in self.lines[start:]:
             if any(n in line for n in needles):
                 return line
         return None

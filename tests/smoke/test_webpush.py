@@ -128,11 +128,9 @@ check("unregistering an unknown endpoint is not an error",
       erin.since(mark))
 
 section("what triggers a push")
-erin.send("JOIN #push")
-erin.read(1.0)
+erin.join("#push")
 frank = Client("frank")
-frank.send("JOIN #push")
-frank.read(1.0)
+frank.join("#push")
 
 before = push_attempts()
 frank.send("PRIVMSG erin :are you awake?")

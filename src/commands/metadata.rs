@@ -1,6 +1,6 @@
 //! draft/metadata-2: METADATA command (GET, LIST, SET, CLEAR, SUB, UNSUB, SUBS, SYNC).
 
-use crate::channel::ChannelStore;
+use crate::channel::{canonical_channel_key, ChannelStore};
 use crate::commands::reply_to_client;
 use crate::config::Config;
 use crate::protocol::{generate_msgid, Message};
@@ -36,6 +36,17 @@ fn normalize_target(target: &str, self_nick: &str) -> String {
     }
 }
 
+/// Storage key for a target. IRC compares nicks and channel names
+/// case-insensitively, so metadata set on "Alice" must be found by a client
+/// asking about "alice". Replies still echo the spelling the client used.
+fn metadata_key(target: &str) -> String {
+    if is_channel(target) {
+        canonical_channel_key(target)
+    } else {
+        target.to_uppercase()
+    }
+}
+
 fn is_channel(t: &str) -> bool {
     t.starts_with('#') || t.starts_with('&')
 }
@@ -46,13 +57,18 @@ async fn target_exists(
     channels: &Arc<RwLock<ChannelStore>>,
 ) -> bool {
     if is_channel(target) {
-        channels.read().await.channels.contains_key(target)
+        channels
+            .read()
+            .await
+            .channels
+            .contains_key(&canonical_channel_key(target))
     } else {
+        // nick_to_id is keyed by the uppercased nick.
         state
             .read()
             .await
             .nick_to_id
-            .contains_key(&target.to_lowercase())
+            .contains_key(&target.to_uppercase())
     }
 }
 
@@ -102,7 +118,7 @@ async fn send_metadata_batch(
                 target.to_string(),
                 key.clone(),
                 "*".to_string(),
-                format!(":{}", value),
+                value.to_string(),
             ],
         )
         .with_prefix(server_name);
@@ -148,22 +164,21 @@ async fn broadcast_metadata_event(
 ) {
     let mut params = vec![target.to_string(), key.to_string(), "*".to_string()];
     if let Some(v) = value {
-        params.push(format!(":{}", v));
+        params.push(v.to_string());
     }
     let event = Message::new("METADATA", params).with_prefix(setter_source);
 
     // Step 1: collect candidate client IDs who can observe the target
     let candidate_ids: Vec<String> = if is_channel(target) {
         let ch_store = channels.read().await;
-        match ch_store.channels.get(target) {
+        match ch_store.channels.get(&canonical_channel_key(target)) {
             Some(ch) => ch.read().await.members.keys().cloned().collect(),
             None => return,
         }
     } else {
         // User target: clients sharing a channel with them, plus the user themselves
         let state_r = state.read().await;
-        let target_lower = target.to_lowercase();
-        let target_id = match state_r.nick_to_id.get(&target_lower).cloned() {
+        let target_id = match state_r.nick_to_id.get(&target.to_uppercase()).cloned() {
             Some(id) => id,
             None => return,
         };
@@ -269,7 +284,7 @@ pub async fn handle_metadata(
                     "METADATA".into(),
                     "SUBCOMMAND_INVALID".into(),
                     "*".into(),
-                    " :invalid subcommand".into(),
+                    "invalid subcommand".into(),
                 ],
             )
             .with_prefix(s),
@@ -317,7 +332,7 @@ pub async fn handle_metadata(
                             "METADATA".into(),
                             "KEY_INVALID".into(),
                             "*".into(),
-                            " :invalid key".into(),
+                            "invalid key".into(),
                         ],
                     )
                     .with_prefix(s),
@@ -337,7 +352,7 @@ pub async fn handle_metadata(
                             "METADATA".into(),
                             "INVALID_TARGET".into(),
                             target.clone(),
-                            " :No such target".into(),
+                            "No such target".into(),
                         ],
                     )
                     .with_prefix(s),
@@ -348,7 +363,7 @@ pub async fn handle_metadata(
             }
 
             let state_r = state.read().await;
-            let meta = state_r.metadata.get(&target);
+            let meta = state_r.metadata.get(&metadata_key(&target));
             let mut entries = Vec::new();
             let mut missing = Vec::new();
 
@@ -363,7 +378,7 @@ pub async fn handle_metadata(
                                 "METADATA".into(),
                                 "KEY_INVALID".into(),
                                 key.clone(),
-                                " :invalid key".into(),
+                                "invalid key".into(),
                             ],
                         )
                         .with_prefix(s),
@@ -408,7 +423,7 @@ pub async fn handle_metadata(
                         target.clone(),
                         key.clone(),
                         "*".into(),
-                        format!(":{}", value),
+                        value.to_string(),
                     ],
                 )
                 .with_prefix(s);
@@ -424,7 +439,7 @@ pub async fn handle_metadata(
                         self_nick.clone(),
                         target.clone(),
                         key.clone(),
-                        " :key not set".into(),
+                        "key not set".into(),
                     ],
                 )
                 .with_prefix(s);
@@ -467,7 +482,7 @@ pub async fn handle_metadata(
                             "METADATA".into(),
                             "INVALID_TARGET".into(),
                             target.clone(),
-                            " :No such target".into(),
+                            "No such target".into(),
                         ],
                     )
                     .with_prefix(s),
@@ -481,7 +496,7 @@ pub async fn handle_metadata(
                 let state_r = state.read().await;
                 state_r
                     .metadata
-                    .get(&target)
+                    .get(&metadata_key(&target))
                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default()
             };
@@ -507,7 +522,7 @@ pub async fn handle_metadata(
                             "METADATA".into(),
                             "KEY_INVALID".into(),
                             "*".into(),
-                            " :invalid key".into(),
+                            "invalid key".into(),
                         ],
                     )
                     .with_prefix(s),
@@ -526,7 +541,7 @@ pub async fn handle_metadata(
                             "METADATA".into(),
                             "KEY_INVALID".into(),
                             key.to_string(),
-                            " :invalid key".into(),
+                            "invalid key".into(),
                         ],
                     )
                     .with_prefix(s),
@@ -589,7 +604,7 @@ pub async fn handle_metadata(
                             vec![
                                 "METADATA".into(),
                                 "VALUE_INVALID".into(),
-                                " :value too long".into(),
+                                "value too long".into(),
                             ],
                         )
                         .with_prefix(s),
@@ -603,10 +618,14 @@ pub async fn handle_metadata(
             // Key count limit (only when setting, not deleting)
             if value.is_some() {
                 let state_r = state.read().await;
-                let current_count = state_r.metadata.get(&target).map(|m| m.len()).unwrap_or(0);
+                let current_count = state_r
+                    .metadata
+                    .get(&metadata_key(&target))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 let already_set = state_r
                     .metadata
-                    .get(&target)
+                    .get(&metadata_key(&target))
                     .and_then(|m| m.get(key))
                     .is_some();
                 drop(state_r);
@@ -620,7 +639,7 @@ pub async fn handle_metadata(
                                 "METADATA".into(),
                                 "LIMIT_REACHED".into(),
                                 target.clone(),
-                                format!(":Metadata key limit ({}) reached", MAX_METADATA_KEYS),
+                                format!("Metadata key limit ({}) reached", MAX_METADATA_KEYS),
                             ],
                         )
                         .with_prefix(s),
@@ -634,7 +653,7 @@ pub async fn handle_metadata(
             // Apply change
             let new_value = {
                 let mut state_w = state.write().await;
-                let entry = state_w.metadata.entry(target.clone()).or_default();
+                let entry = state_w.metadata.entry(metadata_key(&target)).or_default();
                 if let Some(ref val) = value {
                     entry.insert(key.to_string(), val.clone());
                 } else {
@@ -646,9 +665,9 @@ pub async fn handle_metadata(
             // Persist
             if let Some(ref pool) = cfg.db {
                 if let Some(ref v) = new_value {
-                    crate::persist::save_metadata(pool, &target, key, v).await;
+                    crate::persist::save_metadata(pool, &metadata_key(&target), key, v).await;
                 } else {
-                    crate::persist::delete_metadata(pool, &target, key).await;
+                    crate::persist::delete_metadata(pool, &metadata_key(&target), key).await;
                 }
             }
 
@@ -664,7 +683,7 @@ pub async fn handle_metadata(
                             target.clone(),
                             key.to_string(),
                             "*".into(),
-                            format!(":{}", v),
+                            v.to_string(),
                         ],
                     )
                     .with_prefix(s),
@@ -681,7 +700,7 @@ pub async fn handle_metadata(
                             self_nick.clone(),
                             target.clone(),
                             key.to_string(),
-                            " :key not set".into(),
+                            "key not set".into(),
                         ],
                     )
                     .with_prefix(s),
@@ -748,12 +767,12 @@ pub async fn handle_metadata(
 
             let cleared: Vec<(String, String)> = {
                 let mut state_w = state.write().await;
-                let entry = state_w.metadata.entry(target.clone()).or_default();
+                let entry = state_w.metadata.entry(metadata_key(&target)).or_default();
                 entry.drain().collect()
             };
 
             if let Some(ref pool) = cfg.db {
-                crate::persist::clear_metadata(pool, &target).await;
+                crate::persist::clear_metadata(pool, &metadata_key(&target)).await;
             }
 
             // Broadcast deletion events for each cleared key
@@ -797,7 +816,7 @@ pub async fn handle_metadata(
                             "METADATA".into(),
                             "KEY_INVALID".into(),
                             "*".into(),
-                            " :no keys specified".into(),
+                            "no keys specified".into(),
                         ],
                     )
                     .with_prefix(s),
@@ -818,7 +837,7 @@ pub async fn handle_metadata(
                                 "METADATA".into(),
                                 "KEY_INVALID".into(),
                                 key.clone(),
-                                " :invalid key".into(),
+                                "invalid key".into(),
                             ],
                         )
                         .with_prefix(s),
@@ -856,7 +875,7 @@ pub async fn handle_metadata(
                                     "METADATA".into(),
                                     "TOO_MANY_SUBS".into(),
                                     key.clone(),
-                                    format!(":Subscription limit ({}) reached", MAX_SUBS),
+                                    format!("Subscription limit ({}) reached", MAX_SUBS),
                                 ],
                             )
                             .with_prefix(s),
@@ -894,7 +913,7 @@ pub async fn handle_metadata(
                             "METADATA".into(),
                             "KEY_INVALID".into(),
                             "*".into(),
-                            " :no keys specified".into(),
+                            "no keys specified".into(),
                         ],
                     )
                     .with_prefix(s),
@@ -1002,7 +1021,7 @@ pub async fn handle_metadata(
                             "METADATA".into(),
                             "INVALID_TARGET".into(),
                             target.clone(),
-                            " :No such target".into(),
+                            "No such target".into(),
                         ],
                     )
                     .with_prefix(s),
@@ -1017,7 +1036,7 @@ pub async fn handle_metadata(
                 let state_r = state.read().await;
                 state_r
                     .metadata
-                    .get(&target)
+                    .get(&metadata_key(&target))
                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default()
             };
@@ -1038,7 +1057,7 @@ pub async fn handle_metadata(
                         "METADATA".into(),
                         "SUBCOMMAND_INVALID".into(),
                         "*".into(),
-                        " :invalid subcommand".into(),
+                        "invalid subcommand".into(),
                     ],
                 )
                 .with_prefix(s),

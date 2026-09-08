@@ -179,7 +179,7 @@ pub async fn handle_join(
         let ch = ch_store
             .channels
             .entry(ch_key.clone())
-            .or_insert_with(|| RwLock::new(Channel::new(ch_key.clone())));
+            .or_insert_with(|| RwLock::new(Channel::new(ch_name.to_string())));
 
         let mut ch = ch.write().await;
         if ch.is_member(client_id) {
@@ -723,6 +723,12 @@ async fn send_names_for_channel(
     label: Option<&str>,
 ) {
     let ch = ch.read().await;
+    // Report the channel under its own name rather than the case-folded key.
+    let ch_name = if ch.name.is_empty() {
+        ch_name
+    } else {
+        ch.name.as_str()
+    };
     let mut names: Vec<String> = Vec::new();
     let use_userhost = client_caps.contains("userhost-in-names");
     let use_multi_prefix = client_caps.contains("multi-prefix");
@@ -1860,6 +1866,7 @@ pub async fn handle_invite(
         .await
         .source()
         .unwrap_or_else(|| client_id.to_string());
+    let inviter_nick = client.read().await.nick_or_id().to_string();
 
     let ch_key = canonical_channel_key(ch_name);
     let mut ch_store = channels.write().await;
@@ -1935,9 +1942,11 @@ pub async fn handle_invite(
             reply_to_client(
                 &senders,
                 client_id,
+                // 341 <client> <nick> <channel>: the first parameter is the
+                // requesting client's nick, not their nick!user@host.
                 Message::new(
                     "341",
-                    vec![source.clone(), target_nick.into(), ch_name.into()],
+                    vec![inviter_nick.clone(), target_nick.into(), ch_name.into()],
                 )
                 .with_prefix(&cfg.server.name),
                 label,
@@ -2165,7 +2174,8 @@ pub async fn handle_rename(
     tracing::info!(client_id, old = %old_name, new = %new_name, case_only, "RENAME channel");
     let channel = ch_store.channels.remove(&old_key).expect("channel existed");
     let mut ch = channel.write().await;
-    ch.name = new_key.clone();
+    // Store the new name as given; new_key is only the lookup key.
+    ch.name = new_name.to_string();
     drop(ch);
     ch_store.channels.insert(new_key.clone(), channel);
 
@@ -2183,7 +2193,7 @@ pub async fn handle_rename(
 
     let rename_msg = Message::new(
         "RENAME",
-        vec![old_name.into(), new_name.into(), format!(":{}", reason)],
+        vec![old_name.into(), new_name.into(), reason.clone()],
     )
     .with_prefix(&source);
     let mut use_rename_per_client: Vec<(String, bool)> = Vec::new();
@@ -2205,8 +2215,7 @@ pub async fn handle_rename(
             send_to_client(
                 &senders,
                 mid,
-                Message::new("PART", vec![old_name.into(), format!(":{}", reason)])
-                    .with_prefix(&source),
+                Message::new("PART", vec![old_name.into(), reason.clone()]).with_prefix(&source),
             )
             .await;
             send_to_client(

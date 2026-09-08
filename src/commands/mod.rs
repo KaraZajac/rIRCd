@@ -140,7 +140,7 @@ pub async fn handle_message(
                                     "MULTILINE_INVALID_TARGET".into(),
                                     batch_target,
                                     line_target_owned,
-                                    " :Invalid multiline target".into(),
+                                    "Invalid multiline target".into(),
                                 ],
                             )
                             .with_prefix(&cfg.server.name),
@@ -163,7 +163,7 @@ pub async fn handle_message(
                                     "BATCH".into(),
                                     "MULTILINE_INVALID".into(),
                                     "*".into(),
-                                    " :Invalid multiline batch".into(),
+                                    "Invalid multiline batch".into(),
                                 ],
                             )
                             .with_prefix(&cfg.server.name),
@@ -186,7 +186,7 @@ pub async fn handle_message(
                                     "BATCH".into(),
                                     "MULTILINE_INVALID".into(),
                                     "*".into(),
-                                    " :Invalid multiline batch with concatenated blank line".into(),
+                                    "Invalid multiline batch with concatenated blank line".into(),
                                 ],
                             )
                             .with_prefix(&cfg.server.name),

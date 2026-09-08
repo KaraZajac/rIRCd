@@ -1125,7 +1125,7 @@ pub async fn handle_wallops(
         return Ok(());
     }
 
-    let wallops_msg = Message::new("WALLOPS", vec![format!(":{}", text)]).with_prefix(&source);
+    let wallops_msg = Message::new("WALLOPS", vec![text]).with_prefix(&source);
 
     // Collect all clients with +w
     let wallops_ids: Vec<String> = {

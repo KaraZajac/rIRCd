@@ -439,6 +439,9 @@ pub async fn clear_metadata(pool: &sqlx::MySqlPool, target: &str) {
 }
 
 /// Load all metadata from the database.
+///
+/// Rows written before targets were case-folded are folded on the way in, so a
+/// lookup finds them whatever spelling was originally stored.
 pub async fn load_all_metadata(
     pool: &sqlx::MySqlPool,
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
@@ -453,7 +456,12 @@ pub async fn load_all_metadata(
         let target: String = row.get("target");
         let key: String = row.get("meta_key");
         let value: String = row.get("value");
-        out.entry(target).or_default().insert(key, value);
+        let folded = if target.starts_with('#') || target.starts_with('&') {
+            crate::channel::canonical_channel_key(&target)
+        } else {
+            target.to_uppercase()
+        };
+        out.entry(folded).or_default().insert(key, value);
     }
     out
 }

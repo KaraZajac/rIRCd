@@ -325,7 +325,7 @@ pub async fn complete_registration(
             Some(c) => c.read().await.nick_or_id().to_string(),
             None => "*".to_string(),
         };
-        let m = Message::new("730", vec![nick, format!(":{}", source)]).with_prefix(server);
+        let m = Message::new("730", vec![nick, source.clone()]).with_prefix(server);
         if !send_to_client(&senders, w, m).await {
             tracing::warn!(watcher_id = %w, nick = %nick_str, "Monitor: watcher not in senders, 730 not delivered");
         }
@@ -784,7 +784,7 @@ pub async fn handle_nick(
                 };
                 let m = Message::new(
                     "731",
-                    vec![recv_nick, format!(":{}", old_nick.as_deref().unwrap_or(""))],
+                    vec![recv_nick, old_nick.as_deref().unwrap_or("").to_string()],
                 )
                 .with_prefix(server);
                 send_to_client(&senders, w, m).await;
@@ -798,8 +798,8 @@ pub async fn handle_nick(
                     Some(c) => c.read().await.nick_or_id().to_string(),
                     None => "*".to_string(),
                 };
-                let m = Message::new("730", vec![recv_nick, format!(":{}", new_source)])
-                    .with_prefix(server);
+                let m =
+                    Message::new("730", vec![recv_nick, new_source.clone()]).with_prefix(server);
                 send_to_client(&senders, w, m).await;
             }
 
@@ -1213,7 +1213,7 @@ pub async fn handle_quit(
             Some(c) => c.read().await.nick_or_id().to_string(),
             None => "*".to_string(),
         };
-        let m = Message::new("731", vec![nick, format!(":{}", quit_nick)]).with_prefix(server);
+        let m = Message::new("731", vec![nick, quit_nick.clone()]).with_prefix(server);
         if !send_to_client(&senders, w, m).await {
             tracing::warn!(watcher_id = %w, nick = %quit_nick, "Monitor: watcher not in senders, 731 not delivered");
         }
@@ -3314,7 +3314,9 @@ pub async fn handle_setname(
         }
     };
 
-    if realname.len() > NAMELEN {
+    // An empty realname is as invalid as an over-long one: SETNAME with no
+    // parameter must be rejected, not applied.
+    if realname.is_empty() || realname.len() > NAMELEN {
         if has_standard_replies {
             reply_to_client(
                 &senders,
@@ -3326,6 +3328,18 @@ pub async fn handle_setname(
                         "INVALID_REALNAME".into(),
                         "Realname is not valid".into(),
                     ],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+        } else {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "461",
+                    vec!["SETNAME".into(), "Realname is not valid".into()],
                 )
                 .with_prefix(&cfg.server.name),
                 label,

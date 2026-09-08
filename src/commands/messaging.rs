@@ -868,7 +868,7 @@ pub async fn deliver_multiline_batch(
                     "BATCH".into(),
                     "MULTILINE_INVALID".into(),
                     "*".into(),
-                    " :Invalid multiline batch with blank lines only".into(),
+                    "Invalid multiline batch with blank lines only".into(),
                 ],
             )
             .with_prefix(&cfg.server.name),
@@ -887,7 +887,7 @@ pub async fn deliver_multiline_batch(
                     "BATCH".into(),
                     "MULTILINE_MAX_LINES".into(),
                     MULTILINE_MAX_LINES.to_string(),
-                    " :Multiline batch max-lines exceeded".into(),
+                    "Multiline batch max-lines exceeded".into(),
                 ],
             )
             .with_prefix(&cfg.server.name),
@@ -913,7 +913,7 @@ pub async fn deliver_multiline_batch(
                     "BATCH".into(),
                     "MULTILINE_MAX_BYTES".into(),
                     MULTILINE_MAX_BYTES.to_string(),
-                    " :Multiline batch max-bytes exceeded".into(),
+                    "Multiline batch max-bytes exceeded".into(),
                 ],
             )
             .with_prefix(&cfg.server.name),
@@ -1028,7 +1028,7 @@ pub async fn deliver_multiline_batch(
             for (concat, text) in &batch.lines {
                 let mut line_msg = Message::new(
                     batch.command.clone(),
-                    vec![batch.target.clone(), format!(":{}", text)],
+                    vec![batch.target.clone(), text.clone()],
                 )
                 .with_prefix(&source);
                 line_msg
@@ -1057,7 +1057,7 @@ pub async fn deliver_multiline_batch(
             for (_, text) in &batch.lines {
                 let line_msg = Message::new(
                     batch.command.clone(),
-                    vec![batch.target.clone(), format!(":{}", text)],
+                    vec![batch.target.clone(), text.clone()],
                 )
                 .with_prefix(&source);
                 let tagged = add_tags_for_recipient(
@@ -1099,7 +1099,7 @@ pub async fn deliver_multiline_batch(
             for (concat, text) in &batch.lines {
                 let mut line_msg = Message::new(
                     batch.command.clone(),
-                    vec![batch.target.clone(), format!(":{}", text)],
+                    vec![batch.target.clone(), text.clone()],
                 )
                 .with_prefix(&source);
                 line_msg
@@ -1128,7 +1128,7 @@ pub async fn deliver_multiline_batch(
             for (_, text) in &batch.lines {
                 let line_msg = Message::new(
                     batch.command.clone(),
-                    vec![batch.target.clone(), format!(":{}", text)],
+                    vec![batch.target.clone(), text.clone()],
                 )
                 .with_prefix(&source);
                 let tagged = add_tags_for_recipient(
@@ -1756,7 +1756,7 @@ pub async fn handle_chathistory(
             return Ok(());
         }
         (target, cursor, cursor2, limit_param.min(CHATHISTORY_LIMIT))
-    } else {
+    } else if subcommand.starts_with('#') || subcommand.starts_with('&') {
         // Legacy: CHATHISTORY #channel [count]
         let target = params.first().map(|s| s.as_str()).unwrap_or("");
         let limit_param = params
@@ -1764,6 +1764,26 @@ pub async fn handle_chathistory(
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(50);
         (target, "*", None, limit_param.min(CHATHISTORY_LIMIT))
+    } else {
+        // Anything else is an unknown subcommand, which the spec answers with a
+        // standard reply rather than a numeric about the channel name.
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "CHATHISTORY".into(),
+                    "INVALID_PARAMS".into(),
+                    subcommand.clone(),
+                    "Unknown command".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
     };
 
     if target.is_empty() || (!target.starts_with('#') && !target.starts_with('&')) {

@@ -64,11 +64,7 @@ fn build_354_params(
             'r' => realname.to_string(),
             _ => continue,
         };
-        if f == 'r' {
-            params.push(format!(":{}", val));
-        } else {
-            params.push(val);
-        }
+        params.push(val);
     }
     params
 }
@@ -169,7 +165,7 @@ pub async fn handle_who(
                                 cfg.server.name.clone(),
                                 c.nick_or_id().to_string(),
                                 flags_field,
-                                format!(":{} {}", hopcount, realname),
+                                format!("{} {}", hopcount, realname),
                             ],
                         )
                         .with_prefix(&cfg.server.name));
@@ -264,7 +260,7 @@ pub async fn handle_who(
                             cfg.server.name.clone(),
                             c.nick_or_id().to_string(),
                             flags_field,
-                            format!(":{} {}", hopcount, realname),
+                            format!("{} {}", hopcount, realname),
                         ],
                     )
                     .with_prefix(&cfg.server.name));
@@ -570,12 +566,10 @@ pub async fn handle_monitor(
             return Ok(());
         }
     };
+    // Support is advertised with the MONITOR ISUPPORT token, which every client
+    // sees, so the command must work without negotiating a capability first —
+    // real clients drive MONITOR off ISUPPORT alone.
     let nick = client.read().await.nick_or_id().to_string();
-    let has_cap = client.read().await.has_cap("monitor");
-    if !has_cap {
-        tracing::info!(client_id = %client_id, nick = %nick, "MONITOR: client does not have 'monitor' capability, ignoring (client must CAP REQ :monitor)");
-        return Ok(());
-    }
     let targets_str = msg
         .params
         .get(1)
@@ -687,19 +681,13 @@ pub async fn handle_monitor(
             }
 
             if !online_list.is_empty() {
-                let m = Message::new(
-                    "730",
-                    vec![nick.clone(), format!(":{}", online_list.join(","))],
-                )
-                .with_prefix(server);
+                let m = Message::new("730", vec![nick.clone(), online_list.join(",")])
+                    .with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
             if !offline_list.is_empty() {
-                let m = Message::new(
-                    "731",
-                    vec![nick.clone(), format!(":{}", offline_list.join(","))],
-                )
-                .with_prefix(server);
+                let m = Message::new("731", vec![nick.clone(), offline_list.join(",")])
+                    .with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
         }
@@ -746,8 +734,8 @@ pub async fn handle_monitor(
                 }
             };
             for chunk in list.chunks(20) {
-                let m = Message::new("732", vec![nick.clone(), format!(":{}", chunk.join(","))])
-                    .with_prefix(server);
+                let m =
+                    Message::new("732", vec![nick.clone(), chunk.join(",")]).with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
             let m = Message::new("733", vec![nick.clone(), "End of MONITOR list".into()])
@@ -800,13 +788,13 @@ pub async fn handle_monitor(
                 }
             }
             if !online.is_empty() {
-                let m = Message::new("730", vec![nick.clone(), format!(":{}", online.join(","))])
-                    .with_prefix(server);
+                let m =
+                    Message::new("730", vec![nick.clone(), online.join(",")]).with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
             if !offline.is_empty() {
-                let m = Message::new("731", vec![nick.clone(), format!(":{}", offline.join(","))])
-                    .with_prefix(server);
+                let m =
+                    Message::new("731", vec![nick.clone(), offline.join(",")]).with_prefix(server);
                 reply_to_client(&senders, client_id, m, label).await;
             }
         }
@@ -845,8 +833,7 @@ pub async fn handle_ison(
         }
     }
 
-    let m = Message::new("303", vec![nick, format!(":{}", online.join(" "))])
-        .with_prefix(&cfg.server.name);
+    let m = Message::new("303", vec![nick, online.join(" ")]).with_prefix(&cfg.server.name);
     reply_to_client(&senders, client_id, m, label).await;
     Ok(())
 }
@@ -885,8 +872,7 @@ pub async fn handle_userhost(
         }
     }
 
-    let m = Message::new("302", vec![nick, format!(":{}", results.join(" "))])
-        .with_prefix(&cfg.server.name);
+    let m = Message::new("302", vec![nick, results.join(" ")]).with_prefix(&cfg.server.name);
     reply_to_client(&senders, client_id, m, label).await;
     Ok(())
 }
