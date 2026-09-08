@@ -44,3 +44,17 @@ max_line_length = 8191
 # name = "admin"
 # hostmask = "*"
 # password_hash = "$2a$..."
+
+# Email verification for account registration (draft/account-registration VERIFY).
+# With this section present, REGISTER requires a real address and replies
+# VERIFICATION_REQUIRED; the account cannot be used until VERIFY confirms the
+# code that was mailed to it.
+# [email]
+# smtp_host = "smtp.example.com"
+# smtp_port = 587
+# encryption = "starttls"          # starttls | tls | none
+# from = "ExampleNet <noreply@example.com>"
+# smtp_user = "noreply@example.com"
+# smtp_password = "..."
+# subject = "Your IRC account verification code"
+# code_expiry_secs = 86400

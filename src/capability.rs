@@ -1,3 +1,4 @@
+use crate::config::Config;
 use std::collections::HashSet;
 
 /// All IRCv3 capabilities we support
@@ -52,17 +53,21 @@ pub const CAPS: &[&str] = &[
 pub const TAGS_DEPENDENT: &[&str] = &["server-time", "batch", "account-tag"];
 
 /// Build CAP LS reply value (space-separated list).
-/// `tls_port` is required to advertise `sts`; omit it when TLS is not configured.
-/// `sasl_external` adds EXTERNAL to the SASL mechanism list (when TLS client_certs is enabled).
+/// `sts` is advertised only when TLS is configured, and SASL EXTERNAL only when
+/// TLS client certificates are enabled.
 /// `client_is_tls` indicates whether the requesting client is on a TLS connection:
 ///   - plaintext clients get `sts=port=<N>` (upgrade directive)
 ///   - TLS clients get `sts=duration=<N>` (persistence policy)
-pub fn build_cap_list(
-    version_302: bool,
-    tls_port: Option<u16>,
-    sasl_external: bool,
-    client_is_tls: bool,
-) -> Vec<String> {
+pub fn build_cap_list(cfg: &Config, version_302: bool, client_is_tls: bool) -> Vec<String> {
+    let tls_port = cfg.tls_port();
+    let sasl_external = cfg.tls.client_certs && cfg.tls_enabled();
+    // email-required: [email] is configured, so REGISTER needs a mailable address.
+    let account_registration = if cfg.email.is_some() {
+        "draft/account-registration=before-connect,custom-account-name,email-required,min-password-length=6"
+    } else {
+        "draft/account-registration=before-connect,custom-account-name,min-password-length=6"
+    };
+
     let caps: Vec<String> = CAPS
         .iter()
         .copied()
@@ -75,9 +80,7 @@ pub fn build_cap_list(
             "draft/metadata-2" => {
                 "draft/metadata-2=max-subs=50,max-keys=50,max-value-bytes=4096".to_string()
             }
-            "draft/account-registration" => {
-                "draft/account-registration=before-connect,custom-account-name".to_string()
-            }
+            "draft/account-registration" => account_registration.to_string(),
             // STS: plaintext clients get port (upgrade), TLS clients get duration (persistence)
             "sts" if client_is_tls => "sts=duration=2592000".to_string(),
             "sts" => format!("sts=port={}", tls_port.unwrap_or(6697)),

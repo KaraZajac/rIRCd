@@ -41,6 +41,7 @@ This starts an interactive prompt that asks for:
 - **Plain-text port** (default: 6667) and optionally a **TLS port** with cert/key paths
 - **Database credentials** (host, port, name, user, password)
 - **Message of the day**
+- Optionally, **email verification** for account registration (SMTP host, port, from address)
 - Optionally, an **IRC operator** account (password is bcrypt-hashed automatically)
 
 A `config.toml` is written to `/etc/rIRCd/` with all your answers filled in. If the file already exists you are asked before overwriting.
@@ -71,6 +72,10 @@ Press Enter to accept the [default] value.
   Database name [rircdb]:
   Database user [rirc]:
   Database password:
+
+[Email verification]
+  (Requires accounts registered with REGISTER to confirm an address with VERIFY.)
+  Enable email verification? [y/N]:
 
 [IRC Operator]
   Create an IRC operator account? [Y/n]:
@@ -194,6 +199,34 @@ upload_dir = "/var/lib/rircd/uploads"
 max_size = 52428800
 ```
 
+### `[email]`
+
+Optional. Turns on email verification for account registration (draft/account-registration `VERIFY`). With this section present, `REGISTER` requires a real address, the account is stored unusable, and a code is mailed to the address; the account only becomes usable once `VERIFY` confirms the code. The `email-required` token is added to the advertised `draft/account-registration` capability so clients know to ask for an address.
+
+Mail is sent over SMTP with rustls — no system TLS libraries needed.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `smtp_host` | _(required)_ | SMTP server hostname |
+| `smtp_port` | `587` | SMTP port (587 STARTTLS, 465 implicit TLS, 25 plain) |
+| `smtp_user` | _(unset)_ | SMTP username; omit for an unauthenticated relay |
+| `smtp_password` | _(unset)_ | SMTP password |
+| `encryption` | `starttls` | `starttls`, `tls` (implicit) or `none` |
+| `from` | _(required)_ | From address, e.g. `ExampleNet <noreply@example.com>` |
+| `subject` | `Your IRC account verification code` | Subject line |
+| `code_expiry_secs` | `86400` | How long a code stays valid |
+
+```toml
+[email]
+smtp_host = "smtp.example.com"
+smtp_port = 587
+encryption = "starttls"
+from = "ExampleNet <noreply@example.com>"
+smtp_user = "noreply@example.com"
+smtp_password = "s3cr3t"
+code_expiry_secs = 86400
+```
+
 ### `[webirc]`
 
 Optional. Enables WEBIRC gateway support so reverse proxies can pass the real client IP.
@@ -246,6 +279,14 @@ listen = "0.0.0.0:8080"
 public_url = "https://irc.example.com/uploads"
 upload_dir = "/var/lib/rircd/uploads"
 max_size = 52428800
+
+[email]
+smtp_host = "smtp.example.com"
+smtp_port = 587
+encryption = "starttls"
+from = "ExampleNet <noreply@example.com>"
+smtp_user = "noreply@example.com"
+smtp_password = "s3cr3t"
 ```
 
 ---
@@ -272,7 +313,25 @@ User registration is handled via the IRC `REGISTER` command (draft/account-regis
 REGISTER * [email|*] <password>
 ```
 
-This stores a bcrypt hash of the password (for SASL PLAIN) and full SCRAM credentials (for SASL SCRAM-SHA-256) in MariaDB. Passwords must be at least 6 characters.
+This stores a bcrypt hash of the password (for SASL PLAIN) and full SCRAM credentials (for SASL SCRAM-SHA-256) in MariaDB. Passwords must be at least 6 characters. On success the client is logged in immediately, exactly as if it had authenticated with SASL.
+
+### Email verification
+
+If an [`[email]`](#email) section is configured, registration takes a second step. `REGISTER` then requires a real address, and replies:
+
+```
+REGISTER VERIFICATION_REQUIRED <account> :A verification code has been sent to <email>
+```
+
+The account exists but cannot authenticate — SASL PLAIN, SCRAM-SHA-256 and EXTERNAL all refuse it — until the mailed code is confirmed:
+
+```
+VERIFY <account|*> <code>
+```
+
+On success the server replies `VERIFY SUCCESS <account>` and logs the client in. Codes are compared in constant time, are case-insensitive, and expire after `code_expiry_secs` (24h by default); an unverified account whose code has expired is deleted, freeing the name for registration again. Expired rows are also swept at startup.
+
+If the mail cannot be sent, the registration is rolled back and the client receives `FAIL REGISTER TEMPORARILY_UNAVAILABLE`.
 
 Authentication is supported via two SASL mechanisms:
 
@@ -357,7 +416,7 @@ Channels, topics, modes, operator lists, voice lists, and message history are al
 | **draft/read-marker** | Full | MARKREAD target [timestamp]; per-account, persisted in MariaDB |
 | **draft/metadata-2** | Full | METADATA GET/LIST/SET/CLEAR; key-value per user/channel, persisted in MariaDB |
 | **STATUSMSG** | Full | PRIVMSG/NOTICE to `@#channel` (ops+) or `+#channel` (voiced+); advertised in 005 `STATUSMSG=@+` |
-| **draft/account-registration** | Full | REGISTER \* [email] password; VERIFY returns INVALID_CODE (no email verification) |
+| **draft/account-registration** | Full | REGISTER \* [email] password; logs the client in on success; optional email verification via VERIFY (`[email]` config) |
 | **draft/multiline** | Full | BATCH draft/multiline; max-bytes=4096, max-lines=20; fallback for non-multiline clients |
 | **draft/pre-away** | Full | AWAY during registration; applied after NICK/USER complete |
 | **draft/channel-context** | Full | `+draft/channel-context` tag forwarded to channel members |
@@ -376,7 +435,6 @@ Features under consideration for future releases:
 | Feature | Description |
 |---------|-------------|
 | **draft/webpush** | Web Push notifications (RFC 8291) via `WEBPUSH REGISTER`/`UNREGISTER` |
-| **draft/account-registration VERIFY** | Email-based account verification (currently returns `INVALID_CODE`) |
 
 ---
 

@@ -479,7 +479,7 @@
           <tr><td><code>draft/pre-away</code></td><td><span class="status-full">Full</span></td><td>AWAY during registration</td></tr>
           <tr><td><code>draft/network-icon</code></td><td><span class="status-full">Full</span></td><td>ICON= ISUPPORT token</td></tr>
           <tr><td><code>draft/filehost</code></td><td><span class="status-full">Full</span></td><td>HTTPS file uploads; HTTP Basic auth; MIME downloads</td></tr>
-          <tr><td><code>draft/account-registration</code></td><td><span class="status-full">Full</span></td><td>REGISTER from any client</td></tr>
+          <tr><td><code>draft/account-registration</code></td><td><span class="status-full">Full</span></td><td>REGISTER logs the client in; optional email VERIFY</td></tr>
           <tr><td><code>draft/extended-isupport</code></td><td><span class="status-full">Full</span></td><td>ISUPPORT command</td></tr>
           <tr><td><code>WebSocket</code></td><td><span class="status-full">Full</span></td><td>WS + WSS transport; text.ircv3.net subprotocol</td></tr>
           <tr><td><code>WebIRC</code></td><td><span class="status-full">Full</span></td><td>Gateway IP passthrough</td></tr>
@@ -532,6 +532,19 @@
           <tr><td>public_url</td><td>Public download URL</td></tr>
           <tr><td>upload_dir</td><td>Local storage path</td></tr>
           <tr><td>max_size</td><td>Max upload bytes</td></tr>
+        </table>
+      </div>
+      <div class="config-block">
+        <h3>[email]</h3>
+        <table>
+          <tr><td>smtp_host</td><td>SMTP server hostname</td></tr>
+          <tr><td>smtp_port</td><td>SMTP port (default 587)</td></tr>
+          <tr><td>smtp_user</td><td>SMTP username (optional)</td></tr>
+          <tr><td>smtp_password</td><td>SMTP password (optional)</td></tr>
+          <tr><td>encryption</td><td>starttls | tls | none</td></tr>
+          <tr><td>from</td><td>From address for verification mail</td></tr>
+          <tr><td>subject</td><td>Subject line</td></tr>
+          <tr><td>code_expiry_secs</td><td>Code lifetime (default 86400)</td></tr>
         </table>
       </div>
       <div class="config-block">

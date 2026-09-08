@@ -513,8 +513,16 @@ pub async fn handle_message(
             .await
         }
         "VERIFY" => {
-            registration::handle_verify(&client_id, msg, state, senders, cfg, label.as_deref())
-                .await
+            registration::handle_verify(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
         }
         "SETHOST" => {
             registration::handle_sethost(

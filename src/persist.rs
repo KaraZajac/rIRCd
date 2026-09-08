@@ -204,6 +204,16 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
         .await
         .ok();
 
+    // Migrate: add account verification columns (draft/account-registration VERIFY).
+    // `verified` defaults to 1 so accounts registered before verification existed stay usable.
+    for col_def in &[
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified TINYINT NOT NULL DEFAULT 1",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_code VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_expires BIGINT DEFAULT NULL",
+    ] {
+        let _ = sqlx::query(col_def).execute(pool).await;
+    }
+
     sqlx::query("ALTER TABLE users ADD INDEX IF NOT EXISTS idx_certfp (certfp)")
         .execute(pool)
         .await
@@ -232,9 +242,10 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
 // ─── SASL EXTERNAL (certfp) ──────────────────────────────────────────────────
 
 /// Look up an account by TLS client certificate fingerprint (SHA-256 hex).
+/// Unverified accounts cannot be used to authenticate.
 pub async fn lookup_account_by_certfp(pool: &sqlx::MySqlPool, certfp: &str) -> Option<String> {
     use sqlx::Row;
-    sqlx::query("SELECT nick FROM users WHERE certfp = ? LIMIT 1")
+    sqlx::query("SELECT nick FROM users WHERE certfp = ? AND verified = 1 LIMIT 1")
         .bind(certfp)
         .fetch_optional(pool)
         .await
@@ -478,7 +489,7 @@ pub async fn get_scram_credentials(
     let account_lower = account.to_lowercase();
     let row = sqlx::query(
         "SELECT scram_salt, scram_iterations, scram_stored_key, scram_server_key
-         FROM users WHERE nick_lower = ?",
+         FROM users WHERE nick_lower = ? AND verified = 1",
     )
     .bind(&account_lower)
     .fetch_optional(pool)
@@ -507,18 +518,32 @@ pub async fn get_scram_credentials(
 
 // ─── Users ────────────────────────────────────────────────────────────────────
 
+/// A verification code and its expiry (Unix timestamp), stored with a new account
+/// when email verification is enabled. The account cannot authenticate until VERIFY
+/// clears it.
+#[derive(Debug, Clone)]
+pub struct PendingVerification {
+    pub code: String,
+    pub expires_at: i64,
+}
+
 /// Register a new account. Fails if nick already exists or password is too short.
+/// With `verification`, the account is stored unverified and unusable until VERIFY.
 pub async fn register_user(
     pool: &sqlx::MySqlPool,
     nick: &str,
     password: &str,
     email: Option<&str>,
+    verification: Option<&PendingVerification>,
 ) -> Result<(), RegisterError> {
     if password.len() < 6 {
         return Err(RegisterError::WeakPassword);
     }
 
     let nick_lower = nick.to_lowercase();
+
+    // An unverified registration whose code has expired doesn't hold the name.
+    purge_expired_unverified(pool, Some(&nick_lower)).await;
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE nick_lower = ?")
         .bind(&nick_lower)
@@ -541,8 +566,8 @@ pub async fn register_user(
     let server_b64 = B64.encode(server_key);
 
     sqlx::query(
-        "INSERT INTO users (nick, nick_lower, password, email, scram_salt, scram_iterations, scram_stored_key, scram_server_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO users (nick, nick_lower, password, email, scram_salt, scram_iterations, scram_stored_key, scram_server_key, verified, verification_code, verification_expires)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(nick)
     .bind(&nick_lower)
@@ -552,6 +577,9 @@ pub async fn register_user(
     .bind(SCRAM_ITERATIONS)
     .bind(&stored_b64)
     .bind(&server_b64)
+    .bind(i8::from(verification.is_none()))
+    .bind(verification.map(|v| v.code.as_str()))
+    .bind(verification.map(|v| v.expires_at))
     .execute(pool)
     .await
     .map_err(|e| RegisterError::Io(e.to_string()))?;
@@ -559,13 +587,134 @@ pub async fn register_user(
     Ok(())
 }
 
+/// Outcome of a VERIFY attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    /// Code accepted; the account is now verified and may authenticate.
+    Verified,
+    /// No such account, wrong code, or the code has expired.
+    InvalidCode,
+    /// The account exists and needs no verification.
+    AlreadyVerified,
+    /// Database error (description string).
+    Io(String),
+}
+
+/// Check a verification code and, if it matches and hasn't expired, mark the
+/// account verified. The comparison is constant-time and case-insensitive.
+pub async fn verify_account(pool: &sqlx::MySqlPool, account: &str, code: &str) -> VerifyOutcome {
+    use sqlx::Row;
+    use subtle::ConstantTimeEq;
+
+    let account_lower = account.to_lowercase();
+    let row = sqlx::query(
+        "SELECT verified, verification_code, verification_expires FROM users WHERE nick_lower = ?",
+    )
+    .bind(&account_lower)
+    .fetch_optional(pool)
+    .await;
+
+    let row = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => return VerifyOutcome::InvalidCode,
+        Err(e) => return VerifyOutcome::Io(e.to_string()),
+    };
+
+    let verified: i8 = row.get("verified");
+    if verified != 0 {
+        return VerifyOutcome::AlreadyVerified;
+    }
+
+    let stored: Option<String> = row.get("verification_code");
+    let expires: Option<i64> = row.get("verification_expires");
+
+    let Some(stored) = stored else {
+        return VerifyOutcome::InvalidCode;
+    };
+    if expires.is_some_and(|e| chrono::Utc::now().timestamp() > e) {
+        return VerifyOutcome::InvalidCode;
+    }
+
+    let given = code.trim().to_uppercase();
+    let matches: bool = given
+        .as_bytes()
+        .ct_eq(stored.to_uppercase().as_bytes())
+        .into();
+    if !matches {
+        return VerifyOutcome::InvalidCode;
+    }
+
+    match sqlx::query(
+        "UPDATE users SET verified = 1, verification_code = NULL, verification_expires = NULL
+         WHERE nick_lower = ?",
+    )
+    .bind(&account_lower)
+    .execute(pool)
+    .await
+    {
+        Ok(_) => VerifyOutcome::Verified,
+        Err(e) => VerifyOutcome::Io(e.to_string()),
+    }
+}
+
+/// Delete unverified accounts whose verification code has expired, so the name
+/// becomes available again. Pass `only` to restrict the sweep to one account.
+/// Returns the number of rows removed.
+pub async fn purge_expired_unverified(pool: &sqlx::MySqlPool, only: Option<&str>) -> u64 {
+    let now = chrono::Utc::now().timestamp();
+    let result = match only {
+        Some(nick_lower) => {
+            sqlx::query(
+                "DELETE FROM users
+                 WHERE verified = 0 AND verification_expires IS NOT NULL
+                   AND verification_expires < ? AND nick_lower = ?",
+            )
+            .bind(now)
+            .bind(nick_lower)
+            .execute(pool)
+            .await
+        }
+        None => {
+            sqlx::query(
+                "DELETE FROM users
+                 WHERE verified = 0 AND verification_expires IS NOT NULL
+                   AND verification_expires < ?",
+            )
+            .bind(now)
+            .execute(pool)
+            .await
+        }
+    };
+    match result {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            tracing::warn!("Failed to purge expired unverified accounts: {}", e);
+            0
+        }
+    }
+}
+
+/// Delete an account outright. Used to roll back a registration whose
+/// verification mail could not be sent.
+pub async fn delete_account(pool: &sqlx::MySqlPool, account: &str) {
+    let account_lower = account.to_lowercase();
+    if let Err(e) = sqlx::query("DELETE FROM users WHERE nick_lower = ?")
+        .bind(&account_lower)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(account = %account, "Failed to delete account: {}", e);
+    }
+}
+
 /// Verify an account's password against the stored bcrypt hash.
+/// An account awaiting email verification cannot authenticate.
 pub async fn verify_user(pool: &sqlx::MySqlPool, account: &str, password: &str) -> bool {
     use sqlx::Row;
 
     let account_lower = account.to_lowercase();
 
-    let row = sqlx::query("SELECT password FROM users WHERE nick_lower = ?")
+    let row = sqlx::query("SELECT password, verified FROM users WHERE nick_lower = ?")
         .bind(&account_lower)
         .fetch_optional(pool)
         .await;
@@ -579,8 +728,17 @@ pub async fn verify_user(pool: &sqlx::MySqlPool, account: &str, password: &str) 
                     account = %account,
                     "SASL: password verification failed (hash mismatch)"
                 );
+                return false;
             }
-            ok
+            let verified: i8 = r.get("verified");
+            if verified == 0 {
+                tracing::info!(
+                    account = %account,
+                    "SASL: account is awaiting email verification"
+                );
+                return false;
+            }
+            true
         }
         Ok(None) => {
             tracing::info!(

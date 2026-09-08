@@ -25,6 +25,10 @@ pub struct Config {
     /// File hosting endpoint (draft/filehost).
     #[serde(default)]
     pub filehost: Option<FilehostConfig>,
+    /// Outgoing mail, used to send account verification codes
+    /// (draft/account-registration VERIFY). Present = verification required.
+    #[serde(default)]
+    pub email: Option<EmailConfig>,
     /// MariaDB connection settings.
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -105,6 +109,50 @@ fn default_filehost_dir() -> String {
 }
 fn default_filehost_max_size() -> usize {
     50 * 1024 * 1024
+}
+
+// ─── Email ────────────────────────────────────────────────────────────────────
+
+/// SMTP settings for account verification mail. Configuring this section turns on
+/// email verification: REGISTER then requires a real address and replies
+/// VERIFICATION_REQUIRED until the account is confirmed with VERIFY.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmailConfig {
+    /// SMTP server hostname.
+    pub smtp_host: String,
+    /// SMTP port (587 for STARTTLS submission, 465 for implicit TLS, 25 for plain).
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    /// SMTP username; omit for an unauthenticated relay.
+    #[serde(default)]
+    pub smtp_user: Option<String>,
+    /// SMTP password; omit for an unauthenticated relay.
+    #[serde(default)]
+    pub smtp_password: Option<String>,
+    /// Connection security: "starttls" (default), "tls" (implicit) or "none".
+    #[serde(default = "default_smtp_encryption")]
+    pub encryption: String,
+    /// From address, e.g. "ExampleNet <noreply@example.com>".
+    pub from: String,
+    /// Subject line of the verification mail.
+    #[serde(default = "default_email_subject")]
+    pub subject: String,
+    /// How long a verification code stays valid, in seconds (default 24h).
+    #[serde(default = "default_code_expiry")]
+    pub code_expiry_secs: i64,
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+fn default_smtp_encryption() -> String {
+    "starttls".into()
+}
+fn default_email_subject() -> String {
+    "Your IRC account verification code".into()
+}
+fn default_code_expiry() -> i64 {
+    86_400
 }
 
 // ─── Server ───────────────────────────────────────────────────────────────────
@@ -264,6 +312,19 @@ impl Config {
     pub fn tls_enabled(&self) -> bool {
         self.tls.cert.is_some() && self.tls.key.is_some()
     }
+
+    /// Port of the first TLS listener, when TLS is configured. Used to advertise
+    /// `sts=port=<N>` to plaintext clients.
+    pub fn tls_port(&self) -> Option<u16> {
+        if !self.tls_enabled() {
+            return None;
+        }
+        self.server
+            .listen_tls
+            .first()
+            .and_then(|addr| addr.rsplit(':').next())
+            .and_then(|p| p.parse().ok())
+    }
 }
 
 // ─── Load / init ──────────────────────────────────────────────────────────────
@@ -376,6 +437,40 @@ pub fn init_config_dir(dir: &Path) -> anyhow::Result<()> {
     let db_user = prompt("Database user", "rirc");
     let db_pass = rpassword::prompt_password("  Database password: ").unwrap_or_default();
 
+    // ── Email verification ────────────────────────────────────────────────────
+    println!("\n[Email verification]");
+    println!("  (Requires accounts registered with REGISTER to confirm an address with VERIFY.)");
+    let want_email = prompt_bool("Enable email verification?", false);
+    let email_block = if want_email {
+        let smtp_host = prompt("SMTP host", "smtp.example.com");
+        let smtp_port = prompt("SMTP port", "587");
+        let encryption = prompt("Connection security (starttls/tls/none)", "starttls");
+        let from = prompt(
+            "From address",
+            &format!("{} <noreply@{}>", network_name, server_name),
+        );
+        let smtp_user = prompt("SMTP username (blank for none)", "");
+        let smtp_pass = if smtp_user.is_empty() {
+            String::new()
+        } else {
+            rpassword::prompt_password("  SMTP password: ").unwrap_or_default()
+        };
+        let credentials = if smtp_user.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "smtp_user = \"{}\"\nsmtp_password = \"{}\"\n",
+                smtp_user, smtp_pass
+            )
+        };
+        format!(
+            "\n[email]\nsmtp_host = \"{}\"\nsmtp_port = {}\nencryption = \"{}\"\nfrom = \"{}\"\n{}",
+            smtp_host, smtp_port, encryption, from, credentials
+        )
+    } else {
+        String::new()
+    };
+
     // ── IRC Operator ──────────────────────────────────────────────────────────
     println!("\n[IRC Operator]");
     let want_oper = prompt_bool("Create an IRC operator account?", true);
@@ -439,7 +534,7 @@ database = "{db_name}"
 [limits]
 max_channels_per_client = 50
 max_line_length = 8191
-{oper_block}"#
+{email_block}{oper_block}"#
     );
 
     fs::write(&config_path, &config_content)?;

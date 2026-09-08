@@ -459,16 +459,6 @@ pub async fn handle_cap(
                         .insert("cap-notify".to_string());
                 }
             }
-            let tls_port: Option<u16> = if cfg.tls_enabled() {
-                cfg.server
-                    .listen_tls
-                    .first()
-                    .and_then(|addr| addr.rsplit(':').next())
-                    .and_then(|p| p.parse().ok())
-            } else {
-                None
-            };
-            let sasl_external = cfg.tls.client_certs && cfg.tls_enabled();
             let client_is_tls = if is_registered {
                 match state_guard.clients.get(client_id) {
                     Some(c) => c.read().await.is_tls,
@@ -481,7 +471,7 @@ pub async fn handle_cap(
                     .map(|p| p.is_tls)
                     .unwrap_or(false)
             };
-            let caps = build_cap_list(version_302, tls_port, sasl_external, client_is_tls);
+            let caps = build_cap_list(cfg, version_302, client_is_tls);
             let total = caps.len();
             for (i, cap_line) in caps.iter().enumerate() {
                 let is_last = i == total - 1;
@@ -2798,35 +2788,149 @@ pub async fn handle_register(
         .await;
         return Ok(());
     }
-    match persist::register_user(pool, &account, password, email).await {
+
+    // With [email] configured, registrations are held until VERIFY confirms the
+    // address, so an address we can actually mail is required (cap: email-required).
+    let verification = match cfg.email {
+        Some(ref email_cfg) => {
+            let addr = email.unwrap_or("");
+            if !crate::mail::is_valid_email(addr) {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "REGISTER".into(),
+                            "INVALID_EMAIL".into(),
+                            account.clone(),
+                            "A valid email address is required to register".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+            Some(persist::PendingVerification {
+                code: crate::mail::generate_code(),
+                expires_at: chrono::Utc::now().timestamp() + email_cfg.code_expiry_secs,
+            })
+        }
+        None => None,
+    };
+
+    match persist::register_user(pool, &account, password, email, verification.as_ref()).await {
         Ok(()) => {
-            // The spec requires the client to be authenticated as if it had used SASL.
-            login_client(
-                client_id,
-                &account,
-                state.clone(),
-                channels,
-                senders.clone(),
-                cfg,
-                label,
-            )
-            .await;
+            let Some(pending) = verification else {
+                // No verification configured: the spec requires the client to be
+                // authenticated as if it had used SASL.
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "REGISTER",
+                        vec![
+                            "SUCCESS".into(),
+                            account.clone(),
+                            "Account successfully registered".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                login_client(
+                    client_id,
+                    &account,
+                    state.clone(),
+                    channels,
+                    senders.clone(),
+                    cfg,
+                    label,
+                )
+                .await;
+                tracing::info!(client_id, account = %account, "Account registered and logged in");
+                return Ok(());
+            };
+
+            let email_addr = email.unwrap_or("").to_string();
             reply_to_client(
                 &senders,
                 client_id,
                 Message::new(
                     "REGISTER",
                     vec![
-                        "SUCCESS".into(),
+                        "VERIFICATION_REQUIRED".into(),
                         account.clone(),
-                        "Account successfully registered".into(),
+                        format!("A verification code has been sent to {}", email_addr),
                     ],
                 )
                 .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
-            tracing::info!(client_id, account = %account, "Account registered and logged in");
+
+            // Mail delivery can block for as long as the SMTP timeout, and every
+            // command on this server is handled by one task, so send in the
+            // background and tell the client afterwards if it failed.
+            let email_cfg = cfg.email.clone().expect("checked above");
+            let network = cfg.network.name.clone();
+            let server_name = cfg.server.name.clone();
+            let pool = pool.clone();
+            let senders_bg = senders.clone();
+            let client_id_bg = client_id.to_string();
+            let account_bg = account.clone();
+            tokio::spawn(async move {
+                match crate::mail::send_verification(
+                    &email_cfg,
+                    &network,
+                    &email_addr,
+                    &account_bg,
+                    &pending.code,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            client_id = %client_id_bg,
+                            account = %account_bg,
+                            "Verification code sent"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            client_id = %client_id_bg,
+                            account = %account_bg,
+                            error = %e,
+                            "Failed to send verification code; rolling back registration"
+                        );
+                        persist::delete_account(&pool, &account_bg).await;
+                        send_to_client(
+                            &senders_bg,
+                            &client_id_bg,
+                            Message::new(
+                                "FAIL",
+                                vec![
+                                    "REGISTER".into(),
+                                    "TEMPORARILY_UNAVAILABLE".into(),
+                                    account_bg.clone(),
+                                    "Could not send the verification email; please try again"
+                                        .into(),
+                                ],
+                            )
+                            .with_prefix(&server_name),
+                        )
+                        .await;
+                    }
+                }
+            });
+            tracing::info!(
+                client_id,
+                account = %account,
+                "Account registered, awaiting email verification"
+            );
         }
         Err(RegisterError::AccountExists) => {
             reply_to_client(
@@ -2887,57 +2991,193 @@ pub async fn handle_register(
     Ok(())
 }
 
-/// VERIFY <account> <code> — draft/account-registration. We don't require verification; any VERIFY returns INVALID_CODE.
+/// VERIFY {<account>|*} <code> — draft/account-registration. Confirms an account
+/// registered while `[email]` verification is enabled, then logs the client in.
 pub async fn handle_verify(
     client_id: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<crate::channel::ChannelStore>>,
     senders: Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let account = msg.params.first().map(|s| s.as_str()).unwrap_or("*");
-    let _code = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
-    let state_guard = state.read().await;
-    if let Some(c) = state_guard.clients.get(client_id) {
-        let acc_opt = c.read().await.account.clone();
-        if let Some(ref acc) = acc_opt {
+    // Current account and nick, from the registered client or the pending connection.
+    let (current_account, nick) = {
+        let state_r = state.read().await;
+        if let Some(c) = state_r.clients.get(client_id) {
+            let g = c.read().await;
+            (g.account.clone(), g.nick.clone())
+        } else if let Some(conn) = state_r.pending.get(client_id) {
+            (conn.account.clone(), conn.nick.clone())
+        } else {
+            (None, None)
+        }
+    };
+
+    if let Some(acc) = current_account {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "VERIFY".into(),
+                    "ALREADY_AUTHENTICATED".into(),
+                    acc,
+                    "Already logged in".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let account_param = msg.params.first().map(|s| s.as_str()).unwrap_or("*");
+    let code = msg
+        .params
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // "*" means the account named by the current nick.
+    let account = if account_param == "*" {
+        match nick {
+            Some(n) => n,
+            None => {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "VERIFY".into(),
+                            "INVALID_CODE".into(),
+                            "*".into(),
+                            "Send NICK first".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    } else {
+        account_param.to_string()
+    };
+
+    let fail = |code_name: &str, text: &str| {
+        Message::new(
+            "FAIL",
+            vec![
+                "VERIFY".into(),
+                code_name.into(),
+                account.clone(),
+                text.into(),
+            ],
+        )
+        .with_prefix(&cfg.server.name)
+    };
+
+    let pool = match cfg.db.as_ref() {
+        Some(p) => p,
+        None => {
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new(
-                    "FAIL",
-                    vec![
-                        "VERIFY".into(),
-                        "ALREADY_AUTHENTICATED".into(),
-                        acc.clone(),
-                        "Already logged in".into(),
-                    ],
-                )
-                .with_prefix(&cfg.server.name),
+                fail("TEMPORARILY_UNAVAILABLE", "Verification unavailable"),
                 label,
             )
             .await;
             return Ok(());
         }
-    }
-    let account_str = account.to_string();
-    reply_to_client(
-        &senders,
-        client_id,
-        Message::new(
-            "FAIL",
-            vec![
-                "VERIFY".into(),
-                "INVALID_CODE".into(),
-                account_str,
-                "Verification not required or code invalid".into(),
-            ],
+    };
+
+    if code.is_empty() {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail("INVALID_CODE", "Verification code required"),
+            label,
         )
-        .with_prefix(&cfg.server.name),
-        label,
-    )
-    .await;
+        .await;
+        return Ok(());
+    }
+
+    match persist::verify_account(pool, &account, &code).await {
+        persist::VerifyOutcome::Verified => {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "VERIFY",
+                    vec!["SUCCESS".into(), account.clone(), "Account verified".into()],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            login_client(
+                client_id,
+                &account,
+                state.clone(),
+                channels,
+                senders.clone(),
+                cfg,
+                label,
+            )
+            .await;
+            tracing::info!(client_id, account = %account, "Account verified and logged in");
+
+            // A client that verified during connection registration can now proceed.
+            let ready = state
+                .read()
+                .await
+                .pending
+                .get(client_id)
+                .is_some_and(|p| p.ready_to_register());
+            if ready {
+                complete_registration(client_id, state, senders, cfg, label).await?;
+            }
+        }
+        persist::VerifyOutcome::InvalidCode => {
+            tracing::info!(client_id, account = %account, "VERIFY: invalid or expired code");
+            reply_to_client(
+                &senders,
+                client_id,
+                fail("INVALID_CODE", "Invalid or expired verification code"),
+                label,
+            )
+            .await;
+        }
+        persist::VerifyOutcome::AlreadyVerified => {
+            reply_to_client(
+                &senders,
+                client_id,
+                fail("INVALID_CODE", "Verification not required or code invalid"),
+                label,
+            )
+            .await;
+        }
+        persist::VerifyOutcome::Io(e) => {
+            tracing::error!(client_id, account = %account, error = %e, "VERIFY: database error");
+            reply_to_client(
+                &senders,
+                client_id,
+                fail(
+                    "TEMPORARILY_UNAVAILABLE",
+                    "Verification temporarily unavailable",
+                ),
+                label,
+            )
+            .await;
+        }
+    }
     Ok(())
 }
 

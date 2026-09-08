@@ -1218,23 +1218,7 @@ pub async fn handle_rehash(
     };
 
     // Snapshot old cap list before replacing config
-    let old_tls_port: Option<u16> = if cfg.read().await.tls_enabled() {
-        cfg.read()
-            .await
-            .server
-            .listen_tls
-            .first()
-            .and_then(|addr| addr.rsplit(':').next())
-            .and_then(|p| p.parse().ok())
-    } else {
-        None
-    };
-    let old_sasl_external = {
-        let c = cfg.read().await;
-        c.tls.client_certs && c.tls_enabled()
-    };
-    let old_caps_raw =
-        crate::capability::build_cap_list(false, old_tls_port, old_sasl_external, false);
+    let old_caps_raw = crate::capability::build_cap_list(&*cfg.read().await, false, false);
     let old_caps: std::collections::HashSet<String> =
         old_caps_raw[0].split(' ').map(|s| s.to_string()).collect();
 
@@ -1247,23 +1231,7 @@ pub async fn handle_rehash(
     *cfg.write().await = new_cfg;
 
     // Compute new cap list and diff
-    let new_tls_port: Option<u16> = if cfg.read().await.tls_enabled() {
-        cfg.read()
-            .await
-            .server
-            .listen_tls
-            .first()
-            .and_then(|addr| addr.rsplit(':').next())
-            .and_then(|p| p.parse().ok())
-    } else {
-        None
-    };
-    let new_sasl_external = {
-        let c = cfg.read().await;
-        c.tls.client_certs && c.tls_enabled()
-    };
-    let new_caps_raw =
-        crate::capability::build_cap_list(false, new_tls_port, new_sasl_external, false);
+    let new_caps_raw = crate::capability::build_cap_list(&*cfg.read().await, false, false);
     let new_caps: std::collections::HashSet<String> =
         new_caps_raw[0].split(' ').map(|s| s.to_string()).collect();
 

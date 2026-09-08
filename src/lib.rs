@@ -4,6 +4,7 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod filehost;
+pub mod mail;
 pub mod persist;
 pub mod protocol;
 pub mod server;
@@ -33,6 +34,20 @@ pub async fn run_server(mut cfg: Config, config_path: &Path) -> anyhow::Result<(
         )
     })?;
     persist::init_schema(&pool).await?;
+
+    if let Some(ref email) = cfg.email {
+        tracing::info!(
+            "Email verification enabled: REGISTER requires a valid address, \
+             mail relayed via {}:{}",
+            email.smtp_host,
+            email.smtp_port
+        );
+        let purged = persist::purge_expired_unverified(&pool, None).await;
+        if purged > 0 {
+            tracing::info!("Removed {} expired unverified account(s)", purged);
+        }
+    }
+
     cfg.db = Some(pool);
 
     if let Some(ref fh) = cfg.filehost {
