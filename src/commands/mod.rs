@@ -8,7 +8,8 @@ mod server_cmds;
 mod webpush_cmds;
 
 pub use reply::{
-    end_labeled_batch, reply_in_batch, reply_to_client, send_labeled_ack, start_labeled_batch,
+    end_labeled_batch, reply_in_batch, reply_to_client, reply_to_sender, send_labeled_ack,
+    start_labeled_batch,
 };
 
 use crate::channel::ChannelStore;
@@ -17,6 +18,78 @@ use crate::protocol::Message;
 use crate::user::{PendingClientBatch, PendingMultilineBatch, Senders, ServerState};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// KICK names two lists: channels and users. RFC 2812 pairs them when both
+/// have the same length, and otherwise applies the single channel to every
+/// user, or every channel to the single user.
+fn split_kicks(msg: &Message, max: usize) -> Vec<Message> {
+    let (Some(channels), Some(users)) = (msg.params.first(), msg.params.get(1)) else {
+        return vec![msg.clone()];
+    };
+    if !channels.contains(',') && !users.contains(',') {
+        return vec![msg.clone()];
+    }
+    let channels: Vec<&str> = channels.split(',').filter(|c| !c.is_empty()).collect();
+    let users: Vec<&str> = users.split(',').filter(|u| !u.is_empty()).collect();
+    if channels.is_empty() || users.is_empty() {
+        return vec![msg.clone()];
+    }
+    let pairs: Vec<(&str, &str)> = if channels.len() == users.len() {
+        channels
+            .iter()
+            .copied()
+            .zip(users.iter().copied())
+            .collect()
+    } else if channels.len() == 1 {
+        users.iter().map(|u| (channels[0], *u)).collect()
+    } else if users.len() == 1 {
+        channels.iter().map(|c| (*c, users[0])).collect()
+    } else {
+        // Mismatched lists that are not one-to-many either way: RFC 2812 has
+        // no reading for this, so it is left alone and answered as written.
+        return vec![msg.clone()];
+    };
+
+    pairs
+        .into_iter()
+        .take(max)
+        .map(|(ch, user)| {
+            let mut copy = msg.clone();
+            copy.params[0] = ch.to_string();
+            copy.params[1] = user.to_string();
+            copy
+        })
+        .collect()
+}
+
+/// One message per target, for the commands whose first parameter is a
+/// comma-separated target list. A single target — the overwhelming majority of
+/// traffic — comes back as the one message it already was.
+fn split_targets(msg: &Message, max: usize) -> Vec<Message> {
+    let Some(targets) = msg.params.first() else {
+        return vec![msg.clone()];
+    };
+    if !targets.contains(',') {
+        return vec![msg.clone()];
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for target in targets.split(',') {
+        if target.is_empty() || !seen.insert(target.to_uppercase()) {
+            continue;
+        }
+        if out.len() >= max {
+            break;
+        }
+        let mut copy = msg.clone();
+        copy.params[0] = target.to_string();
+        out.push(copy);
+    }
+    if out.is_empty() {
+        out.push(msg.clone());
+    }
+    out
+}
 
 /// Messages one client-initiated batch may carry before the server gives up on it.
 const CLIENT_BATCH_MAX_MESSAGES: usize = 100;
@@ -434,40 +507,103 @@ pub async fn handle_message(
             .await
         }
         "PRIVMSG" => {
-            messaging::handle_privmsg(
-                &client_id,
-                msg,
-                state,
-                channels,
-                senders,
-                cfg,
-                label.as_deref(),
-            )
-            .await
+            let parts = split_targets(&msg, cfg.limits.max_targets);
+            // Naming several targets is still one command, so its answer is one
+            // labeled response: a batch around the lot rather than a label on
+            // each piece.
+            let parent_batch = match (parts.len() > 1, label.as_deref()) {
+                (true, Some(l)) => {
+                    Some(start_labeled_batch(&senders, &client_id, l, &cfg.server.name).await)
+                }
+                _ => None,
+            };
+            let mut result = Ok(());
+            for one in parts {
+                result = messaging::handle_privmsg(
+                    &client_id,
+                    one,
+                    state.clone(),
+                    channels.clone(),
+                    senders.clone(),
+                    cfg,
+                    label.as_deref(),
+                    parent_batch.as_deref(),
+                )
+                .await;
+                if result.is_err() {
+                    break;
+                }
+            }
+            if let Some(ref br) = parent_batch {
+                end_labeled_batch(&senders, &client_id, br, &cfg.server.name).await;
+            }
+            result
         }
         "NOTICE" => {
-            messaging::handle_notice(
-                &client_id,
-                msg,
-                state,
-                channels,
-                senders,
-                cfg,
-                label.as_deref(),
-            )
-            .await
+            let parts = split_targets(&msg, cfg.limits.max_targets);
+            // Naming several targets is still one command, so its answer is one
+            // labeled response: a batch around the lot rather than a label on
+            // each piece.
+            let parent_batch = match (parts.len() > 1, label.as_deref()) {
+                (true, Some(l)) => {
+                    Some(start_labeled_batch(&senders, &client_id, l, &cfg.server.name).await)
+                }
+                _ => None,
+            };
+            let mut result = Ok(());
+            for one in parts {
+                result = messaging::handle_notice(
+                    &client_id,
+                    one,
+                    state.clone(),
+                    channels.clone(),
+                    senders.clone(),
+                    cfg,
+                    label.as_deref(),
+                    parent_batch.as_deref(),
+                )
+                .await;
+                if result.is_err() {
+                    break;
+                }
+            }
+            if let Some(ref br) = parent_batch {
+                end_labeled_batch(&senders, &client_id, br, &cfg.server.name).await;
+            }
+            result
         }
         "TAGMSG" => {
-            messaging::handle_tagmsg(
-                &client_id,
-                msg,
-                state,
-                channels,
-                senders,
-                cfg,
-                label.as_deref(),
-            )
-            .await
+            let parts = split_targets(&msg, cfg.limits.max_targets);
+            // Naming several targets is still one command, so its answer is one
+            // labeled response: a batch around the lot rather than a label on
+            // each piece.
+            let parent_batch = match (parts.len() > 1, label.as_deref()) {
+                (true, Some(l)) => {
+                    Some(start_labeled_batch(&senders, &client_id, l, &cfg.server.name).await)
+                }
+                _ => None,
+            };
+            let mut result = Ok(());
+            for one in parts {
+                result = messaging::handle_tagmsg(
+                    &client_id,
+                    one,
+                    state.clone(),
+                    channels.clone(),
+                    senders.clone(),
+                    cfg,
+                    label.as_deref(),
+                    parent_batch.as_deref(),
+                )
+                .await;
+                if result.is_err() {
+                    break;
+                }
+            }
+            if let Some(ref br) = parent_batch {
+                end_labeled_batch(&senders, &client_id, br, &cfg.server.name).await;
+            }
+            result
         }
         "MODE" => {
             channel_cmds::handle_mode(
@@ -494,16 +630,23 @@ pub async fn handle_message(
             .await
         }
         "KICK" => {
-            channel_cmds::handle_kick(
-                &client_id,
-                msg,
-                state,
-                channels,
-                senders,
-                cfg,
-                label.as_deref(),
-            )
-            .await
+            let mut result = Ok(());
+            for one in split_kicks(&msg, cfg.limits.max_targets) {
+                result = channel_cmds::handle_kick(
+                    &client_id,
+                    one,
+                    state.clone(),
+                    channels.clone(),
+                    senders.clone(),
+                    cfg,
+                    label.as_deref(),
+                )
+                .await;
+                if result.is_err() {
+                    break;
+                }
+            }
+            result
         }
         "INVITE" => {
             channel_cmds::handle_invite(
@@ -714,7 +857,8 @@ pub async fn handle_message(
         "WHOWAS" => {
             server_cmds::handle_whowas(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
-        "HELP" => {
+        // HELPOP is what several networks call HELP; the same answer serves.
+        "HELP" | "HELPOP" => {
             server_cmds::handle_help(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
         "KNOCK" => {
@@ -790,5 +934,117 @@ pub async fn handle_message(
             .await;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    fn msg(command: &str, params: &[&str]) -> Message {
+        Message::new(command, params.iter().map(|p| p.to_string()).collect())
+    }
+
+    fn targets_of(m: &Message, max: usize) -> Vec<String> {
+        split_targets(m, max)
+            .into_iter()
+            .map(|m| m.params[0].clone())
+            .collect()
+    }
+
+    #[test]
+    fn one_target_passes_through_untouched() {
+        let m = msg("PRIVMSG", &["#chan", "hi"]);
+        let out = split_targets(&m, 4);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].params, m.params);
+    }
+
+    #[test]
+    fn a_target_list_becomes_one_message_each() {
+        let m = msg("PRIVMSG", &["alice,bob,#chan", "hi"]);
+        assert_eq!(targets_of(&m, 4), ["alice", "bob", "#chan"]);
+        // The text travels with every copy.
+        assert!(split_targets(&m, 4).iter().all(|m| m.params[1] == "hi"));
+    }
+
+    #[test]
+    fn a_target_named_twice_is_delivered_once() {
+        let m = msg("PRIVMSG", &["alice,Alice,alice", "hi"]);
+        assert_eq!(targets_of(&m, 4), ["alice"]);
+    }
+
+    #[test]
+    fn the_target_limit_is_a_limit() {
+        let m = msg("PRIVMSG", &["a,b,c,d,e,f", "hi"]);
+        assert_eq!(targets_of(&m, 3), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn empty_entries_in_the_list_are_skipped() {
+        let m = msg("PRIVMSG", &["a,,b,", "hi"]);
+        assert_eq!(targets_of(&m, 4), ["a", "b"]);
+    }
+
+    /// A list of nothing but commas is left alone rather than turned into no
+    /// message at all: the handler answers it, as it would any bad target.
+    #[test]
+    fn a_list_of_nothing_is_left_for_the_handler() {
+        let m = msg("PRIVMSG", &[",,,", "hi"]);
+        assert_eq!(targets_of(&m, 4), [",,,"]);
+    }
+
+    fn kick_pairs(m: &Message, max: usize) -> Vec<(String, String)> {
+        split_kicks(m, max)
+            .into_iter()
+            .map(|m| (m.params[0].clone(), m.params[1].clone()))
+            .collect()
+    }
+
+    #[test]
+    fn one_channel_kicks_every_named_user() {
+        let m = msg("KICK", &["#chan", "bar,baz", "bye"]);
+        assert_eq!(
+            kick_pairs(&m, 4),
+            [
+                ("#chan".to_string(), "bar".to_string()),
+                ("#chan".to_string(), "baz".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn equal_length_lists_are_paired_in_order() {
+        let m = msg("KICK", &["#a,#b", "bar,baz", "bye"]);
+        assert_eq!(
+            kick_pairs(&m, 4),
+            [
+                ("#a".to_string(), "bar".to_string()),
+                ("#b".to_string(), "baz".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn one_user_is_kicked_from_every_named_channel() {
+        let m = msg("KICK", &["#a,#b", "bar", "bye"]);
+        assert_eq!(
+            kick_pairs(&m, 4),
+            [
+                ("#a".to_string(), "bar".to_string()),
+                ("#b".to_string(), "bar".to_string())
+            ]
+        );
+    }
+
+    /// Two lists of different lengths, neither of them one: RFC 2812 has no
+    /// reading for that, so it goes through as written and is refused.
+    #[test]
+    fn mismatched_lists_are_not_guessed_at() {
+        let m = msg("KICK", &["#a,#b", "x,y,z", "bye"]);
+        assert_eq!(
+            kick_pairs(&m, 4),
+            [("#a,#b".to_string(), "x,y,z".to_string())]
+        );
     }
 }

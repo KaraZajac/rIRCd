@@ -882,6 +882,115 @@ check("REHASH is acknowledged (382)", bool(oper_client.find(" 382 ", lines=oper_
 check("the server stays up after REHASH", bool(Client("afterrehash").find(" 001 ")))
 oper_client.close()
 
+section("LIST filters (ELIST=CMNTU)")
+# Names unique to this run: other suites share the server and its channel list.
+ONE, TWO = f"#lsone{RUN_ID}", f"#lstwo{RUN_ID}"
+lister = Client("lister")
+lister.join(ONE)
+lister.join(TWO)
+
+
+def listed(filter_str):
+    mark = lister.mark()
+    lister.send(f"LIST {filter_str}")
+    lister.wait_for(" 323 ", seconds=3)
+    return {l.split()[3] for l in lister.find(" 322 ", lines=lister.since(mark))}
+
+
+check("a name mask selects", listed(f"*one{RUN_ID}") == {ONE}, listed(f"*one{RUN_ID}"))
+check("a negated mask deselects", ONE not in listed(f"!*one{RUN_ID}"), listed(f"!*one{RUN_ID}"))
+check("both are listed by a wider mask", {ONE, TWO} <= listed(f"#ls*{RUN_ID}"), listed(f"#ls*{RUN_ID}"))
+check("a channel with a member is not listed as empty", not ({ONE, TWO} & listed("<1")), listed("<1"))
+check("everything was created less than ten minutes ago", {ONE, TWO} <= listed("C<10"), listed("C<10"))
+check("nothing was created more than ten minutes ago", not ({ONE, TWO} & listed("C>10")), listed("C>10"))
+
+section("HELPOP")
+mark = lister.mark()
+lister.send("HELPOP PRIVMSG")
+lister.read(1.0)
+check("HELPOP answers like HELP (704/705/706)",
+      bool(lister.find(" 704 ", lines=lister.since(mark))), lister.since(mark)[-3:])
+
+section("several targets at once")
+t1 = Client("targetone")
+t2 = Client("targettwo")
+mark1, mark2 = t1.mark(), t2.mark()
+lister.send("PRIVMSG targetone,targettwo :one line, two people")
+t1.read(1.0)
+t2.read(1.0)
+check("a two-target PRIVMSG reaches both",
+      bool(t1.find("one line, two people", lines=t1.since(mark1)))
+      and bool(t2.find("one line, two people", lines=t2.since(mark2))))
+
+kicker = Client("kicker")
+kicker.join("#kicks")
+t1.join("#kicks")
+t2.join("#kicks")
+kicker.read(1.0)
+mark = kicker.mark()
+kicker.send("KICK #kicks targetone,targettwo :both of you")
+kicker.read(1.5)
+kicked = {l.split()[3] for l in kicker.find("KICK", lines=kicker.since(mark))}
+check("one KICK removes both named users", kicked == {"targetone", "targettwo"}, kicked)
+t1.close()
+t2.close()
+kicker.close()
+
+section("mute extban and ban list details")
+muter = Client("muter")
+muter.join("#mutes")
+muter.read(0.5)
+mark = muter.mark()
+muter.send("MODE #mutes +b ~m:muted!*@*")
+muter.read(1.0)
+check("a mute extban is accepted", not muter.find(" 482 ", lines=muter.since(mark)), muter.since(mark)[-3:])
+
+muted = Client("muted")
+mark = muted.mark()
+muted.send("JOIN #mutes")
+muted.read(1.5)
+check("a mute does not keep anyone out", bool(muted.find("JOIN", "#mutes", lines=muted.since(mark))),
+      muted.since(mark)[-3:])
+
+mark = muted.mark()
+muted.send("MODE #mutes +b")
+muted.read(1.0)
+banlist = muted.find(" 367 ", lines=muted.since(mark))
+check("a non-op may read the ban list", bool(banlist), muted.since(mark)[-3:])
+check("the ban list says who set the entry and when",
+      bool(banlist) and len(banlist[0].split()) >= 7 and "muter" in banlist[0], banlist)
+
+mark = muted.mark()
+muted.send("PRIVMSG #mutes :can I speak?")
+muted.read(1.0)
+check("a muted user cannot speak (404)", bool(muted.find(" 404 ", lines=muted.since(mark))),
+      muted.since(mark)[-3:])
+
+muter.send("MODE #mutes +v muted")
+muter.read(1.0)
+mark = muted.mark()
+muted.send("PRIVMSG #mutes :and now?")
+muted.read(1.0)
+check("voice lifts the mute", not muted.find(" 404 ", lines=muted.since(mark)), muted.since(mark)[-3:])
+muted.close()
+muter.close()
+
+section("INVITE with no parameters lists invitations")
+inviter = Client("inviter")
+inviter.join("#invited")
+invitee = Client("invitee")
+inviter.send("INVITE invitee #invited")
+inviter.read(1.0)
+mark = invitee.mark()
+invitee.send("INVITE")
+invitee.read(1.5)
+check("336 names the channel", bool(invitee.find(" 336 ", "#invited", lines=invitee.since(mark))),
+      invitee.since(mark)[-3:])
+check("337 ends the list", bool(invitee.find(" 337 ", lines=invitee.since(mark))), invitee.since(mark)[-3:])
+inviter.close()
+invitee.close()
+lister.close()
+
 op.close()
 joiner.close()
 chanop.close()

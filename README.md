@@ -127,6 +127,7 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 | `register_before_connect` | `true` | Allow `REGISTER` before the handshake finishes; advertised as `before-connect` |
 | `multiclient` | `false` | Let one account hold several connections at once — a desktop and a phone, say. They share a nick and a single place in every channel; anything addressed to the user reaches all of them, while the answer to a command goes back to the connection that sent it, and each connection sees only the message tags it negotiated |
 | `persistent_sessions` | `false` | Treat an account as one continuing session: logging in takes its nick back from an earlier session and rejoins that session's channels. Off by default — it disconnects the earlier session, which is what someone reconnecting after a dropped link wants and what someone with two clients open does not |
+| `password` | _(unset)_ | A password every connection must send with `PASS` before registering. Stored in the clear on purpose: it is shared with everyone allowed on the server, so it is a door key rather than a secret about any one person. A wrong or missing one gets 464 and the link is closed |
 
 ### `[network]`
 
@@ -178,6 +179,7 @@ key  = "/etc/rIRCd/key.pem"
 | `flood_burst` | `10` | Commands a client may send back to back before being throttled |
 | `flood_rate` | `1` | Commands per second the flood allowance refills at |
 | `min_password_length` | `6` | Shortest password `REGISTER` accepts; advertised in `draft/account-registration` |
+| `max_targets` | `4` | Recipients one `PRIVMSG`, `NOTICE`, `TAGMSG` or `KICK` may name at once; advertised as `TARGMAX` |
 
 ### `[[opers]]`
 
@@ -505,6 +507,7 @@ still accepted in `CAP REQ` so older clients keep working.
 | **typing** | Full | TAGMSG with `+typing=active/paused/done`; forwarded via client-only tag relay |
 | **reply** | Full | Messages with `+reply=<msgid>` tag forwarded as-is |
 | **ACCOUNTEXTBAN** | Full | ISUPPORT token (not a capability); MODE +b ~a:account, JOIN 474 when banned by account |
+| **EXTBAN mute** | Full | ISUPPORT `EXTBAN=~,am`; `MODE +b ~m:nick!*@*` keeps someone from talking without keeping them out. Voice lifts it, and `MODE +e ~m:mask` excepts from it. `MODE #chan +b` with no mask reads the list without needing op, and RPL_BANLIST/RPL_EXCEPTLIST/RPL_INVITELIST name who set each entry and when |
 | **sasl** | Full | AUTHENTICATE PLAIN, SCRAM-SHA-256, and EXTERNAL (TLS client cert); 903/904; certfp auto-associated on PLAIN/SCRAM login |
 | **monitor** | Full | MONITOR +/−/C/L/S; 730/731/732/733/734; on join/quit/nick |
 | **extended-monitor** | Full | AWAY/ACCOUNT/CHGHOST/SETNAME forwarded for monitored nicks; `nick!user@host` masks (`*`/`?`) may be monitored as well as plain nicks |
@@ -546,7 +549,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 
 | Command | Numerics | Description |
 |---------|----------|-------------|
-| `LIST` | 321/322/323 | List channels; supports `>N`/`<N` (user count filter) and glob name masks |
+| `LIST` | 321/322/323 | List channels. `ELIST=CMNTU`: `>N`/`<N` by user count, a glob name mask, `!mask` for the channels it does not match, `C>N`/`C<N` by how long ago the channel was created, `T>N`/`T<N` by how long ago the topic was set (both in minutes) |
 | `LUSERS` | 251/252/254/255/265/266 | Server user/channel statistics |
 | `VERSION` | 351 | Server version string |
 | `TIME` | 391 | Server local time |
@@ -558,7 +561,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `STATS m` | 212/219 | How often each command has been used |
 | `WHOWAS` | 314/312/369 | Historical nick info; up to 5 entries per nick, in-memory |
 | `WHO` mask | 352/315 | Supports glob masks (`*`, `?`) against nick!user@host; respects +i invisible mode |
-| `HELP` | 704/705/706 | Per-command help text |
+| `HELP` / `HELPOP` | 704/705/706 | Per-command help text |
 | `KNOCK` | 710/711 | Request invite to an invite-only channel; notifies ops |
 | `KILL` | — | Oper-only: forcibly disconnect a user; broadcasts QUIT to their channels |
 | `KLINE` | — | Oper-only: `KLINE [<seconds>] <mask> :<reason>` — refuse connections matching a mask; existing ones are closed. Persisted in MariaDB |

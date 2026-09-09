@@ -306,6 +306,11 @@ pub struct ServerConfig {
     /// without accounts it does nothing, and it changes what a nick means.
     #[serde(default)]
     pub multiclient: bool,
+    /// A password every connection must send with PASS before registering.
+    /// Stored in the clear on purpose: it is shared with everyone allowed on
+    /// the server, so it is a door key, not a secret about any one person.
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 fn default_register_before_connect() -> bool {
@@ -361,6 +366,7 @@ impl Default for ServerConfig {
             register_before_connect: default_register_before_connect(),
             persistent_sessions: false,
             multiclient: false,
+            password: None,
         }
     }
 }
@@ -409,6 +415,11 @@ pub struct LimitsConfig {
     /// Connections allowed from one address at a time; 0 for no limit.
     #[serde(default = "default_max_per_ip")]
     pub max_connections_per_ip: usize,
+    /// Recipients one PRIVMSG, NOTICE, TAGMSG or KICK may name at once.
+    /// Advertised as TARGMAX; a low number keeps one line from becoming a
+    /// fan-out.
+    #[serde(default = "default_max_targets")]
+    pub max_targets: usize,
     /// Connections allowed in total; 0 for no limit.
     #[serde(default)]
     pub max_clients: usize,
@@ -427,6 +438,10 @@ pub struct LimitsConfig {
     /// draft/account-registration capability, so the two cannot drift apart.
     #[serde(default = "default_min_password_length")]
     pub min_password_length: usize,
+}
+
+fn default_max_targets() -> usize {
+    4
 }
 
 fn default_max_channels() -> usize {
@@ -452,6 +467,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_channels_per_client: default_max_channels(),
+            max_targets: default_max_targets(),
             max_connections_per_ip: default_max_per_ip(),
             max_clients: 0,
             max_line_length: default_max_line_length(),
@@ -784,6 +800,12 @@ motd = """
 registration_timeout_secs = 60
 ping_timeout_secs = 90
 disconnect_timeout_secs = 150
+# A password every connection must send with PASS before it can register.
+# Leave it out for a server anyone may connect to.
+# password = "choose-something"
+# One account, several connections at once (a desktop and a phone). They share
+# a nick and one place in every channel.
+# multiclient = true
 
 [network]
 name = "{network_name}"
@@ -798,6 +820,8 @@ database = "{db_name}"
 [limits]
 max_channels_per_client = 50
 max_line_length = 8191
+# Recipients one PRIVMSG, NOTICE, TAGMSG or KICK may name at once.
+max_targets = 4
 {email_block}{oper_block}"#
     );
 

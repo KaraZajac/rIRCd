@@ -56,7 +56,7 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// only to clients that enabled the capability.
 fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=U EXCEPTS INVEX UTF8ONLY WHOX BOT=B EXTBAN=~,a ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1,NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length);
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets);
     let deny = cfg
         .server
         .client_tag_deny
@@ -104,6 +104,33 @@ pub async fn complete_registration(
         Some(p) if p.nick.is_some() && p.user.is_some() => p,
         _ => return Ok(()),
     };
+
+    // A server password is checked once, here: PASS has to arrive before the
+    // NICK/USER pair that completes registration, so this is the first moment
+    // it is known whether one was given at all.
+    if let Some(ref expected) = cfg.server.password {
+        let given = pending.pass.clone().unwrap_or_default();
+        // ct_eq is false for differing lengths, so this is the whole check.
+        if !bool::from(<[u8] as subtle::ConstantTimeEq>::ct_eq(
+            given.as_bytes(),
+            expected.as_bytes(),
+        )) {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("464", vec!["*".into(), "Password incorrect".into()])
+                    .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            senders.write().await.close_user(
+                client_id,
+                Message::new("ERROR", vec!["Closing link: Password incorrect".into()])
+                    .with_prefix(&cfg.server.name),
+            );
+            return Ok(());
+        }
+    }
 
     let nick = pending.nick.unwrap();
     let user = pending.user.unwrap();

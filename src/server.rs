@@ -205,6 +205,7 @@ pub async fn run(
             ch_guard.ban_exceptions = e.ban_exceptions;
             ch_guard.invite_exceptions = e.invite_exceptions;
             ch_guard.quiet_list = e.quiets;
+            ch_guard.list_meta = e.list_meta;
             ch_guard.persisted_voice = e.voice;
             // Restore channel modes
             for c in e.mode_flags.chars() {

@@ -62,6 +62,22 @@ pub async fn end_labeled_batch(
     }
 }
 
+/// Answer the client that sent the command, inside the batch when the command
+/// opened one. A command naming several targets is one labeled response, so
+/// its parts belong to a batch rather than each carrying the label.
+pub async fn reply_to_sender(
+    senders: &Senders,
+    client_id: &str,
+    msg: Message,
+    label: Option<&str>,
+    parent_batch: Option<&str>,
+) {
+    match parent_batch {
+        Some(br) => reply_in_batch(senders, client_id, msg, br).await,
+        None => reply_to_client(senders, client_id, msg, label).await,
+    }
+}
+
 /// Send a reply inside a labeled-response batch (adds batch tag, no label tag).
 pub async fn reply_in_batch(senders: &Senders, client_id: &str, mut msg: Message, batch_ref: &str) {
     msg.add_tag("batch", Some(batch_ref.to_string()));

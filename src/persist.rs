@@ -47,6 +47,9 @@ pub struct ChannelEntry {
     pub invite_exceptions: Vec<String>,
     /// Quiet masks (+q).
     pub quiets: Vec<String>,
+    /// Who set each list entry and when, keyed by list letter followed by the
+    /// mask (e.g. "b*!*@example.com"). Needed for RPL_BANLIST and its kin.
+    pub list_meta: std::collections::HashMap<String, (String, i64)>,
 }
 
 /// One line of channel history from the database.
@@ -280,6 +283,13 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    for stmt in [
+        "ALTER TABLE channel_lists ADD COLUMN IF NOT EXISTS set_by VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE channel_lists ADD COLUMN IF NOT EXISTS set_at BIGINT NOT NULL DEFAULT 0",
+    ] {
+        let _ = sqlx::query(stmt).execute(pool).await;
+    }
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS server_bans (
             mask       VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -444,6 +454,8 @@ pub async fn set_channel_list_entry(
     list_type: char,
     mask: &str,
     add: bool,
+    set_by: &str,
+    set_at: i64,
 ) {
     let _ = sqlx::query("INSERT IGNORE INTO channels (name) VALUES (?)")
         .bind(channel_name)
@@ -461,11 +473,15 @@ pub async fn set_channel_list_entry(
 
     let result = if add {
         sqlx::query(
-            "INSERT IGNORE INTO channel_lists (channel_id, list_type, mask) VALUES (?, ?, ?)",
+            "INSERT INTO channel_lists (channel_id, list_type, mask, set_by, set_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE set_by = VALUES(set_by), set_at = VALUES(set_at)",
         )
         .bind(id)
         .bind(list_type.to_string())
         .bind(mask)
+        .bind(set_by)
+        .bind(set_at)
         .execute(pool)
         .await
     } else {
@@ -523,23 +539,30 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
         let created_at: i64 = row.try_get("created_ts").unwrap_or(0);
         let founder: String = row.try_get("founder").unwrap_or_default();
 
-        let list_rows =
-            sqlx::query("SELECT list_type, mask FROM channel_lists WHERE channel_id = ?")
-                .bind(id)
-                .fetch_all(pool)
-                .await
-                .unwrap_or_default();
+        let list_rows = sqlx::query(
+            "SELECT list_type, mask, set_by, set_at FROM channel_lists WHERE channel_id = ?",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
         let mut bans = Vec::new();
         let mut ban_exceptions = Vec::new();
         let mut invite_exceptions = Vec::new();
         let mut quiets = Vec::new();
+        let mut list_meta: std::collections::HashMap<String, (String, i64)> =
+            std::collections::HashMap::new();
         for r in &list_rows {
             let list_type: String = r.get("list_type");
             let mask: String = r.get("mask");
-            match list_type.chars().next() {
-                Some('e') => ban_exceptions.push(mask),
-                Some('I') => invite_exceptions.push(mask),
-                Some('q') => quiets.push(mask),
+            let set_by: String = r.try_get("set_by").unwrap_or_default();
+            let set_at: i64 = r.try_get("set_at").unwrap_or(0);
+            let kind = list_type.chars().next().unwrap_or('b');
+            list_meta.insert(format!("{}{}", kind, mask), (set_by, set_at));
+            match kind {
+                'e' => ban_exceptions.push(mask),
+                'I' => invite_exceptions.push(mask),
+                'q' => quiets.push(mask),
                 _ => bans.push(mask),
             }
         }
@@ -578,6 +601,7 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
             ban_exceptions,
             invite_exceptions,
             quiets,
+            list_meta,
         });
     }
     entries

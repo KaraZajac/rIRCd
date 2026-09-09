@@ -1,5 +1,5 @@
 use crate::channel::{canonical_channel_key, ChannelStore};
-use crate::commands::reply_to_client;
+use crate::commands::{reply_to_client, reply_to_sender};
 use crate::config::Config;
 use crate::persist;
 use crate::protocol::{add_tags_for_recipient, generate_msgid, Message, SenderTags};
@@ -267,6 +267,7 @@ async fn push_notify(
     crate::webpush::notify(cfg, &account, &tagged);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_privmsg(
     client_id: &str,
     msg: Message,
@@ -275,6 +276,7 @@ pub async fn handle_privmsg(
     senders: Senders,
     cfg: &Config,
     label: Option<&str>,
+    parent_batch: Option<&str>,
 ) -> anyhow::Result<()> {
     let target = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     // The text is params[1]: `PRIVMSG #chan` has none, and trailing() would
@@ -291,11 +293,12 @@ pub async fn handle_privmsg(
             Some(c) => c.read().await.nick_or_id().to_string(),
             None => "*".to_string(),
         };
-        reply_to_client(
+        reply_to_sender(
             &senders,
             client_id,
             Message::new(numeric, vec![nick, why.into()]).with_prefix(&cfg.server.name),
             label,
+            parent_batch,
         )
         .await;
         return Ok(());
@@ -310,7 +313,7 @@ pub async fn handle_privmsg(
                 None => "*".to_string(),
             }
         };
-        reply_to_client(
+        reply_to_sender(
             &senders,
             client_id,
             Message::new(
@@ -319,6 +322,7 @@ pub async fn handle_privmsg(
             )
             .with_prefix(&cfg.server.name),
             label,
+            parent_batch,
         )
         .await;
         return Ok(());
@@ -328,12 +332,13 @@ pub async fn handle_privmsg(
     let client = match state_guard.clients.get(client_id) {
         Some(c) => c.clone(),
         None => {
-            reply_to_client(
+            reply_to_sender(
                 &senders,
                 client_id,
                 Message::new("451", vec!["*".into(), "You have not registered".into()])
                     .with_prefix(&cfg.server.name),
                 label,
+                parent_batch,
             )
             .await;
             return Ok(());
@@ -404,7 +409,7 @@ pub async fn handle_privmsg(
             .unwrap_or(false);
 
         if !is_owner {
-            reply_to_client(
+            reply_to_sender(
                 &senders,
                 client_id,
                 Message::new(
@@ -419,6 +424,7 @@ pub async fn handle_privmsg(
                 )
                 .with_prefix(&cfg.server.name),
                 label,
+                parent_batch,
             )
             .await;
             return Ok(());
@@ -467,7 +473,7 @@ pub async fn handle_privmsg(
             let ch = ch.read().await;
             // +n: reject non-members when no-external-messages is set
             if !ch.is_member(&state_guard.user_id(client_id)) && ch.modes.no_external {
-                reply_to_client(
+                reply_to_sender(
                     &senders,
                     client_id,
                     Message::new(
@@ -480,6 +486,7 @@ pub async fn handle_privmsg(
                     )
                     .with_prefix(&cfg.server.name),
                     label,
+                    parent_batch,
                 )
                 .await;
                 return Ok(());
@@ -487,7 +494,7 @@ pub async fn handle_privmsg(
 
             // +C: block CTCP queries, but not ACTION
             if ch.modes.no_ctcp && is_blockable_ctcp(&text) {
-                reply_to_client(
+                reply_to_sender(
                     &senders,
                     client_id,
                     Message::new(
@@ -500,14 +507,22 @@ pub async fn handle_privmsg(
                     )
                     .with_prefix(&cfg.server.name),
                     label,
+                    parent_batch,
                 )
                 .await;
                 return Ok(());
             }
 
-            // +q: sender is quieted
-            if ch.is_quieted(sender_account.as_deref(), &source) {
-                reply_to_client(
+            // +q, or a mute extban. Voice is permission to speak, so it lifts
+            // either one.
+            if !ch
+                .members
+                .get(&state_guard.user_id(client_id))
+                .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                .unwrap_or(false)
+                && ch.is_muted(sender_account.as_deref(), &source)
+            {
+                reply_to_sender(
                     &senders,
                     client_id,
                     Message::new(
@@ -520,6 +535,7 @@ pub async fn handle_privmsg(
                     )
                     .with_prefix(&cfg.server.name),
                     label,
+                    parent_batch,
                 )
                 .await;
                 return Ok(());
@@ -527,7 +543,7 @@ pub async fn handle_privmsg(
 
             // +R: registered users only for speaking
             if ch.modes.registered_only && sender_account.is_none() {
-                reply_to_client(
+                reply_to_sender(
                     &senders,
                     client_id,
                     Message::new(
@@ -540,6 +556,7 @@ pub async fn handle_privmsg(
                     )
                     .with_prefix(&cfg.server.name),
                     label,
+                    parent_batch,
                 )
                 .await;
                 return Ok(());
@@ -553,7 +570,7 @@ pub async fn handle_privmsg(
                     .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
                     .unwrap_or(false)
             {
-                reply_to_client(
+                reply_to_sender(
                     &senders,
                     client_id,
                     Message::new(
@@ -566,6 +583,7 @@ pub async fn handle_privmsg(
                     )
                     .with_prefix(&cfg.server.name),
                     label,
+                    parent_batch,
                 )
                 .await;
                 return Ok(());
@@ -625,7 +643,7 @@ pub async fn handle_privmsg(
                             cfg.server.client_tag_deny.as_deref(),
                             &sender_tags,
                         );
-                        reply_to_client(&senders, client_id, tagged, label).await;
+                        reply_to_sender(&senders, client_id, tagged, label, parent_batch).await;
                     }
                     continue;
                 }
@@ -673,12 +691,13 @@ pub async fn handle_privmsg(
             )
             .await;
         } else {
-            reply_to_client(
+            reply_to_sender(
                 &senders,
                 client_id,
                 Message::new("403", vec![target.into(), "No such channel".into()])
                     .with_prefix(&cfg.server.name),
                 label,
+                parent_batch,
             )
             .await;
         }
@@ -735,12 +754,13 @@ pub async fn handle_privmsg(
             };
             if let Some(away_msg) = target_away {
                 let sender_nick = source.split('!').next().unwrap_or("*").to_string();
-                reply_to_client(
+                reply_to_sender(
                     &senders,
                     client_id,
                     Message::new("301", vec![sender_nick, target.to_string(), away_msg])
                         .with_prefix(&cfg.server.name),
                     label,
+                    parent_batch,
                 )
                 .await;
             }
@@ -758,10 +778,10 @@ pub async fn handle_privmsg(
                     cfg.server.client_tag_deny.as_deref(),
                     &sender_tags,
                 );
-                reply_to_client(&senders, client_id, tagged, label).await;
+                reply_to_sender(&senders, client_id, tagged, label, parent_batch).await;
             }
         } else {
-            reply_to_client(
+            reply_to_sender(
                 &senders,
                 client_id,
                 Message::new(
@@ -774,6 +794,7 @@ pub async fn handle_privmsg(
                 )
                 .with_prefix(&cfg.server.name),
                 label,
+                parent_batch,
             )
             .await;
         }
@@ -782,6 +803,7 @@ pub async fn handle_privmsg(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_notice(
     client_id: &str,
     msg: Message,
@@ -790,6 +812,7 @@ pub async fn handle_notice(
     senders: Senders,
     cfg: &Config,
     label: Option<&str>,
+    parent_batch: Option<&str>,
 ) -> anyhow::Result<()> {
     let raw_target = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let text = msg.trailing().unwrap_or("").to_string();
@@ -871,8 +894,15 @@ pub async fn handle_notice(
             if ch.modes.registered_only && sender_account.is_none() {
                 return Ok(());
             }
-            // +q: sender is quieted
-            if ch.is_quieted(sender_account.as_deref(), &source) {
+            // +q, or a mute extban. Voice is permission to speak, so it lifts
+            // either one.
+            if !ch
+                .members
+                .get(&state_guard.user_id(client_id))
+                .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                .unwrap_or(false)
+                && ch.is_muted(sender_account.as_deref(), &source)
+            {
                 return Ok(());
             }
             for (mid, memb) in &ch.members {
@@ -902,7 +932,7 @@ pub async fn handle_notice(
                             cfg.server.client_tag_deny.as_deref(),
                             &sender_tags,
                         );
-                        reply_to_client(&senders, client_id, tagged, label).await;
+                        reply_to_sender(&senders, client_id, tagged, label, parent_batch).await;
                     }
                     continue;
                 }
@@ -993,7 +1023,7 @@ pub async fn handle_notice(
                     cfg.server.client_tag_deny.as_deref(),
                     &sender_tags,
                 );
-                reply_to_client(&senders, client_id, tagged, label).await;
+                reply_to_sender(&senders, client_id, tagged, label, parent_batch).await;
             }
         }
     }
@@ -1393,6 +1423,7 @@ fn parse_client_tags(s: &str) -> std::collections::HashMap<String, Option<String
 }
 
 /// TAGMSG: like PRIVMSG but no text; only delivered to clients with message-tags cap.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_tagmsg(
     client_id: &str,
     msg: Message,
@@ -1401,15 +1432,17 @@ pub async fn handle_tagmsg(
     senders: Senders,
     cfg: &Config,
     label: Option<&str>,
+    parent_batch: Option<&str>,
 ) -> anyhow::Result<()> {
     let target = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     if target.is_empty() {
-        reply_to_client(
+        reply_to_sender(
             &senders,
             client_id,
             Message::new("411", vec!["No recipient given (TAGMSG)".into()])
                 .with_prefix(&cfg.server.name),
             label,
+            parent_batch,
         )
         .await;
         return Ok(());
@@ -1453,7 +1486,7 @@ pub async fn handle_tagmsg(
 
             // +n: reject non-members when no-external-messages is set
             if !ch.is_member(&state_guard.user_id(client_id)) && ch.modes.no_external {
-                reply_to_client(
+                reply_to_sender(
                     &senders,
                     client_id,
                     Message::new(
@@ -1466,14 +1499,22 @@ pub async fn handle_tagmsg(
                     )
                     .with_prefix(&cfg.server.name),
                     label,
+                    parent_batch,
                 )
                 .await;
                 return Ok(());
             }
 
-            // +q: sender is quieted
-            if ch.is_quieted(sender_account.as_deref(), &source) {
-                reply_to_client(
+            // +q, or a mute extban. Voice is permission to speak, so it lifts
+            // either one.
+            if !ch
+                .members
+                .get(&state_guard.user_id(client_id))
+                .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                .unwrap_or(false)
+                && ch.is_muted(sender_account.as_deref(), &source)
+            {
+                reply_to_sender(
                     &senders,
                     client_id,
                     Message::new(
@@ -1486,6 +1527,7 @@ pub async fn handle_tagmsg(
                     )
                     .with_prefix(&cfg.server.name),
                     label,
+                    parent_batch,
                 )
                 .await;
                 return Ok(());
@@ -1493,7 +1535,7 @@ pub async fn handle_tagmsg(
 
             // +R: registered users only for speaking
             if ch.modes.registered_only && sender_account.is_none() {
-                reply_to_client(
+                reply_to_sender(
                     &senders,
                     client_id,
                     Message::new(
@@ -1505,6 +1547,7 @@ pub async fn handle_tagmsg(
                     )
                     .with_prefix(&cfg.server.name),
                     label,
+                    parent_batch,
                 )
                 .await;
                 return Ok(());
@@ -1518,7 +1561,7 @@ pub async fn handle_tagmsg(
                     .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
                     .unwrap_or(false)
             {
-                reply_to_client(
+                reply_to_sender(
                     &senders,
                     client_id,
                     Message::new(
@@ -1531,6 +1574,7 @@ pub async fn handle_tagmsg(
                     )
                     .with_prefix(&cfg.server.name),
                     label,
+                    parent_batch,
                 )
                 .await;
                 return Ok(());
@@ -1558,7 +1602,7 @@ pub async fn handle_tagmsg(
                             cfg.server.client_tag_deny.as_deref(),
                             &sender_tags,
                         );
-                        reply_to_client(&senders, client_id, tagged, label).await;
+                        reply_to_sender(&senders, client_id, tagged, label, parent_batch).await;
                         continue;
                     }
                     send_to_client_with_caps(
@@ -1621,7 +1665,7 @@ pub async fn handle_tagmsg(
                         cfg.server.client_tag_deny.as_deref(),
                         &sender_tags,
                     );
-                    reply_to_client(&senders, client_id, tagged, label).await;
+                    reply_to_sender(&senders, client_id, tagged, label, parent_batch).await;
                 }
             }
             if tagmsg_should_persist(&msg.tags) {

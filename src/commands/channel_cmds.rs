@@ -895,7 +895,6 @@ pub async fn handle_names(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 /// One channel's RPL_NAMREPLY, without the RPL_ENDOFNAMES that closes a list.
 /// Used when several channels are answered under one ending.
 #[allow(clippy::too_many_arguments)]
@@ -1079,10 +1078,9 @@ pub(crate) async fn send_names_for_channel(
         .with_prefix(server);
         reply_in_batch(senders, client_id, names, parent).await;
         reply_in_batch(senders, client_id, end, parent).await;
-    } else if label.is_some() {
+    } else if let Some(label) = label {
         // labeled-response: wrap in labeled-response batch for multi-message reply
-        let lr_ref =
-            crate::commands::start_labeled_batch(senders, client_id, label.unwrap(), server).await;
+        let lr_ref = crate::commands::start_labeled_batch(senders, client_id, label, server).await;
         crate::commands::reply_in_batch(
             senders,
             client_id,
@@ -1131,25 +1129,51 @@ pub async fn handle_list(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    // Parse optional filter: LIST [<filter>]
-    // Filter can be: ">N" (more than N users), "<N" (fewer than N), or a channel name mask
+    // LIST [<filter>], the ELIST=CMNTU forms:
+    //   >N / <N   more or fewer than N users
+    //   mask      channel names matching the glob
+    //   !mask     channel names not matching it
+    //   C>N / C<N created more or less than N minutes ago
+    //   T>N / T<N topic set more or less than N minutes ago
     let filter = msg.params.first().map(|s| s.as_str()).unwrap_or("");
-    let min_users: Option<usize> = if let Some(stripped) = filter.strip_prefix('>') {
-        stripped.parse().ok()
-    } else {
+    let min_users: Option<usize> = filter.strip_prefix('>').and_then(|v| v.parse().ok());
+    let max_users: Option<usize> = filter.strip_prefix('<').and_then(|v| v.parse().ok());
+    let older_than_mins: Option<i64> = filter
+        .strip_prefix("C>")
+        .or_else(|| filter.strip_prefix("c>"))
+        .and_then(|v| v.parse().ok());
+    let newer_than_mins: Option<i64> = filter
+        .strip_prefix("C<")
+        .or_else(|| filter.strip_prefix("c<"))
+        .and_then(|v| v.parse().ok());
+    let topic_older_than_mins: Option<i64> = filter
+        .strip_prefix("T>")
+        .or_else(|| filter.strip_prefix("t>"))
+        .and_then(|v| v.parse().ok());
+    let topic_newer_than_mins: Option<i64> = filter
+        .strip_prefix("T<")
+        .or_else(|| filter.strip_prefix("t<"))
+        .and_then(|v| v.parse().ok());
+    let time_filtered = older_than_mins.is_some()
+        || newer_than_mins.is_some()
+        || topic_older_than_mins.is_some()
+        || topic_newer_than_mins.is_some();
+    let negated_mask: Option<&str> = if time_filtered {
         None
-    };
-    let max_users: Option<usize> = if let Some(stripped) = filter.strip_prefix('<') {
-        stripped.parse().ok()
     } else {
-        None
+        filter.strip_prefix('!').filter(|m| !m.is_empty())
     };
-    let name_mask: Option<&str> =
-        if !filter.is_empty() && !filter.starts_with('>') && !filter.starts_with('<') {
-            Some(filter)
-        } else {
-            None
-        };
+    let name_mask: Option<&str> = if filter.is_empty()
+        || time_filtered
+        || negated_mask.is_some()
+        || filter.starts_with('>')
+        || filter.starts_with('<')
+    {
+        None
+    } else {
+        Some(filter)
+    };
+    let now = chrono::Utc::now().timestamp();
 
     let state = state.read().await;
     let client = match state.clients.get(client_id) {
@@ -1188,6 +1212,41 @@ pub async fn handle_list(
             let mask_lower = mask.to_lowercase();
             if !crate::user::glob_match(&mask_lower, &ch_name.to_lowercase()) {
                 continue;
+            }
+        }
+        if let Some(mask) = negated_mask {
+            let mask_lower = mask.to_lowercase();
+            if crate::user::glob_match(&mask_lower, &ch_name.to_lowercase()) {
+                continue;
+            }
+        }
+        let age_mins = (now - ch.created_at) / 60;
+        if let Some(mins) = older_than_mins {
+            if age_mins <= mins {
+                continue;
+            }
+        }
+        if let Some(mins) = newer_than_mins {
+            if age_mins >= mins {
+                continue;
+            }
+        }
+        // A channel whose topic was never set has no topic age, so it matches
+        // neither "set recently" nor "set a while ago".
+        if topic_older_than_mins.is_some() || topic_newer_than_mins.is_some() {
+            let Some(set_at) = ch.topic_time else {
+                continue;
+            };
+            let topic_age_mins = (now - set_at) / 60;
+            if let Some(mins) = topic_older_than_mins {
+                if topic_age_mins <= mins {
+                    continue;
+                }
+            }
+            if let Some(mins) = topic_newer_than_mins {
+                if topic_age_mins >= mins {
+                    continue;
+                }
             }
         }
         let topic = ch.topic.as_deref().unwrap_or("");
@@ -1329,7 +1388,14 @@ pub async fn handle_mode(
             }
 
             let mode_str = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
-            if !is_op {
+            // `MODE #chan +b` with no mask asks what the list holds. Reading a
+            // list is not changing one, so it does not need op.
+            let list_query_only = msg.params.len() == 2
+                && !mode_str.is_empty()
+                && mode_str
+                    .chars()
+                    .all(|c| matches!(c, '+' | '-' | 'b' | 'e' | 'I' | 'q'));
+            if !is_op && !list_query_only {
                 reply_to_client(
                     &senders,
                     client_id,
@@ -1355,6 +1421,9 @@ pub async fn handle_mode(
             let mut rejected_modes: Vec<(char, bool)> = Vec::new();
             // (list, mask, added) — likewise, so bans survive a restart.
             let mut list_changes: Vec<(char, String, bool)> = Vec::new();
+            // Who is setting them, for RPL_BANLIST and its kin.
+            let setter = nick.clone();
+            let set_at = chrono::Utc::now().timestamp();
             // param_idx starts at 2: params[0]=target, params[1]=mode_str, params[2+]=mode args
             let mut param_idx: usize = 2;
             for c in mode_str.chars() {
@@ -1496,25 +1565,39 @@ pub async fn handle_mode(
                                 } else if !ch.bans.contains(mask) {
                                     ch.bans.push(mask.clone());
                                     list_changes.push(('b', mask.clone(), true));
+                                    ch.list_meta
+                                        .insert(format!("b{}", mask), (setter.clone(), set_at));
                                 }
                             } else {
                                 ch.bans.retain(|b| b != mask);
                                 list_changes.push(('b', mask.clone(), false));
+                                ch.list_meta.remove(&format!("b{}", mask));
                             }
                             param_idx += 1;
                         } else {
                             // No param: list bans (367 RPL_BANLIST / 368 RPL_ENDOFBANLIST)
                             let bans = ch.bans.clone();
+                            let meta_b: std::collections::HashMap<String, (String, i64)> = bans
+                                .iter()
+                                .map(|m| (m.clone(), ch.list_entry_meta('b', m, &cfg.server.name)))
+                                .collect();
                             drop(ch);
                             drop(ch_store);
                             for ban in &bans {
                                 reply_to_client(
                                     &senders,
                                     client_id,
-                                    Message::new(
-                                        "367",
-                                        vec![nick.clone(), target.into(), ban.clone()],
-                                    )
+                                    Message::new("367", {
+                                        let (by, at) =
+                                            meta_b.get(ban.as_str()).cloned().unwrap_or_default();
+                                        vec![
+                                            nick.clone(),
+                                            target.into(),
+                                            ban.clone(),
+                                            by,
+                                            at.to_string(),
+                                        ]
+                                    })
                                     .with_prefix(&cfg.server.name),
                                     label,
                                 )
@@ -1557,10 +1640,13 @@ pub async fn handle_mode(
                                 } else if !ch.quiet_list.contains(mask) {
                                     ch.quiet_list.push(mask.clone());
                                     list_changes.push(('q', mask.clone(), true));
+                                    ch.list_meta
+                                        .insert(format!("q{}", mask), (setter.clone(), set_at));
                                 }
                             } else {
                                 ch.quiet_list.retain(|q| q != mask);
                                 list_changes.push(('q', mask.clone(), false));
+                                ch.list_meta.remove(&format!("q{}", mask));
                             }
                             param_idx += 1;
                         } else {
@@ -1737,25 +1823,42 @@ pub async fn handle_mode(
                                 } else if !ch.ban_exceptions.contains(mask) {
                                     ch.ban_exceptions.push(mask.clone());
                                     list_changes.push(('e', mask.clone(), true));
+                                    ch.list_meta
+                                        .insert(format!("e{}", mask), (setter.clone(), set_at));
                                 }
                             } else {
                                 ch.ban_exceptions.retain(|b| b != mask);
                                 list_changes.push(('e', mask.clone(), false));
+                                ch.list_meta.remove(&format!("e{}", mask));
                             }
                             param_idx += 1;
                         } else {
                             // No param: list ban exceptions (348/349)
                             let exceptions = ch.ban_exceptions.clone();
+                            let meta_e: std::collections::HashMap<String, (String, i64)> =
+                                exceptions
+                                    .iter()
+                                    .map(|m| {
+                                        (m.clone(), ch.list_entry_meta('e', m, &cfg.server.name))
+                                    })
+                                    .collect();
                             drop(ch);
                             drop(ch_store);
                             for exc in &exceptions {
                                 reply_to_client(
                                     &senders,
                                     client_id,
-                                    Message::new(
-                                        "348",
-                                        vec![nick.clone(), target.into(), exc.clone()],
-                                    )
+                                    Message::new("348", {
+                                        let (by, at) =
+                                            meta_e.get(exc.as_str()).cloned().unwrap_or_default();
+                                        vec![
+                                            nick.clone(),
+                                            target.into(),
+                                            exc.clone(),
+                                            by,
+                                            at.to_string(),
+                                        ]
+                                    })
                                     .with_prefix(&cfg.server.name),
                                     label,
                                 )
@@ -1802,25 +1905,44 @@ pub async fn handle_mode(
                                 } else if !ch.invite_exceptions.contains(mask) {
                                     ch.invite_exceptions.push(mask.clone());
                                     list_changes.push(('I', mask.clone(), true));
+                                    ch.list_meta
+                                        .insert(format!("I{}", mask), (setter.clone(), set_at));
                                 }
                             } else {
                                 ch.invite_exceptions.retain(|b| b != mask);
                                 list_changes.push(('I', mask.clone(), false));
+                                ch.list_meta.remove(&format!("I{}", mask));
                             }
                             param_idx += 1;
                         } else {
                             // No param: list invite exceptions (346/347)
                             let invexes = ch.invite_exceptions.clone();
+                            let meta_invex: std::collections::HashMap<String, (String, i64)> =
+                                invexes
+                                    .iter()
+                                    .map(|m| {
+                                        (m.clone(), ch.list_entry_meta('I', m, &cfg.server.name))
+                                    })
+                                    .collect();
                             drop(ch);
                             drop(ch_store);
                             for exc in &invexes {
                                 reply_to_client(
                                     &senders,
                                     client_id,
-                                    Message::new(
-                                        "346",
-                                        vec![nick.clone(), target.into(), exc.clone()],
-                                    )
+                                    Message::new("346", {
+                                        let (by, at) = meta_invex
+                                            .get(exc.as_str())
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        vec![
+                                            nick.clone(),
+                                            target.into(),
+                                            exc.clone(),
+                                            by,
+                                            at.to_string(),
+                                        ]
+                                    })
                                     .with_prefix(&cfg.server.name),
                                     label,
                                 )
@@ -1885,7 +2007,7 @@ pub async fn handle_mode(
             drop(ch_store);
             if let Some(ref mode_msg) = mode_msg {
                 for mid in &member_ids_mode {
-                    senders.read().await.deliver(mid, &mode_msg);
+                    senders.read().await.deliver(mid, mode_msg);
                 }
             }
             // Persist channel modes to database
@@ -1904,8 +2026,10 @@ pub async fn handle_mode(
                     crate::persist::set_channel_access(pool, &ch_key, who, *is_op, *granted).await;
                 }
                 for (list_type, mask, added) in &list_changes {
-                    crate::persist::set_channel_list_entry(pool, &ch_key, *list_type, mask, *added)
-                        .await;
+                    crate::persist::set_channel_list_entry(
+                        pool, &ch_key, *list_type, mask, *added, &setter, set_at,
+                    )
+                    .await;
                 }
             }
         }
@@ -2353,9 +2477,50 @@ pub async fn handle_invite(
     let target_nick = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let ch_name = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
 
+    // Bare INVITE lists the channels this client has been invited to.
+    if target_nick.is_empty() && ch_name.is_empty() {
+        let state_r = state.read().await;
+        let nick = match state_r.clients.get(client_id) {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => "*".to_string(),
+        };
+        let user_id = state_r.user_id(client_id);
+        drop(state_r);
+
+        let invited: Vec<String> = {
+            let ch_store = channels.read().await;
+            let mut names = Vec::new();
+            for ch in ch_store.channels.values() {
+                let ch = ch.read().await;
+                if ch.invite_list.contains(&user_id) {
+                    names.push(ch.name.clone());
+                }
+            }
+            names
+        };
+        for ch_name in invited {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("336", vec![nick.clone(), ch_name]).with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+        }
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("337", vec![nick, "End of /INVITE list".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
     if target_nick.is_empty() || ch_name.is_empty() {
         // Silence is not an answer: a client waiting on INVITE would wait for
-        // ever. (Listing one's own invitations is optional and not supported.)
+        // ever.
         let nick = match state.read().await.clients.get(client_id) {
             Some(c) => c.read().await.nick_or_id().to_string(),
             None => "*".to_string(),
