@@ -2117,6 +2117,11 @@ pub async fn update_channel_history_message(
 
 /// Maximum number of WHOWAS entries retained per nick in the database.
 const MAX_WHOWAS_DB: i64 = 20;
+/// How long a WHOWAS row is kept. Nobody asks who held a nick a month ago, and
+/// keeping every name forever is disk that grows without an end.
+const WHOWAS_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+/// Entries written between sweeps of the expired rows.
+const WHOWAS_SWEEP_INTERVAL: u32 = 500;
 
 /// Persist a WHOWAS entry and prune old entries for the same nick.
 pub async fn save_whowas(
@@ -2154,6 +2159,21 @@ pub async fn save_whowas(
     .bind(MAX_WHOWAS_DB)
     .execute(pool)
     .await;
+
+    // Per-nick pruning bounds the rows for any one name but not the number of
+    // names, and every distinct nick that ever connected leaves some behind.
+    // Once in a while, drop what is old enough that nobody is asking.
+    static SINCE_SWEEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SINCE_SWEEP
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(WHOWAS_SWEEP_INTERVAL)
+    {
+        let cutoff = chrono::Utc::now().timestamp() - WHOWAS_RETENTION_SECS;
+        let _ = sqlx::query("DELETE FROM whowas WHERE quit_time < FROM_UNIXTIME(?)")
+            .bind(cutoff)
+            .execute(pool)
+            .await;
+    }
 }
 
 /// Load WHOWAS entries for a nick (most recent first).

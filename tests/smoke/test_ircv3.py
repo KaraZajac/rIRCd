@@ -447,6 +447,21 @@ md.read(1.5)
 check("METADATA CLEAR removes it", not md.find("Meta Owner", lines=md.since(mark)), md.since(mark))
 md.close()
 
+# Metadata is filed under the nick, and a nick with nothing behind it belongs to
+# whoever holds it next — so it must not come with the last holder's keys.
+handover = Client("handover")
+handover.send("METADATA * SET display-name :The First Holder")
+handover.read(1.0)
+handover.close()
+time.sleep(0.6)
+second = Client("handover")
+mark = second.mark()
+second.send("METADATA * LIST")
+second.read(1.5)
+check("a nick does not inherit the last holder's metadata",
+      not second.find("The First Holder", lines=second.since(mark)), second.since(mark))
+second.close()
+
 section("draft/channel-rename")
 ren = Client("renamer2", caps=["draft/channel-rename"])
 ren.join("#before")

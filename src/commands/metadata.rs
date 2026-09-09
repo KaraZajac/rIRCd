@@ -435,7 +435,7 @@ pub async fn handle_metadata(
         .await;
     }
 
-    let (self_nick, is_oper, setter_source, has_batch) = {
+    let (self_nick, is_oper, setter_source, has_batch, self_account) = {
         let state_r = state.read().await;
         let client = match state_r.clients.get(client_id) {
             Some(c) => c.clone(),
@@ -454,7 +454,13 @@ pub async fn handle_metadata(
         let g = client.read().await;
         let src = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
         let has_batch = g.capabilities.contains("batch");
-        (g.nick_or_id().to_string(), g.oper, src, has_batch)
+        (
+            g.nick_or_id().to_string(),
+            g.oper,
+            src,
+            has_batch,
+            g.account.clone(),
+        )
     };
 
     let target = normalize_target(target_param, &self_nick);
@@ -870,12 +876,18 @@ pub async fn handle_metadata(
                 value.clone()
             };
 
-            // Persist
+            // Persist. A nick with no account behind it is not a lasting
+            // identity: keeping its keys would hand them to whoever takes the
+            // name next, and would grow the table for as long as names came
+            // and went. Channels and accounts do persist.
+            let lasting = is_channel(&target) || self_account.is_some();
             if let Some(ref pool) = cfg.db {
-                if let Some(ref v) = new_value {
-                    crate::persist::save_metadata(pool, &metadata_key(&target), key, v).await;
-                } else {
-                    crate::persist::delete_metadata(pool, &metadata_key(&target), key).await;
+                if lasting {
+                    if let Some(ref v) = new_value {
+                        crate::persist::save_metadata(pool, &metadata_key(&target), key, v).await;
+                    } else {
+                        crate::persist::delete_metadata(pool, &metadata_key(&target), key).await;
+                    }
                 }
             }
 

@@ -8,6 +8,9 @@ use tokio::sync::{mpsc, RwLock};
 // ─── WHOWAS ───────────────────────────────────────────────────────────────────
 
 const MAX_WHOWAS: usize = 5;
+/// Nicks kept in the in-memory WHOWAS record. Past this the oldest name goes;
+/// the database keeps a longer tail for the ones that matter.
+const MAX_WHOWAS_NICKS: usize = 10_000;
 
 /// One WHOWAS history entry (recorded on NICK change or QUIT)
 #[derive(Debug, Clone)]
@@ -605,6 +608,10 @@ pub struct ServerState {
     pub pending_client_batches: HashMap<String, PendingClientBatch>,
     /// WHOWAS history: nick_lower -> recent entries
     pub whowas: HashMap<String, VecDeque<WhowasEntry>>,
+    /// The nicks in `whowas`, oldest first. WHOWAS is a record of who was here
+    /// recently, and without a bound on how many names it keeps, a map entry
+    /// is left behind by every distinct nick that ever connected.
+    pub whowas_order: VecDeque<String>,
     /// Server start time (Unix timestamp)
     pub started_at: i64,
     /// Path to the config file on disk (used by REHASH to reload)
@@ -702,10 +709,21 @@ impl ServerState {
     /// Push an already-built WhowasEntry (useful when the client borrow conflicts with &mut self).
     pub fn push_whowas(&mut self, entry: WhowasEntry) {
         let key = entry.nick.to_lowercase();
+        if !self.whowas.contains_key(&key) {
+            self.whowas_order.push_back(key.clone());
+        }
         let list = self.whowas.entry(key).or_default();
         list.push_back(entry);
         while list.len() > MAX_WHOWAS {
             list.pop_front();
+        }
+        while self.whowas.len() > MAX_WHOWAS_NICKS {
+            match self.whowas_order.pop_front() {
+                Some(oldest) => {
+                    self.whowas.remove(&oldest);
+                }
+                None => break,
+            }
         }
     }
 
@@ -741,9 +759,20 @@ impl ServerState {
         }
         self.clients.remove(&user_id);
         self.session_to_user.remove(&user_id);
-        let nick = client.read().await.nick.clone();
+        let (nick, account) = {
+            let g = client.read().await;
+            (g.nick.clone(), g.account.clone())
+        };
         if let Some(ref n) = nick {
             self.nick_to_id.remove(&n.to_uppercase());
+            // Metadata is filed under the nick, and a nick with no account
+            // behind it belongs to whoever holds it next. Leaving the keys
+            // there would hand somebody else's display name and avatar to the
+            // next person to take the name, and would grow without bound as
+            // names came and went.
+            if account.is_none() {
+                self.metadata.remove(&n.to_uppercase());
+            }
         }
         Some(client)
     }
@@ -897,6 +926,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// WHOWAS remembers who was here recently, not everyone who ever was: a
+    /// server that never forgets a nick keeps a map entry for each one that
+    /// ever connected, which is a leak an attacker can drive with a script.
+    #[test]
+    fn whowas_forgets_the_oldest_nicks() {
+        let mut state = ServerState::default();
+        let entry = |nick: &str| WhowasEntry {
+            nick: nick.to_string(),
+            user: "u".into(),
+            host: "h".into(),
+            realname: "r".into(),
+            server: "s".into(),
+            timestamp: 0,
+        };
+
+        for i in 0..(MAX_WHOWAS_NICKS + 500) {
+            state.push_whowas(entry(&format!("nick{i}")));
+        }
+        assert_eq!(state.whowas.len(), MAX_WHOWAS_NICKS);
+        assert!(
+            !state.whowas.contains_key("nick0"),
+            "the oldest nick should have gone"
+        );
+        assert!(state
+            .whowas
+            .contains_key(&format!("nick{}", MAX_WHOWAS_NICKS + 499)));
+
+        // Several visits by one nick are still one entry in the record, with
+        // the last few kept.
+        let mut state = ServerState::default();
+        for _ in 0..(MAX_WHOWAS + 3) {
+            state.push_whowas(entry("recurring"));
+        }
+        assert_eq!(state.whowas.len(), 1);
+        assert_eq!(state.whowas["recurring"].len(), MAX_WHOWAS);
+        assert_eq!(state.whowas_order.len(), 1);
     }
 
     /// A mask built to make a backtracking matcher work hardest still has to

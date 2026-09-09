@@ -2487,14 +2487,17 @@ pub async fn handle_markread(
         return Ok(());
     }
     let client_arc = state.read().await.clients.get(client_id).cloned();
-    let key = match client_arc {
-        Some(c) => c
-            .read()
-            .await
-            .account
-            .clone()
-            .unwrap_or_else(|| client_id.to_string()),
-        None => client_id.to_string(),
+    // Where a user has read up to belongs to the account, which comes back
+    // tomorrow. A client with no account is keyed by its connection id so the
+    // marker works for as long as the connection does — but that id never
+    // returns, so it is not written to the database.
+    let account = match client_arc {
+        Some(c) => c.read().await.account.clone(),
+        None => None,
+    };
+    let key = match account.clone() {
+        Some(a) => a,
+        None => state.read().await.user_id(client_id),
     };
     let timestamp_param = msg.params.get(1).map(|s| s.as_str());
 
@@ -2554,7 +2557,7 @@ pub async fn handle_markread(
             entry.get(target).cloned().unwrap_or(ts)
         };
         // Persist to database
-        if let Some(ref pool) = cfg.db {
+        if let (Some(pool), true) = (cfg.db.as_ref(), account.is_some()) {
             persist::save_read_marker(pool, &key, target, &updated_ts).await;
         }
         let m = Message::new(

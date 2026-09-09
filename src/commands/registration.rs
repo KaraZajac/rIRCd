@@ -278,7 +278,7 @@ pub async fn complete_registration(
     };
 
     let server = &cfg.server.name;
-    let nick_str = &client.read().await.nick.clone().unwrap();
+    let nick_str = &client.read().await.nick_or_id().to_string();
 
     tracing::info!(
         client_id,
@@ -379,7 +379,10 @@ pub async fn complete_registration(
                 entry.insert(k.clone(), v.clone());
             }
         }
-        if let Some(ref pool) = cfg.db {
+        // Only an account is a lasting identity to file keys under; a bare
+        // nick belongs to whoever holds it next.
+        let account = client.read().await.account.clone();
+        if let (Some(pool), true) = (cfg.db.as_ref(), account.is_some()) {
             for (k, v) in &pending_metadata {
                 crate::persist::save_metadata(pool, &key, k, v).await;
             }
