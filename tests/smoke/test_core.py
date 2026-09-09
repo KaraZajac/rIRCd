@@ -42,7 +42,11 @@ check("005 ISUPPORT sent", bool(alice.find(" 005 ")))
 check("MOTD delivered (375/372/376)", bool(alice.find(" 376 ")) or bool(alice.find(" 422 ")))
 
 isupport = " ".join(alice.find(" 005 "))
-for token in ["CHANTYPES=#", "PREFIX=(ohv)@%+", "NETWORK=", "CASEMAPPING=", "CHATHISTORY=", "STATUSMSG=@+"]:
+# A feature the server implements but does not advertise is one no client will
+# offer, so the tokens are worth pinning alongside the behaviour.
+for token in ["CHANTYPES=#", "PREFIX=(ohv)@%+", "NETWORK=", "CASEMAPPING=", "CHATHISTORY=",
+              "STATUSMSG=@+", "KNOCK", "EXCEPTS", "INVEX", "SAFELIST", "ELIST=CMNTU",
+              "EXTBAN=~,am", "MONITOR=", "TARGMAX=", "METADATA=", "UTF8ONLY", "WHOX"]:
     check(f"ISUPPORT has {token}", token in isupport, isupport[:300])
 check("VAPID advertised to a draft/webpush client", "VAPID=" in isupport, isupport[:300])
 
