@@ -720,7 +720,7 @@ pub async fn handle_monitor(
             // Pattern-based online check (extended-monitor)
             for pat in &added_patterns {
                 let mut matched = false;
-                for c in state_r.clients.values() {
+                for (_, c) in state_r.users() {
                     let g = c.read().await;
                     if let Some(src) = g.source() {
                         if crate::user::glob_match(pat, &src.to_lowercase()) {
@@ -814,7 +814,7 @@ pub async fn handle_monitor(
                     // Pattern-based check
                     let state_r = state.read().await;
                     let mut matched = false;
-                    for c in state_r.clients.values() {
+                    for (_, c) in state_r.users() {
                         let g = c.read().await;
                         if let Some(src) = g.source() {
                             if crate::user::glob_match(n, &src.to_lowercase()) {

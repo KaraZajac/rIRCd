@@ -705,6 +705,8 @@ pub async fn run(
         }
     }
 
+    state.write().await.sid = sid.clone();
+
     let cfg_arc = Arc::new(RwLock::new(cfg));
 
     {

@@ -77,6 +77,38 @@ pub fn our_sid(cfg: &Config) -> String {
     }
 }
 
+/// The next user id for this server: its SID and six characters.
+///
+/// A user is named by this id everywhere it matters — in the client table, in
+/// channel membership, and (once users cross links) on other servers. Deriving
+/// it from the SID is what lets any server tell which server a user is on by
+/// looking at the first three characters, and what keeps two servers from ever
+/// choosing the same id for two different people.
+pub fn next_uid(sid: &str, counter: &std::sync::atomic::AtomicU64) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tail = [b'A'; 6];
+    // Least significant first, so consecutive ids differ in the last character
+    // and a log reads in the order the users arrived.
+    for slot in tail.iter_mut().rev() {
+        *slot = ALPHABET[(n % ALPHABET.len() as u64) as usize];
+        n /= ALPHABET.len() as u64;
+    }
+    let mut uid = String::with_capacity(9);
+    uid.push_str(sid);
+    uid.push_str(std::str::from_utf8(&tail).unwrap_or("AAAAAA"));
+    uid
+}
+
+/// Whether a string looks like a user id this network would have issued.
+pub fn valid_uid(uid: &str) -> bool {
+    uid.len() == 9
+        && valid_sid(&uid[..3])
+        && uid[3..]
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
 /// What a peer said about itself during the handshake.
 #[derive(Debug, Clone)]
 pub struct LinkGreeting {
@@ -716,6 +748,38 @@ mod tests {
         }
         for bad in ["", "A11", "1A", "1AAA", "1aa", "1A-", "1 A"] {
             assert!(!valid_sid(bad), "{bad} should not be a sid");
+        }
+    }
+
+    #[test]
+    fn user_ids_are_unique_and_carry_their_server() {
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let uid = next_uid("1AA", &counter);
+            assert!(valid_uid(&uid), "{uid} is not a usable user id");
+            assert_eq!(&uid[..3], "1AA", "{uid} does not name its server");
+            assert!(seen.insert(uid.clone()), "{uid} was issued twice");
+        }
+        // Two servers never choose the same id, however many they issue.
+        let other = std::sync::atomic::AtomicU64::new(0);
+        for _ in 0..1000 {
+            assert!(!seen.contains(&next_uid("2BB", &other)));
+        }
+    }
+
+    #[test]
+    fn a_uid_that_is_not_one_is_refused() {
+        for bad in [
+            "",
+            "1AA",
+            "1AAAAAAA",
+            "1AAAAAAAAA",
+            "AAAAAAAAA",
+            "1AAaaaaaa",
+            "1AA-AAAAA",
+        ] {
+            assert!(!valid_uid(bad), "{bad} should not be a user id");
         }
     }
 

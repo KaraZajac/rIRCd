@@ -80,8 +80,18 @@ pub struct Client {
 }
 
 impl Client {
+    /// A new user. `id` is the user's own id — its UID on a linked network —
+    /// and `session_id` the connection it arrived on, which is a different
+    /// string as soon as a user can have more than one.
+    /// A user whose id is also the connection it is on. Used where there is no
+    /// separate user id yet: an unregistered connection, and the tests.
     pub fn new(id: String, host: String) -> Self {
-        let id_for_sessions = id.clone();
+        let session = id.clone();
+        Self::new_on(id, session, host)
+    }
+
+    pub fn new_on(id: String, session_id: String, host: String) -> Self {
+        let id_for_sessions = session_id;
         Self {
             id,
             nick: None,
@@ -608,6 +618,10 @@ pub struct ServerState {
     pub pending_client_batches: HashMap<String, PendingClientBatch>,
     /// WHOWAS history: nick_lower -> recent entries
     pub whowas: HashMap<String, VecDeque<WhowasEntry>>,
+    /// This server's id on a linked network, and the counter behind the ids it
+    /// gives its users. Empty until the server sets it at startup.
+    pub sid: String,
+    pub uid_counter: std::sync::atomic::AtomicU64,
     /// The nicks in `whowas`, oldest first. WHOWAS is a record of who was here
     /// recently, and without a bound on how many names it keeps, a map entry
     /// is left behind by every distinct nick that ever connected.
@@ -736,16 +750,42 @@ impl ServerState {
             .unwrap_or_else(|| session_id.to_string())
     }
 
-    pub async fn add_client(&mut self, client: Client) -> Arc<RwLock<Client>> {
+    pub async fn add_client(&mut self, client: Client, session_id: &str) -> Arc<RwLock<Client>> {
         let id = client.id.clone();
         let client = Arc::new(RwLock::new(client));
         self.clients.insert(id.clone(), client.clone());
+        // The user answers to its own id, and so does the connection it came in
+        // on — which is a different string once users have ids of their own.
         self.session_to_user.insert(id.clone(), id.clone());
-        self.max_clients = self.max_clients.max(self.clients.len());
+        if session_id != id {
+            self.clients.insert(session_id.to_string(), client.clone());
+            self.session_to_user
+                .insert(session_id.to_string(), id.clone());
+        }
+        self.max_clients = self.max_clients.max(self.user_count());
         if let Some(ref nick) = client.read().await.nick {
             self.nick_to_id.insert(nick.to_uppercase(), id);
         }
         client
+    }
+
+    /// Every user here, once each.
+    ///
+    /// The client table answers to a user's own id and to every connection id
+    /// that reaches it, so iterating it counts a user with two connections
+    /// twice — and with ids of their own, every user has at least two entries.
+    pub fn users(&self) -> impl Iterator<Item = (&String, &Arc<RwLock<Client>>)> {
+        self.clients.iter().filter(|(id, _)| {
+            self.session_to_user
+                .get(*id)
+                .map(|user| user == *id)
+                .unwrap_or(true)
+        })
+    }
+
+    /// How many people are here, as against how many connections.
+    pub fn user_count(&self) -> usize {
+        self.users().count()
     }
 
     /// Remove a user and every connection it had.

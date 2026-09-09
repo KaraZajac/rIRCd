@@ -37,11 +37,11 @@ pub async fn handle_lusers(
         None => return Ok(()),
     };
 
-    let total_users = state.clients.len();
+    let total_users = state.user_count();
     let peak_users = state.max_clients.max(total_users);
     let mut ops = 0usize;
     let mut invisible_users = 0usize;
-    for c in state.clients.values() {
+    for (_, c) in state.users() {
         let g = c.read().await;
         if g.oper {
             ops += 1;
@@ -1433,7 +1433,9 @@ pub async fn handle_rehash(
     // Send CAP NEW / CAP DEL to clients with cap-notify
     if !cap_new.is_empty() || !cap_del.is_empty() {
         let state_r = state.read().await;
-        let client_ids: Vec<String> = state_r.clients.keys().cloned().collect();
+        // Once per user: the client table also answers to the id of every
+        // connection that reaches one, and CAP NEW twice is CAP NEW wrong.
+        let client_ids: Vec<String> = state_r.users().map(|(id, _)| id.clone()).collect();
         for cid in &client_ids {
             let has_cap_notify = match state_r.clients.get(cid) {
                 Some(c) => c.read().await.has_cap("cap-notify"),
@@ -1683,7 +1685,7 @@ pub async fn handle_kline(
         let mut state_w = state.write().await;
         state_w.server_bans.retain(|b| b.mask != ban.mask);
         state_w.server_bans.push(ban.clone());
-        for (id, client) in state_w.clients.iter() {
+        for (id, client) in state_w.users() {
             let g = client.read().await;
             let source = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
             if crate::user::glob_match(&ban.mask.to_lowercase(), &source.to_lowercase())

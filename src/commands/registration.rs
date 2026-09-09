@@ -271,7 +271,7 @@ pub async fn complete_registration(
             user
         }
         None => {
-            let client = state_guard.add_client(client).await;
+            let client = state_guard.add_client(client, client_id).await;
             drop(state_guard);
             client
         }
