@@ -100,6 +100,12 @@ impl ConnectionLimits {
 /// NAMES reply on a busy channel; a client that lets it fill is not reading.
 const SEND_QUEUE: usize = 1024;
 
+/// Bytes the writer will hold for a client that is behind. Past this it stops
+/// taking from the queue, the queue fills, and the connection is dropped —
+/// which is what "not reading" means, measured in how far behind the client is
+/// rather than in how much it was sent.
+const SEND_BACKLOG_BYTES: usize = 1 << 20;
+
 /// Keepalive timeout values passed from config.
 #[derive(Clone, Copy)]
 pub struct KeepaliveConfig {
@@ -182,6 +188,61 @@ pub async fn handle_client(
     .await;
 }
 
+/// Format queued messages onto a socket, batching whatever is already waiting
+/// into one write.
+///
+/// Writing one message per syscall made the queue in front of this the real
+/// limit on how much a client could be sent at once: a LIST on a busy server
+/// outruns the socket, fills the queue, and the client that asked for it is
+/// dropped for "not reading". Formatting everything that is already waiting
+/// into one buffer lets the queue drain as fast as memory allows, so the limit
+/// becomes how far behind a client may fall rather than how many lines it may
+/// ask for — and a burst costs one write instead of one per line.
+async fn write_loop<W>(
+    writer: &mut W,
+    send_rx: &mut mpsc::Receiver<Message>,
+    out_line_limit: usize,
+    client_id: &str,
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut backlog: Vec<u8> = Vec::with_capacity(BUF_SIZE);
+    let mut sent = 0usize;
+    loop {
+        if sent == backlog.len() {
+            backlog.clear();
+            sent = 0;
+            let Some(first) = send_rx.recv().await else {
+                return;
+            };
+            backlog.extend_from_slice(format_message_within(&first, out_line_limit).as_bytes());
+        }
+        // Whatever else is already queued goes in the same write.
+        while backlog.len() < SEND_BACKLOG_BYTES {
+            match send_rx.try_recv() {
+                Ok(msg) => backlog
+                    .extend_from_slice(format_message_within(&msg, out_line_limit).as_bytes()),
+                Err(_) => break,
+            }
+        }
+        match writer.write(&backlog[sent..]).await {
+            Ok(0) => {
+                error!("Write error for {}: peer closed", client_id);
+                return;
+            }
+            Ok(n) => sent += n,
+            Err(e) => {
+                error!("Write error for {}: {}", client_id, e);
+                return;
+            }
+        }
+        if sent == backlog.len() && writer.flush().await.is_err() {
+            error!("Write error for {}: flush failed", client_id);
+            return;
+        }
+    }
+}
+
 async fn handle_client_stream<S>(
     stream: S,
     client_id: String,
@@ -203,13 +264,7 @@ async fn handle_client_stream<S>(
     // Two bytes of the limit belong to the CRLF.
     let out_line_limit = keepalive.max_line_length.saturating_sub(2);
     let mut writer_task = tokio::spawn(async move {
-        while let Some(msg) = send_rx.recv().await {
-            let line = format_message_within(&msg, out_line_limit);
-            if writer.write_all(line.as_bytes()).await.is_err() || writer.flush().await.is_err() {
-                error!("Write error for {}", client_id_clone);
-                break;
-            }
-        }
+        write_loop(&mut writer, &mut send_rx, out_line_limit, &client_id_clone).await;
     });
 
     // Raised when the outbound queue overflows: the peer is not reading, and the
@@ -780,6 +835,124 @@ pub async fn handle_client_ws(
             is_tls,
         })
         .await;
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn line(n: usize) -> Message {
+        Message::new(
+            "322",
+            vec!["nick".into(), format!("#chan{n}"), "1".into(), "".into()],
+        )
+        .with_prefix("irc.example.org")
+    }
+
+    /// A client that asks for a long answer must get all of it. Before the
+    /// writer batched, a reply longer than the queue outran the socket and the
+    /// client that asked for it was dropped part-way through its own LIST.
+    #[tokio::test]
+    async fn a_reply_longer_than_the_queue_arrives_whole() {
+        const LINES: usize = 20_000;
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::channel::<Message>(SEND_QUEUE);
+
+        let writer = tokio::spawn(async move {
+            let mut server = server;
+            write_loop(&mut server, &mut rx, 510, "test").await;
+        });
+
+        // The reader drains slowly enough that the socket buffer fills, which
+        // is what puts back-pressure on the writer.
+        let reader = tokio::spawn(async move {
+            let mut got = String::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                match client.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+                if got.matches("\r\n").count() >= LINES {
+                    break;
+                }
+            }
+            got
+        });
+
+        let feeder = tokio::spawn(async move {
+            for n in 0..LINES {
+                // The dispatch loop does not wait, so neither does this: if the
+                // queue is full the client is being dropped, which is the
+                // failure this test is about.
+                if tx.try_send(line(n)).is_err() {
+                    return Err(n);
+                }
+                if n.is_multiple_of(256) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            Ok(())
+        });
+
+        let fed = tokio::time::timeout(std::time::Duration::from_secs(30), feeder)
+            .await
+            .expect("feeding did not finish")
+            .expect("feeder task panicked");
+        assert!(
+            fed.is_ok(),
+            "the queue filled at line {:?}",
+            fed.unwrap_err()
+        );
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(30), reader)
+            .await
+            .expect("reading did not finish")
+            .expect("reader task panicked");
+        writer.abort();
+
+        assert_eq!(got.matches("\r\n").count(), LINES, "not every line arrived");
+        // ...and in the order they were queued.
+        let first = got.find("#chan0 ").expect("first line missing");
+        let last = got
+            .find(&format!("#chan{} ", LINES - 1))
+            .expect("last line missing");
+        assert!(first < last, "lines arrived out of order");
+    }
+
+    /// The other half: a peer that has stopped reading altogether must not cost
+    /// the server unbounded memory. The backlog has an end, and past it the
+    /// queue fills — which is what marks the connection for disconnection.
+    #[tokio::test]
+    async fn a_peer_that_never_reads_fills_the_queue() {
+        let (client, server) = tokio::io::duplex(64);
+        let (tx, mut rx) = mpsc::channel::<Message>(SEND_QUEUE);
+        let writer = tokio::spawn(async move {
+            let mut server = server;
+            write_loop(&mut server, &mut rx, 510, "test").await;
+        });
+
+        let mut queued = 0usize;
+        let filled = loop {
+            if tx.try_send(line(queued)).is_err() {
+                break true;
+            }
+            queued += 1;
+            if queued.is_multiple_of(128) {
+                tokio::task::yield_now().await;
+            }
+            if queued > 200_000 {
+                break false;
+            }
+        };
+        writer.abort();
+        drop(client);
+        assert!(
+            filled,
+            "the queue never filled for a peer that read nothing: {queued} messages went in"
+        );
+    }
 }
 
 #[cfg(test)]
