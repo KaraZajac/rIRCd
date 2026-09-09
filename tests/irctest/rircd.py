@@ -17,15 +17,12 @@ See tests/irctest/run.sh, which sets all of this up.
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Optional, Type
 
 from irctest import patma
-from irctest.basecontrollers import (
-    BaseServerController,
-    DirectoryBasedController,
-    NotImplementedByController,
-)
+from irctest.basecontrollers import BaseServerController, DirectoryBasedController
 from irctest.cases import BaseServerTestCase
 from irctest.specifications import Capabilities, OptionalBehaviors
 
@@ -90,15 +87,33 @@ def worker_database() -> str:
 
 
 def reset_database(name: str) -> None:
-    """Create the database if needed, and empty whatever is in it."""
+    """Create the database if needed, and empty whatever is in it.
+
+    DELETE rather than TRUNCATE, and retried: the previous test's server is
+    killed rather than shut down, so its connections can still be open when
+    the next test starts. TRUNCATE wants an exclusive metadata lock and fails
+    behind them, which fails a test that had not begun.
+    """
     mariadb(f"CREATE DATABASE IF NOT EXISTS `{name}`")
     tables = [t for t in mariadb("SHOW TABLES", database=name).split() if t]
-    if tables:
-        truncates = " ".join(f"TRUNCATE TABLE `{t}`;" for t in tables)
-        mariadb(
-            f"SET FOREIGN_KEY_CHECKS=0; {truncates} SET FOREIGN_KEY_CHECKS=1;",
-            database=name,
-        )
+    if not tables:
+        return
+    deletes = " ".join(f"DELETE FROM `{t}`;" for t in tables)
+    last: Optional[subprocess.CalledProcessError] = None
+    for attempt in range(10):
+        try:
+            mariadb(
+                f"SET FOREIGN_KEY_CHECKS=0; {deletes} SET FOREIGN_KEY_CHECKS=1;",
+                database=name,
+            )
+            return
+        except subprocess.CalledProcessError as e:
+            last = e
+            time.sleep(0.2 * (attempt + 1))
+    raise RuntimeError(
+        f"could not empty {name} after 10 attempts: "
+        f"{last.stderr.strip() if last else 'unknown'}"
+    )
 
 
 CONFIG = """\
@@ -110,6 +125,7 @@ listen_ws = [{listen_ws}]
 motd = "irctest"
 description = "test server"
 register_before_connect = {register_before_connect}
+{password_line}
 # The read-marker tests reconnect and expect to resume their session, and open
 # a second connection on one account.
 persistent_sessions = true
@@ -156,7 +172,7 @@ class RircdController(BaseServerController, DirectoryBasedController):
     software_name = "rIRCd"
     supported_sasl_mechanisms = {"PLAIN", "SCRAM-SHA-256", "EXTERNAL"}
     supports_sts = True
-    extban_mute_char = None
+    extban_mute_char = "m"
 
     capabilities = frozenset(
         (
@@ -217,6 +233,7 @@ class RircdController(BaseServerController, DirectoryBasedController):
         super().__init__(*args, **kwargs)
         self._db_name: Optional[str] = None
         self._config_path: Optional[Path] = None
+        self._password: Optional[str] = None
 
     def run(
         self,
@@ -231,10 +248,7 @@ class RircdController(BaseServerController, DirectoryBasedController):
         websocket_hostname: Optional[str] = None,
         websocket_port: Optional[int] = None,
     ) -> None:
-        if password is not None:
-            # rIRCd accepts PASS during registration but has no connection
-            # password to check it against.
-            raise NotImplementedByController("PASS")
+        self._password = password
 
         self.create_config()
         assert self.directory
@@ -271,6 +285,9 @@ class RircdController(BaseServerController, DirectoryBasedController):
                     "false"
                     if self.test_config.account_registration_before_connect is False
                     else "true"
+                ),
+                password_line=(
+                    f'password = "{self._password}"' if self._password else ""
                 ),
                 # Only the capability value and REGISTER's answer are under test,
                 # so the address this points at never has to accept mail.

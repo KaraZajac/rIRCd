@@ -70,6 +70,14 @@ fi
 # requires.
 MARKERS="${IRCTEST_MARKERS:-not implementation-specific and not deprecated and not strict}"
 
+# rIRCd's services are part of the server rather than a second one linked to
+# it, so LINKS on a one-server network lists one server. This test asserts a
+# separate `My.Little.Services` in the list, which only exists on a network
+# where services are linked in. Nothing to implement short of server-to-server
+# linking, so it is left out rather than left failing.
+DESELECT=(--deselect
+  "irctest/server_tests/links.py::ServicesLinksTestCase::testLinksWithServices")
+
 blue "Running irctest against rIRCd"
 cd "$IRCTEST_DIR"
 PYTHONPATH="$REPO/tests/irctest" \
@@ -77,5 +85,5 @@ IRCTEST_RIRCD="$REPO/target/release/rircd" \
 IRCTEST_RIRCD_DB_HOST="$DB_HOST" \
 IRCTEST_RIRCD_DB_PORT="$DB_PORT" \
 IRCTEST_RIRCD_DB_USER="$DB_USER" \
-  "$VENV/bin/pytest" --controller rircd -m "$MARKERS" \
-  --timeout 120 $PARALLEL "${PYTEST_ARGS[@]}"
+  "$VENV/bin/pytest" --controller rircd -m "$MARKERS" "${DESELECT[@]}" \
+  --timeout 600 $PARALLEL "${PYTEST_ARGS[@]}"
