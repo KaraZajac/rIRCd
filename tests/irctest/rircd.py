@@ -179,10 +179,21 @@ class RircdController(BaseServerController, DirectoryBasedController):
         )
     )
 
+    # Behaviours the specifications leave optional. Anything not declared here
+    # is skipped rather than run, so under-declaring flatters the result: these
+    # are the ones rIRCd actually does.
     optional_behaviors = frozenset(
         (
             OptionalBehaviors.BAN_EXCEPTION_MODE,
+            OptionalBehaviors.CAP_REQ_MINUS,
+            OptionalBehaviors.ELIST_U,
             OptionalBehaviors.INVITE_EXCEPTION_MODE,
+            OptionalBehaviors.INVITE_OVERRIDES_LIMIT,
+            OptionalBehaviors.MULTI_JOIN,
+            OptionalBehaviors.MULTI_NAMES_COMMAND,
+            OptionalBehaviors.NO_CTCP,
+            OptionalBehaviors.SASL_AFTER_REGISTRATION,
+            OptionalBehaviors.SASL_REAUTHENTICATION,
         )
     )
 

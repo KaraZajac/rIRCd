@@ -285,8 +285,10 @@ async fn handle_join_inner(
             }
         }
 
+        // An invitation is permission to come in, so it outlasts a full
+        // channel: refusing someone you just invited defeats the invite.
         if let Some(limit) = ch.modes.user_limit {
-            if ch.member_count() >= limit as usize {
+            if ch.member_count() >= limit as usize && !ch.invite_list.contains(&user_id) {
                 reply_self!(Message::new(
                     "471",
                     vec![
@@ -710,48 +712,139 @@ pub async fn handle_names(
         return Ok(());
     }
 
+    // `NAMES #a,#b` is one command with one answer: a list per channel, then a
+    // single RPL_ENDOFNAMES naming what was asked for. Ending each channel
+    // separately would look like several answers to a client that sent one.
+    let asked_for = msg.params.first().cloned().unwrap_or_default();
+    let single = ch_names.len() == 1;
+
     for ch_name in ch_names {
         let ch_key = canonical_channel_key(ch_name);
-        if let Some(ch) = ch_store.channels.get(&ch_key) {
-            send_names_for_channel(
-                ch,
-                &ch_key,
-                &nick,
-                &state,
-                &senders,
-                client_id,
-                &cfg.server.name,
-                &client_caps,
-                label,
-                None,
-            )
-            .await;
-        } else {
+        match ch_store.channels.get(&ch_key) {
+            Some(ch) if single => {
+                send_names_for_channel(
+                    ch,
+                    &ch_key,
+                    &nick,
+                    &state,
+                    &senders,
+                    client_id,
+                    &cfg.server.name,
+                    &client_caps,
+                    label,
+                    None,
+                )
+                .await;
+            }
+            Some(ch) => {
+                send_name_reply_for_channel(
+                    ch,
+                    &ch_key,
+                    &nick,
+                    &state,
+                    &senders,
+                    client_id,
+                    &cfg.server.name,
+                    &client_caps,
+                    label,
+                )
+                .await;
+            }
             // "If the channel name is invalid or the channel does not exist,
             // one RPL_ENDOFNAMES containing the given channel name should be
             // returned" — Modern §names-message. There is no error reply.
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new(
-                    "366",
-                    vec![
-                        nick.clone(),
-                        ch_name.to_string(),
-                        "End of /NAMES list".into(),
-                    ],
+            None if single => {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "366",
+                        vec![
+                            nick.clone(),
+                            ch_name.to_string(),
+                            "End of /NAMES list".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
                 )
-                .with_prefix(&cfg.server.name),
-                label,
-            )
-            .await;
+                .await;
+            }
+            None => {}
         }
+    }
+
+    if !single {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "366",
+                vec![nick.clone(), asked_for, "End of /NAMES list".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
     }
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
+/// One channel's RPL_NAMREPLY, without the RPL_ENDOFNAMES that closes a list.
+/// Used when several channels are answered under one ending.
+#[allow(clippy::too_many_arguments)]
+async fn send_name_reply_for_channel(
+    ch: &RwLock<Channel>,
+    ch_name: &str,
+    nick: &str,
+    state: &ServerState,
+    senders: &Senders,
+    client_id: &str,
+    server: &str,
+    client_caps: &std::collections::HashSet<String>,
+    label: Option<&str>,
+) {
+    let ch = ch.read().await;
+    let use_userhost = client_caps.contains("userhost-in-names");
+    let use_multi_prefix = client_caps.contains("multi-prefix");
+    let mut names = Vec::new();
+    for (mid, memb) in &ch.members {
+        if let Some(c) = state.clients.get(mid) {
+            let c = c.read().await;
+            let prefix_str = if use_multi_prefix {
+                memb.modes.prefixes_ordered()
+            } else {
+                memb.modes.prefix().to_string()
+            };
+            let who = if use_userhost {
+                c.source().unwrap_or_else(|| c.nick_or_id().to_string())
+            } else {
+                c.nick_or_id().to_string()
+            };
+            names.push(format!("{}{}", prefix_str, who));
+        }
+    }
+    let chan_prefix = if ch.modes.secret { "@" } else { "=" };
+    reply_to_client(
+        senders,
+        client_id,
+        Message::new(
+            "353",
+            vec![
+                nick.into(),
+                chan_prefix.into(),
+                ch_name.into(),
+                names.join(" "),
+            ],
+        )
+        .with_prefix(server),
+        label,
+    )
+    .await;
+}
+
 pub(crate) async fn send_names_for_channel(
     ch: &RwLock<Channel>,
     ch_name: &str,
