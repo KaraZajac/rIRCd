@@ -8,9 +8,11 @@ fn config_from(toml_src: &str) -> Config {
     toml::from_str(toml_src).expect("config parses")
 }
 
-/// The single CAP LS line for a non-302 client.
+/// The CAP LS listing as a 3.2 client sees it. Values such as
+/// `min-password-length` are a 3.2 feature and are not sent to a 3.1 client, so
+/// a test that reads them has to ask as a 3.2 one.
 fn cap_line(cfg: &Config) -> String {
-    build_cap_list(cfg, false, false).join(" ")
+    build_cap_list(cfg, true, false).join(" ")
 }
 
 /// Value of one CAP LS token, e.g. `sasl=PLAIN` -> `Some("PLAIN")`.
@@ -90,7 +92,7 @@ fn sts_is_advertised_only_with_tls_configured() {
     );
     assert_eq!(cap_value(&tls, "sts").as_deref(), Some("port=6697"));
     assert_eq!(
-        build_cap_list(&tls, false, true)
+        build_cap_list(&tls, true, true)
             .join(" ")
             .split(' ')
             .find(|t| t.starts_with("sts=")),
