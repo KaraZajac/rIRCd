@@ -439,6 +439,10 @@ async fn handle_join_inner(
         let topic_setter = ch.topic_setter.clone();
         let topic_time = ch.topic_time;
         drop(ch);
+        // One event happened at one time. Stamping each copy as it is built
+        // gives two people in the same channel two different times for the
+        // same join, and history a third.
+        let happened_at = crate::protocol::server_time_now();
         for mid in &member_ids {
             let caps = match state.clients.get(mid) {
                 Some(c) => c.read().await.capabilities.clone(),
@@ -457,6 +461,10 @@ async fn handle_join_inner(
             } else {
                 Message::new("JOIN", vec![ch_key.clone()]).with_prefix(&source)
             };
+            let mut join_msg = join_msg;
+            join_msg
+                .tags
+                .insert("time".to_string(), Some(happened_at.clone()));
             // The joining client's own copy is part of the answer to its JOIN,
             // so it goes inside the labeled batch; everyone else's does not.
             if mid == client_id {
@@ -488,7 +496,7 @@ async fn handle_join_inner(
         }
 
         // Record JOIN event for draft/event-playback
-        cfg.record_history(&ch_key, &source, "", None, "JOIN");
+        cfg.record_history_at(&ch_key, &source, "", None, "JOIN", &happened_at);
 
         // Remember the membership for this account, so a mention can still reach
         // them by push once they disconnect.
@@ -678,8 +686,12 @@ pub async fn handle_part(
         }
         let ch_key = canonical_channel_key(ch_name);
 
-        let part_msg =
+        let happened_at = crate::protocol::server_time_now();
+        let mut part_msg =
             Message::new("PART", vec![ch_name.to_string(), reason.clone()]).with_prefix(&source);
+        part_msg
+            .tags
+            .insert("time".to_string(), Some(happened_at.clone()));
 
         let mut ch_store = channels.write().await;
         let mut should_remove = false;
@@ -737,7 +749,7 @@ pub async fn handle_part(
         tracing::debug!(client_id, channel = %ch_name, reason = %reason, "PART");
 
         // Record PART event for draft/event-playback
-        cfg.record_history(&ch_key, &source, &reason, None, "PART");
+        cfg.record_history_at(&ch_key, &source, &reason, None, "PART", &happened_at);
 
         // Leaving a channel means no more notifications from it.
         if let Some(ref account) = parting_account {
@@ -2268,8 +2280,12 @@ pub async fn handle_topic(
         // the same msgid and server-time tags: without them a client cannot tell
         // two topic changes apart, or place them in time.
         let topic_msgid = crate::protocol::generate_msgid();
-        let topic_msg =
+        let happened_at = crate::protocol::server_time_now();
+        let mut topic_msg =
             Message::new("TOPIC", vec![ch_name.into(), topic_text.clone()]).with_prefix(&source);
+        topic_msg
+            .tags
+            .insert("time".to_string(), Some(happened_at.clone()));
         let member_ids_for_topic: Vec<String> = ch.members.keys().cloned().collect();
         drop(ch);
         for mid in &member_ids_for_topic {
@@ -2290,7 +2306,14 @@ pub async fn handle_topic(
         }
 
         // Record TOPIC event for draft/event-playback
-        cfg.record_history(&ch_key, &source, &topic_text, Some(&topic_msgid), "TOPIC");
+        cfg.record_history_at(
+            &ch_key,
+            &source,
+            &topic_text,
+            Some(&topic_msgid),
+            "TOPIC",
+            &happened_at,
+        );
 
         // Setting a topic is announced with the TOPIC message above, which the
         // setter receives along with everyone else. 331/332/333 answer a query

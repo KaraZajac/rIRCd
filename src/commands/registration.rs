@@ -1276,8 +1276,15 @@ pub async fn handle_nick(
                 send_to_client(&senders, w, m).await;
             }
 
-            // Broadcast NICK change to channel members (and self)
-            let nick_msg = Message::new("NICK", vec![nick.clone()]).with_prefix(&old_source);
+            // Broadcast NICK change to channel members (and self). One event
+            // happened at one time: stamping each copy separately gives two
+            // people in the same channel two different times for it, and
+            // history a third.
+            let happened_at = crate::protocol::server_time_now();
+            let mut nick_msg = Message::new("NICK", vec![nick.clone()]).with_prefix(&old_source);
+            nick_msg
+                .tags
+                .insert("time".to_string(), Some(happened_at.clone()));
             // The sender's own copy is the answer to their NICK, so it carries
             // the label; the copies other members see do not.
             reply_to_client(&senders, client_id, nick_msg.clone(), label).await;
@@ -1301,7 +1308,7 @@ pub async fn handle_nick(
                 }
 
                 // Record NICK event for draft/event-playback (one per channel)
-                cfg.record_history(ch_name, &old_source, &nick, None, "NICK");
+                cfg.record_history_at(ch_name, &old_source, &nick, None, "NICK", &happened_at);
             }
 
             return Ok(());
@@ -1677,7 +1684,11 @@ pub async fn handle_quit(
 
     tracing::info!(client_id, nick = %quit_nick, reason = %reason, channels = channel_names.len(), "Client quit");
 
-    let quit_msg = Message::new("QUIT", vec![reason.clone()]).with_prefix(&source);
+    let happened_at = crate::protocol::server_time_now();
+    let mut quit_msg = Message::new("QUIT", vec![reason.clone()]).with_prefix(&source);
+    quit_msg
+        .tags
+        .insert("time".to_string(), Some(happened_at.clone()));
 
     for ch_name in &channel_names {
         let mut ch_store = channels.write().await;
@@ -1698,7 +1709,7 @@ pub async fn handle_quit(
         drop(ch_store);
 
         // Record QUIT event for draft/event-playback (one per channel)
-        cfg.record_history(ch_name, &source, &reason, None, "QUIT");
+        cfg.record_history_at(ch_name, &source, &reason, None, "QUIT", &happened_at);
     }
 
     // 901 RPL_LOGGEDOUT: notify the client they are no longer logged in
