@@ -203,8 +203,13 @@ impl PendingConnection {
     /// Ready to complete registration: have NICK+USER, either legacy client or CAP END, and SASL
     /// is not actively in progress (if the client requested the sasl cap, wait for it to complete).
     pub fn ready_to_register(&self) -> bool {
-        let sasl_in_progress =
-            self.sasl_mechanism.is_some() && self.account.is_none() && !self.sasl_failed;
+        // Only wait for SASL if the client asked for it. An AUTHENTICATE from a
+        // client that never negotiated the capability must not hold its
+        // registration open for ever.
+        let sasl_in_progress = self.capabilities.contains("sasl")
+            && self.sasl_mechanism.is_some()
+            && self.account.is_none()
+            && !self.sasl_failed;
         self.nick.is_some()
             && self.user.is_some()
             && (!self.cap_negotiating || self.cap_ended)
@@ -252,9 +257,14 @@ impl MsgIdStore {
 }
 
 /// Glob matching: `*` matches any sequence of chars, `?` matches any single char.
+/// Match an IRC mask such as `nick!user@host` against a source.
+///
+/// Nicks, usernames and hostnames are all case-insensitive in IRC, so a ban on
+/// `bar!*@*` has to catch `Bar!user@host` — otherwise changing the case of a
+/// nick walks straight through a ban.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let t: Vec<char> = text.to_lowercase().chars().collect();
     let (pl, tl) = (p.len(), t.len());
     let mut dp = vec![vec![false; tl + 1]; pl + 1];
     dp[0][0] = true;
@@ -564,6 +574,18 @@ impl ServerState {
 
 #[cfg(test)]
 mod tests {
+    use super::glob_match;
+
+    /// A ban on `bar!*@*` has to catch `Bar!user@host`: matching by case let
+    /// anyone walk through a ban by capitalising their nick.
+    #[test]
+    fn masks_match_regardless_of_case() {
+        assert!(glob_match("bar!*@*", "Bar!username@127.0.0.1"));
+        assert!(glob_match("BAR!*@*", "bar!username@127.0.0.1"));
+        assert!(glob_match("*!*@Example.COM", "nick!user@example.com"));
+        assert!(!glob_match("baz!*@*", "Bar!username@127.0.0.1"));
+    }
+
     use super::*;
     use std::time::Duration;
 

@@ -56,8 +56,14 @@ fn strip_colors(text: &str) -> String {
 }
 
 /// Returns true if the text is a CTCP message (starts and ends with \x01).
-fn is_ctcp(text: &str) -> bool {
-    text.starts_with('\x01')
+/// A CTCP that +C blocks. ACTION is how clients send "/me", which is ordinary
+/// conversation rather than a client query, so it is not blocked.
+fn is_blockable_ctcp(text: &str) -> bool {
+    let Some(body) = text.strip_prefix('\x01') else {
+        return false;
+    };
+    let verb = body.split([' ', '\x01']).next().unwrap_or("");
+    !verb.eq_ignore_ascii_case("ACTION")
 }
 
 /// Send message to a recipient, adding server-time/msgid/account tags and client-only (+prefix) tags.
@@ -269,14 +275,24 @@ pub async fn handle_privmsg(
     label: Option<&str>,
 ) -> anyhow::Result<()> {
     let target = msg.params.first().map(|s| s.as_str()).unwrap_or("");
-    let text = msg.trailing().unwrap_or("").to_string();
+    // The text is params[1]: `PRIVMSG #chan` has none, and trailing() would
+    // return the target as the message body.
+    let text = msg.params.get(1).cloned().unwrap_or_default();
 
     if target.is_empty() || text.is_empty() {
+        let (numeric, why) = if target.is_empty() {
+            ("411", "No recipient given (PRIVMSG)")
+        } else {
+            ("412", "No text to send")
+        };
+        let nick = match state.read().await.clients.get(client_id) {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => "*".to_string(),
+        };
         reply_to_client(
             &senders,
             client_id,
-            Message::new("411", vec!["No recipient given (PRIVMSG)".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(numeric, vec![nick, why.into()]).with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -452,7 +468,11 @@ pub async fn handle_privmsg(
                     client_id,
                     Message::new(
                         "404",
-                        vec![target.into(), "Cannot send to channel (+n)".into()],
+                        vec![
+                            sender_nick.clone(),
+                            target.into(),
+                            "Cannot send to channel (+n)".into(),
+                        ],
                     )
                     .with_prefix(&cfg.server.name),
                     label,
@@ -461,14 +481,15 @@ pub async fn handle_privmsg(
                 return Ok(());
             }
 
-            // +C: block CTCPs (ACTION \x01ACTION...\x01 is also blocked)
-            if ch.modes.no_ctcp && is_ctcp(&text) {
+            // +C: block CTCP queries, but not ACTION
+            if ch.modes.no_ctcp && is_blockable_ctcp(&text) {
                 reply_to_client(
                     &senders,
                     client_id,
                     Message::new(
                         "404",
                         vec![
+                            sender_nick.clone(),
                             target.into(),
                             "CTCPs are not allowed in this channel (+C)".into(),
                         ],
@@ -487,7 +508,11 @@ pub async fn handle_privmsg(
                     client_id,
                     Message::new(
                         "404",
-                        vec![target.into(), "You are quieted in this channel (+q)".into()],
+                        vec![
+                            sender_nick.clone(),
+                            target.into(),
+                            "You are quieted in this channel (+q)".into(),
+                        ],
                     )
                     .with_prefix(&cfg.server.name),
                     label,
@@ -504,6 +529,7 @@ pub async fn handle_privmsg(
                     Message::new(
                         "404",
                         vec![
+                            sender_nick.clone(),
                             target.into(),
                             "You must be registered to speak here (+R)".into(),
                         ],
@@ -528,7 +554,11 @@ pub async fn handle_privmsg(
                     client_id,
                     Message::new(
                         "404",
-                        vec![target.into(), "Cannot send to channel (+m)".into()],
+                        vec![
+                            sender_nick.clone(),
+                            target.into(),
+                            "Cannot send to channel (+m)".into(),
+                        ],
                     )
                     .with_prefix(&cfg.server.name),
                     label,
@@ -724,8 +754,15 @@ pub async fn handle_privmsg(
             reply_to_client(
                 &senders,
                 client_id,
-                Message::new("401", vec![target.into(), "No such nick/channel".into()])
-                    .with_prefix(&cfg.server.name),
+                Message::new(
+                    "401",
+                    vec![
+                        sender_nick.clone(),
+                        target.into(),
+                        "No such nick/channel".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -1335,6 +1372,7 @@ pub async fn handle_tagmsg(
         .source()
         .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
+    let sender_nick = sender_data.nick_or_id().to_string();
     let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
     let echo_message = sender_data.has_cap("echo-message");
     drop(sender_data);
@@ -1362,7 +1400,11 @@ pub async fn handle_tagmsg(
                     client_id,
                     Message::new(
                         "404",
-                        vec![target.into(), "Cannot send to channel (+n)".into()],
+                        vec![
+                            sender_nick.clone(),
+                            target.into(),
+                            "Cannot send to channel (+n)".into(),
+                        ],
                     )
                     .with_prefix(&cfg.server.name),
                     label,
@@ -1378,7 +1420,11 @@ pub async fn handle_tagmsg(
                     client_id,
                     Message::new(
                         "404",
-                        vec![target.into(), "You are quieted in this channel (+q)".into()],
+                        vec![
+                            sender_nick.clone(),
+                            target.into(),
+                            "You are quieted in this channel (+q)".into(),
+                        ],
                     )
                     .with_prefix(&cfg.server.name),
                     label,
@@ -1419,7 +1465,11 @@ pub async fn handle_tagmsg(
                     client_id,
                     Message::new(
                         "404",
-                        vec![target.into(), "Cannot send to channel (+m)".into()],
+                        vec![
+                            sender_nick.clone(),
+                            target.into(),
+                            "Cannot send to channel (+m)".into(),
+                        ],
                     )
                     .with_prefix(&cfg.server.name),
                     label,
@@ -1550,9 +1600,41 @@ pub async fn handle_redact(
     // Per IRCv3 message-redaction spec: REDACT <target> <msgid> [:<reason>]
     let target_param = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let msgid = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
-    let reason = msg.trailing().unwrap_or("message redacted").to_string();
+    let reason = msg.params.get(2).cloned();
 
     tracing::info!(client_id, target_param, msgid, "REDACT received");
+
+    // A channel the client is not in is not a target it can redact in, and
+    // saying so is a different answer from "no such message".
+    if target_param.starts_with('#') || target_param.starts_with('&') {
+        let ch_key = canonical_channel_key(target_param);
+        let is_member = {
+            let ch_store = channels.read().await;
+            match ch_store.channels.get(&ch_key) {
+                Some(ch) => ch.read().await.members.contains_key(client_id),
+                None => false,
+            }
+        };
+        if !is_member {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "REDACT".into(),
+                        "INVALID_TARGET".into(),
+                        target_param.to_string(),
+                        "You are not on that channel".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    }
 
     if target_param.is_empty() || msgid.is_empty() {
         reply_to_client(
@@ -1627,6 +1709,8 @@ pub async fn handle_redact(
                         vec![
                             "REDACT".into(),
                             "UNKNOWN_MSGID".into(),
+                            target_param.to_string(),
+                            msgid.to_string(),
                             "No such message".into(),
                         ],
                     )
@@ -1654,6 +1738,29 @@ pub async fn handle_redact(
             None => return Ok(()),
         }
     };
+
+    // The message has to actually be in the target the client named: being an
+    // operator of one channel is not authority over a message in another.
+    if !target.eq_ignore_ascii_case(target_param) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "REDACT".into(),
+                    "UNKNOWN_MSGID".into(),
+                    target_param.to_string(),
+                    msgid.to_string(),
+                    "No such message".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
 
     // Authorization: own message (by nick), channel op, or IRC oper
     let is_own = sender_nick
@@ -1694,6 +1801,8 @@ pub async fn handle_redact(
                 vec![
                     "REDACT".into(),
                     "REDACT_FORBIDDEN".into(),
+                    target_param.to_string(),
+                    msgid.to_string(),
                     "You may not redact this message".into(),
                 ],
             )
@@ -1723,8 +1832,11 @@ pub async fn handle_redact(
     }
 
     // Per spec: :<nick!user@host> REDACT <target> <msgid> :<reason>
-    let redact_relay = Message::new("REDACT", vec![target.clone(), msgid.to_string(), reason])
-        .with_prefix(&source);
+    let mut relay_params = vec![target.clone(), msgid.to_string()];
+    if let Some(ref r) = reason {
+        relay_params.push(r.clone());
+    }
+    let redact_relay = Message::new("REDACT", relay_params).with_prefix(&source);
 
     // Deliver only to clients that have negotiated the message-redaction capability
     if target.starts_with('#') || target.starts_with('&') {
@@ -2306,6 +2418,27 @@ pub async fn handle_markread(
         } else {
             ts.to_string()
         };
+        // A marker that is not a timestamp would sort against the stored one as
+        // arbitrary text, so it is rejected rather than stored.
+        if chrono::DateTime::parse_from_rfc3339(&ts).is_err() {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "MARKREAD".into(),
+                        "INVALID_PARAMS".into(),
+                        target.to_string(),
+                        "Invalid timestamp".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
         tracing::debug!(client_id, target, timestamp = %ts, "MARKREAD set");
         let updated_ts = {
             let mut state_w = state.write().await;

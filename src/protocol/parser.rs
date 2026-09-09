@@ -1,13 +1,20 @@
 use super::message::Message;
 use std::collections::HashMap;
 
-const MAX_MESSAGE_BODY: usize = 512;
+/// The protocol's own limit on a message body. An operator may raise it — some
+/// servers do, and clients that send long SASL responses or passwords need it —
+/// so it is the default rather than a hard ceiling.
+pub const DEFAULT_MAX_MESSAGE_BODY: usize = 512;
 const MAX_TAG_DATA: usize = 4094;
 const MAX_TOTAL_TAGGED: usize = 8191;
 
 /// Parse an IRC message from a line (without CRLF).
 /// Returns error if line exceeds limits or is malformed.
 pub fn parse_message(line: &str) -> Result<Message, ParseError> {
+    parse_message_with_limit(line, DEFAULT_MAX_MESSAGE_BODY)
+}
+
+pub fn parse_message_with_limit(line: &str, max_body: usize) -> Result<Message, ParseError> {
     let line = line
         .trim_end_matches("\r\n")
         .trim_end_matches('\n')
@@ -75,7 +82,7 @@ pub fn parse_message(line: &str) -> Result<Message, ParseError> {
         line.find(' ').map(|p| p + 1).unwrap_or(0)
     };
     let body = &line[body_start.min(line.len())..];
-    if body.len() > MAX_MESSAGE_BODY {
+    if body.len() > max_body {
         return Err(ParseError::InputTooLong);
     }
 

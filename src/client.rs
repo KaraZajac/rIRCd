@@ -1,4 +1,4 @@
-use crate::protocol::{format_message, parse_message, Message, ParseError};
+use crate::protocol::{format_message, parse_message_with_limit, Message, ParseError};
 use crate::server::ClientMessage;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -104,6 +104,8 @@ const SEND_QUEUE: usize = 1024;
 #[derive(Clone, Copy)]
 pub struct KeepaliveConfig {
     pub ping_secs: u64,
+    /// Longest message body accepted, before tags.
+    pub max_line_length: usize,
     pub disconnect_secs: u64,
     pub registration_secs: u64,
     /// Commands a client may send back to back before being throttled.
@@ -280,7 +282,7 @@ async fn handle_client_stream<S>(
                             }
                         };
 
-                        match parse_message(line) {
+                        match parse_message_with_limit(line, keepalive.max_line_length) {
                             Ok(msg) => {
                                 debug!(client = %client_id, command = %msg.command, "received");
 
@@ -527,7 +529,7 @@ pub async fn handle_client_ws(
                         if line.is_empty() {
                             continue;
                         }
-                        match parse_message(line) {
+                        match parse_message_with_limit(line, keepalive.max_line_length) {
                             Ok(msg) => {
                                 debug!(client = %client_id, command = %msg.command, "received (ws)");
 
@@ -630,7 +632,7 @@ pub async fn handle_client_ws(
                         if line.is_empty() {
                             continue;
                         }
-                        match parse_message(line) {
+                        match parse_message_with_limit(line, keepalive.max_line_length) {
                             Ok(msg) => {
                                 debug!(client = %client_id, command = %msg.command, "received (ws/bin)");
 

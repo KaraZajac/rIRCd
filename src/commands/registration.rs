@@ -50,7 +50,7 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// only to clients that enabled the capability.
 fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN=512 MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=U EXCEPTS INVEX UTF8ONLY WHOX BOT=B ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1 METADATA=50{}", network);
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=U EXCEPTS INVEX UTF8ONLY WHOX BOT=B EXTBAN=~,a ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1 METADATA=50{}", network, linelen = cfg.limits.max_line_length);
     let deny = cfg
         .server
         .client_tag_deny
@@ -481,6 +481,7 @@ pub async fn handle_cap(
         (reg, nick)
     };
     let mut state_guard = state.write().await;
+    let mut sasl_aborted: Option<String> = None;
 
     match subcmd {
         "LS" => {
@@ -643,6 +644,17 @@ pub async fn handle_cap(
             if !is_registered {
                 let conn = state_guard.get_or_create_pending(client_id, host);
                 conn.cap_ended = true;
+                // Ending negotiation with an exchange still in flight abandons
+                // it: say so and let registration finish, rather than holding
+                // the connection open for a response that is not coming.
+                if conn.sasl_mechanism.is_some() && conn.account.is_none() {
+                    let nick = conn.nick.clone().unwrap_or_else(|| "*".to_string());
+                    conn.sasl_mechanism = None;
+                    conn.sasl_plain_buffer.clear();
+                    conn.sasl_chunk_count = 0;
+                    conn.sasl_scram = None;
+                    sasl_aborted = Some(nick);
+                }
             }
         }
         _ => {
@@ -674,6 +686,17 @@ pub async fn handle_cap(
         false
     };
     drop(state_guard);
+
+    if let Some(nick) = sasl_aborted {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("906", vec![nick, "SASL authentication aborted".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+    }
 
     if should_complete {
         complete_registration(client_id, state, senders, cfg, label).await?;
@@ -1394,6 +1417,8 @@ pub async fn handle_authenticate(
     label: Option<&str>,
 ) -> anyhow::Result<()> {
     let mechanism = msg.params.first().map(|s| s.as_str()).unwrap_or("");
+    // Naming a mechanism starts an attempt; "+" and base64 payloads continue one.
+    let is_mechanism_selection = matches!(mechanism, "PLAIN" | "SCRAM-SHA-256" | "EXTERNAL");
 
     // ── Check stored mechanism for routing ────────────────────────────────────
     let stored_mechanism = {
@@ -1424,7 +1449,11 @@ pub async fn handle_authenticate(
                 .await;
                 return Ok(());
             }
-            if conn.sasl_failed {
+            // A failed attempt does not end SASL: "the client MAY retry from the
+            // AUTHENTICATE <mechanism> command" (sasl-3.1). Naming a mechanism
+            // starts a fresh attempt; anything else after a failure is ignored,
+            // so a half-sent response cannot be resumed into a success.
+            if conn.sasl_failed && !is_mechanism_selection {
                 return Ok(());
             }
         }
@@ -1667,9 +1696,23 @@ pub async fn handle_authenticate(
             client_id,
             Message::new(
                 "908",
-                vec![nick, mechs.into(), "are available SASL mechanisms".into()],
+                vec![
+                    nick.clone(),
+                    mechs.into(),
+                    "are available SASL mechanisms".into(),
+                ],
             )
             .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        // 908 lists what is on offer; the attempt itself still has to fail, or
+        // the client is left waiting for an answer that never comes.
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("904", vec![nick, "SASL authentication failed".into()])
+                .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -1742,8 +1785,10 @@ pub async fn handle_authenticate(
         "empty"
     };
 
-    // RFC 4616: authzid + authcid + passwd ≤ 255+255+255 octets decoded → base64 ≤ 1024 bytes. Use 1200 to allow real-world clients that send slightly over (e.g. padding).
-    const MAX_SASL_PLAIN_BUF: usize = 1200;
+    // Bounds the whole base64 response, so a client cannot make the server hold
+    // an unbounded buffer by never terminating its AUTHENTICATE sequence.
+    // Generous enough for the long passphrases people actually use.
+    const MAX_SASL_PLAIN_BUF: usize = 4096;
 
     tracing::info!(
         client_id = %client_id,
@@ -1770,6 +1815,9 @@ pub async fn handle_authenticate(
         // pending connection was removed by complete_registration() and just recreated above.
         if mechanism == "PLAIN" {
             conn.sasl_mechanism = Some("PLAIN".to_string());
+            conn.sasl_failed = false;
+            conn.sasl_plain_buffer.clear();
+            conn.sasl_chunk_count = 0;
         }
         // is_end = true when we have the full response: token is "+" or token.len() < 400.
         let explicit_end = token == "+";
@@ -1809,10 +1857,12 @@ pub async fn handle_authenticate(
                     max = MAX_SASL_PLAIN_BUF,
                     "SASL AUTHENTICATE: buffer exceeded max length, sending 905"
                 );
+                // 905 is for one AUTHENTICATE line over 400 bytes. A response
+                // that never ends is a failed exchange, not a long line.
                 reply_to_client(
                     &senders,
                     client_id,
-                    Message::new("905", vec![nick, "SASL message too long".into()])
+                    Message::new("904", vec![nick, "SASL authentication failed".into()])
                         .with_prefix(&cfg.server.name),
                     label,
                 )
@@ -1861,21 +1911,17 @@ pub async fn handle_authenticate(
         return Ok(());
     }
 
-    // We only decode when we have the complete payload: client sent AUTHENTICATE + or a chunk < 400 (last chunk).
-    // If we got a full 400-byte chunk, just request more and do not pad/decode.
+    // Decode only once the whole payload is in: the client sent AUTHENTICATE +
+    // or a chunk shorter than 400 bytes. A full 400-byte chunk means more is
+    // coming — and the client sends the rest without waiting, so answering it
+    // would put an unexpected AUTHENTICATE + where the client expects the
+    // result of the exchange.
     if !is_end {
-        tracing::info!(
+        tracing::debug!(
             client_id = %client_id,
             buffer_len = to_decode.len(),
-            "SASL AUTHENTICATE: sending AUTHENTICATE + (request next chunk)"
+            "SASL AUTHENTICATE: full chunk, waiting for the rest"
         );
-        reply_to_client(
-            &senders,
-            client_id,
-            Message::new("AUTHENTICATE", vec!["+".into()]).with_prefix(&cfg.server.name),
-            label,
-        )
-        .await;
         return Ok(());
     }
 
@@ -1997,30 +2043,10 @@ pub async fn handle_authenticate(
         return Ok(());
     }
 
-    // RFC 4616: "MUST be capable of accepting authzid, authcid, and passwd ... up to and including 255 octets"
-    const MAX_PLAIN_FIELD: usize = 255;
-    if authzid.len() > MAX_PLAIN_FIELD
-        || authcid.len() > MAX_PLAIN_FIELD
-        || passwd.len() > MAX_PLAIN_FIELD
-    {
-        tracing::info!(
-            client_id = %client_id,
-            authzid_len = authzid.len(),
-            authcid_len = authcid.len(),
-            "SASL AUTHENTICATE: field exceeds 255 octets, sending 904"
-        );
-        sasl_fail(
-            state,
-            &senders,
-            client_id,
-            cfg,
-            label,
-            &nick,
-            "SASL authentication failed",
-        )
-        .await;
-        return Ok(());
-    }
+    // RFC 4616's 255 octets is what a server MUST be capable of accepting, not a
+    // maximum it may impose: a longer password is still a valid one. The whole
+    // response is bounded by MAX_SASL_PLAIN_BUF above, which is the limit that
+    // actually protects the server.
 
     // RFC 4616: "verify that the authentication credentials permit the client to act as the (presented or derived) authorization identity"
     // For IRC we only allow acting as self; if authzid is set and differs from authcid, reject.
@@ -2104,10 +2130,13 @@ pub async fn handle_authenticate(
                 .user
                 .as_ref()
                 .map(|u| format!("{}!{}@{}", nick, u, conn.host))
-                .unwrap_or_else(|| client_id.to_string());
+                // USER has not arrived yet, but 900's second parameter is a
+                // mask; the internal connection id is not one and means
+                // nothing to a client.
+                .unwrap_or_else(|| format!("{}!*@{}", nick, conn.host));
             (Vec::new(), client_id.to_string(), uih)
         } else {
-            (Vec::new(), client_id.to_string(), client_id.to_string())
+            (Vec::new(), client_id.to_string(), format!("{}!*@*", nick))
         }
     };
 
@@ -2667,7 +2696,7 @@ pub async fn handle_oper(
                     client_id,
                     Message::new(
                         "381",
-                        vec!["*".into(), "You are now an IRC operator".into()],
+                        vec![oper_nick.clone(), "You are now an IRC operator".into()],
                     )
                     .with_prefix(&cfg.server.name),
                     label,
@@ -3003,8 +3032,15 @@ pub async fn handle_register(
         return Ok(());
     }
 
-    let outcome =
-        persist::register_user(pool, &account, password, email, verification.as_ref()).await;
+    let outcome = persist::register_user(
+        pool,
+        &account,
+        password,
+        email,
+        verification.as_ref(),
+        cfg.limits.min_password_length,
+    )
+    .await;
     cfg.db_health
         .note(!matches!(outcome, Err(RegisterError::Io(_))));
     match outcome {

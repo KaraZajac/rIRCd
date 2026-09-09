@@ -354,44 +354,6 @@ pub async fn handle_join(
         let topic = ch.topic.clone();
         let topic_setter = ch.topic_setter.clone();
         let topic_time = ch.topic_time;
-        let created_at = ch.created_at;
-        // Build mode string for 324 RPL_CHANNELMODE sent after NAMES
-        let join_mode_str = {
-            let mut flags = String::from("+");
-            if ch.modes.invite_only {
-                flags.push('i');
-            }
-            if ch.modes.moderated {
-                flags.push('m');
-            }
-            if ch.modes.no_external {
-                flags.push('n');
-            }
-            if ch.modes.secret {
-                flags.push('s');
-            }
-            if ch.modes.topic_protect {
-                flags.push('t');
-            }
-            if ch.modes.registered_only {
-                flags.push('R');
-            }
-            if ch.modes.no_colors {
-                flags.push('c');
-            }
-            if ch.modes.no_ctcp {
-                flags.push('C');
-            }
-            if ch.key.is_some() {
-                flags.push('k');
-            }
-            if ch.modes.user_limit.is_some() {
-                flags.push('l');
-            }
-            flags
-        };
-        let join_mode_key = ch.key.clone();
-        let join_mode_limit = ch.modes.user_limit;
         drop(ch);
         for mid in &member_ids {
             let caps = match state.clients.get(mid) {
@@ -470,18 +432,24 @@ pub async fn handle_join(
             )
             .await;
         }
-        // 329 RPL_CREATIONTIME
-        reply_to_client(
-            &senders,
-            client_id,
-            Message::new(
-                "329",
-                vec![nick.clone(), ch_key.clone(), created_at.to_string()],
-            )
-            .with_prefix(&cfg.server.name),
-            label,
-        )
-        .await;
+        // draft/read-marker: the marker has to reach the client before
+        // RPL_ENDOFNAMES, so it is sent ahead of the NAMES burst.
+        if client_caps.contains("draft/read-marker") {
+            let key = account.clone().unwrap_or_else(|| client_id.to_string());
+            let ts = state
+                .read_markers
+                .get(&key)
+                .and_then(|m| m.get(&ch_key).cloned())
+                .unwrap_or_else(|| "*".to_string());
+            let ts_param = if ts == "*" {
+                "*".to_string()
+            } else {
+                format!("timestamp={}", ts)
+            };
+            let m = Message::new("MARKREAD", vec![ch_key.clone(), ts_param])
+                .with_prefix(&cfg.server.name);
+            send_to_client(&senders, client_id, m).await;
+        }
 
         // no-implicit-names: send NAMES to joining user unless they have the cap
         if !client_caps.contains("no-implicit-names") {
@@ -500,41 +468,9 @@ pub async fn handle_join(
                 .await;
             }
         }
-        // 324 RPL_CHANNELMODE: send current channel modes after NAMES burst
-        {
-            let mut rp = vec![nick.clone(), ch_key.clone(), join_mode_str.clone()];
-            if let Some(ref k) = join_mode_key {
-                rp.push(k.clone());
-            }
-            if let Some(lim) = join_mode_limit {
-                rp.push(lim.to_string());
-            }
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new("324", rp).with_prefix(&cfg.server.name),
-                label,
-            )
-            .await;
-        }
-        // draft/read-marker: send MARKREAD for channel (before ENDOFNAMES per spec; we send after NAMES)
-        if client_caps.contains("draft/read-marker") {
-            let key = account.clone().unwrap_or_else(|| client_id.to_string());
-            let ts = state
-                .read_markers
-                .get(&key)
-                .and_then(|m| m.get(&ch_key).cloned())
-                .unwrap_or_else(|| "*".to_string());
-            let ts_param = if ts == "*" {
-                "*".to_string()
-            } else {
-                format!("timestamp={}", ts)
-            };
-            let m = Message::new("MARKREAD", vec![ch_key.clone(), ts_param])
-                .with_prefix(&cfg.server.name);
-            send_to_client(&senders, client_id, m).await;
-        }
-
+        // RPL_CHANNELMODEIS (324) and RPL_CREATIONTIME (329) answer `MODE
+        // #channel`. Sending them on JOIN too puts unasked-for numerics between
+        // the JOINs of a multi-channel join, which clients read positionally.
         // draft/metadata-2: push existing channel metadata to the joining client
         if client_caps.contains("draft/metadata-2") {
             let ch_meta: Vec<(String, String)> = state
@@ -613,7 +549,13 @@ pub async fn handle_part(
     };
     // Collected while the state read guard is held, applied once it is released.
     let mut forgotten_memberships: Vec<(String, String)> = Vec::new();
-    let reason = msg.trailing().unwrap_or("Leaving").to_string();
+    // params[1], not trailing(): `PART #chan` has no reason, and trailing()
+    // would hand back the channel name as one.
+    let reason = msg
+        .params
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "Leaving".to_string());
 
     for ch_name in ch_names.split(',') {
         let ch_name = ch_name.trim();
@@ -1130,6 +1072,8 @@ pub async fn handle_mode(
             let mut plus = true;
             // (who, is_op, granted) — persisted once the channel lock is released.
             let mut access_changes: Vec<(String, bool, bool)> = Vec::new();
+            // Mode changes the server refused, so they are left out of the echo.
+            let mut rejected_modes: Vec<(char, bool)> = Vec::new();
             // (list, mask, added) — likewise, so bans survive a restart.
             let mut list_changes: Vec<(char, String, bool)> = Vec::new();
             // param_idx starts at 2: params[0]=target, params[1]=mode_str, params[2+]=mode args
@@ -1149,64 +1093,105 @@ pub async fn handle_mode(
                     'C' => ch.modes.no_ctcp = plus,
                     'k' => {
                         if plus {
-                            // Enforce KEYLEN=64
-                            ch.key = msg.params.get(param_idx).map(|k| {
-                                if k.len() > 64 {
-                                    crate::protocol::truncate_bytes(k, 64).to_string()
-                                } else {
-                                    k.clone()
-                                }
-                            });
+                            let key = msg.params.get(param_idx).cloned().unwrap_or_default();
+                            param_idx += 1;
+                            // A key with a space in it cannot be used in a JOIN,
+                            // and an empty or over-long one is not a key at all.
+                            // Refusing it beats setting one nobody can use.
+                            if key.is_empty() || key.contains(' ') || key.len() > 64 {
+                                reply_to_client(
+                                    &senders,
+                                    client_id,
+                                    Message::new(
+                                        "696",
+                                        vec![
+                                            nick.clone(),
+                                            target.into(),
+                                            "k".into(),
+                                            "*".into(),
+                                            "Invalid channel key".into(),
+                                        ],
+                                    )
+                                    .with_prefix(&cfg.server.name),
+                                    label,
+                                )
+                                .await;
+                                rejected_modes.push(('k', plus));
+                                continue;
+                            }
+                            ch.key = Some(key);
                         } else {
                             ch.key = None;
+                            param_idx += 1;
                         }
-                        param_idx += 1;
                     }
                     'o' => {
-                        if let Some(target_nick) = msg.params.get(param_idx) {
-                            if let Some(target_id) =
-                                state.nick_to_id.get(&target_nick.to_uppercase())
-                            {
-                                if let Some(memb) = ch.members.get_mut(target_id) {
-                                    memb.modes.op = plus;
-                                    // Remember it, so the user keeps the status
-                                    // next time they join — in memory for this
-                                    // run, and in the database for the next one.
-                                    if let Some(c) = state.clients.get(target_id) {
-                                        let g = c.read().await;
-                                        let who = g
-                                            .account
-                                            .clone()
-                                            .unwrap_or_else(|| g.nick_or_id().to_string());
-                                        if plus {
-                                            if !ch.persisted_operators.contains(&who) {
-                                                ch.persisted_operators.push(who.clone());
-                                            }
-                                        } else {
-                                            ch.persisted_operators.retain(|o| o != &who);
-                                        }
-                                        access_changes.push((who, true, plus));
-                                    }
-                                } else {
-                                    let _ = reply_to_client(
-                                        &senders,
-                                        client_id,
-                                        Message::new(
-                                            "441",
-                                            vec![
-                                                nick.clone(),
-                                                target_nick.clone(),
-                                                target.into(),
-                                                "They aren't on that channel".into(),
-                                            ],
-                                        )
-                                        .with_prefix(&cfg.server.name),
-                                        label,
-                                    )
-                                    .await;
+                        let Some(target_nick) = msg.params.get(param_idx).cloned() else {
+                            continue;
+                        };
+                        param_idx += 1;
+                        let target_id = state.nick_to_id.get(&target_nick.to_uppercase()).cloned();
+                        // A mode change naming someone who is not here does not
+                        // half-apply: it is refused, and no MODE is echoed.
+                        let Some(target_id) = target_id else {
+                            reply_to_client(
+                                &senders,
+                                client_id,
+                                Message::new(
+                                    "401",
+                                    vec![
+                                        nick.clone(),
+                                        target_nick.clone(),
+                                        "No such nick/channel".into(),
+                                    ],
+                                )
+                                .with_prefix(&cfg.server.name),
+                                label,
+                            )
+                            .await;
+                            rejected_modes.push(('o', plus));
+                            continue;
+                        };
+                        if !ch.members.contains_key(&target_id) {
+                            reply_to_client(
+                                &senders,
+                                client_id,
+                                Message::new(
+                                    "441",
+                                    vec![
+                                        nick.clone(),
+                                        target_nick.clone(),
+                                        target.into(),
+                                        "They aren't on that channel".into(),
+                                    ],
+                                )
+                                .with_prefix(&cfg.server.name),
+                                label,
+                            )
+                            .await;
+                            rejected_modes.push(('o', plus));
+                            continue;
+                        }
+                        if let Some(memb) = ch.members.get_mut(&target_id) {
+                            memb.modes.op = plus;
+                        }
+                        // Remember it, so the user keeps the status next time
+                        // they join — in memory for this run, and in the
+                        // database for the next one.
+                        if let Some(c) = state.clients.get(&target_id) {
+                            let g = c.read().await;
+                            let who = g
+                                .account
+                                .clone()
+                                .unwrap_or_else(|| g.nick_or_id().to_string());
+                            if plus {
+                                if !ch.persisted_operators.contains(&who) {
+                                    ch.persisted_operators.push(who.clone());
                                 }
+                            } else {
+                                ch.persisted_operators.retain(|o| o != &who);
                             }
-                            param_idx += 1;
+                            access_changes.push((who, true, plus));
                         }
                     }
                     'b' => {
@@ -1418,9 +1403,33 @@ pub async fn handle_mode(
                     }
                     'l' => {
                         if plus {
-                            if let Some(limit_str) = msg.params.get(param_idx) {
-                                ch.modes.user_limit = limit_str.parse().ok();
-                                param_idx += 1;
+                            let raw = msg.params.get(param_idx).cloned().unwrap_or_default();
+                            param_idx += 1;
+                            // A limit is a positive number; zero, a negative or
+                            // a word is not a smaller limit, it is a mistake.
+                            match raw.parse::<u32>() {
+                                Ok(n) if n > 0 => ch.modes.user_limit = Some(n),
+                                _ => {
+                                    reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "696",
+                                            vec![
+                                                nick.clone(),
+                                                target.into(),
+                                                "l".into(),
+                                                if raw.is_empty() { "*".to_string() } else { raw },
+                                                "Invalid channel limit".into(),
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
+                                    rejected_modes.push(('l', plus));
+                                    continue;
+                                }
                             }
                         } else {
                             ch.modes.user_limit = None;
@@ -1588,13 +1597,18 @@ pub async fn handle_mode(
             let mode_key_val = ch.key.clone();
             let mode_limit_val = ch.modes.user_limit;
             let member_ids_mode: Vec<String> = ch.members.keys().cloned().collect();
-            let mode_msg = Message::new("MODE", msg.params.clone()).with_prefix(nick.as_str());
+            let echo_params = filter_mode_echo(&msg.params, &rejected_modes);
+            let mode_msg = echo_params
+                .clone()
+                .map(|p| Message::new("MODE", p).with_prefix(nick.as_str()));
             tracing::debug!(client_id, channel = %target, modes = %msg.params[1..].join(" "), "MODE change");
             drop(ch);
             drop(ch_store);
-            for mid in &member_ids_mode {
-                if let Some(tx) = senders.read().await.get(mid) {
-                    tx.send(mode_msg.clone());
+            if let Some(ref mode_msg) = mode_msg {
+                for mid in &member_ids_mode {
+                    if let Some(tx) = senders.read().await.get(mid) {
+                        tx.send(mode_msg.clone());
+                    }
                 }
             }
             // Persist channel modes to database
@@ -1694,6 +1708,54 @@ pub async fn handle_mode(
     Ok(())
 }
 
+/// Rebuild a MODE echo without the changes the server refused.
+///
+/// A rejected change must not be announced: a client told `+o nobody` succeeded
+/// would show ops nobody has. Walks the requested mode string in order,
+/// consuming each mode's parameter, and drops the ones in `rejected`.
+fn filter_mode_echo(params: &[String], rejected: &[(char, bool)]) -> Option<Vec<String>> {
+    // Modes taking a parameter whichever way they are set, and `l` which takes
+    // one only when set.
+    const ALWAYS_PARAM: &str = "ovhbeIqk";
+    let channel = params.first()?;
+    let mode_str = params.get(1)?;
+    let mut rest = params[2..].iter();
+
+    let mut plus = true;
+    let mut kept = String::new();
+    let mut kept_params: Vec<String> = Vec::new();
+    let mut last_sign: Option<bool> = None;
+
+    for c in mode_str.chars() {
+        match c {
+            '+' => plus = true,
+            '-' => plus = false,
+            _ => {
+                let takes_param = ALWAYS_PARAM.contains(c) || (c == 'l' && plus);
+                let param = if takes_param { rest.next() } else { None };
+                if rejected.contains(&(c, plus)) {
+                    continue;
+                }
+                if last_sign != Some(plus) {
+                    kept.push(if plus { '+' } else { '-' });
+                    last_sign = Some(plus);
+                }
+                kept.push(c);
+                if let Some(p) = param {
+                    kept_params.push(p.clone());
+                }
+            }
+        }
+    }
+
+    if kept.is_empty() {
+        return None;
+    }
+    let mut out = vec![channel.clone(), kept];
+    out.extend(kept_params);
+    Some(out)
+}
+
 pub async fn handle_topic(
     client_id: &str,
     msg: Message,
@@ -1704,7 +1766,9 @@ pub async fn handle_topic(
     label: Option<&str>,
 ) -> anyhow::Result<()> {
     let ch_name = msg.params.first().map(|s| s.as_str()).unwrap_or("");
-    let new_topic = msg.trailing().map(|s| s.to_string());
+    // Only params[1] sets a topic. `TOPIC #chan` is a query, and reading it via
+    // trailing() made it a request to set the topic to the channel's own name.
+    let new_topic = msg.params.get(1).cloned();
 
     let state = state.read().await;
     let client = match state.clients.get(client_id) {
@@ -1861,10 +1925,17 @@ pub async fn handle_kick(
 ) -> anyhow::Result<()> {
     let ch_name = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let target_nick = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
-    // Enforce KICKLEN=307
+    let kicker_nick = match state.read().await.clients.get(client_id) {
+        Some(c) => c.read().await.nick_or_id().to_string(),
+        None => client_id.to_string(),
+    };
+    // KICK's comment is params[2] and KICKLEN caps it at 307. With none given
+    // the kicker's own nick is the conventional default.
     let reason = msg
-        .trailing()
-        .unwrap_or("Kicked")
+        .params
+        .get(2)
+        .map(|s| s.as_str())
+        .unwrap_or(kicker_nick.as_str())
         .chars()
         .take(307)
         .collect::<String>();
@@ -2012,6 +2083,23 @@ pub async fn handle_invite(
     let ch_name = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
 
     if target_nick.is_empty() || ch_name.is_empty() {
+        // Silence is not an answer: a client waiting on INVITE would wait for
+        // ever. (Listing one's own invitations is optional and not supported.)
+        let nick = match state.read().await.clients.get(client_id) {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => "*".to_string(),
+        };
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "461",
+                vec![nick, "INVITE".into(), "Not enough parameters".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
         return Ok(());
     }
 
@@ -2160,7 +2248,7 @@ pub async fn handle_rename(
 ) -> anyhow::Result<()> {
     let old_name = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let new_name = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
-    let reason = msg.trailing().unwrap_or("").to_string();
+    let reason = msg.params.get(2).cloned().unwrap_or_default();
 
     if old_name.is_empty() || new_name.is_empty() {
         reply_to_client(

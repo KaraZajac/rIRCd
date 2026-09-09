@@ -470,12 +470,13 @@ pub async fn handle_whowas(
 ) -> anyhow::Result<()> {
     let s = cfg.server.name.as_str();
     let target_nick = msg.params.first().map(|s| s.as_str()).unwrap_or("");
-    let count: usize = msg
-        .params
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5)
-        .min(20);
+    let count: usize = match msg.params.get(1).and_then(|s| s.parse::<i64>().ok()) {
+        Some(n) if n > 0 => (n as usize).min(20),
+        // "If a non-positive number is passed as being <count>, then a full
+        // search is done" — RFC 1459 §4.5.3.
+        Some(_) => 20,
+        None => 5,
+    };
 
     let nick = match state.read().await.clients.get(client_id) {
         Some(c) => c.read().await.nick_or_id().to_string(),
@@ -803,7 +804,11 @@ pub async fn handle_knock(
 ) -> anyhow::Result<()> {
     let s = cfg.server.name.as_str();
     let ch_name = msg.params.first().map(|s| s.as_str()).unwrap_or("");
-    let knock_msg = msg.trailing().unwrap_or("knock knock").to_string();
+    let knock_msg = msg
+        .params
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "knock knock".to_string());
 
     let state = state.read().await;
     let (nick, source, account) = match state.clients.get(client_id) {

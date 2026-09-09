@@ -799,8 +799,9 @@ pub async fn register_user(
     password: &str,
     email: Option<&str>,
     verification: Option<&PendingVerification>,
+    min_password_length: usize,
 ) -> Result<(), RegisterError> {
-    if password.len() < 6 {
+    if password.len() < min_password_length {
         return Err(RegisterError::WeakPassword);
     }
 

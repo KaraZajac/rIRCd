@@ -344,6 +344,7 @@ pub async fn run(
     }
     let keepalive = client::KeepaliveConfig {
         ping_secs: cfg.server.ping_timeout_secs,
+        max_line_length: cfg.limits.max_line_length,
         disconnect_secs: cfg.server.disconnect_timeout_secs,
         registration_secs: cfg.server.registration_timeout_secs,
         flood_burst: cfg.limits.flood_burst,

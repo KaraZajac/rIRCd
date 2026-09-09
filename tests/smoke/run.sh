@@ -181,7 +181,7 @@ max_channels_per_client = 50
 # Every suite connects from 127.0.0.1, so the per-address limit is off here.
 # It defaults to 16 and is exercised by the unit tests instead.
 max_connections_per_ip = 0
-max_line_length = 8191
+max_line_length = 512
 
 [email]
 smtp_host = "127.0.0.1"

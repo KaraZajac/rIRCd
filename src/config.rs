@@ -379,9 +379,9 @@ pub struct LimitsConfig {
     /// Connections allowed in total; 0 for no limit.
     #[serde(default)]
     pub max_clients: usize,
-    /// Accepted for compatibility with older configs; the protocol fixes the
-    /// message body at 512 bytes (8191 including tags), which is what the server
-    /// enforces and advertises as LINELEN.
+    /// Longest message body accepted, before tags. 512 is the protocol's own
+    /// limit and the default; raising it lets clients send the long SASL
+    /// responses and passwords that some do. Advertised as LINELEN.
     #[serde(default = "default_max_line_length")]
     pub max_line_length: usize,
     /// Commands a client may send back to back before being throttled.
@@ -390,6 +390,10 @@ pub struct LimitsConfig {
     /// Commands per second the flood allowance refills at.
     #[serde(default = "default_flood_rate")]
     pub flood_rate: f64,
+    /// Shortest password REGISTER will accept. Advertised to clients in the
+    /// draft/account-registration capability, so the two cannot drift apart.
+    #[serde(default = "default_min_password_length")]
+    pub min_password_length: usize,
 }
 
 fn default_max_channels() -> usize {
@@ -399,13 +403,16 @@ fn default_max_per_ip() -> usize {
     16
 }
 fn default_max_line_length() -> usize {
-    8191
+    crate::protocol::DEFAULT_MAX_MESSAGE_BODY
 }
 fn default_flood_burst() -> f64 {
     10.0
 }
 fn default_flood_rate() -> f64 {
     1.0
+}
+fn default_min_password_length() -> usize {
+    6
 }
 
 impl Default for LimitsConfig {
@@ -417,6 +424,7 @@ impl Default for LimitsConfig {
             max_line_length: default_max_line_length(),
             flood_burst: default_flood_burst(),
             flood_rate: default_flood_rate(),
+            min_password_length: default_min_password_length(),
         }
     }
 }

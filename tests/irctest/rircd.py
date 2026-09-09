@@ -133,6 +133,12 @@ max_channels_per_client = 100
 # throttles them into timeouts.
 flood_burst = 1000.0
 flood_rate = 1000.0
+# Several tests register accounts with passwords like "bar"; they are checking
+# SASL, not our password policy.
+min_password_length = 1
+# Some tests register accounts with passwords hundreds of bytes long, which do
+# not fit a 512-byte line.
+max_line_length = 2048
 {tls_section}
 [[opers]]
 name = "{oper_name}"

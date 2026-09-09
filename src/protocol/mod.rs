@@ -7,4 +7,4 @@ pub use format::{
     to_server_time, truncate_bytes, SenderTags,
 };
 pub use message::Message;
-pub use parser::{parse_message, ParseError};
+pub use parser::{parse_message, parse_message_with_limit, ParseError, DEFAULT_MAX_MESSAGE_BODY};

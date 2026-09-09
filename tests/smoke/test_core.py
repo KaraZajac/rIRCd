@@ -63,7 +63,15 @@ alice.read(1.0)
 check("peers see the JOIN", bool(alice.find("JOIN", "#smoke", lines=alice.since(mark))), alice.since(mark))
 check("332 topic on join", bool(bob.find(" 332 ", "#smoke")), bob.lines[-6:])
 check("333 topic setter/time", bool(bob.find(" 333 ", "#smoke")))
-check("329 creation time", bool(bob.find(" 329 ", "#smoke")))
+# 324 and 329 answer `MODE #channel`; sending them on JOIN too puts unasked-for
+# numerics between the JOINs of a multi-channel join, which clients read by
+# position.
+check("no 329 in the JOIN burst", not bob.find(" 329 ", "#smoke"), bob.lines[-8:])
+mark = bob.mark()
+bob.send("MODE #smoke")
+bob.read(1.0)
+check("324 channel modes on MODE", bool(bob.find(" 324 ", "#smoke", lines=bob.since(mark))))
+check("329 creation time on MODE", bool(bob.find(" 329 ", "#smoke", lines=bob.since(mark))))
 
 section("messaging")
 mark = bob.mark()

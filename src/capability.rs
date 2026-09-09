@@ -82,10 +82,18 @@ pub fn build_cap_list(cfg: &Config, version_302: bool, client_is_tls: bool) -> V
     // current nick, because channel op/voice lists match a nick or an account name
     // interchangeably, so a freely chosen account name could inherit someone else's ops.
     // email-required: [email] is configured, so REGISTER needs a mailable address.
+    // The advertised minimum is the one REGISTER actually enforces, so a client
+    // is never told a password is acceptable and then refused.
     let account_registration = if cfg.email.is_some() {
-        "draft/account-registration=before-connect,email-required,min-password-length=6"
+        format!(
+            "draft/account-registration=before-connect,email-required,min-password-length={}",
+            cfg.limits.min_password_length
+        )
     } else {
-        "draft/account-registration=before-connect,min-password-length=6"
+        format!(
+            "draft/account-registration=before-connect,min-password-length={}",
+            cfg.limits.min_password_length
+        )
     };
 
     let caps: Vec<String> = CAPS
