@@ -516,8 +516,8 @@ still accepted in `CAP REQ` so older clients keep working.
 | **draft/chathistory** | Full | CHATHISTORY LATEST/BEFORE/AFTER/AROUND/BETWEEN/TARGETS for channels **and direct conversations**; BATCH chathistory; DB-backed; limit 200 |
 | **draft/event-playback** | Full | JOIN/PART/QUIT/TOPIC/NICK events stored in DB and replayed in CHATHISTORY |
 | **draft/network-icon** | Full | Optional `ICON=` ISUPPORT token; config `network.icon` |
-| **draft/read-marker** | Full | MARKREAD target [timestamp]; per-account, persisted in MariaDB |
-| **draft/metadata-2** / **draft/metadata-3** | Full | METADATA GET/LIST/SET/CLEAR/SUB/UNSUB/SUBS/SYNC; key-value per user and channel, persisted in MariaDB. Both names of the same specification are advertised; replies to a `-3` client come back in a `metadata` batch and subscription notices as RPL_KEYVALUE. `before-connect` lets a client set its own keys during registration; RPL_WHOISKEYVALUE (760) carries them in WHOIS. An invite-only or secret channel does not hand its metadata to non-members |
+| **draft/read-marker** | Full | MARKREAD target [timestamp]; per-account, persisted in MariaDB. A client with no account keeps its marker for the life of the connection only — a connection id does not come back tomorrow to read it |
+| **draft/metadata-2** / **draft/metadata-3** | Full | METADATA GET/LIST/SET/CLEAR/SUB/UNSUB/SUBS/SYNC; key-value per user and channel, persisted in MariaDB for accounts (a bare nick's keys last as long as its connection, so the next holder of the name does not inherit them). Both names of the same specification are advertised; replies to a `-3` client come back in a `metadata` batch and subscription notices as RPL_KEYVALUE. `before-connect` lets a client set its own keys during registration; RPL_WHOISKEYVALUE (760) carries them in WHOIS. An invite-only or secret channel does not hand its metadata to non-members |
 | **STATUSMSG** | Full | PRIVMSG/NOTICE to `@#channel` (ops+) or `+#channel` (voiced+); advertised in 005 `STATUSMSG=@+` |
 | **draft/account-registration** | Full | REGISTER \* [email] password; logs the client in on success; optional email verification via VERIFY (`[email]` config) |
 | **draft/multiline** | Full | BATCH draft/multiline; max-bytes=4096, max-lines=20; fallback for non-multiline clients |
@@ -559,7 +559,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `STATS o` | 243/219 | IRC operator list |
 | `STATS k` | 216/219 | Server bans in force, with time remaining |
 | `STATS m` | 212/219 | How often each command has been used |
-| `WHOWAS` | 314/312/369 | Historical nick info; up to 5 entries per nick, in-memory |
+| `WHOWAS` | 314/312/369 | Historical nick info; the last 5 visits of each of the last 10,000 nicks in memory, 20 per nick in the database for 30 days |
 | `WHO` mask | 352/315 | Supports glob masks (`*`, `?`) against nick!user@host; respects +i invisible mode |
 | `HELP` / `HELPOP` | 704/705/706 | Per-command help text |
 | `KNOCK` | 710/711 | Request invite to an invite-only channel; notifies ops |
