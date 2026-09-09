@@ -549,7 +549,7 @@ pub async fn handle_privmsg(
             if ch.modes.moderated
                 && !ch
                     .members
-                    .get(client_id)
+                    .get(&state_guard.user_id(client_id))
                     .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
                     .unwrap_or(false)
             {
@@ -861,7 +861,7 @@ pub async fn handle_notice(
             if ch.modes.moderated
                 && !ch
                     .members
-                    .get(client_id)
+                    .get(&state_guard.user_id(client_id))
                     .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
                     .unwrap_or(false)
             {
@@ -1514,7 +1514,7 @@ pub async fn handle_tagmsg(
             if ch.modes.moderated
                 && !ch
                     .members
-                    .get(client_id)
+                    .get(&state_guard.user_id(client_id))
                     .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
                     .unwrap_or(false)
             {
@@ -1829,13 +1829,14 @@ pub async fn handle_redact(
 
     let is_op = if target.starts_with('#') || target.starts_with('&') {
         let ch_key = canonical_channel_key(&target);
+        let uid = state.read().await.user_id(client_id);
         let ch_store = channels.read().await;
         match ch_store.channels.get(&ch_key) {
             Some(ch) => ch
                 .read()
                 .await
                 .members
-                .get(client_id)
+                .get(&uid)
                 .map(|m| m.modes.op)
                 .unwrap_or(false),
             None => false,

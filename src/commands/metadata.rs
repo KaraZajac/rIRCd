@@ -552,12 +552,13 @@ pub async fn handle_metadata(
             let can_set = if target == self_nick {
                 true
             } else if is_channel(&target) {
+                let uid = state.read().await.user_id(client_id);
                 let ch_store = channels.read().await;
                 if let Some(ch) = ch_store.channels.get(&target) {
                     ch.read()
                         .await
                         .members
-                        .get(client_id)
+                        .get(&uid)
                         .map(|m| m.modes.op)
                         .unwrap_or(false)
                 } else {
@@ -725,12 +726,13 @@ pub async fn handle_metadata(
             let can_set = if target == self_nick {
                 true
             } else if is_channel(&target) {
+                let uid = state.read().await.user_id(client_id);
                 let ch_store = channels.read().await;
                 if let Some(ch) = ch_store.channels.get(&target) {
                     ch.read()
                         .await
                         .members
-                        .get(client_id)
+                        .get(&uid)
                         .map(|m| m.modes.op)
                         .unwrap_or(false)
                 } else {

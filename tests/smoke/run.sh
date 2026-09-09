@@ -162,6 +162,11 @@ Everything here is throwaway.
 auto_join = "#lobby, #help"
 # Cloak connecting clients so the cloaking path is exercised.
 cloak_key = "smoke-cloak-key"
+# One account, several connections. On by default here because the session
+# path is where a connection id and a user id stop being the same string,
+# and only a test that opens two connections notices when they are confused.
+multiclient = true
+persistent_sessions = true
 
 [network]
 name = "SmokeNet"
@@ -253,12 +258,14 @@ export SMOKE_MAIL_DIR="$MAIL_DIR"
 export SMOKE_SERVER_LOG="$SERVER_LOG"
 export SMOKE_OPER_NAME="smokeoper"
 export SMOKE_OPER_PASSWORD="$OPER_PASSWORD"
+export SMOKE_CONFIG="$ETC_DIR/config.toml"
+export SMOKE_RIRCD_BIN="$REPO/target/debug/rircd"
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 
 status=0
 if [ "$SERVE_ONLY" = 0 ]; then
   if [ ${#SUITES[@]} -eq 0 ]; then
-    SUITES=(test_core.py test_ircv3.py test_features.py test_websocket.py test_account.py test_webpush.py)
+    SUITES=(test_core.py test_ircv3.py test_features.py test_websocket.py test_account.py test_webpush.py test_multiclient.py)
   fi
   for suite in "${SUITES[@]}"; do
     say "Running $suite"

@@ -221,7 +221,77 @@ async fn handle_join_inner(
             .or_insert_with(|| RwLock::new(Channel::new(ch_name.to_string())));
 
         let mut ch = ch.write().await;
-        if ch.is_member(&state.user_id(client_id)) {
+        if ch.is_member(&user_id) {
+            // Another connection of this user is already in the channel, so the
+            // channel does not change and nobody else hears anything. This
+            // connection has never been told what is in here, though, so it
+            // gets the burst a fresh join would get — otherwise a second client
+            // on the same account shows an empty window for a channel it is in.
+            let catch_up = senders.read().await.sessions_of(&user_id).len() > 1;
+            let topic = ch.topic.clone();
+            let topic_setter = ch.topic_setter.clone();
+            let topic_time = ch.topic_time;
+            drop(ch);
+            if !catch_up {
+                continue;
+            }
+            let realname = match state.clients.get(client_id) {
+                Some(c) => c
+                    .read()
+                    .await
+                    .realname
+                    .clone()
+                    .unwrap_or_else(|| "*".to_string()),
+                None => "*".to_string(),
+            };
+            let join_msg = if client_caps.contains("extended-join") {
+                Message::new(
+                    "JOIN",
+                    vec![
+                        ch_key.clone(),
+                        account.clone().unwrap_or_else(|| "*".to_string()),
+                        realname,
+                    ],
+                )
+                .with_prefix(&source)
+            } else {
+                Message::new("JOIN", vec![ch_key.clone()]).with_prefix(&source)
+            };
+            reply_self!(join_msg);
+            if let Some(ref topic_str) = topic {
+                reply_self!(Message::new(
+                    "332",
+                    vec![nick.clone(), ch_key.clone(), topic_str.clone()],
+                )
+                .with_prefix(&cfg.server.name));
+                reply_self!(Message::new(
+                    "333",
+                    vec![
+                        nick.clone(),
+                        ch_key.clone(),
+                        topic_setter.as_deref().unwrap_or("*").to_string(),
+                        topic_time.unwrap_or(0).to_string(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name));
+            }
+            if !client_caps.contains("no-implicit-names") {
+                if let Some(ch_ref) = ch_store.channels.get(&ch_key) {
+                    send_names_for_channel(
+                        ch_ref,
+                        &ch_key,
+                        &nick,
+                        &state,
+                        &senders,
+                        client_id,
+                        &cfg.server.name,
+                        &client_caps,
+                        label,
+                        batch_ref,
+                    )
+                    .await;
+                }
+            }
             continue;
         }
 
@@ -254,7 +324,7 @@ async fn handle_join_inner(
         }
 
         if ch.modes.invite_only
-            && !ch.invite_list.contains(client_id)
+            && !ch.invite_list.contains(&user_id)
             && !ch.is_invite_exempt(account.as_deref(), &source)
         {
             reply_self!(Message::new(
@@ -1957,7 +2027,7 @@ pub async fn handle_topic(
         let mut ch = ch.write().await;
         let is_op = ch
             .members
-            .get(client_id)
+            .get(&state.user_id(client_id))
             .map(|m| m.modes.op)
             .unwrap_or(false);
 
@@ -2148,7 +2218,7 @@ pub async fn handle_kick(
         let mut ch = ch.write().await;
         let is_op = ch
             .members
-            .get(client_id)
+            .get(&state.user_id(client_id))
             .map(|m| m.modes.op)
             .unwrap_or(false);
         if !is_op {
@@ -2305,7 +2375,7 @@ pub async fn handle_invite(
 
         let is_op = ch
             .members
-            .get(client_id)
+            .get(&state.user_id(client_id))
             .map(|m| m.modes.op)
             .unwrap_or(false);
         if !is_op {
@@ -2531,14 +2601,9 @@ pub async fn handle_rename(
     };
     let (is_member, is_op, member_ids, topic, topic_setter, topic_time) = {
         let ch = ch_ref.read().await;
-        let is_member = ch
-            .members
-            .contains_key(&state.read().await.user_id(client_id));
-        let is_op = ch
-            .members
-            .get(client_id)
-            .map(|m| m.modes.op)
-            .unwrap_or(false);
+        let uid = state.read().await.user_id(client_id);
+        let is_member = ch.members.contains_key(&uid);
+        let is_op = ch.members.get(&uid).map(|m| m.modes.op).unwrap_or(false);
         let member_ids: Vec<String> = ch.members.keys().cloned().collect();
         (
             is_member,
