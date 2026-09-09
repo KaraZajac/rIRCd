@@ -290,7 +290,7 @@ pub async fn handle_links(
                 nick.clone(),
                 s.to_string(),
                 s.to_string(),
-                format!("0 rIRCd v{}", env!("CARGO_PKG_VERSION")),
+                format!("0 {}", cfg.server.description),
             ],
         )
         .with_prefix(s),

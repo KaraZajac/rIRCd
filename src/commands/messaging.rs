@@ -989,6 +989,17 @@ pub(crate) const MULTILINE_MAX_BYTES: usize = 4096;
 pub(crate) const MULTILINE_MAX_LINES: usize = 20;
 
 /// Deliver a completed draft/multiline batch: validate, then send as batch to capable clients or as separate lines to others.
+/// A multiline batch as a client that cannot receive one should see it: the
+/// lines as separate messages, minus the blank ones. A blank line separates
+/// paragraphs within the batch and has nothing to say on its own.
+fn flatten_multiline(lines: &[(bool, String)]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|(_, text)| text.clone())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
 pub async fn deliver_multiline_batch(
     client_id: &str,
     batch: PendingMultilineBatch,
@@ -1007,7 +1018,6 @@ pub async fn deliver_multiline_batch(
                 vec![
                     "BATCH".into(),
                     "MULTILINE_INVALID".into(),
-                    "*".into(),
                     "Invalid multiline batch with blank lines only".into(),
                 ],
             )
@@ -1148,6 +1158,10 @@ pub async fn deliver_multiline_batch(
         ],
     )
     .with_prefix(&cfg.server.name);
+    let batch_tags = batch.tags.clone();
+    // One message, so one timestamp: every line a client sees, batched or
+    // flattened, carries the time the message was sent.
+    let batch_time = crate::protocol::server_time_now();
 
     drop(state_guard);
 
@@ -1170,7 +1184,23 @@ pub async fn deliver_multiline_batch(
         let has_multiline = caps.contains("draft/multiline");
 
         if has_multiline {
-            send_to_client(&senders, mid, batch_start.clone()).await;
+            // draft/multiline: one message split over several lines, so the
+            // msgid, time and client-only tags belong to the batch as a whole
+            // and are attached to its opening message, not to each line.
+            let mut start = batch_start.clone();
+            start
+                .tags
+                .insert("time".to_string(), Some(batch_time.clone()));
+            let tagged_start = add_tags_for_recipient(
+                start,
+                &caps,
+                sender_account.as_deref(),
+                Some(&msgid),
+                Some(&batch_tags),
+                cfg.server.client_tag_deny.as_deref(),
+                &sender_tags,
+            );
+            send_to_client(&senders, mid, tagged_start).await;
             for (concat, text) in &batch.lines {
                 let mut line_msg = Message::new(
                     batch.command.clone(),
@@ -1185,33 +1215,30 @@ pub async fn deliver_multiline_batch(
                         .tags
                         .insert("draft/multiline-concat".to_string(), None);
                 }
-                let tagged = add_tags_for_recipient(
-                    line_msg,
-                    &caps,
-                    sender_account.as_deref(),
-                    Some(&msgid),
-                    None,
-                    cfg.server.client_tag_deny.as_deref(),
-                    &sender_tags,
-                );
-                send_to_client(&senders, mid, tagged).await;
+                send_to_client(&senders, mid, line_msg).await;
             }
             let batch_end = Message::new("BATCH", vec![format!("-{}", batch.ref_tag)])
                 .with_prefix(&cfg.server.name);
             send_to_client(&senders, mid, batch_end).await;
         } else {
-            for (_, text) in &batch.lines {
-                let line_msg = Message::new(
+            for (i, text) in flatten_multiline(&batch.lines).iter().enumerate() {
+                let mut line_msg = Message::new(
                     batch.command.clone(),
                     vec![batch.target.clone(), text.clone()],
                 )
                 .with_prefix(&source);
+                line_msg
+                    .tags
+                    .insert("time".to_string(), Some(batch_time.clone()));
+                // The msgid identifies the message, which was sent once: it goes
+                // on the first line only, not on each fragment.
+                let line_msgid = if i == 0 { Some(msgid.as_str()) } else { None };
                 let tagged = add_tags_for_recipient(
                     line_msg,
                     &caps,
                     sender_account.as_deref(),
-                    Some(&msgid),
-                    None,
+                    line_msgid,
+                    Some(&batch_tags),
                     cfg.server.client_tag_deny.as_deref(),
                     &sender_tags,
                 );
@@ -1231,6 +1258,8 @@ pub async fn deliver_multiline_batch(
             }
         };
         let has_multiline = sender_caps.contains("draft/multiline");
+        // The label came in on the opening BATCH, not the closing one.
+        let label = batch.label.as_deref().or(label);
         if has_multiline {
             let echo_batch_start = Message::new(
                 "BATCH",
@@ -1241,7 +1270,20 @@ pub async fn deliver_multiline_batch(
                 ],
             )
             .with_prefix(&cfg.server.name);
-            reply_to_client(&senders, client_id, echo_batch_start, label).await;
+            let mut echo_batch_start = echo_batch_start;
+            echo_batch_start
+                .tags
+                .insert("time".to_string(), Some(batch_time.clone()));
+            let tagged_start = add_tags_for_recipient(
+                echo_batch_start,
+                &sender_caps,
+                sender_account.as_deref(),
+                Some(&msgid),
+                Some(&batch_tags),
+                cfg.server.client_tag_deny.as_deref(),
+                &sender_tags,
+            );
+            reply_to_client(&senders, client_id, tagged_start, label).await;
             for (concat, text) in &batch.lines {
                 let mut line_msg = Message::new(
                     batch.command.clone(),
@@ -1256,33 +1298,28 @@ pub async fn deliver_multiline_batch(
                         .tags
                         .insert("draft/multiline-concat".to_string(), None);
                 }
-                let tagged = add_tags_for_recipient(
-                    line_msg,
-                    &sender_caps,
-                    sender_account.as_deref(),
-                    Some(&msgid),
-                    None,
-                    cfg.server.client_tag_deny.as_deref(),
-                    &sender_tags,
-                );
-                reply_to_client(&senders, client_id, tagged, label).await;
+                send_to_client(&senders, client_id, line_msg).await;
             }
             let batch_end = Message::new("BATCH", vec![format!("-{}", batch.ref_tag)])
                 .with_prefix(&cfg.server.name);
-            reply_to_client(&senders, client_id, batch_end, label).await;
+            send_to_client(&senders, client_id, batch_end).await;
         } else {
-            for (_, text) in &batch.lines {
-                let line_msg = Message::new(
+            for (i, text) in flatten_multiline(&batch.lines).iter().enumerate() {
+                let mut line_msg = Message::new(
                     batch.command.clone(),
                     vec![batch.target.clone(), text.clone()],
                 )
                 .with_prefix(&source);
+                line_msg
+                    .tags
+                    .insert("time".to_string(), Some(batch_time.clone()));
+                let line_msgid = if i == 0 { Some(msgid.as_str()) } else { None };
                 let tagged = add_tags_for_recipient(
                     line_msg,
                     &sender_caps,
                     sender_account.as_deref(),
-                    Some(&msgid),
-                    None,
+                    line_msgid,
+                    Some(&batch_tags),
                     cfg.server.client_tag_deny.as_deref(),
                     &sender_tags,
                 );

@@ -1,7 +1,7 @@
 use crate::channel::{
     canonical_channel_key, Channel, ChannelMemberModeSet, ChannelMembership, ChannelStore,
 };
-use crate::commands::reply_to_client;
+use crate::commands::{end_labeled_batch, reply_in_batch, reply_to_client, start_labeled_batch};
 use crate::config::Config;
 use crate::protocol::{add_batch_tag, generate_msgid, Message};
 use crate::user::{Senders, ServerState};
@@ -23,6 +23,9 @@ async fn send_to_client(senders: &Senders, client_id: &str, msg: Message) {
     }
 }
 
+/// JOIN answers with several messages — the JOIN itself, the topic, the names —
+/// so a labeled JOIN needs them wrapped in a labeled-response batch rather than
+/// each carrying the label on its own.
 pub async fn handle_join(
     client_id: &str,
     msg: Message,
@@ -32,33 +35,78 @@ pub async fn handle_join(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
+    let wants_batch = match label {
+        Some(_) => match state.read().await.clients.get(client_id) {
+            Some(c) => c.read().await.has_cap("batch"),
+            None => false,
+        },
+        None => false,
+    };
+    let batch_ref = match (label, wants_batch) {
+        (Some(l), true) => {
+            Some(start_labeled_batch(&senders, client_id, l, &cfg.server.name).await)
+        }
+        _ => None,
+    };
+
+    let result = handle_join_inner(
+        client_id,
+        msg,
+        state,
+        channels,
+        senders.clone(),
+        cfg,
+        label,
+        batch_ref.as_deref(),
+    )
+    .await;
+
+    if let Some(ref br) = batch_ref {
+        end_labeled_batch(&senders, client_id, br, &cfg.server.name).await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_join_inner(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+    batch_ref: Option<&str>,
+) -> anyhow::Result<()> {
+    // Every message the joining client gets belongs to its JOIN, so each is
+    // tagged into the batch when there is one.
+    macro_rules! reply_self {
+        ($msg:expr) => {
+            match batch_ref {
+                Some(br) => reply_in_batch(&senders, client_id, $msg, br).await,
+                None => reply_to_client(&senders, client_id, $msg, label).await,
+            }
+        };
+    }
     let state_arc = state.clone();
     let state = state.read().await;
     let client = match state.clients.get(client_id) {
         Some(c) => c.clone(),
         None => {
-            reply_to_client(
-                &senders,
-                client_id,
+            reply_self!(
                 Message::new("451", vec!["*".into(), "You have not registered".into()])
-                    .with_prefix(&cfg.server.name),
-                label,
-            )
-            .await;
+                    .with_prefix(&cfg.server.name)
+            );
             return Ok(());
         }
     };
 
     let ch_names = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     if ch_names.is_empty() {
-        reply_to_client(
-            &senders,
-            client_id,
+        reply_self!(
             Message::new("461", vec!["JOIN".into(), "Not enough parameters".into()])
-                .with_prefix(&cfg.server.name),
-            label,
-        )
-        .await;
+                .with_prefix(&cfg.server.name)
+        );
         return Ok(());
     }
 
@@ -129,17 +177,11 @@ pub async fn handle_join(
             || ch_name.contains('\x07')
             || ch_name.contains('\x00')
         {
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new(
-                    "403",
-                    vec![nick.clone(), ch_name.to_string(), "No such channel".into()],
-                )
-                .with_prefix(&cfg.server.name),
-                label,
+            reply_self!(Message::new(
+                "403",
+                vec![nick.clone(), ch_name.to_string(), "No such channel".into()],
             )
-            .await;
+            .with_prefix(&cfg.server.name));
             continue;
         }
         let provided_key = keys.get(ch_idx).copied().unwrap_or("");
@@ -154,21 +196,15 @@ pub async fn handle_join(
                 Some(c) => c.read().await.nick_or_id().to_string(),
                 None => return Ok(()),
             };
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new(
-                    "405",
-                    vec![
-                        nick,
-                        ch_name.to_string(),
-                        "You have joined too many channels".into(),
-                    ],
-                )
-                .with_prefix(&cfg.server.name),
-                label,
+            reply_self!(Message::new(
+                "405",
+                vec![
+                    nick,
+                    ch_name.to_string(),
+                    "You have joined too many channels".into(),
+                ],
             )
-            .await;
+            .with_prefix(&cfg.server.name));
             continue;
         }
 
@@ -188,40 +224,28 @@ pub async fn handle_join(
         if ch.is_banned(account.as_deref(), &source)
             && !ch.is_ban_exempt(account.as_deref(), &source)
         {
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new(
-                    "474",
-                    vec![
-                        nick.clone(),
-                        ch_name.to_string(),
-                        "Cannot join channel (+b)".into(),
-                    ],
-                )
-                .with_prefix(&cfg.server.name),
-                label,
+            reply_self!(Message::new(
+                "474",
+                vec![
+                    nick.clone(),
+                    ch_name.to_string(),
+                    "Cannot join channel (+b)".into(),
+                ],
             )
-            .await;
+            .with_prefix(&cfg.server.name));
             continue;
         }
 
         if ch.modes.registered_only && account.is_none() {
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new(
-                    "477",
-                    vec![
-                        nick.clone(),
-                        ch_name.to_string(),
-                        "Cannot join channel (+R) - you must be registered".into(),
-                    ],
-                )
-                .with_prefix(&cfg.server.name),
-                label,
+            reply_self!(Message::new(
+                "477",
+                vec![
+                    nick.clone(),
+                    ch_name.to_string(),
+                    "Cannot join channel (+R) - you must be registered".into(),
+                ],
             )
-            .await;
+            .with_prefix(&cfg.server.name));
             continue;
         }
 
@@ -229,63 +253,45 @@ pub async fn handle_join(
             && !ch.invite_list.contains(client_id)
             && !ch.is_invite_exempt(account.as_deref(), &source)
         {
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new(
-                    "473",
-                    vec![
-                        nick.clone(),
-                        ch_name.to_string(),
-                        "Cannot join channel (+i)".into(),
-                    ],
-                )
-                .with_prefix(&cfg.server.name),
-                label,
+            reply_self!(Message::new(
+                "473",
+                vec![
+                    nick.clone(),
+                    ch_name.to_string(),
+                    "Cannot join channel (+i)".into(),
+                ],
             )
-            .await;
+            .with_prefix(&cfg.server.name));
             continue;
         }
 
         if let Some(ref key) = ch.key {
             // Constant-time comparison to prevent timing attacks on channel keys
             if !ct_eq(provided_key.as_bytes(), key.as_bytes()) {
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    Message::new(
-                        "475",
-                        vec![
-                            nick.clone(),
-                            ch_name.to_string(),
-                            "Cannot join channel (+k)".into(),
-                        ],
-                    )
-                    .with_prefix(&cfg.server.name),
-                    label,
+                reply_self!(Message::new(
+                    "475",
+                    vec![
+                        nick.clone(),
+                        ch_name.to_string(),
+                        "Cannot join channel (+k)".into(),
+                    ],
                 )
-                .await;
+                .with_prefix(&cfg.server.name));
                 continue;
             }
         }
 
         if let Some(limit) = ch.modes.user_limit {
             if ch.member_count() >= limit as usize {
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    Message::new(
-                        "471",
-                        vec![
-                            nick.clone(),
-                            ch_name.to_string(),
-                            "Cannot join channel (+l)".into(),
-                        ],
-                    )
-                    .with_prefix(&cfg.server.name),
-                    label,
+                reply_self!(Message::new(
+                    "471",
+                    vec![
+                        nick.clone(),
+                        ch_name.to_string(),
+                        "Cannot join channel (+l)".into(),
+                    ],
                 )
-                .await;
+                .with_prefix(&cfg.server.name));
                 continue;
             }
         }
@@ -373,7 +379,11 @@ pub async fn handle_join(
             } else {
                 Message::new("JOIN", vec![ch_key.clone()]).with_prefix(&source)
             };
-            if let Some(tx) = senders.read().await.get(mid) {
+            // The joining client's own copy is part of the answer to its JOIN,
+            // so it goes inside the labeled batch; everyone else's does not.
+            if mid == client_id {
+                reply_self!(join_msg);
+            } else if let Some(tx) = senders.read().await.get(mid) {
                 tx.send(join_msg);
             }
         }
@@ -409,28 +419,18 @@ pub async fn handle_join(
         }
 
         if let Some(ref topic_str) = topic {
-            reply_to_client(
-                &senders,
-                client_id,
+            reply_self!(
                 Message::new("332", vec![nick.clone(), ch_key.clone(), topic_str.clone()])
-                    .with_prefix(&cfg.server.name),
-                label,
-            )
-            .await;
+                    .with_prefix(&cfg.server.name)
+            );
             // 333 RPL_TOPICWHOTIME
             let setter = topic_setter.as_deref().unwrap_or("*");
             let time_str = topic_time.unwrap_or(0).to_string();
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new(
-                    "333",
-                    vec![nick.clone(), ch_key.clone(), setter.to_string(), time_str],
-                )
-                .with_prefix(&cfg.server.name),
-                label,
+            reply_self!(Message::new(
+                "333",
+                vec![nick.clone(), ch_key.clone(), setter.to_string(), time_str],
             )
-            .await;
+            .with_prefix(&cfg.server.name));
         }
         // draft/read-marker: the marker has to reach the client before
         // RPL_ENDOFNAMES, so it is sent ahead of the NAMES burst.
@@ -448,7 +448,7 @@ pub async fn handle_join(
             };
             let m = Message::new("MARKREAD", vec![ch_key.clone(), ts_param])
                 .with_prefix(&cfg.server.name);
-            send_to_client(&senders, client_id, m).await;
+            reply_self!(m);
         }
 
         // no-implicit-names: send NAMES to joining user unless they have the cap
@@ -464,6 +464,7 @@ pub async fn handle_join(
                     &cfg.server.name,
                     &client_caps,
                     label,
+                    batch_ref,
                 )
                 .await;
             }
@@ -697,6 +698,7 @@ pub async fn handle_names(
                 &cfg.server.name,
                 &client_caps,
                 label,
+                None,
             )
             .await;
         }
@@ -715,6 +717,26 @@ pub async fn handle_names(
                 client_id,
                 &cfg.server.name,
                 &client_caps,
+                label,
+                None,
+            )
+            .await;
+        } else {
+            // "If the channel name is invalid or the channel does not exist,
+            // one RPL_ENDOFNAMES containing the given channel name should be
+            // returned" — Modern §names-message. There is no error reply.
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "366",
+                    vec![
+                        nick.clone(),
+                        ch_name.to_string(),
+                        "End of /NAMES list".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
                 label,
             )
             .await;
@@ -735,6 +757,7 @@ async fn send_names_for_channel(
     server: &str,
     client_caps: &std::collections::HashSet<String>,
     label: Option<&str>,
+    parent_batch: Option<&str>,
 ) {
     let ch = ch.read().await;
     // Report the channel under its own name rather than the case-folded key.
@@ -782,7 +805,12 @@ async fn send_names_for_channel(
         let msg = add_batch_tag(
             Message::new(
                 "353",
-                vec![nick.into(), chan_prefix.into(), ch_name.into(), names_str],
+                vec![
+                    nick.into(),
+                    chan_prefix.into(),
+                    ch_name.into(),
+                    names_str.clone(),
+                ],
             )
             .with_prefix(server),
             &batch_ref,
@@ -795,11 +823,60 @@ async fn send_names_for_channel(
             .with_prefix(server),
             &batch_ref,
         );
-        // labeled-response: label goes only on the BATCH start, not inner messages
-        reply_to_client(senders, client_id, batch_start, label).await;
-        reply_to_client(senders, client_id, msg, None).await;
-        reply_to_client(senders, client_id, end_msg, None).await;
-        reply_to_client(senders, client_id, batch_end, None).await;
+        // labeled-response: the label goes on the BATCH start, not on the
+        // messages inside it. When this batch is itself inside one — a JOIN's
+        // labeled response — it is the nesting that ties it to the command, so
+        // its opening and closing lines carry the parent's reference instead.
+        match parent_batch {
+            // Inside another batch — a JOIN's labeled response — these are just
+            // more of that answer, so they join it directly. A batch of their
+            // own would put them one level down, where a client reading the
+            // labeled response does not look for them.
+            Some(parent) => {
+                let names = Message::new(
+                    "353",
+                    vec![
+                        nick.into(),
+                        chan_prefix.into(),
+                        ch_name.into(),
+                        names_str.clone(),
+                    ],
+                )
+                .with_prefix(server);
+                let end = Message::new(
+                    "366",
+                    vec![nick.into(), ch_name.into(), "End of /NAMES list".into()],
+                )
+                .with_prefix(server);
+                reply_in_batch(senders, client_id, names, parent).await;
+                reply_in_batch(senders, client_id, end, parent).await;
+            }
+            None => {
+                reply_to_client(senders, client_id, batch_start, label).await;
+                reply_to_client(senders, client_id, msg, None).await;
+                reply_to_client(senders, client_id, end_msg, None).await;
+                reply_to_client(senders, client_id, batch_end, None).await;
+            }
+        }
+    } else if let Some(parent) = parent_batch {
+        // Already inside the caller's labeled response; these belong to it.
+        let names = Message::new(
+            "353",
+            vec![
+                nick.into(),
+                chan_prefix.into(),
+                ch_name.into(),
+                names_str.clone(),
+            ],
+        )
+        .with_prefix(server);
+        let end = Message::new(
+            "366",
+            vec![nick.into(), ch_name.into(), "End of /NAMES list".into()],
+        )
+        .with_prefix(server);
+        reply_in_batch(senders, client_id, names, parent).await;
+        reply_in_batch(senders, client_id, end, parent).await;
     } else if label.is_some() {
         // labeled-response: wrap in labeled-response batch for multi-message reply
         let lr_ref =
@@ -2183,8 +2260,31 @@ pub async fn handle_invite(
             tracing::debug!(client_id, channel = %ch_name, target = %target_nick, "INVITE");
             let invite_msg = Message::new("INVITE", vec![target_nick.into(), ch_name.into()])
                 .with_prefix(&source);
+            // An INVITE is a message from a user, so it carries the sender's
+            // tags — account-tag among them — like any other.
+            let inviter_account = state
+                .clients
+                .get(client_id)
+                .map(|c| async { c.read().await.account.clone() });
+            let inviter_account = match inviter_account {
+                Some(f) => f.await,
+                None => None,
+            };
+            let target_caps = match state.clients.get(target_id) {
+                Some(c) => c.read().await.capabilities.clone(),
+                None => Default::default(),
+            };
+            let tagged_invite = crate::protocol::add_tags_for_recipient(
+                invite_msg.clone(),
+                &target_caps,
+                inviter_account.as_deref(),
+                None,
+                None,
+                cfg.server.client_tag_deny.as_deref(),
+                &crate::protocol::SenderTags::default(),
+            );
             if let Some(tx) = senders.read().await.get(target_id) {
-                tx.send(invite_msg.clone());
+                tx.send(tagged_invite);
             }
             reply_to_client(
                 &senders,
@@ -2520,6 +2620,7 @@ pub async fn handle_rename(
                     &cfg.server.name,
                     &caps,
                     label,
+                    None,
                 )
                 .await;
             }

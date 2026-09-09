@@ -107,6 +107,8 @@ listen = [{listen}]
 listen_tls = [{listen_tls}]
 listen_ws = [{listen_ws}]
 motd = "irctest"
+description = "test server"
+register_before_connect = {register_before_connect}
 # irctest asserts on exact 005 values, and a cloak would change the host
 # halfway through registration.
 nick_protection = {nick_protection}
@@ -136,10 +138,8 @@ flood_rate = 1000.0
 # Several tests register accounts with passwords like "bar"; they are checking
 # SASL, not our password policy.
 min_password_length = 1
-# Some tests register accounts with passwords hundreds of bytes long, which do
-# not fit a 512-byte line.
-max_line_length = 2048
 {tls_section}
+{email_section}
 [[opers]]
 name = "{oper_name}"
 hostmask = "*"
@@ -249,6 +249,19 @@ class RircdController(BaseServerController, DirectoryBasedController):
                 listen_tls=listen_tls,
                 listen_ws=listen_ws,
                 nick_protection="true" if run_services else "false",
+                register_before_connect=(
+                    "false"
+                    if self.test_config.account_registration_before_connect is False
+                    else "true"
+                ),
+                # Only the capability value and REGISTER's answer are under test,
+                # so the address this points at never has to accept mail.
+                email_section=(
+                    '[email]\nsmtp_host = "127.0.0.1"\nsmtp_port = 1\n'
+                    'encryption = "none"\nfrom = "irctest <noreply@example.com>"\n'
+                    if self.test_config.account_registration_requires_email
+                    else ""
+                ),
                 db_host=DB_HOST,
                 db_port=DB_PORT,
                 db_user=DB_USER,

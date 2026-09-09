@@ -50,7 +50,7 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// only to clients that enabled the capability.
 fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=U EXCEPTS INVEX UTF8ONLY WHOX BOT=B EXTBAN=~,a ACCOUNTEXTBAN=~a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1 METADATA=50{}", network, linelen = cfg.limits.max_line_length);
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=U EXCEPTS INVEX UTF8ONLY WHOX BOT=B EXTBAN=~,a ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:1,NOTICE:1,KICK:1 METADATA=50{}", network, linelen = cfg.limits.max_line_length);
     let deny = cfg
         .server
         .client_tag_deny
@@ -796,6 +796,14 @@ pub async fn handle_nick(
         }
     }
 
+    // Changing to the nick you already have, spelling and all, changes nothing:
+    // no echo, and nothing for anyone else to hear about.
+    if let Some(client) = state_guard.clients.get(client_id) {
+        if client.read().await.nick.as_deref() == Some(nick.as_str()) {
+            return Ok(());
+        }
+    }
+
     if let Some(client) = state_guard.clients.get(client_id) {
         let client_guard = client.write().await;
         if client_guard.registered {
@@ -862,7 +870,12 @@ pub async fn handle_nick(
             state_guard
                 .nick_to_id
                 .insert(nick.to_uppercase(), client_id.to_string());
-            // monitor: 731 to watchers of old nick, 730 to watchers of new nick
+            // monitor: 731 to watchers of old nick, 730 to watchers of new nick.
+            // A change of case is the same nick, so nobody went offline or came
+            // online and there is nothing to report.
+            let case_change_only = old_nick
+                .as_deref()
+                .is_some_and(|old| old.eq_ignore_ascii_case(&nick));
             let watchers_old: Vec<String> = state_guard
                 .monitor_watchers
                 .by_nick
@@ -888,7 +901,7 @@ pub async fn handle_nick(
                 None => nick.clone(),
             };
             for w in &watchers_old {
-                if *w == client_id {
+                if *w == client_id || case_change_only {
                     continue;
                 }
                 let client_arc = state.read().await.clients.get(w).cloned();
@@ -904,7 +917,7 @@ pub async fn handle_nick(
                 send_to_client(&senders, w, m).await;
             }
             for w in &watchers_new {
-                if *w == client_id {
+                if *w == client_id || case_change_only {
                     continue;
                 }
                 let client_arc = state.read().await.clients.get(w).cloned();
@@ -919,7 +932,9 @@ pub async fn handle_nick(
 
             // Broadcast NICK change to channel members (and self)
             let nick_msg = Message::new("NICK", vec![nick.clone()]).with_prefix(&old_source);
-            send_to_client(&senders, client_id, nick_msg.clone()).await;
+            // The sender's own copy is the answer to their NICK, so it carries
+            // the label; the copies other members see do not.
+            reply_to_client(&senders, client_id, nick_msg.clone(), label).await;
             let channel_names: Vec<String> = match state.read().await.clients.get(client_id) {
                 Some(c) => c.read().await.channels.keys().cloned().collect(),
                 None => Vec::new(),
@@ -949,6 +964,14 @@ pub async fn handle_nick(
 
     let nick_taken = state_guard.nick_to_id.contains_key(&nick.to_uppercase());
     if nick_taken {
+        // Remember what was asked for: REGISTER needs to tell someone trying to
+        // claim a nick in use that the account is taken, not that they gave no
+        // nick at all.
+        // The pending entry may not exist yet if NICK is the first thing sent.
+        if !state_guard.clients.contains_key(client_id) {
+            let conn = state_guard.get_or_create_pending(client_id, host);
+            conn.nick_in_use = Some(nick.clone());
+        }
         reply_to_client(
             &senders,
             client_id,
@@ -1022,7 +1045,24 @@ pub async fn handle_user(
     }
 
     let user = msg.params.first().cloned().unwrap_or_else(|| "user".into());
-    let realname = msg.trailing().unwrap_or("").to_string();
+    // USER takes four parameters, the last being the real name. Fewer than that,
+    // or an empty real name, is not a usable registration.
+    let realname = msg.params.get(3).cloned().unwrap_or_default();
+    if msg.params.len() < 4 || realname.is_empty() {
+        drop(state_guard);
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "461",
+                vec!["*".into(), "USER".into(), "Not enough parameters".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
 
     let conn = state_guard.get_or_create_pending(client_id, host);
     conn.user = Some(user);
@@ -2000,13 +2040,19 @@ pub async fn handle_authenticate(
 
     // RFC 4616: message = [authzid] UTF8NUL authcid UTF8NUL passwd → exactly 3 parts
     let parts: Vec<&str> = decoded.splitn(3, '\0').collect();
-    let nick: String = state
-        .read()
-        .await
-        .pending
-        .get(client_id)
-        .and_then(|c| c.nick.clone())
-        .unwrap_or_else(|| "*".to_string());
+    // A client authenticating after registration has no pending entry, and its
+    // nick is what the numerics and the ACCOUNT notification are addressed to.
+    let nick: String = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => state_r
+                .pending
+                .get(client_id)
+                .and_then(|c| c.nick.clone())
+                .unwrap_or_else(|| "*".to_string()),
+        }
+    };
 
     if parts.len() != 3 {
         tracing::info!(client_id = %client_id, parts_len = parts.len(), "SASL AUTHENTICATE: malformed PLAIN (expected 3 NUL-separated parts), sending 904");
@@ -2702,6 +2748,16 @@ pub async fn handle_oper(
                     label,
                 )
                 .await;
+                // Becoming an operator is a user mode change, and clients track
+                // their modes from MODE rather than from the numeric.
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("MODE", vec![oper_nick.clone(), "+o".into()])
+                        .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
             } else {
                 reply_to_client(
                     &senders,
@@ -2876,6 +2932,36 @@ pub async fn handle_register(
             return Ok(());
         }
     };
+    // before-connect: registering mid-handshake is optional, and the capability
+    // only advertises it when it is allowed. Refuse it otherwise rather than
+    // letting it through unannounced.
+    if !cfg.server.register_before_connect && !state.read().await.clients.contains_key(client_id) {
+        let nick = state
+            .read()
+            .await
+            .pending
+            .get(client_id)
+            .and_then(|c| c.nick.clone())
+            .unwrap_or_else(|| "*".to_string());
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "REGISTER".into(),
+                    "COMPLETE_CONNECTION_REQUIRED".into(),
+                    nick,
+                    "Finish connecting before registering an account".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
     let account = {
         // before-connect: a client may register before it finishes connecting, so
         // read the nick and account from the pending connection in that case.
@@ -2891,6 +2977,34 @@ pub async fn handle_register(
             }
         };
         if nick.is_empty() {
+            // The nick they asked for belongs to someone: the account name they
+            // would register is taken too.
+            let wanted = {
+                let state_r = state.read().await;
+                state_r
+                    .pending
+                    .get(client_id)
+                    .and_then(|c| c.nick_in_use.clone())
+            };
+            if let Some(wanted) = wanted {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "REGISTER".into(),
+                            "ACCOUNT_EXISTS".into(),
+                            wanted,
+                            "That nickname is already in use".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
             reply_to_client(
                 &senders,
                 client_id,

@@ -84,17 +84,21 @@ pub fn build_cap_list(cfg: &Config, version_302: bool, client_is_tls: bool) -> V
     // email-required: [email] is configured, so REGISTER needs a mailable address.
     // The advertised minimum is the one REGISTER actually enforces, so a client
     // is never told a password is acceptable and then refused.
-    let account_registration = if cfg.email.is_some() {
-        format!(
-            "draft/account-registration=before-connect,email-required,min-password-length={}",
-            cfg.limits.min_password_length
-        )
-    } else {
-        format!(
-            "draft/account-registration=before-connect,min-password-length={}",
-            cfg.limits.min_password_length
-        )
-    };
+    let mut registration_values: Vec<String> = Vec::new();
+    if cfg.server.register_before_connect {
+        registration_values.push("before-connect".into());
+    }
+    if cfg.email.is_some() {
+        registration_values.push("email-required".into());
+    }
+    registration_values.push(format!(
+        "min-password-length={}",
+        cfg.limits.min_password_length
+    ));
+    let account_registration = format!(
+        "draft/account-registration={}",
+        registration_values.join(",")
+    );
 
     let caps: Vec<String> = CAPS
         .iter()
@@ -114,6 +118,16 @@ pub fn build_cap_list(cfg: &Config, version_302: bool, client_is_tls: bool) -> V
             "sts" if client_is_tls => "sts=duration=2592000".to_string(),
             "sts" => format!("sts=port={}", tls_port.unwrap_or(6697)),
             _ => c.to_string(),
+        })
+        // "If a client has not indicated support for CAP LS 302 features, the
+        // server MUST NOT send these new features to the client" — a 3.1 client
+        // gets bare names, without the values 3.2 introduced.
+        .map(|c| {
+            if version_302 {
+                c
+            } else {
+                c.split('=').next().unwrap_or(&c).to_string()
+            }
         })
         .collect();
 

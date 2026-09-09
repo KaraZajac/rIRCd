@@ -176,6 +176,10 @@ pub struct PendingConnection {
     pub sasl_scram: Option<ScramServerState>,
     /// True if this connection is over TLS
     pub is_tls: bool,
+    /// A nick this connection asked for and was refused because someone else
+    /// holds it. REGISTER uses it to say the account is taken rather than that
+    /// no nick was given.
+    pub nick_in_use: Option<String>,
 }
 
 impl PendingConnection {
@@ -197,6 +201,7 @@ impl PendingConnection {
             sasl_mechanism: None,
             sasl_scram: None,
             is_tls: false,
+            nick_in_use: None,
         }
     }
 
@@ -447,6 +452,12 @@ pub struct PendingMultilineBatch {
     pub target: String,
     pub command: String,
     pub lines: Vec<(bool, String)>,
+    /// The label from the opening BATCH. The whole response belongs to that
+    /// command, but it is only delivered when the closing BATCH arrives.
+    pub label: Option<String>,
+    /// Client-only tags from the opening BATCH. They describe the message as a
+    /// whole, so they are relayed on its opening line.
+    pub tags: HashMap<String, Option<String>>,
 }
 
 /// In-flight draft/client-batch for one client

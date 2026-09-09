@@ -159,6 +159,26 @@ pub fn build_tls_acceptor(cfg: &Config) -> anyhow::Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(cfg_tls)))
 }
 
+/// The subprotocols we support, in the order the client asked for them.
+fn supported_ws_protocols(headers: &axum::http::HeaderMap) -> Vec<String> {
+    const SUPPORTED: &[&str] = &["text.ircv3.net", "binary.ircv3.net"];
+    let offered: Vec<String> = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| SUPPORTED.contains(&p.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if offered.is_empty() {
+        SUPPORTED.iter().map(|s| s.to_string()).collect()
+    } else {
+        offered
+    }
+}
+
 pub async fn run(
     mut cfg: Config,
     config_path: &Path,
@@ -496,7 +516,11 @@ pub async fn run(
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("unknown")
                             .to_string();
-                        ws.protocols(["text.ircv3.net", "binary.ircv3.net"])
+                        // The client lists subprotocols in its order of
+                        // preference, and that is the order to choose from:
+                        // offering ours instead would pick text for a client
+                        // that asked for binary first.
+                        ws.protocols(supported_ws_protocols(&headers))
                             .on_upgrade(move |socket| {
                                 client::handle_client_ws(
                                     socket,

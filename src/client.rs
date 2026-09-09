@@ -1,4 +1,4 @@
-use crate::protocol::{format_message, parse_message_with_limit, Message, ParseError};
+use crate::protocol::{format_message_within, parse_message_with_limit, Message, ParseError};
 use crate::server::ClientMessage;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -200,9 +200,11 @@ async fn handle_client_stream<S>(
     let (send_tx, mut send_rx) = mpsc::channel::<Message>(SEND_QUEUE);
 
     let client_id_clone = client_id.clone();
+    // Two bytes of the limit belong to the CRLF.
+    let out_line_limit = keepalive.max_line_length.saturating_sub(2);
     let mut writer_task = tokio::spawn(async move {
         while let Some(msg) = send_rx.recv().await {
-            let line = format_message(&msg);
+            let line = format_message_within(&msg, out_line_limit);
             if writer.write_all(line.as_bytes()).await.is_err() || writer.flush().await.is_err() {
                 error!("Write error for {}", client_id_clone);
                 break;
@@ -460,6 +462,13 @@ pub async fn handle_client_ws(
 ) {
     use axum::extract::ws;
 
+    // A client that negotiated binary.ircv3.net is expecting binary frames;
+    // sending it text ones leaves it decoding the wrong type.
+    let send_binary = socket
+        .protocol()
+        .and_then(|p| p.to_str().ok())
+        .is_some_and(|p| p == "binary.ircv3.net");
+
     info!("Client connected (WebSocket): {} from {}", client_id, host);
     let _slot = match limits.claim(&host) {
         Ok(slot) => slot,
@@ -512,11 +521,16 @@ pub async fn handle_client_ws(
             }
             // Write outgoing IRC messages to WebSocket as text frames (no CRLF)
             Some(msg) = send_rx.recv() => {
-                let mut line = format_message(&msg);
+                let mut line = format_message_within(&msg, keepalive.max_line_length.saturating_sub(2));
                 while line.ends_with('\n') || line.ends_with('\r') {
                     line.pop();
                 }
-                if socket.send(ws::Message::Text(line.into())).await.is_err() {
+                let frame = if send_binary {
+                    ws::Message::Binary(line.into_bytes().into())
+                } else {
+                    ws::Message::Text(line.into())
+                };
+                if socket.send(frame).await.is_err() {
                     error!("WebSocket write error for {}", client_id);
                     break;
                 }

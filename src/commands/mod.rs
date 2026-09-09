@@ -62,6 +62,8 @@ pub async fn handle_message(
                         target,
                         command: String::new(),
                         lines: Vec::new(),
+                        label: label.clone(),
+                        tags: msg.tags.clone(),
                     },
                 );
                 return Ok(());
@@ -188,7 +190,6 @@ pub async fn handle_message(
                                 vec![
                                     "BATCH".into(),
                                     "MULTILINE_INVALID".into(),
-                                    "*".into(),
                                     "Invalid multiline batch with concatenated blank line".into(),
                                 ],
                             )

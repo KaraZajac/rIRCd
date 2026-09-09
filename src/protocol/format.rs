@@ -19,6 +19,36 @@ pub fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
 }
 
 /// Format an IRC message for sending (with CRLF).
+/// Serialise a message so the line stays inside `max_line` bytes, excluding the
+/// CRLF, by shortening its final parameter.
+///
+/// A message the server relays grows: it gains a `:nick!user@host ` prefix it
+/// did not have when the sender wrote it. Without this, that growth pushes the
+/// line past the protocol limit and the peer is the one that has to deal with
+/// it — by truncating at a byte that may be mid-character, or by dropping the
+/// line entirely.
+pub fn format_message_within(msg: &Message, max_line: usize) -> String {
+    let line = format_message(msg);
+    // The limit is on the message body. Tags are counted separately (and have
+    // their own, larger limit), so a message with tags must not be cut short
+    // because of them.
+    let tag_len = if msg.tags.is_empty() {
+        0
+    } else {
+        line.find(' ').map(|i| i + 1).unwrap_or(0)
+    };
+    let body_len = line.len().saturating_sub(2 + tag_len); // without tags or CRLF
+    if body_len <= max_line || msg.params.is_empty() {
+        return line;
+    }
+    let excess = body_len - max_line;
+    let last = msg.params.len() - 1;
+    let mut shortened = msg.clone();
+    let keep = shortened.params[last].len().saturating_sub(excess);
+    shortened.params[last] = truncate_bytes(&shortened.params[last], keep).to_string();
+    format_message(&shortened)
+}
+
 pub fn format_message(msg: &Message) -> String {
     let mut out = String::new();
 
@@ -42,8 +72,17 @@ pub fn format_message(msg: &Message) -> String {
         // The last parameter needs the ':' when it holds spaces, starts with a
         // ':' of its own, or is empty — without it an empty one is not a
         // parameter at all, it is a trailing space the peer discards.
+        //
+        // For the commands whose final parameter is free-form text it is always
+        // written as trailing, whether or not this particular text happens to
+        // need it: that is how the sender wrote it, and how the length of the
+        // line is reckoned.
+        const TEXT_COMMANDS: &[&str] = &["PRIVMSG", "NOTICE"];
         if i == msg.params.len() - 1
-            && (param.contains(' ') || param.starts_with(':') || param.is_empty())
+            && (param.contains(' ')
+                || param.starts_with(':')
+                || param.is_empty()
+                || (msg.params.len() > 1 && TEXT_COMMANDS.contains(&msg.command.as_str())))
         {
             out.push(':');
         }

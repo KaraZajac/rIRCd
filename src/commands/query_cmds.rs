@@ -64,7 +64,9 @@ fn build_354_params(
             'r' => realname.to_string(),
             _ => continue,
         };
-        params.push(val);
+        // An empty parameter in the middle of a message cannot be sent, so it
+        // would silently shift every field after it. "*" is the placeholder.
+        params.push(if val.is_empty() { "*".to_string() } else { val });
     }
     params
 }
@@ -120,7 +122,8 @@ pub async fn handle_who(
 
     if target.starts_with('#') || target.starts_with('&') {
         let ch_store = channels.read().await;
-        if let Some(ch) = ch_store.channels.get(target) {
+        let ch_key = crate::channel::canonical_channel_key(target);
+        if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
             for (mid, memb) in &ch.members {
                 if let Some(c) = state.clients.get(mid) {
@@ -132,21 +135,28 @@ pub async fn handle_who(
                     };
                     let hopcount = "0";
                     let realname = c.realname.as_deref().unwrap_or("");
-                    let flags = if c.away_message.is_some() { "G" } else { "H" };
-                    let oplevel = if memb.modes.op { "@" } else { "" };
+                    let mut flags = String::from(if c.away_message.is_some() { "G" } else { "H" });
+                    if c.bot {
+                        flags.push('B');
+                    }
+                    // WHOX's oplevel field: "n/a" where a channel has no op
+                    // levels. It must not be empty — an empty parameter in the
+                    // middle of a message cannot be sent, so it would vanish
+                    // and shift every field after it.
+                    let oplevel = if memb.modes.op { "@" } else { "n/a" };
 
                     if use_whox {
                         let params = build_354_params(
                             &nick,
                             &whox_requested,
                             whox_token.as_deref(),
-                            target,
+                            &ch_key,
                             c.display_user(),
                             &c.host,
                             c.display_host(),
                             &cfg.server.name,
                             c.nick_or_id(),
-                            flags,
+                            &flags,
                             hopcount,
                             "0",
                             c.account.as_deref(),
@@ -161,7 +171,7 @@ pub async fn handle_who(
                             "352",
                             vec![
                                 nick.clone(),
-                                target.to_string(),
+                                ch_key.clone(),
                                 c.display_user().to_string(),
                                 c.display_host().to_string(),
                                 cfg.server.name.clone(),
@@ -215,10 +225,13 @@ pub async fn handle_who(
                 .collect()
         };
 
+        // +i hides a user from mask searches, not from someone who already knows
+        // the nick and asks for it directly.
+        let is_mask_query = target.contains('*') || target.contains('?');
         for target_id in &matching_ids {
             if let Some(c) = state.clients.get(target_id) {
                 let c = c.read().await;
-                if c.invisible && target_id != client_id {
+                if c.invisible && is_mask_query && target_id != client_id {
                     let shares_channel =
                         c.channels.keys().any(|ch| requester_channels.contains(ch));
                     if !shares_channel {
@@ -227,7 +240,10 @@ pub async fn handle_who(
                 }
                 let hopcount = "0";
                 let realname = c.realname.as_deref().unwrap_or("");
-                let flags = if c.away_message.is_some() { "G" } else { "H" };
+                let mut flags = String::from(if c.away_message.is_some() { "G" } else { "H" });
+                if c.bot {
+                    flags.push('B');
+                }
                 let channel = c.channels.keys().next().map(|s| s.as_str()).unwrap_or("*");
 
                 if use_whox {
@@ -241,7 +257,7 @@ pub async fn handle_who(
                         c.display_host(),
                         &cfg.server.name,
                         c.nick_or_id(),
-                        flags,
+                        &flags,
                         hopcount,
                         "0",
                         c.account.as_deref(),

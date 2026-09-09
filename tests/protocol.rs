@@ -145,3 +145,23 @@ fn empty_last_param_keeps_its_colon() {
     let parsed = parse_message("PONG irc.example.com :").expect("parses");
     assert_eq!(parsed.params, vec!["irc.example.com", ""]);
 }
+
+/// A relayed message grows by its `:nick!user@host ` prefix. If that pushes the
+/// line past the limit the server must shorten it, rather than leaving the peer
+/// to cut it at a byte that may be mid-character.
+#[test]
+fn outgoing_lines_are_kept_within_the_limit() {
+    use rircd::protocol::format_message_within;
+
+    let long = "x".repeat(500);
+    let msg = Message::new("PRIVMSG", vec!["#chan".into(), long])
+        .with_prefix("someone!user@host.example.com");
+
+    let line = format_message_within(&msg, 510);
+    assert_eq!(line.len(), 512, "510 bytes of content plus CRLF");
+    assert!(line.ends_with("\r\n"));
+
+    // A message that already fits is untouched.
+    let short = Message::new("PRIVMSG", vec!["#chan".into(), "hi".into()]).with_prefix("a!b@c");
+    assert_eq!(format_message_within(&short, 510), format_message(&short));
+}

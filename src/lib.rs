@@ -39,7 +39,13 @@ pub async fn run_server(mut cfg: Config, config_path: &Path) -> anyhow::Result<(
         .map_err(|e| {
             anyhow::anyhow!(
                 "Failed to connect to MariaDB ({}): {}",
-                url.replace(&cfg.database.password, "***"),
+                // Replacing an empty password would insert the mask between
+                // every character of the URL.
+                if cfg.database.password.is_empty() {
+                    url.clone()
+                } else {
+                    url.replace(&cfg.database.password, "***")
+                },
                 e
             )
         })?;

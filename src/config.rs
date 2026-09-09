@@ -285,6 +285,21 @@ pub struct ServerConfig {
     /// Example: "#general, #help, #dev"
     #[serde(default)]
     pub auto_join: Option<String>,
+    /// One-line description of this server, shown by LINKS.
+    #[serde(default = "default_server_description")]
+    pub description: String,
+    /// Allow REGISTER before the client has finished connecting. Advertised as
+    /// `before-connect` in the draft/account-registration capability.
+    #[serde(default = "default_register_before_connect")]
+    pub register_before_connect: bool,
+}
+
+fn default_register_before_connect() -> bool {
+    true
+}
+
+fn default_server_description() -> String {
+    format!("rIRCd v{}", env!("CARGO_PKG_VERSION"))
 }
 
 fn default_nick_protection() -> bool {
@@ -328,6 +343,8 @@ impl Default for ServerConfig {
             admin_email: None,
             nick_protection: default_nick_protection(),
             auto_join: None,
+            description: default_server_description(),
+            register_before_connect: default_register_before_connect(),
         }
     }
 }
