@@ -92,6 +92,11 @@ fn parse_params(s: &str) -> Result<Vec<String>, ParseError> {
     let mut rest = s;
 
     loop {
+        // One or more spaces separate parameters (RFC 1459 §2.3.1), so runs of
+        // them are one separator, not empty parameters between them. Clients do
+        // send them: an omitted optional argument, as in `WHOIS  nick`, leaves
+        // two spaces behind.
+        rest = rest.trim_start_matches(' ');
         if rest.is_empty() {
             break;
         }

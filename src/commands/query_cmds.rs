@@ -292,7 +292,10 @@ pub async fn handle_whois(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let target_nick = msg.params.first().map(|s| s.as_str()).unwrap_or("");
+    // WHOIS is `[<server>] <nick>`: with two parameters the first names the
+    // server to ask, and the nick is the last one. Reading params[0] blindly
+    // made `WHOIS irc.example.com alice` a lookup for the server name.
+    let target_nick = msg.params.last().map(|s| s.as_str()).unwrap_or("");
 
     let state = state.read().await;
     let client = match state.clients.get(client_id) {
@@ -354,16 +357,24 @@ pub async fn handle_whois(
             let c = c.read().await;
             // Filter channel list: hide secret (+s) and private (+p) channels
             // from non-members
-            let requester_channels: std::collections::HashSet<String> =
-                match state.clients.get(client_id) {
-                    Some(rc) => rc.read().await.channels.keys().cloned().collect(),
-                    None => Default::default(),
-                };
+            let (requester_channels, use_multi_prefix) = match state.clients.get(client_id) {
+                Some(rc) => {
+                    let rc = rc.read().await;
+                    (
+                        rc.channels.keys().cloned().collect(),
+                        rc.capabilities.contains("multi-prefix"),
+                    )
+                }
+                None => (std::collections::HashSet::new(), false),
+            };
             let ch_store = channels.read().await;
+            // RPL_WHOISCHANNELS carries the same status prefix as NAMES: '@' for
+            // an operator, '%' halfop, '+' voice, and every applicable one when
+            // the asking client negotiated multi-prefix.
             let ch_list: Vec<String> = c
                 .channels
-                .keys()
-                .filter(|ch_name| {
+                .iter()
+                .filter(|(ch_name, _)| {
                     if requester_channels.contains(*ch_name) {
                         return true; // querier is a member, always show
                     }
@@ -378,7 +389,14 @@ pub async fn handle_whois(
                         None => true,
                     }
                 })
-                .cloned()
+                .map(|(ch_name, memb)| {
+                    let prefix = if use_multi_prefix {
+                        memb.modes.prefixes_ordered()
+                    } else {
+                        memb.modes.prefix().to_string()
+                    };
+                    format!("{}{}", prefix, ch_name)
+                })
                 .collect();
             drop(ch_store);
             let ch_str = ch_list.join(" ");

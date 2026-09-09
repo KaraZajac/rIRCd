@@ -697,6 +697,19 @@ pub async fn handle_nick(
     let nick = msg.params.first().cloned();
     let nick = match nick {
         Some(n) if !n.is_empty() && is_valid_nick(&n) => n,
+        // A nick that was given but cannot be used is a different error from
+        // giving none at all, and the client needs to see which one it sent.
+        Some(n) if !n.is_empty() => {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("432", vec!["*".into(), n, "Erroneous nickname".into()])
+                    .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
         _ => {
             reply_to_client(
                 &senders,
@@ -1108,16 +1121,31 @@ pub async fn handle_motd(
 pub async fn handle_ping(
     client_id: &str,
     msg: Message,
-    _state: Arc<RwLock<ServerState>>,
+    state: Arc<RwLock<ServerState>>,
     senders: Senders,
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let token = msg
-        .params
-        .first()
-        .map(|s| s.as_str())
-        .unwrap_or(&cfg.server.name);
+    // PING carries the token to echo back. Without one there is nothing to
+    // answer with, so it is an error rather than a PONG naming ourselves.
+    let Some(token) = msg.params.first().map(|s| s.as_str()) else {
+        let nick = {
+            let state_r = state.read().await;
+            match state_r.clients.get(client_id) {
+                Some(c) => c.read().await.nick_or_id().to_string(),
+                None => "*".to_string(),
+            }
+        };
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("409", vec![nick, "No origin specified".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
     reply_to_client(
         &senders,
         client_id,
@@ -1179,6 +1207,15 @@ pub async fn handle_quit(
             (source, chans, had_account, nick, list)
         } else {
             state_guard.pending.remove(client_id);
+            drop(state_guard);
+            // A connection that quits before registering ends the same way:
+            // forgetting it is not enough, the socket has to be closed.
+            if let Some(sink) = senders.write().await.remove(client_id) {
+                sink.close(
+                    Message::new("ERROR", vec![format!("Closing link: {}", reason)])
+                        .with_prefix(&cfg.server.name),
+                );
+            }
             return Ok(());
         }
     };
@@ -1306,7 +1343,16 @@ pub async fn handle_quit(
         state_w.certfps.remove(client_id);
         state_w.remove_client(client_id).await;
     }
-    senders.write().await.remove(client_id);
+
+    // QUIT ends the connection: send ERROR and close it. Dropping the sink is
+    // not enough — the connection task holds a sender of its own, so without
+    // the kill signal the socket stays open until it times out.
+    if let Some(sink) = senders.write().await.remove(client_id) {
+        sink.close(
+            Message::new("ERROR", vec![format!("Closing link: {}", reason)])
+                .with_prefix(&cfg.server.name),
+        );
+    }
 
     Ok(())
 }
@@ -2581,12 +2627,23 @@ pub async fn handle_oper(
 ) -> anyhow::Result<()> {
     let name = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let password = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
+    let oper_nick = match state.read().await.clients.get(client_id) {
+        Some(c) => c.read().await.nick_or_id().to_string(),
+        None => "*".to_string(),
+    };
     if name.is_empty() || password.is_empty() {
         reply_to_client(
             &senders,
             client_id,
-            Message::new("461", vec!["OPER".into(), "Not enough parameters".into()])
-                .with_prefix(&cfg.server.name),
+            Message::new(
+                "461",
+                vec![
+                    oper_nick.clone(),
+                    "OPER".into(),
+                    "Not enough parameters".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
             label,
         )
         .await;
@@ -2633,7 +2690,7 @@ pub async fn handle_oper(
     reply_to_client(
         &senders,
         client_id,
-        Message::new("464", vec!["*".into(), "Password incorrect".into()])
+        Message::new("464", vec![oper_nick, "Password incorrect".into()])
             .with_prefix(&cfg.server.name),
         label,
     )
@@ -3472,9 +3529,12 @@ pub async fn handle_away(
     label: Option<&str>,
 ) -> anyhow::Result<()> {
     // AWAYLEN=307 (matches ISUPPORT)
+    // "If this command is sent with no parameters, or with the empty string as
+    // the parameter, the user is no longer away" — Modern §away-message.
     let away_msg = msg
         .trailing()
         .map(|s| crate::protocol::truncate_bytes(s, 307))
+        .filter(|s| !s.is_empty())
         .map(String::from);
     let (source, nick, channel_list) = {
         let mut state = state.write().await;

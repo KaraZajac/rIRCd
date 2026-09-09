@@ -106,6 +106,10 @@ pub struct KeepaliveConfig {
     pub ping_secs: u64,
     pub disconnect_secs: u64,
     pub registration_secs: u64,
+    /// Commands a client may send back to back before being throttled.
+    pub flood_burst: f64,
+    /// Commands per second the allowance refills at.
+    pub flood_rate: f64,
 }
 
 pub async fn handle_client_tls(
@@ -209,9 +213,9 @@ async fn handle_client_stream<S>(
     let kill = Arc::new(tokio::sync::Notify::new());
 
     // Flood control: classic IRC token bucket
-    const FLOOD_CAPACITY: f64 = 10.0;
-    const FLOOD_REFILL_RATE: f64 = 1.0;
-    let mut flood_tokens: f64 = FLOOD_CAPACITY;
+    let flood_capacity = keepalive.flood_burst;
+    let flood_refill_rate = keepalive.flood_rate;
+    let mut flood_tokens: f64 = flood_capacity;
     let mut flood_last_refill = tokio::time::Instant::now();
     // Reference tag of the batch this client currently has open, if any.
     let mut open_batch: Option<String> = None;
@@ -301,12 +305,15 @@ async fn handle_client_stream<S>(
                                 let now = tokio::time::Instant::now();
                                 let elapsed = now.duration_since(flood_last_refill).as_secs_f64();
                                 flood_tokens =
-                                    (flood_tokens + elapsed * FLOOD_REFILL_RATE).min(FLOOD_CAPACITY);
+                                    (flood_tokens + elapsed * flood_refill_rate).min(flood_capacity);
                                 flood_last_refill = now;
 
+                                // PING is exempt because dropping it makes a
+                                // responsive server look dead: the client is
+                                // waiting for a PONG that will never come.
                                 const FLOOD_EXEMPT: &[&str] = &[
-                                    "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PONG", "QUIT",
-                                    "BATCH",
+                                    "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PING", "PONG",
+                                    "QUIT", "BATCH",
                                 ];
                                 // Lines inside an open batch form one logical message.
                                 // Charging a token each makes the advertised multiline
@@ -469,9 +476,9 @@ pub async fn handle_client_ws(
     let kill = Arc::new(tokio::sync::Notify::new());
 
     // Flood control
-    const FLOOD_CAPACITY: f64 = 10.0;
-    const FLOOD_REFILL_RATE: f64 = 1.0;
-    let mut flood_tokens: f64 = FLOOD_CAPACITY;
+    let flood_capacity = keepalive.flood_burst;
+    let flood_refill_rate = keepalive.flood_rate;
+    let mut flood_tokens: f64 = flood_capacity;
     let mut flood_last_refill = tokio::time::Instant::now();
     // Reference tag of the batch this client currently has open, if any.
     let mut open_batch: Option<String> = None;
@@ -542,12 +549,16 @@ pub async fn handle_client_ws(
 
                                 let now = tokio::time::Instant::now();
                                 let elapsed = now.duration_since(flood_last_refill).as_secs_f64();
-                                flood_tokens = (flood_tokens + elapsed * FLOOD_REFILL_RATE).min(FLOOD_CAPACITY);
+                                flood_tokens =
+                                    (flood_tokens + elapsed * flood_refill_rate).min(flood_capacity);
                                 flood_last_refill = now;
 
+                                // PING is exempt because dropping it makes a
+                                // responsive server look dead: the client is
+                                // waiting for a PONG that will never come.
                                 const FLOOD_EXEMPT: &[&str] = &[
-                                    "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PONG", "QUIT",
-                                    "BATCH",
+                                    "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PING", "PONG",
+                                    "QUIT", "BATCH",
                                 ];
                                 // Lines inside an open batch form one logical message.
                                 // Charging a token each makes the advertised multiline
@@ -641,7 +652,8 @@ pub async fn handle_client_ws(
 
                                 let now = tokio::time::Instant::now();
                                 let elapsed = now.duration_since(flood_last_refill).as_secs_f64();
-                                flood_tokens = (flood_tokens + elapsed * FLOOD_REFILL_RATE).min(FLOOD_CAPACITY);
+                                flood_tokens =
+                                    (flood_tokens + elapsed * flood_refill_rate).min(flood_capacity);
                                 flood_last_refill = now;
 
                                 const FLOOD_EXEMPT_B: &[&str] = &[

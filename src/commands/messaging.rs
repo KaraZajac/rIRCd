@@ -91,6 +91,21 @@ async fn send_to_client_with_caps(
 /// Accounts outlive nicks, so keying on the account keeps a conversation
 /// together when someone changes nick. An unregistered user has only a nick,
 /// and rIRCd account names are nicks, so the two coincide for everyone else.
+/// The identity a conversation is keyed by: the account when the user has one,
+/// otherwise the bare nick, each marked so the two can never collide.
+async fn conversation_key_id(state: &ServerState, nick: &str) -> String {
+    if let Some(id) = state.nick_to_id.get(&nick.to_uppercase()) {
+        if let Some(client) = state.clients.get(id) {
+            let g = client.read().await;
+            return match g.account {
+                Some(ref a) => crate::persist::account_id(a),
+                None => crate::persist::nick_id(g.nick_or_id()),
+            };
+        }
+    }
+    crate::persist::nick_id(nick)
+}
+
 async fn conversation_identity(state: &ServerState, nick: &str) -> String {
     if let Some(id) = state.nick_to_id.get(&nick.to_uppercase()) {
         if let Some(client) = state.clients.get(id) {
@@ -665,10 +680,11 @@ pub async fn handle_privmsg(
 
             // Keep direct conversations in history so CHATHISTORY can replay them.
             if pending_edit_msgid.is_none() {
-                let me = sender_account
-                    .clone()
-                    .unwrap_or_else(|| sender_nick.clone());
-                let peer = conversation_identity(&state_guard, target).await;
+                let me = match sender_account {
+                    Some(ref a) => persist::account_id(a),
+                    None => persist::nick_id(&sender_nick),
+                };
+                let peer = conversation_key_id(&state_guard, target).await;
                 let key = persist::direct_message_key(&me, &peer);
                 cfg.record_history(&key, &source, &text, Some(&msgid), "PRIVMSG");
             }
@@ -902,10 +918,11 @@ pub async fn handle_notice(
 
             {
                 let sender_nick = source.split('!').next().unwrap_or(&source);
-                let me = sender_account
-                    .clone()
-                    .unwrap_or_else(|| sender_nick.to_string());
-                let peer = conversation_identity(&state_guard, target).await;
+                let me = match sender_account {
+                    Some(ref a) => persist::account_id(a),
+                    None => persist::nick_id(sender_nick),
+                };
+                let peer = conversation_key_id(&state_guard, target).await;
                 let key = persist::direct_message_key(&me, &peer);
                 cfg.record_history(&key, &source, &text, Some(&msgid), "NOTICE");
             }
@@ -1251,6 +1268,40 @@ pub async fn deliver_multiline_batch(
     Ok(())
 }
 
+/// Client-only tags worth keeping: a TAGMSG has no text, so unless it is marked
+/// to persist there is nothing about it to replay.
+const PERSIST_TAGS: &[&str] = &["+draft/persist", "+persist"];
+
+fn tagmsg_should_persist(tags: &std::collections::HashMap<String, Option<String>>) -> bool {
+    PERSIST_TAGS.iter().any(|t| tags.contains_key(*t))
+}
+
+/// A TAGMSG carries its meaning in its tags, so history stores them in place of
+/// the text, in the same `key=value;key` form they arrive in.
+fn serialize_client_tags(tags: &std::collections::HashMap<String, Option<String>>) -> String {
+    let mut parts: Vec<String> = tags
+        .iter()
+        .filter(|(k, _)| k.starts_with('+'))
+        .map(|(k, v)| match v {
+            Some(v) => format!("{}={}", k, v),
+            None => k.clone(),
+        })
+        .collect();
+    parts.sort();
+    parts.join(";")
+}
+
+fn parse_client_tags(s: &str) -> std::collections::HashMap<String, Option<String>> {
+    let mut out = std::collections::HashMap::new();
+    for part in s.split(';').filter(|p| !p.is_empty()) {
+        match part.split_once('=') {
+            Some((k, v)) => out.insert(k.to_string(), Some(v.to_string())),
+            None => out.insert(part.to_string(), None),
+        };
+    }
+    out
+}
+
 /// TAGMSG: like PRIVMSG but no text; only delivered to clients with message-tags cap.
 pub async fn handle_tagmsg(
     client_id: &str,
@@ -1415,6 +1466,15 @@ pub async fn handle_tagmsg(
                     )
                     .await;
                 }
+                if tagmsg_should_persist(&msg.tags) {
+                    cfg.record_history(
+                        &ch_key,
+                        &source,
+                        &serialize_client_tags(&msg.tags),
+                        Some(&msgid),
+                        "TAGMSG",
+                    );
+                }
             }
         }
     } else {
@@ -1455,6 +1515,22 @@ pub async fn handle_tagmsg(
                     );
                     reply_to_client(&senders, client_id, tagged, label).await;
                 }
+            }
+            if tagmsg_should_persist(&msg.tags) {
+                let sender_nick = source.split('!').next().unwrap_or(&source);
+                let me = match sender_account {
+                    Some(ref a) => persist::account_id(a),
+                    None => persist::nick_id(sender_nick),
+                };
+                let peer = conversation_key_id(&state_guard, target).await;
+                let key = persist::direct_message_key(&me, &peer);
+                cfg.record_history(
+                    &key,
+                    &source,
+                    &serialize_client_tags(&msg.tags),
+                    Some(&msgid),
+                    "TAGMSG",
+                );
             }
         }
     }
@@ -1739,6 +1815,9 @@ pub async fn handle_chathistory(
         .await;
         return Ok(());
     }
+    // History is queued and written in batches, so a client asking right after
+    // it spoke would otherwise be told its own last messages do not exist.
+    cfg.flush_history().await;
     let params = &msg.params;
     let (requester_nick, requester_identity) = {
         let state_r = state.read().await;
@@ -1746,7 +1825,10 @@ pub async fn handle_chathistory(
             Some(c) => {
                 let g = c.read().await;
                 let nick = g.nick_or_id().to_string();
-                let identity = g.account.clone().unwrap_or_else(|| nick.clone());
+                let identity = match g.account {
+                    Some(ref a) => crate::persist::account_id(a),
+                    None => crate::persist::nick_id(&nick),
+                };
                 (nick, identity)
             }
             None => return Ok(()),
@@ -1803,11 +1885,7 @@ pub async fn handle_chathistory(
         if let Some(ref ref_id) = batch_ref {
             let batch_start = Message::new(
                 "BATCH",
-                vec![
-                    format!("+{}", ref_id),
-                    "chathistory".into(),
-                    "targets".into(),
-                ],
+                vec![format!("+{}", ref_id), "draft/chathistory-targets".into()],
             )
             .with_prefix(&cfg.server.name);
             send_to_client(&senders, client_id, batch_start).await;
@@ -1815,11 +1893,7 @@ pub async fn handle_chathistory(
         for (chan, latest_ts) in &targets {
             let mut m = Message::new(
                 "CHATHISTORY",
-                vec![
-                    "TARGETS".into(),
-                    chan.clone(),
-                    format!("timestamp={}", latest_ts),
-                ],
+                vec!["TARGETS".into(), chan.clone(), latest_ts.clone()],
             );
             m.prefix = Some(cfg.server.name.clone());
             if let Some(ref ref_id) = batch_ref {
@@ -1930,14 +2004,22 @@ pub async fn handle_chathistory(
     // Direct conversations are stored under a key derived from both nicks, so a
     // client can only ever address a conversation it is part of.
     let is_channel_target = target.starts_with('#') || target.starts_with('&');
+    // The peer as the server knows it, which is not necessarily how the client
+    // spelled it: nicks are case-insensitive, so a client may ask for a
+    // conversation with FOO and the replayed messages still have to name foo.
+    let (canonical_peer, peer_key_id) = if is_channel_target {
+        (target.to_string(), String::new())
+    } else {
+        let state_r = state.read().await;
+        (
+            conversation_identity(&state_r, target).await,
+            conversation_key_id(&state_r, target).await,
+        )
+    };
     let history_key = if is_channel_target {
         canonical_channel_key(target)
     } else {
-        let peer = {
-            let state_r = state.read().await;
-            conversation_identity(&state_r, target).await
-        };
-        persist::direct_message_key(&requester_identity, &peer)
+        persist::direct_message_key(&requester_identity, &peer_key_id)
     };
 
     // Channel history is for members; a direct conversation is addressed by a key
@@ -1960,7 +2042,9 @@ pub async fn handle_chathistory(
                 vec![
                     "CHATHISTORY".into(),
                     "INVALID_TARGET".into(),
-                    "CHATHISTORY".into(),
+                    // The third field is the subcommand that failed, so a
+                    // client can tell which of several in flight this answers.
+                    subcommand.clone(),
                     target.into(),
                     "You're not on that channel".into(),
                 ],
@@ -2007,6 +2091,10 @@ pub async fn handle_chathistory(
                 )
                 .await
             }
+        }
+        ("LATEST", c) if c != "*" => {
+            persist::read_channel_history_latest_after(pool, &history_key, c, limit, include_events)
+                .await
         }
         _ => persist::read_channel_history(pool, &history_key, limit, include_events).await,
     };
@@ -2067,7 +2155,7 @@ pub async fn handle_chathistory(
         } else {
             let author = e.source.split('!').next().unwrap_or(&e.source);
             if author.eq_ignore_ascii_case(&requester_nick) {
-                target.to_string()
+                canonical_peer.clone()
             } else {
                 requester_nick.clone()
             }
@@ -2088,6 +2176,11 @@ pub async fn handle_chathistory(
             "TOPIC" => Message::new("TOPIC", vec![target.into(), e.text.clone()]),
             "NICK" => Message::new("NICK", vec![e.text.clone()]),
             "NOTICE" => Message::new("NOTICE", vec![target.into(), e.text.clone()]),
+            "TAGMSG" => {
+                let mut m = Message::new("TAGMSG", vec![target.into()]);
+                m.tags = parse_client_tags(&e.text);
+                m
+            }
             _ => Message::new("PRIVMSG", vec![target.into(), e.text.clone()]),
         };
         m.prefix = Some(e.source.clone());

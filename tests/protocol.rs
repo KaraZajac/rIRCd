@@ -116,3 +116,32 @@ fn truncation_never_splits_a_character() {
     assert_eq!(truncate_bytes("🎉", 2), "");
     assert_eq!(truncate_bytes("", 10), "");
 }
+
+/// A run of spaces is one separator. `WHOIS  nick` — the server argument left
+/// out — used to parse as an empty first parameter, so the nick landed in
+/// params[1] and WHOIS answered 431 "No nickname given".
+#[test]
+fn runs_of_spaces_are_one_separator() {
+    let msg = parse_message("WHOIS  coolNick").expect("parses");
+    assert_eq!(msg.command, "WHOIS");
+    assert_eq!(msg.params, vec!["coolNick"]);
+
+    let spaced = parse_message("MODE   #chan    +o    alice").expect("parses");
+    assert_eq!(spaced.params, vec!["#chan", "+o", "alice"]);
+
+    // The trailing parameter still keeps the spaces inside it.
+    let trailing = parse_message("PRIVMSG #chan  :  hello  world").expect("parses");
+    assert_eq!(trailing.params, vec!["#chan", "  hello  world"]);
+}
+
+/// An empty last parameter is still a parameter. Without the ':' it is sent as
+/// a trailing space, which the peer discards — `PONG server ""` arrived as
+/// `PONG server`.
+#[test]
+fn empty_last_param_keeps_its_colon() {
+    let pong = Message::new("PONG", vec!["irc.example.com".into(), String::new()]);
+    assert_eq!(format_message(&pong), "PONG irc.example.com :\r\n");
+
+    let parsed = parse_message("PONG irc.example.com :").expect("parses");
+    assert_eq!(parsed.params, vec!["irc.example.com", ""]);
+}

@@ -39,7 +39,12 @@ pub fn format_message(msg: &Message) -> String {
 
     for (i, param) in msg.params.iter().enumerate() {
         out.push(' ');
-        if i == msg.params.len() - 1 && (param.contains(' ') || param.starts_with(':')) {
+        // The last parameter needs the ':' when it holds spaces, starts with a
+        // ':' of its own, or is empty — without it an empty one is not a
+        // parameter at all, it is a trailing space the peer discards.
+        if i == msg.params.len() - 1
+            && (param.contains(' ') || param.starts_with(':') || param.is_empty())
+        {
             out.push(':');
         }
         out.push_str(param);
@@ -78,9 +83,33 @@ fn escape_tag_value(s: &str) -> String {
 }
 
 /// Add server-time tag (ISO 8601) to tags
+/// The IRCv3 server-time format: exactly three decimal places and a literal
+/// 'Z'. `to_rfc3339` is a different rendering of the same instant
+/// (nanoseconds, numeric offset) that clients do not accept here, and that
+/// sorts differently when timestamps are compared as strings.
+pub fn server_time_now() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string()
+}
+
+/// Normalise a stored timestamp to the server-time format, leaving it alone if
+/// it cannot be parsed.
+pub fn to_server_time(ts: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        Ok(dt) => dt
+            .with_timezone(&Utc)
+            .format("%Y-%m-%dT%H:%M:%S.%3fZ")
+            .to_string(),
+        Err(_) => ts.to_string(),
+    }
+}
+
+/// Stamp the message with the time it is being sent, unless it already carries
+/// one. Replayed history arrives with the time it was originally sent, and that
+/// is the whole point of it — overwriting it with the time of the CHATHISTORY
+/// request makes every message look like it was sent just now.
 pub fn add_server_time(tags: &mut HashMap<String, Option<String>>) {
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string();
-    tags.insert("time".to_string(), Some(now));
+    tags.entry("time".to_string())
+        .or_insert_with(|| Some(Utc::now().format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string()));
 }
 
 /// Add IRCv3 tags for a recipient: server-time, msgid, account, bot; then client-only tags (+prefix).

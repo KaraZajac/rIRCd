@@ -384,6 +384,12 @@ pub struct LimitsConfig {
     /// enforces and advertises as LINELEN.
     #[serde(default = "default_max_line_length")]
     pub max_line_length: usize,
+    /// Commands a client may send back to back before being throttled.
+    #[serde(default = "default_flood_burst")]
+    pub flood_burst: f64,
+    /// Commands per second the flood allowance refills at.
+    #[serde(default = "default_flood_rate")]
+    pub flood_rate: f64,
 }
 
 fn default_max_channels() -> usize {
@@ -395,6 +401,12 @@ fn default_max_per_ip() -> usize {
 fn default_max_line_length() -> usize {
     8191
 }
+fn default_flood_burst() -> f64 {
+    10.0
+}
+fn default_flood_rate() -> f64 {
+    1.0
+}
 
 impl Default for LimitsConfig {
     fn default() -> Self {
@@ -403,6 +415,8 @@ impl Default for LimitsConfig {
             max_connections_per_ip: default_max_per_ip(),
             max_clients: 0,
             max_line_length: default_max_line_length(),
+            flood_burst: default_flood_burst(),
+            flood_rate: default_flood_rate(),
         }
     }
 }
@@ -479,7 +493,7 @@ impl Config {
                 text: text.to_string(),
                 msgid: msgid.map(String::from),
                 command: command.to_string(),
-                ts: chrono::Utc::now().to_rfc3339(),
+                ts: crate::protocol::server_time_now(),
             });
         }
     }

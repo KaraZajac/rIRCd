@@ -1089,8 +1089,21 @@ pub async fn handle_mode(
                 if let Some(limit) = ch.modes.user_limit {
                     reply_params.push(limit.to_string());
                 }
+                let created_at = ch.created_at;
                 let msg = Message::new("324", reply_params).with_prefix(&cfg.server.name);
                 reply_to_client(&senders, client_id, msg, label).await;
+                // 329 RPL_CREATIONTIME accompanies RPL_CHANNELMODEIS.
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "329",
+                        vec![nick.clone(), ch_key.clone(), created_at.to_string()],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
                 return Ok(());
             }
 
@@ -1786,36 +1799,40 @@ pub async fn handle_topic(
 
         let topic_text = new_topic.unwrap_or_default();
         tracing::debug!(client_id, channel = %ch_name, topic = %topic_text, "TOPIC set");
+        // A topic change is replayable history like any other event, so it needs
+        // the same msgid and server-time tags: without them a client cannot tell
+        // two topic changes apart, or place them in time.
+        let topic_msgid = crate::protocol::generate_msgid();
         let topic_msg =
             Message::new("TOPIC", vec![ch_name.into(), topic_text.clone()]).with_prefix(&source);
         let member_ids_for_topic: Vec<String> = ch.members.keys().cloned().collect();
         drop(ch);
         for mid in &member_ids_for_topic {
+            let caps = match state.clients.get(mid) {
+                Some(c) => c.read().await.capabilities.clone(),
+                None => Default::default(),
+            };
+            let tagged = crate::protocol::add_tags_for_recipient(
+                topic_msg.clone(),
+                &caps,
+                None,
+                Some(&topic_msgid),
+                None,
+                cfg.server.client_tag_deny.as_deref(),
+                &crate::protocol::SenderTags::default(),
+            );
             if let Some(tx) = senders.read().await.get(mid) {
-                tx.send(topic_msg.clone());
+                tx.send(tagged);
             }
         }
 
         // Record TOPIC event for draft/event-playback
-        cfg.record_history(&ch_key, &source, &topic_text, None, "TOPIC");
+        cfg.record_history(&ch_key, &source, &topic_text, Some(&topic_msgid), "TOPIC");
 
-        // 333 RPL_TOPICWHOTIME to the setter
-        reply_to_client(
-            &senders,
-            client_id,
-            Message::new(
-                "333",
-                vec![
-                    nick.clone(),
-                    ch_name.into(),
-                    source.clone(),
-                    topic_time_ts.to_string(),
-                ],
-            )
-            .with_prefix(&cfg.server.name),
-            label,
-        )
-        .await;
+        // Setting a topic is announced with the TOPIC message above, which the
+        // setter receives along with everyone else. 331/332/333 answer a query
+        // — sending 333 here too gives the setter a second message for one
+        // action, which clients count as two.
     } else {
         reply_to_client(
             &senders,

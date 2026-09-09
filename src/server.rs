@@ -346,6 +346,8 @@ pub async fn run(
         ping_secs: cfg.server.ping_timeout_secs,
         disconnect_secs: cfg.server.disconnect_timeout_secs,
         registration_secs: cfg.server.registration_timeout_secs,
+        flood_burst: cfg.limits.flood_burst,
+        flood_rate: cfg.limits.flood_rate,
     };
 
     for listen_addr in &cfg.server.listen {

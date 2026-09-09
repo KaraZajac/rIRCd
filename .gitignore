@@ -31,3 +31,7 @@
 
 # Config overrides (keep defaults, ignore local overrides)
 local-config.toml
+
+# Python bytecode from the irctest controller
+__pycache__/
+*.pyc

@@ -1043,6 +1043,26 @@ pub async fn verify_user(pool: &sqlx::MySqlPool, account: &str, password: &str) 
 /// Sorted and case-folded so both participants derive the same key, and prefixed
 /// so it can never collide with a channel name (channels start with # or &).
 /// The conversation follows the nick, like the rest of this server's account model.
+/// Marks whether a conversation partner is an account or a bare nick.
+///
+/// An account and an unregistered nick that spell the same are not the same
+/// conversation: without this, registering a nick would hand you the history
+/// addressed to whoever was using it before.
+pub fn account_id(account: &str) -> String {
+    format!("a:{}", account.to_lowercase())
+}
+
+pub fn nick_id(nick: &str) -> String {
+    format!("n:{}", nick.to_lowercase())
+}
+
+/// The display name inside a conversation identity.
+pub fn conversation_display(id: &str) -> &str {
+    id.strip_prefix("a:")
+        .or_else(|| id.strip_prefix("n:"))
+        .unwrap_or(id)
+}
+
 pub fn direct_message_key(a: &str, b: &str) -> String {
     let (a, b) = (a.to_lowercase(), b.to_lowercase());
     if a <= b {
@@ -1058,9 +1078,9 @@ pub fn direct_message_peer(key: &str, viewer: &str) -> Option<String> {
     let (a, b) = pair.split_once('|')?;
     let viewer = viewer.to_lowercase();
     if a == viewer {
-        Some(b.to_string())
+        Some(conversation_display(b).to_string())
     } else if b == viewer {
-        Some(a.to_string())
+        Some(conversation_display(a).to_string())
     } else {
         None
     }
@@ -1475,7 +1495,7 @@ pub async fn append_channel_history(
     msgid: Option<&str>,
     command: &str,
 ) -> anyhow::Result<()> {
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = crate::protocol::server_time_now();
 
     sqlx::query(
         "INSERT INTO channel_history (channel, ts, source, text, msgid, command) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1512,7 +1532,7 @@ pub async fn append_channel_history(
 fn row_to_entry(r: &sqlx::mysql::MySqlRow) -> HistoryEntry {
     use sqlx::Row;
     HistoryEntry {
-        ts: r.get("ts"),
+        ts: crate::protocol::to_server_time(&r.get::<String, _>("ts")),
         source: r.get("source"),
         text: r.get("text"),
         msgid: r.get("msgid"),
@@ -1682,7 +1702,10 @@ pub async fn read_channel_history_around(
     limit: usize,
     include_events: bool,
 ) -> Result<Vec<HistoryEntry>, HistoryUnavailable> {
-    let half = limit.div_ceil(2).max(1) as i64;
+    // `limit` messages in total, centred on the cursor and including it. The
+    // "before" query selects `id <= pivot`, so the pivot is counted there.
+    let after_half = ((limit.max(1) - 1) / 2) as i64;
+    let before_half = limit.max(1) as i64 - after_half;
     let pivot_id = match resolve_cursor(pool, channel_name, cursor).await {
         Some(id) => id,
         None => return Ok(Vec::new()),
@@ -1700,7 +1723,7 @@ pub async fn read_channel_history_around(
     let before = sqlx::query(&before_sql)
         .bind(channel_name)
         .bind(pivot_id)
-        .bind(half)
+        .bind(before_half)
         .fetch_all(pool)
         .await
         .unwrap_or_default();
@@ -1711,7 +1734,7 @@ pub async fn read_channel_history_around(
     let after = sqlx::query(&after_sql)
         .bind(channel_name)
         .bind(pivot_id)
-        .bind(half)
+        .bind(after_half)
         .fetch_all(pool)
         .await
         .unwrap_or_default();
@@ -1738,16 +1761,21 @@ pub async fn list_history_targets(
     use sqlx::Row;
 
     let viewer_lower = viewer.to_lowercase();
+    // The window applies to each conversation's most recent message, not to the
+    // messages individually: a target whose latest message is outside the range
+    // is not in the range, even if older ones fall inside it. Both bounds are
+    // exclusive. Earliest conversation first, so a limit keeps the oldest.
     let rows = sqlx::query(
         "SELECT channel, MAX(ts) AS latest_ts FROM channel_history
-         WHERE ts >= ? AND ts <= ?
-           AND (channel NOT LIKE 'pm:%' OR channel LIKE ? OR channel LIKE ?)
-         GROUP BY channel ORDER BY latest_ts DESC LIMIT ?",
+         WHERE (channel NOT LIKE 'pm:%' OR channel LIKE ? OR channel LIKE ?)
+         GROUP BY channel
+         HAVING latest_ts > ? AND latest_ts < ?
+         ORDER BY latest_ts ASC LIMIT ?",
     )
-    .bind(from_ts)
-    .bind(to_ts)
     .bind(format!("pm:{}|%", viewer_lower))
     .bind(format!("pm:%|{}", viewer_lower))
+    .bind(from_ts)
+    .bind(to_ts)
     .bind(limit as i64)
     .fetch_all(pool)
     .await
@@ -1768,6 +1796,45 @@ pub async fn list_history_targets(
 
 /// Read entries BETWEEN two cursors (inclusive start, exclusive end), oldest-first.
 /// Used by CHATHISTORY BETWEEN subcommand.
+/// The most recent messages that are newer than `cursor` — CHATHISTORY LATEST
+/// with a cursor, which asks for the newest page after a point rather than the
+/// oldest one.
+pub async fn read_channel_history_latest_after(
+    pool: &sqlx::MySqlPool,
+    channel_name: &str,
+    cursor: &str,
+    limit: usize,
+    include_events: bool,
+) -> Result<Vec<HistoryEntry>, HistoryUnavailable> {
+    let after_id = match resolve_cursor(pool, channel_name, cursor).await {
+        Some(id) => id,
+        None => return Ok(Vec::new()),
+    };
+    let event_filter = if include_events {
+        ""
+    } else {
+        " AND (command = 'PRIVMSG' OR command = 'NOTICE')"
+    };
+    let sql = format!(
+        "SELECT id, ts, source, text, msgid, command, original_msgid
+         FROM channel_history
+         WHERE channel = ? AND id > ? AND redacted=0{event_filter}
+         ORDER BY id DESC
+         LIMIT ?"
+    );
+    sqlx::query(&sql)
+        .bind(channel_name)
+        .bind(after_id)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.iter().rev().map(row_to_entry).collect())
+        .map_err(|e| {
+            tracing::warn!("Failed to read history for '{}': {}", channel_name, e);
+            HistoryUnavailable(e.to_string())
+        })
+}
+
 pub async fn read_channel_history_between(
     pool: &sqlx::MySqlPool,
     channel_name: &str,
@@ -1784,16 +1851,23 @@ pub async fn read_channel_history_between(
         Some(id) => id,
         None => return Ok(Vec::new()),
     };
+    // Both bounds are exclusive, and the pair may be given in either order.
+    // The order is not just cosmetic: with a limit smaller than the range, the
+    // cursor given first is the one to read away from, so `BETWEEN a b 3` and
+    // `BETWEEN b a 3` return opposite ends of the same range.
+    let forwards = start_id <= end_id;
+    let (start_id, end_id) = (start_id.min(end_id), start_id.max(end_id));
     let event_filter = if include_events {
         ""
     } else {
         " AND (command = 'PRIVMSG' OR command = 'NOTICE')"
     };
+    let order = if forwards { "ASC" } else { "DESC" };
     let sql = format!(
         "SELECT id, ts, source, text, msgid, command, original_msgid
          FROM channel_history
-         WHERE channel = ? AND id >= ? AND id < ? AND redacted=0{event_filter}
-         ORDER BY id ASC
+         WHERE channel = ? AND id > ? AND id < ? AND redacted=0{event_filter}
+         ORDER BY id {order}
          LIMIT ?"
     );
     sqlx::query(&sql)
@@ -1803,7 +1877,14 @@ pub async fn read_channel_history_between(
         .bind(limit as i64)
         .fetch_all(pool)
         .await
-        .map(|rows| rows.iter().map(row_to_entry).collect())
+        .map(|rows| {
+            // Always hand back oldest-first, whichever end was read from.
+            let mut entries: Vec<HistoryEntry> = rows.iter().map(row_to_entry).collect();
+            if !forwards {
+                entries.reverse();
+            }
+            entries
+        })
         .map_err(|e| {
             tracing::warn!("Failed to read history for '{}': {}", channel_name, e);
             HistoryUnavailable(e.to_string())
