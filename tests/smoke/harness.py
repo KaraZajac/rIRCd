@@ -13,6 +13,8 @@ import time
 
 IRC_HOST = os.environ.get("SMOKE_IRC_HOST", "127.0.0.1")
 IRC_PORT = int(os.environ.get("SMOKE_IRC_PORT", "16667"))
+# A second plain listener, for the tests that care which one a client used.
+IRC_PORT2 = int(os.environ.get("SMOKE_IRC_PORT2", "16669"))
 DB_SOCKET = os.environ.get("SMOKE_DB_SOCKET", "")  # also used to stop/start it in the outage suite
 MAIL_DIR = os.environ.get("SMOKE_MAIL_DIR", "")
 # Distinct per run, so suites can be re-run against a live server (--reuse)
@@ -29,8 +31,8 @@ AUTH_SECRET = "BTBZMqHH6r4Tts7J_aSIgg"
 class Client:
     """One IRC connection, with a record of every line the server sent."""
 
-    def __init__(self, nick=None, user=None, realname=None, caps=None, timeout=10):
-        self.sock = socket.create_connection((IRC_HOST, IRC_PORT), timeout=timeout)
+    def __init__(self, nick=None, user=None, realname=None, caps=None, timeout=10, port=None):
+        self.sock = socket.create_connection((IRC_HOST, port or IRC_PORT), timeout=timeout)
         self.buf = ""
         self.lines = []
         self.nick = nick

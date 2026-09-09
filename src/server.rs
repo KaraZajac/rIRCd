@@ -387,6 +387,15 @@ pub async fn run(
             },
         );
     }
+    // One source of connection ids for every listener.
+    //
+    // A counter per listener means the plain port and the TLS port both hand
+    // out "client-1", and a server that offers both — which is every real one —
+    // gives two different people the same id. Everything about a user is keyed
+    // by it: the second to register would take the first's place in the client
+    // table and its sink, and the first would stop being addressable.
+    let connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     let keepalive = client::KeepaliveConfig {
         ping_secs: cfg.server.ping_timeout_secs,
         max_line_length: cfg.limits.max_line_length,
@@ -409,13 +418,15 @@ pub async fn run(
         let tx = tx.clone();
         let server_name = server_name.clone();
         let limits = limits.clone();
-        let mut client_counter = 0u64;
+        let connections = connections.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, addr)) => {
-                        client_counter += 1;
-                        let client_id = format!("client-{}", client_counter);
+                        let client_id = format!(
+                            "client-{}",
+                            connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        );
                         let host = addr.ip().to_string();
                         let tx = tx.clone();
                         let server_name = server_name.clone();
@@ -455,13 +466,15 @@ pub async fn run(
             let tls_acc = acceptor.clone();
             let server_name = server_name_tls.clone();
             let limits = limits.clone();
-            let mut client_counter = 0u64;
+            let connections = connections.clone();
             tokio::spawn(async move {
                 loop {
                     match listener.accept().await {
                         Ok((stream, addr)) => {
-                            client_counter += 1;
-                            let client_id = format!("client-{}", client_counter);
+                            let client_id = format!(
+                                "client-{}",
+                                connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            );
                             let host = addr.ip().to_string();
                             let tx = tx.clone();
                             let acc = tls_acc.clone();
@@ -526,7 +539,7 @@ pub async fn run(
         let ws_state = WsState {
             tx: tx_ws,
             server_name: server_name_ws,
-            counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            counter: connections.clone(),
             keepalive,
             limits: limits.clone(),
         };
@@ -593,13 +606,15 @@ pub async fn run(
             let tx_wss = tx.clone();
             let server_name_wss = server_name.clone();
             let limits_wss = limits.clone();
+            let connections = connections.clone();
             tokio::spawn(async move {
-                let mut counter = 0u64;
                 loop {
                     match listener.accept().await {
                         Ok((stream, addr)) => {
-                            counter += 1;
-                            let client_id = format!("wss-{}", counter);
+                            let client_id = format!(
+                                "wss-{}",
+                                connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            );
                             let host = addr.ip().to_string();
                             let acc = tls_acc.clone();
                             let tx = tx_wss.clone();

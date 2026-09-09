@@ -320,6 +320,44 @@ def commands_before_registration():
 
 survives("privileged commands before registration", commands_before_registration, f"h11{RUN}")
 
+section("two listeners, two people")
+# Connection ids came from a counter per listener, so the first client on each
+# port was handed the same one — and everything about a user is keyed by it.
+from harness import IRC_PORT2  # noqa: E402
+
+one = Client(f"port1{RUN}")
+two = Client(f"port2{RUN}", port=IRC_PORT2)
+check("both clients registered", bool(one.find(" 001 ")) and bool(two.find(" 001 ")))
+
+mark = two.mark()
+one.send(f"PRIVMSG port2{RUN} :meant for the second one")
+two.read(1.5)
+check(
+    "a message reaches the client it was addressed to",
+    bool(two.find("meant for the second one", lines=two.since(mark))),
+    two.since(mark)[-3:],
+)
+
+mark = one.mark()
+two.send(f"PRIVMSG port1{RUN} :and back the other way")
+one.read(1.5)
+check(
+    "and the reply reaches the other",
+    bool(one.find("and back the other way", lines=one.since(mark))),
+    one.since(mark)[-3:],
+)
+
+mark = one.mark()
+one.send("WHOIS port2%s" % RUN)
+one.read(1.5)
+check(
+    "each is a user in its own right",
+    bool(one.find(" 311 ", f"port2{RUN}", lines=one.since(mark))),
+    one.since(mark)[-3:],
+)
+one.close()
+two.close()
+
 section("still standing")
 check("the server is still accepting and serving clients", still_alive("everything", f"h12{RUN}"))
 
