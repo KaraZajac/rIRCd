@@ -8,6 +8,8 @@ repository = "https://github.com/rircd/rircd"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+# For catch_unwind on the dispatch loop; already in the tree via axum/tokio-util.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }

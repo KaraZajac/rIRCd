@@ -187,22 +187,18 @@ async fn upload_file(
         });
 
     // Also try Content-Type to derive extension if no filename given.
-    let ext = if let Some(ref name) = original_name {
-        name.rsplit('.')
-            .next()
-            .map(|e| format!(".{}", e))
-            .unwrap_or_default()
-    } else {
-        headers
+    let ext = match original_name {
+        Some(ref name) => sanitize_extension(name),
+        None => headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .and_then(|ct| {
                 let mime: mime_guess::mime::Mime = ct.parse().ok()?;
                 mime_guess::get_mime_extensions(&mime)
                     .and_then(|exts| exts.first())
-                    .map(|e| format!(".{}", e))
+                    .map(|e| sanitize_extension(&format!("x.{}", e)))
             })
-            .unwrap_or_default()
+            .unwrap_or_default(),
     };
 
     let unique_id = uuid::Uuid::new_v4();
@@ -226,8 +222,14 @@ async fn upload_file(
     );
 
     let mut resp = (StatusCode::CREATED, url.clone()).into_response();
-    resp.headers_mut()
-        .insert(header::LOCATION, HeaderValue::from_str(&url).unwrap());
+    match HeaderValue::from_str(&url) {
+        Ok(v) => {
+            resp.headers_mut().insert(header::LOCATION, v);
+        }
+        // public_url comes from the config file; a stray non-ASCII character in
+        // it is the operator's problem, not a reason to drop the upload.
+        Err(_) => warn!(url = %url, "Upload URL is not a valid header value; Location omitted"),
+    }
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/uri-list"),
@@ -248,16 +250,7 @@ async fn download_file(
         Err(_) => return (StatusCode::NOT_FOUND, "File not found").into_response(),
     };
 
-    let content_type = mime_guess::from_path(&safe_name)
-        .first_or_octet_stream()
-        .to_string();
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(&content_type)
-            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
-    );
+    let mut headers = serving_headers(&safe_name);
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(data.len()));
 
     (StatusCode::OK, headers, data).into_response()
@@ -276,19 +269,89 @@ async fn head_file(
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let content_type = mime_guess::from_path(&safe_name)
-        .first_or_octet_stream()
-        .to_string();
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(&content_type)
-            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
-    );
+    let mut headers = serving_headers(&safe_name);
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(meta.len()));
 
     (StatusCode::OK, headers).into_response()
+}
+
+/// Types we are willing to hand back for the browser to render in place.
+/// Everything else is served as a download: a file this server stores on
+/// behalf of a user must never be able to become script on this origin.
+/// SVG and HTML are absent deliberately — both can carry script.
+const INLINE_TYPES: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+    ("avif", "image/avif"),
+    ("bmp", "image/bmp"),
+    ("ico", "image/x-icon"),
+    ("mp3", "audio/mpeg"),
+    ("ogg", "audio/ogg"),
+    ("oga", "audio/ogg"),
+    ("opus", "audio/ogg"),
+    ("wav", "audio/wav"),
+    ("flac", "audio/flac"),
+    ("m4a", "audio/mp4"),
+    ("mp4", "video/mp4"),
+    ("m4v", "video/mp4"),
+    ("webm", "video/webm"),
+    ("mov", "video/quicktime"),
+    ("txt", "text/plain; charset=utf-8"),
+    ("log", "text/plain; charset=utf-8"),
+];
+
+/// The extension an upload is stored under. The client names the file, so the
+/// name is a hint and nothing more: ASCII letters and digits, lowercased and
+/// short. Anything else is stored without an extension rather than trusted —
+/// it is what decides the content type on the way back out.
+fn sanitize_extension(name: &str) -> String {
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return String::new();
+    };
+    if ext.is_empty() || ext.len() > 16 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return String::new();
+    }
+    format!(".{}", ext.to_ascii_lowercase())
+}
+
+/// The content type a stored file is served with, and whether the browser may
+/// render it in place.
+fn serving_type(stored_name: &str) -> (&'static str, bool) {
+    let ext = stored_name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match INLINE_TYPES.iter().find(|(e, _)| *e == ext) {
+        Some((_, ct)) => (ct, true),
+        None => ("application/octet-stream", false),
+    }
+}
+
+/// Response headers for serving a stored file, on both GET and HEAD.
+fn serving_headers(stored_name: &str) -> HeaderMap {
+    let (content_type, inline) = serving_type(stored_name);
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    // The type above is the whole answer; the browser must not go looking for
+    // a more interesting one in the bytes.
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    if !inline {
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
+    headers
 }
 
 /// Strip path traversal from filename.
@@ -321,5 +384,59 @@ fn extract_url_path(url: &str) -> String {
         }
     } else {
         "/".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extension_comes_from_the_name_but_is_not_trusted() {
+        assert_eq!(sanitize_extension("holiday.PNG"), ".png");
+        assert_eq!(sanitize_extension("notes.txt"), ".txt");
+        // No dot, nothing to take.
+        assert_eq!(sanitize_extension("passwd"), "");
+        // A path in the extension would put the file somewhere of the
+        // uploader's choosing.
+        assert_eq!(sanitize_extension("a./../../etc/cron.d/evil"), "");
+        assert_eq!(sanitize_extension("x.png/../../y"), "");
+        // Trailing dot, and an extension long enough to be a payload.
+        assert_eq!(sanitize_extension("x."), "");
+        assert_eq!(sanitize_extension(&format!("x.{}", "a".repeat(17))), "");
+        assert_eq!(
+            sanitize_extension(&format!("x.{}", "a".repeat(16))),
+            format!(".{}", "a".repeat(16))
+        );
+    }
+
+    #[test]
+    fn uploads_are_never_served_as_script_on_this_origin() {
+        for name in ["evil.html", "evil.htm", "evil.svg", "evil.xhtml", "evil.js"] {
+            let (ct, inline) = serving_type(name);
+            assert_eq!(ct, "application/octet-stream", "{name}");
+            assert!(!inline, "{name} must not render in place");
+        }
+        let headers = serving_headers("evil.html");
+        assert_eq!(headers[header::CONTENT_DISPOSITION], "attachment");
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    }
+
+    #[test]
+    fn images_still_display_in_place() {
+        let (ct, inline) = serving_type("cat.jpg");
+        assert_eq!(ct, "image/jpeg");
+        assert!(inline);
+        let headers = serving_headers("cat.jpg");
+        assert!(!headers.contains_key(header::CONTENT_DISPOSITION));
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    }
+
+    #[test]
+    fn download_names_cannot_walk_out_of_the_upload_directory() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), "....etcpasswd");
+        assert_eq!(sanitize_filename("..\\..\\windows"), "....windows");
+        assert_eq!(sanitize_filename(".."), "invalid");
+        assert_eq!(sanitize_filename("/"), "invalid");
     }
 }

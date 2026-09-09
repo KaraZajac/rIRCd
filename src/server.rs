@@ -262,6 +262,15 @@ pub async fn run(
 
     // ── Filehost HTTP endpoint ─────────────────────────────────────────────────
     if let Some(ref fh_cfg) = cfg.filehost {
+        // Uploads are authenticated against the user database, so without one
+        // the filehost would accept anything from anyone. The rest of the
+        // server is fine without it, so this is a refusal to start that one
+        // listener rather than a reason to bring everything down.
+        let Some(db_pool) = cfg.db.clone() else {
+            anyhow::bail!(
+                "[filehost] needs [database]: uploads are authenticated against the user database"
+            );
+        };
         let upload_dir = std::path::PathBuf::from(&fh_cfg.upload_dir);
         if let Err(e) = std::fs::create_dir_all(&upload_dir) {
             error!(
@@ -275,7 +284,7 @@ pub async fn run(
             upload_dir,
             public_url: fh_cfg.public_url.clone(),
             max_size: fh_cfg.max_size,
-            db_pool: cfg.db.clone().expect("database pool required for filehost"),
+            db_pool,
         });
 
         let app = crate::filehost::router(fh_state);
@@ -695,7 +704,16 @@ pub async fn run(
                     .unwrap_or_default();
 
                 debug!(client = %client_id, command = %cmd, "handling message");
-                let result = commands::handle_message(
+                // Every client's messages go through this one loop, so a panic
+                // in a handler would take the server down for everyone over one
+                // client's input. Contain it: the connection that caused it is
+                // closed, and the rest of the server carries on.
+                //
+                // Lock guards are released as the stack unwinds, so nothing is
+                // left held; state may be inconsistent for that one command,
+                // which is a smaller price than the whole server going away.
+                use futures_util::future::FutureExt;
+                let handled = std::panic::AssertUnwindSafe(commands::handle_message(
                     cm.client_id,
                     cm.host,
                     cm.msg,
@@ -703,8 +721,38 @@ pub async fn run(
                     channels.clone(),
                     senders.clone(),
                     cfg_arc.clone(),
-                )
+                ))
+                .catch_unwind()
                 .await;
+
+                let result = match handled {
+                    Ok(result) => result,
+                    Err(panic) => {
+                        let detail = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        error!(
+                            client = %client_id,
+                            command = %cmd,
+                            params = %params_preview,
+                            trailing = %trailing_preview,
+                            panic = %detail,
+                            "Handler panicked; closing that connection and carrying on"
+                        );
+                        let server_name = cfg_arc.read().await.server.name.clone();
+                        senders.write().await.close_user(
+                            &client_id,
+                            Message::new(
+                                "ERROR",
+                                vec!["Closing link: the server could not handle that".into()],
+                            )
+                            .with_prefix(&server_name),
+                        );
+                        Ok(())
+                    }
+                };
 
                 if let Err(e) = result {
                     warn!(

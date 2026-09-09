@@ -274,26 +274,41 @@ impl MsgIdStore {
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.to_lowercase().chars().collect();
     let t: Vec<char> = text.to_lowercase().chars().collect();
-    let (pl, tl) = (p.len(), t.len());
-    let mut dp = vec![vec![false; tl + 1]; pl + 1];
-    dp[0][0] = true;
-    for i in 1..=pl {
-        if p[i - 1] == '*' {
-            dp[i][0] = dp[i - 1][0];
+
+    // Greedy match with one backtrack point, rather than a full dynamic
+    // programming table: every ban, except and invite mask on a channel is
+    // matched against every joining user, and a table costs
+    // pattern x source bytes of scratch each time it is asked.
+    let (mut i, mut j) = (0usize, 0usize);
+    // Where the last `*` was, and how much of the text it has been made to
+    // swallow so far. `None` means we have not seen one yet, so a mismatch
+    // is final.
+    let mut star: Option<usize> = None;
+    let mut swallowed = 0usize;
+
+    while j < t.len() {
+        if i < p.len() && (p[i] == '?' || p[i] == t[j]) {
+            i += 1;
+            j += 1;
+        } else if i < p.len() && p[i] == '*' {
+            star = Some(i);
+            i += 1;
+            swallowed = j;
+        } else if let Some(s) = star {
+            // Give the `*` one more character and try the rest again.
+            i = s + 1;
+            swallowed += 1;
+            j = swallowed;
+        } else {
+            return false;
         }
     }
-    for i in 1..=pl {
-        for j in 1..=tl {
-            dp[i][j] = if p[i - 1] == '*' {
-                dp[i - 1][j] || dp[i][j - 1]
-            } else if p[i - 1] == '?' || p[i - 1] == t[j - 1] {
-                dp[i - 1][j - 1]
-            } else {
-                false
-            };
-        }
+
+    // Trailing `*`s match the empty remainder.
+    while i < p.len() && p[i] == '*' {
+        i += 1;
     }
-    dp[pl][tl]
+    i == p.len()
 }
 
 /// Reverse index: nick (lowercase) -> set of client_ids that have this nick in their monitor list.
@@ -813,6 +828,81 @@ mod tests {
         assert!(glob_match("BAR!*@*", "bar!username@127.0.0.1"));
         assert!(glob_match("*!*@Example.COM", "nick!user@example.com"));
         assert!(!glob_match("baz!*@*", "Bar!username@127.0.0.1"));
+    }
+
+    /// The straightforward table-based glob, kept only to check the greedy one
+    /// against. It is obviously correct and obviously too expensive to run on
+    /// every join.
+    fn glob_match_reference(pattern: &str, text: &str) -> bool {
+        let p: Vec<char> = pattern.to_lowercase().chars().collect();
+        let t: Vec<char> = text.to_lowercase().chars().collect();
+        let (pl, tl) = (p.len(), t.len());
+        let mut dp = vec![vec![false; tl + 1]; pl + 1];
+        dp[0][0] = true;
+        for i in 1..=pl {
+            if p[i - 1] == '*' {
+                dp[i][0] = dp[i - 1][0];
+            }
+        }
+        for i in 1..=pl {
+            for j in 1..=tl {
+                dp[i][j] = if p[i - 1] == '*' {
+                    dp[i - 1][j] || dp[i][j - 1]
+                } else if p[i - 1] == '?' || p[i - 1] == t[j - 1] {
+                    dp[i - 1][j - 1]
+                } else {
+                    false
+                };
+            }
+        }
+        dp[pl][tl]
+    }
+
+    /// Exhaustively over a small alphabet: the fast matcher has to agree with
+    /// the table on every pattern and every string, or a ban that used to hold
+    /// stops holding.
+    #[test]
+    fn fast_glob_agrees_with_the_table() {
+        let alphabet = ['a', 'b', '*', '?'];
+        let mut patterns = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for p in &patterns {
+                for c in alphabet {
+                    next.push(format!("{p}{c}"));
+                }
+            }
+            patterns.extend(next);
+        }
+        let mut texts = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for t in &texts {
+                for c in ['a', 'b'] {
+                    next.push(format!("{t}{c}"));
+                }
+            }
+            texts.extend(next);
+        }
+        for p in &patterns {
+            for t in &texts {
+                assert_eq!(
+                    glob_match(p, t),
+                    glob_match_reference(p, t),
+                    "pattern {p:?} against {t:?}"
+                );
+            }
+        }
+    }
+
+    /// A mask built to make a backtracking matcher work hardest still has to
+    /// come back, and without allocating a table the size of the two inputs.
+    #[test]
+    fn a_pathological_mask_still_terminates() {
+        let mask = format!("{}b", "a*".repeat(200));
+        let source = "a".repeat(400);
+        assert!(!glob_match(&mask, &source));
+        assert!(glob_match(&mask, &format!("{source}b")));
     }
 
     use super::*;

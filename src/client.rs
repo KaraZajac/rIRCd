@@ -267,18 +267,29 @@ async fn handle_client_stream<S>(
                         let line = match std::str::from_utf8(&buf) {
                             Ok(s) => s,
                             Err(_) => {
-                                let _ = send_tx
-                        .try_send(
-                                        Message::new(
-                                            "FAIL",
-                                            vec![
-                                                "*".into(),
-                                                "INVALID_UTF8".into(),
-                                                "Message contained invalid UTF-8".into(),
-                                            ],
-                                        )
-                                        .with_prefix(&server_name),
-                                    );
+                                // The line cannot be handled, but the command
+                                // word is ASCII in any message that has one, so
+                                // the client can still be told what was refused.
+                                let command = {
+                                    let lossy = String::from_utf8_lossy(&buf);
+                                    parse_message_with_limit(
+                                        &lossy,
+                                        keepalive.max_line_length,
+                                    )
+                                    .map(|m| m.command)
+                                    .unwrap_or_else(|_| "*".to_string())
+                                };
+                                let _ = send_tx.try_send(
+                                    Message::new(
+                                        "FAIL",
+                                        vec![
+                                            command,
+                                            "INVALID_UTF8".into(),
+                                            "Message contained invalid UTF-8".into(),
+                                        ],
+                                    )
+                                    .with_prefix(&server_name),
+                                );
                                 buf.clear();
                                 continue;
                             }
@@ -628,18 +639,26 @@ pub async fn handle_client_ws(
                         let line = match std::str::from_utf8(&data) {
                             Ok(s) => s.trim(),
                             Err(_) => {
-                                let _ = send_tx
-                        .try_send(
-                                        Message::new(
-                                            "FAIL",
-                                            vec![
-                                                "*".into(),
-                                                "INVALID_UTF8".into(),
-                                                "Message contained invalid UTF-8".into(),
-                                            ],
-                                        )
-                                        .with_prefix(&server_name),
-                                    );
+                                let command = {
+                                    let lossy = String::from_utf8_lossy(&data);
+                                    parse_message_with_limit(
+                                        &lossy,
+                                        keepalive.max_line_length,
+                                    )
+                                    .map(|m| m.command)
+                                    .unwrap_or_else(|_| "*".to_string())
+                                };
+                                let _ = send_tx.try_send(
+                                    Message::new(
+                                        "FAIL",
+                                        vec![
+                                            command,
+                                            "INVALID_UTF8".into(),
+                                            "Message contained invalid UTF-8".into(),
+                                        ],
+                                    )
+                                    .with_prefix(&server_name),
+                                );
                                 continue;
                             }
                         };
