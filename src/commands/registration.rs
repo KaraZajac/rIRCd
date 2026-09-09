@@ -3113,7 +3113,7 @@ pub async fn handle_oper(
         return Ok(());
     }
     for oper in &cfg.opers {
-        if oper.name == name && bcrypt::verify(password, &oper.password_hash).unwrap_or(false) {
+        if oper.name == name && crate::persist::bcrypt_verify(password, &oper.password_hash).await {
             let found = if let Some(c) = state.read().await.clients.get(client_id) {
                 let mut g = c.write().await;
                 g.oper = true;

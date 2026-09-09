@@ -844,7 +844,8 @@ pub async fn register_user(
         return Err(RegisterError::AccountExists);
     }
 
-    let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
+    let hash = bcrypt_hash(password)
+        .await
         .map_err(|e| RegisterError::Io(e.to_string()))?;
 
     // Compute SCRAM-SHA-256 credentials at registration time
@@ -1018,6 +1019,55 @@ pub async fn nick_is_registered(pool: &sqlx::MySqlPool, health: &DbHealth, nick:
 
 /// Verify an account's password against the stored bcrypt hash.
 /// An account awaiting email verification cannot authenticate.
+/// How many password checks may run at once. bcrypt is CPU-bound by design, so
+/// without a cap a burst of login attempts — which anybody may send, to SASL,
+/// to OPER or to the filehost — is a burst of CPU the rest of the server has to
+/// share. One per core lets the machine work at full speed and no faster.
+fn password_work_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        tokio::sync::Semaphore::new(cores)
+    })
+}
+
+/// bcrypt is deliberately slow — a fifth of a second of CPU at the default
+/// cost. Run on a runtime thread it stalls every other client that thread was
+/// serving, so it goes to the blocking pool instead, and only so many at once.
+pub async fn bcrypt_verify(password: &str, hash: &str) -> bool {
+    let _permit = password_work_permits().acquire().await;
+    let (password, hash) = (password.to_string(), hash.to_string());
+    tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash).unwrap_or(false))
+        .await
+        .unwrap_or(false)
+}
+
+/// Likewise for hashing, which costs more than verifying.
+pub async fn bcrypt_hash(password: &str) -> Result<String, bcrypt::BcryptError> {
+    let _permit = password_work_permits().acquire().await;
+    let password = password.to_string();
+    match tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST)).await {
+        Ok(result) => result,
+        Err(_) => Err(bcrypt::BcryptError::InvalidHash(
+            "password hashing did not finish".into(),
+        )),
+    }
+}
+
+/// A hash of something that is never a password. Verifying against it costs
+/// what verifying a real one costs, so a login attempt takes the same time
+/// whether or not the account exists — otherwise the clock answers "is this
+/// name registered?" to anyone who asks.
+fn absent_account_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        bcrypt::hash("\0 no such account", bcrypt::DEFAULT_COST)
+            .unwrap_or_else(|_| String::from("$2b$12$"))
+    })
+}
+
 pub async fn verify_user(pool: &sqlx::MySqlPool, account: &str, password: &str) -> bool {
     use sqlx::Row;
 
@@ -1031,7 +1081,7 @@ pub async fn verify_user(pool: &sqlx::MySqlPool, account: &str, password: &str) 
     match row {
         Ok(Some(r)) => {
             let hash: String = r.get("password");
-            let ok = bcrypt::verify(password, &hash).unwrap_or(false);
+            let ok = bcrypt_verify(password, &hash).await;
             if !ok {
                 tracing::info!(
                     account = %account,
@@ -1050,6 +1100,9 @@ pub async fn verify_user(pool: &sqlx::MySqlPool, account: &str, password: &str) 
             true
         }
         Ok(None) => {
+            // Spend what a real check would have spent, so the time taken does
+            // not say whether the account exists.
+            let _ = bcrypt_verify(password, absent_account_hash()).await;
             tracing::info!(
                 account = %account,
                 "SASL: account not found in database"
@@ -1394,11 +1447,19 @@ enum HistoryOp {
 /// in order, batched into a single statement per drain.
 #[derive(Clone, Debug)]
 pub struct HistoryWriter {
-    tx: tokio::sync::mpsc::UnboundedSender<HistoryOp>,
+    tx: tokio::sync::mpsc::Sender<HistoryOp>,
 }
 
 /// Rows written in one statement.
 const HISTORY_BATCH: usize = 200;
+/// Rows that may be waiting to be written before new ones are dropped.
+///
+/// The queue is fed by client traffic and drained by a database, so it must
+/// have an end: when the database is slow or gone, an unbounded one grows for
+/// as long as people keep talking. History is already best-effort — a failed
+/// write drops its batch — so dropping the oldest excess is the same answer
+/// arrived at sooner, and it is bounded.
+const HISTORY_QUEUE: usize = 10_000;
 /// Appends to one target before its history is pruned again.
 const PRUNE_INTERVAL: u32 = 100;
 
@@ -1407,7 +1468,7 @@ impl HistoryWriter {
     /// first to notice the database has gone, and marking it down there saves
     /// every later command from waiting on it.
     pub fn spawn(pool: sqlx::MySqlPool, health: DbHealth) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<HistoryOp>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<HistoryOp>(HISTORY_QUEUE);
         tokio::spawn(async move {
             let mut since_prune: std::collections::HashMap<String, u32> = Default::default();
             while let Some(op) = rx.recv().await {
@@ -1489,16 +1550,35 @@ impl HistoryWriter {
         Self { tx }
     }
 
-    /// Queue a row. Returns immediately; the row is written in order.
+    /// Queue a row. Returns immediately; the row is written in order, or
+    /// dropped if the writer is already this far behind.
     pub fn append(&self, entry: HistoryWrite) {
-        let _ = self.tx.send(HistoryOp::Append(Box::new(entry)));
+        if self
+            .tx
+            .try_send(HistoryOp::Append(Box::new(entry)))
+            .is_err()
+        {
+            // One line per second at most: a full queue means thousands of
+            // these, and the log is not the place to put the backlog.
+            static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            if let Ok(mut last) = LAST.lock() {
+                let now = std::time::Instant::now();
+                if last.is_none_or(|t| now.duration_since(t).as_secs() >= 1) {
+                    *last = Some(now);
+                    tracing::warn!(
+                        queued = HISTORY_QUEUE,
+                        "History is being dropped: the database is not keeping up"
+                    );
+                }
+            }
+        }
     }
 
     /// Wait for queued rows to reach the database. Used before operations that
     /// read or modify history by msgid, so they cannot miss a pending row.
     pub async fn flush(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if self.tx.send(HistoryOp::Flush(tx)).is_ok() {
+        if self.tx.send(HistoryOp::Flush(tx)).await.is_ok() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
         }
     }

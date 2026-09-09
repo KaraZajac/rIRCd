@@ -178,6 +178,14 @@ fn supported_ws_protocols(headers: &axum::http::HeaderMap) -> Vec<String> {
     }
 }
 
+/// Longest a TLS handshake may take before the connection is dropped.
+///
+/// Without it, opening a socket and sending one byte holds a task and a file
+/// descriptor for as long as the attacker likes: the per-address and total
+/// connection limits are claimed after the handshake, so a stalled one is not
+/// counted against anything. Any real client finishes in well under a second.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn run(
     mut cfg: Config,
     config_path: &Path,
@@ -304,8 +312,16 @@ pub async fn run(
                                 let app = app.clone();
                                 tokio::spawn(async move {
                                     let acceptor = acceptor.read().await.clone();
-                                    match acceptor.accept(stream).await {
-                                        Ok(tls_stream) => {
+                                    match tokio::time::timeout(
+                                        TLS_HANDSHAKE_TIMEOUT,
+                                        acceptor.accept(stream),
+                                    )
+                                    .await
+                                    {
+                                        Err(_) => {
+                                            tracing::debug!("Filehost TLS handshake timed out");
+                                        }
+                                        Ok(Ok(tls_stream)) => {
                                             let io = hyper_util::rt::TokioIo::new(tls_stream);
                                             let service =
                                                 hyper_util::service::TowerToHyperService::new(app);
@@ -319,7 +335,7 @@ pub async fn run(
                                                 tracing::debug!("Filehost connection error: {}", e);
                                             }
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
                                             tracing::debug!("Filehost TLS handshake failed: {}", e);
                                         }
                                     }
@@ -453,8 +469,14 @@ pub async fn run(
                             let limits = limits.clone();
                             tokio::spawn(async move {
                                 let acc = acc.read().await.clone();
-                                match acc.accept(stream).await {
-                                    Ok(tls_stream) => {
+                                match tokio::time::timeout(
+                                    TLS_HANDSHAKE_TIMEOUT,
+                                    acc.accept(stream),
+                                )
+                                .await
+                                {
+                                    Err(_) => debug!("TLS handshake timed out"),
+                                    Ok(Ok(tls_stream)) => {
                                         let certfp = extract_certfp(&tls_stream);
                                         client::handle_client_tls(
                                             tls_stream,
@@ -468,7 +490,7 @@ pub async fn run(
                                         )
                                         .await
                                     }
-                                    Err(e) => error!("TLS handshake failed: {}", e),
+                                    Ok(Err(e)) => error!("TLS handshake failed: {}", e),
                                 }
                             });
                         }
@@ -585,8 +607,14 @@ pub async fn run(
                             let limits = limits_wss.clone();
                             tokio::spawn(async move {
                                 let acc = acc.read().await.clone();
-                                match acc.accept(stream).await {
-                                    Ok(tls_stream) => {
+                                match tokio::time::timeout(
+                                    TLS_HANDSHAKE_TIMEOUT,
+                                    acc.accept(stream),
+                                )
+                                .await
+                                {
+                                    Err(_) => debug!("WSS TLS handshake timed out"),
+                                    Ok(Ok(tls_stream)) => {
                                         let certfp = extract_certfp(&tls_stream);
                                         let io = hyper_util::rt::TokioIo::new(tls_stream);
                                         let tx_c = tx.clone();
@@ -634,7 +662,7 @@ pub async fn run(
                                             tracing::debug!("WSS connection error: {}", e);
                                         }
                                     }
-                                    Err(e) => error!("WSS TLS handshake failed: {}", e),
+                                    Ok(Err(e)) => error!("WSS TLS handshake failed: {}", e),
                                 }
                             });
                         }
