@@ -4,7 +4,6 @@ use crate::commands;
 use crate::config::Config;
 use crate::protocol::Message;
 use crate::user::ServerState;
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -249,7 +248,7 @@ pub async fn run(
     }
     // Store the config path so REHASH can reload from disk
     state.write().await.config_path = Some(config_path.to_path_buf());
-    let senders: crate::user::Senders = Arc::new(RwLock::new(HashMap::new()));
+    let senders: crate::user::Senders = Arc::new(RwLock::new(Default::default()));
 
     let (tx, mut rx) = mpsc::channel::<ClientMessage>(256);
 
@@ -650,10 +649,19 @@ pub async fn run(
                     None => break,
                 };
                 let client_id = cm.client_id.clone();
-                senders.write().await.insert(
-                    client_id.clone(),
-                    crate::user::ClientSink::new(cm.send_tx.clone(), cm.kill.clone()),
-                );
+                {
+                    // A connection registers once. Re-registering it here would
+                    // undo the link to its user when it is one of several
+                    // sessions on an account.
+                    let mut senders_w = senders.write().await;
+                    if !senders_w.contains(&client_id) {
+                        senders_w.insert_session(
+                            &client_id,
+                            &client_id,
+                            crate::user::ClientSink::new(cm.send_tx.clone(), cm.kill.clone()),
+                        );
+                    }
+                }
 
                 // Store TLS client certificate fingerprint for SASL EXTERNAL
                 if let Some(ref fp) = cm.certfp {

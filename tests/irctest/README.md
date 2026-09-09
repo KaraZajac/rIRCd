@@ -57,17 +57,17 @@ specification requires. Override with `IRCTEST_MARKERS` to see them.
 
 ## What is left
 
-Two tests do not pass, and neither is a conformance defect:
+One test does not pass, and it is not a conformance defect:
 
-- `testReadMarkerPropagatedToOtherSessions` needs two live connections sharing
-  one nick and account. That is session multiplexing — one user, several
-  sockets — which rIRCd does not have: a nick belongs to a connection.
-  `persistent_sessions` gives the neighbouring behaviour (logging in resumes
-  your session rather than joining it), which is not what this test asks for.
 - `testLinksWithServices` expects services to appear in `LINKS` as a linked
   server named `My.Little.Services`. rIRCd's services are built into the
   server, so there is no second server; reporting one would put a false claim
   about the network's shape on the wire.
+
+The controller turns on `multiclient` and `persistent_sessions`, which are off
+by default. Both change what an account means — one connection or several, and
+whether logging in takes a nick back — so they are the operator's decision, not
+the server's.
 
 ## Failures are findings
 

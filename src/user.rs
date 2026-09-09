@@ -72,10 +72,13 @@ pub struct Client {
     pub metadata_subscriptions: std::collections::HashSet<String>,
     /// True if this connection is over TLS (used for STS policy and WHOIS secure line)
     pub is_tls: bool,
+    /// Connections this user is reading on. Its own id is the first of them.
+    pub sessions: Vec<String>,
 }
 
 impl Client {
     pub fn new(id: String, host: String) -> Self {
+        let id_for_sessions = id.clone();
         Self {
             id,
             nick: None,
@@ -100,6 +103,7 @@ impl Client {
             last_active: Utc::now().timestamp(),
             metadata_subscriptions: std::collections::HashSet::new(),
             is_tls: false,
+            sessions: vec![id_for_sessions],
         }
     }
 
@@ -405,12 +409,169 @@ impl ClientSink {
 }
 
 /// Outbound channels for every connected client, keyed by client id.
-pub type Senders = Arc<RwLock<HashMap<String, ClientSink>>>;
+/// The connections the server can write to, and which user each belongs to.
+///
+/// A user may hold more than one connection at a time — a desktop and a phone
+/// on the same account. Replies to a command go back to the connection that
+/// sent it; anything addressed to the *user* goes to all of them. Keeping both
+/// in one place is what lets the rest of the server carry on addressing a
+/// single id without knowing which kind it is.
+#[derive(Debug, Default)]
+pub struct SessionRegistry {
+    /// One entry per live connection, keyed by its own id.
+    sinks: HashMap<String, ClientSink>,
+    /// Sessions belonging to each user, keyed by the user's id. The user's id
+    /// is the id of the session that created it, and that session is in here
+    /// too, so a user with one connection has one entry pointing at itself.
+    sessions: HashMap<String, Vec<String>>,
+    /// What each connection negotiated. Capabilities belong to a connection,
+    /// not to the account behind it: one may speak IRCv3 and another not.
+    session_caps: HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl SessionRegistry {
+    /// The sink for one connection. Used for replies, which belong to the
+    /// connection that asked and not to the user's other ones.
+    pub fn get(&self, session_id: &str) -> Option<&ClientSink> {
+        self.sinks.get(session_id)
+    }
+
+    /// Add a connection, as a user's first session or an additional one.
+    pub fn insert_session(&mut self, user_id: &str, session_id: &str, sink: ClientSink) {
+        self.sinks.insert(session_id.to_string(), sink);
+        let sessions = self.sessions.entry(user_id.to_string()).or_default();
+        if !sessions.iter().any(|s| s == session_id) {
+            sessions.push(session_id.to_string());
+        }
+    }
+
+    /// Forget one connection. Returns its sink, and whether the user has any
+    /// connections left.
+    pub fn remove_session(
+        &mut self,
+        user_id: &str,
+        session_id: &str,
+    ) -> (Option<ClientSink>, bool) {
+        let sink = self.sinks.remove(session_id);
+        let mut any_left = false;
+        if let Some(sessions) = self.sessions.get_mut(user_id) {
+            sessions.retain(|s| s != session_id);
+            any_left = !sessions.is_empty();
+            if !any_left {
+                self.sessions.remove(user_id);
+            }
+        }
+        (sink, any_left)
+    }
+
+    /// Forget a connection without knowing which user it belongs to.
+    pub fn remove(&mut self, id: &str) -> Option<ClientSink> {
+        for sessions in self.sessions.values_mut() {
+            sessions.retain(|s| s != id);
+        }
+        self.sessions.retain(|_, v| !v.is_empty());
+        self.session_caps.remove(id);
+        self.sinks.remove(id)
+    }
+
+    /// Every connection a user has. Falls back to the id itself so an id that
+    /// names a connection rather than a user still reaches something.
+    pub fn sessions_of(&self, user_id: &str) -> Vec<String> {
+        match self.sessions.get(user_id) {
+            Some(sessions) => sessions.clone(),
+            None => vec![user_id.to_string()],
+        }
+    }
+
+    /// What one connection negotiated.
+    pub fn caps_of(&self, session_id: &str) -> std::collections::HashSet<String> {
+        self.session_caps
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_session_caps(&mut self, session_id: &str, caps: std::collections::HashSet<String>) {
+        self.session_caps.insert(session_id.to_string(), caps);
+    }
+
+    /// Everything any of a user's connections negotiated. Messages are built
+    /// for this set and trimmed back per connection on the way out, so a
+    /// capability one connection asked for is not lost because another did not.
+    pub fn union_caps(&self, user_id: &str) -> std::collections::HashSet<String> {
+        let mut union = std::collections::HashSet::new();
+        for session in self.sessions_of(user_id) {
+            if let Some(caps) = self.session_caps.get(&session) {
+                union.extend(caps.iter().cloned());
+            }
+        }
+        union
+    }
+
+    /// Send to every connection a user has, each seeing only the tags it
+    /// negotiated.
+    pub fn deliver(&self, user_id: &str, msg: &Message) {
+        let sessions = self.sessions_of(user_id);
+        for session in &sessions {
+            let Some(sink) = self.sinks.get(session) else {
+                continue;
+            };
+            if msg.tags.is_empty() {
+                sink.send(msg.clone());
+                continue;
+            }
+            let mut copy = msg.clone();
+            crate::protocol::retain_negotiated_tags(&mut copy, &self.caps_of(session));
+            sink.send(copy);
+        }
+    }
+
+    pub fn contains(&self, session_id: &str) -> bool {
+        self.sinks.contains_key(session_id)
+    }
+
+    /// Move a connection that was its own user into another user's set of
+    /// sessions, keeping its sink.
+    pub fn reassign_session(&mut self, user_id: &str, session_id: &str) {
+        self.sessions.remove(session_id);
+        let sessions = self.sessions.entry(user_id.to_string()).or_default();
+        if !sessions.iter().any(|s| s == session_id) {
+            sessions.push(session_id.to_string());
+        }
+    }
+
+    /// Disconnect a user: every connection it has, not just one of them.
+    /// Killing a user that left another session open would leave that session
+    /// on the server after the user was told it was gone.
+    pub fn close_user(&mut self, user_id: &str, msg: Message) {
+        for session in self.sessions_of(user_id) {
+            if let Some(sink) = self.sinks.remove(&session) {
+                sink.close(msg.clone());
+            }
+            self.session_caps.remove(&session);
+        }
+        self.sessions.remove(user_id);
+    }
+
+    /// Every live connection, for the few things addressed to the whole server.
+    pub fn all_sinks(&self) -> impl Iterator<Item = &ClientSink> {
+        self.sinks.values()
+    }
+}
+
+pub type Senders = Arc<RwLock<SessionRegistry>>;
 
 /// Shared server state: all clients and channels
 #[derive(Debug, Default)]
 pub struct ServerState {
+    /// Every connection, keyed by its own id. All of a user's connections map
+    /// to the same `Client`, so looking one up by any of its session ids finds
+    /// the same nick, channels and account.
     pub clients: HashMap<String, Arc<RwLock<Client>>>,
+    /// Which user each connection belongs to. A user's id is the id of the
+    /// connection that created it, so for a user with one connection this maps
+    /// an id to itself.
+    pub session_to_user: HashMap<String, String>,
     pub pending: HashMap<String, PendingConnection>,
     pub nick_to_id: HashMap<String, String>,
     pub msgid_store: MsgIdStore,
@@ -529,10 +690,20 @@ impl ServerState {
         }
     }
 
+    /// The user a connection belongs to. An id that names no known connection
+    /// is returned unchanged, so callers that already hold a user id are safe.
+    pub fn user_id(&self, session_id: &str) -> String {
+        self.session_to_user
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| session_id.to_string())
+    }
+
     pub async fn add_client(&mut self, client: Client) -> Arc<RwLock<Client>> {
         let id = client.id.clone();
         let client = Arc::new(RwLock::new(client));
         self.clients.insert(id.clone(), client.clone());
+        self.session_to_user.insert(id.clone(), id.clone());
         self.max_clients = self.max_clients.max(self.clients.len());
         if let Some(ref nick) = client.read().await.nick {
             self.nick_to_id.insert(nick.to_uppercase(), id);
@@ -540,13 +711,60 @@ impl ServerState {
         client
     }
 
+    /// Remove a user and every connection it had.
     pub async fn remove_client(&mut self, id: &str) -> Option<Arc<RwLock<Client>>> {
-        let client = self.clients.remove(id)?;
+        let user_id = self.user_id(id);
+        let client = self.clients.get(&user_id).cloned()?;
+        let sessions = client.read().await.sessions.clone();
+        for session in &sessions {
+            self.clients.remove(session);
+            self.session_to_user.remove(session);
+        }
+        self.clients.remove(&user_id);
+        self.session_to_user.remove(&user_id);
         let nick = client.read().await.nick.clone();
         if let Some(ref n) = nick {
             self.nick_to_id.remove(&n.to_uppercase());
         }
         Some(client)
+    }
+
+    /// Add another connection to a user that is already here.
+    pub async fn attach_session(&mut self, user_id: &str, session_id: &str) -> bool {
+        let Some(client) = self.clients.get(user_id).cloned() else {
+            return false;
+        };
+        {
+            let mut guard = client.write().await;
+            if !guard.sessions.iter().any(|s| s == session_id) {
+                guard.sessions.push(session_id.to_string());
+            }
+        }
+        self.clients.insert(session_id.to_string(), client);
+        self.session_to_user
+            .insert(session_id.to_string(), user_id.to_string());
+        true
+    }
+
+    /// Drop one connection. Returns whether the user still has others; when it
+    /// has none the caller removes the user itself.
+    pub async fn detach_session(&mut self, session_id: &str) -> bool {
+        let user_id = self.user_id(session_id);
+        let Some(client) = self.clients.get(&user_id).cloned() else {
+            return false;
+        };
+        let remaining = {
+            let mut guard = client.write().await;
+            guard.sessions.retain(|s| s != session_id);
+            guard.sessions.len()
+        };
+        // The connection the user was created from keeps its entry until the
+        // user itself goes, because its id is the user's id.
+        if session_id != user_id {
+            self.clients.remove(session_id);
+            self.session_to_user.remove(session_id);
+        }
+        remaining > 0
     }
 
     pub async fn get_client(&self, id: &str) -> Option<Arc<RwLock<Client>>> {
@@ -635,5 +853,119 @@ mod tests {
                 .is_err(),
             "an already-closed connection needs no kill signal"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn sink() -> (ClientSink, mpsc::Receiver<Message>) {
+        let (tx, rx) = mpsc::channel(16);
+        (
+            ClientSink::new(tx, Arc::new(tokio::sync::Notify::new())),
+            rx,
+        )
+    }
+
+    fn caps(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn tagged() -> Message {
+        let mut m = Message::new("PRIVMSG", vec!["#chan".into(), "hi".into()]);
+        m.tags
+            .insert("time".into(), Some("2026-01-01T00:00:00.000Z".into()));
+        m.tags.insert("msgid".into(), Some("abc".into()));
+        m
+    }
+
+    /// Anything addressed to the user reaches every connection it has open.
+    #[tokio::test]
+    async fn delivery_reaches_all_of_a_users_connections() {
+        let mut registry = SessionRegistry::default();
+        let (desktop, mut desktop_rx) = sink();
+        let (phone, mut phone_rx) = sink();
+        registry.insert_session("user", "user", desktop);
+        registry.insert_session("user", "phone", phone);
+
+        registry.deliver(
+            "user",
+            &Message::new("PRIVMSG", vec!["#chan".into(), "hi".into()]),
+        );
+
+        assert!(desktop_rx.try_recv().is_ok());
+        assert!(phone_rx.try_recv().is_ok());
+    }
+
+    /// Capabilities belong to a connection, so each copy carries only the tags
+    /// that connection negotiated. A client that never asked for tags may not
+    /// be able to parse a line that has them.
+    #[tokio::test]
+    async fn each_connection_sees_only_the_tags_it_negotiated() {
+        let mut registry = SessionRegistry::default();
+        let (modern, mut modern_rx) = sink();
+        let (plain, mut plain_rx) = sink();
+        registry.insert_session("user", "user", modern);
+        registry.insert_session("user", "plain", plain);
+        registry.set_session_caps("user", caps(&["server-time", "message-tags"]));
+        registry.set_session_caps("plain", caps(&[]));
+
+        registry.deliver("user", &tagged());
+
+        let to_modern = modern_rx.try_recv().expect("delivered");
+        assert!(to_modern.tags.contains_key("time"));
+        assert!(to_modern.tags.contains_key("msgid"));
+
+        let to_plain = plain_rx.try_recv().expect("delivered");
+        assert!(to_plain.tags.is_empty(), "got {:?}", to_plain.tags);
+    }
+
+    /// A message is built for everything any connection asked for, then trimmed
+    /// per connection, so one connection's capability is not lost because
+    /// another lacks it.
+    #[tokio::test]
+    async fn a_users_capabilities_are_the_union_of_its_connections() {
+        let mut registry = SessionRegistry::default();
+        let (a, _a_rx) = sink();
+        let (b, _b_rx) = sink();
+        registry.insert_session("user", "user", a);
+        registry.insert_session("user", "phone", b);
+        registry.set_session_caps("user", caps(&["server-time"]));
+        registry.set_session_caps("phone", caps(&["message-tags"]));
+
+        let union = registry.union_caps("user");
+        assert!(union.contains("server-time"));
+        assert!(union.contains("message-tags"));
+    }
+
+    /// A reply belongs to the connection that asked, not to the user's others.
+    #[tokio::test]
+    async fn a_reply_goes_only_to_the_connection_that_asked() {
+        let mut registry = SessionRegistry::default();
+        let (desktop, mut desktop_rx) = sink();
+        let (phone, mut phone_rx) = sink();
+        registry.insert_session("user", "user", desktop);
+        registry.insert_session("user", "phone", phone);
+
+        registry
+            .get("phone")
+            .expect("session is here")
+            .send(Message::new("PONG", vec!["token".into()]));
+
+        assert!(phone_rx.try_recv().is_ok());
+        assert!(
+            desktop_rx.try_recv().is_err(),
+            "the other connection heard a reply that was not its own"
+        );
+    }
+
+    /// An id that names no session still reaches the connection it names, so
+    /// callers holding a plain connection id are not silently dropped.
+    #[tokio::test]
+    async fn an_unknown_user_falls_back_to_the_id_itself() {
+        let registry = SessionRegistry::default();
+        assert_eq!(registry.sessions_of("nobody"), vec!["nobody".to_string()]);
     }
 }

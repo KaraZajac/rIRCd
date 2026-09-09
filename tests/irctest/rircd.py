@@ -110,8 +110,10 @@ listen_ws = [{listen_ws}]
 motd = "irctest"
 description = "test server"
 register_before_connect = {register_before_connect}
-# The read-marker tests reconnect and expect to resume their session.
+# The read-marker tests reconnect and expect to resume their session, and open
+# a second connection on one account.
 persistent_sessions = true
+multiclient = true
 # irctest asserts on exact 005 values, and a cloak would change the host
 # halfway through registration.
 nick_protection = {nick_protection}

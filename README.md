@@ -125,6 +125,7 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 | `cloak_key` | _(unset)_ | If set, connecting clients receive an HMAC-SHA256-based virtual host cloak (e.g. `"mysecret"`) |
 | `description` | `rIRCd v<version>` | One-line description of this server, shown by `LINKS` |
 | `register_before_connect` | `true` | Allow `REGISTER` before the handshake finishes; advertised as `before-connect` |
+| `multiclient` | `false` | Let one account hold several connections at once — a desktop and a phone, say. They share a nick and a single place in every channel; anything addressed to the user reaches all of them, while the answer to a command goes back to the connection that sent it, and each connection sees only the message tags it negotiated |
 | `persistent_sessions` | `false` | Treat an account as one continuing session: logging in takes its nick back from an earlier session and rejoins that session's channels. Off by default — it disconnects the earlier session, which is what someone reconnecting after a dropped link wants and what someone with two clients open does not |
 
 ### `[network]`

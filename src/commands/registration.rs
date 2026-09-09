@@ -33,13 +33,19 @@ fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Send a message to a client. Returns true if the client was in senders and the send was attempted.
-async fn send_to_client(senders: &Senders, client_id: &str, msg: Message) -> bool {
-    if let Some(tx) = senders.read().await.get(client_id) {
-        tx.send(msg);
-        true
-    } else {
-        false
+/// Deliver to a user: every connection they have open, not just one.
+/// Returns whether they had any.
+async fn send_to_client(senders: &Senders, user_id: &str, msg: Message) -> bool {
+    let registry = senders.read().await;
+    let sessions = registry.sessions_of(user_id);
+    let mut delivered = false;
+    for session in sessions {
+        if let Some(sink) = registry.get(&session) {
+            sink.send(msg.clone());
+            delivered = true;
+        }
     }
+    delivered
 }
 
 /// Maximum ISUPPORT tokens per 005 line (RFC recommends ≤13).
@@ -105,18 +111,29 @@ pub async fn complete_registration(
 
     let mut state_guard = state.write().await;
 
+    // Set when this connection joins a user that is already here, rather than
+    // becoming one of its own.
+    let mut attach_to: Option<String> = None;
+
     if let Some(holder_id) = state_guard.nick_to_id.get(&nick.to_uppercase()).cloned() {
-        // With persistent sessions an account has one session, so logging in
-        // resumes it: the nick comes back from the connection that had it.
-        // Without this, reconnecting after a dropped link finds your own nick
-        // taken by the connection you just lost, until the server notices.
-        let same_account = cfg.server.persistent_sessions
-            && pending.account.is_some()
+        // The nick is in use. If it is in use by this same account, this is the
+        // same person arriving on another connection, and what happens next is
+        // the operator's choice: join the existing user as another session, or
+        // take over from the connection that had it.
+        let same_account = pending.account.is_some()
             && match state_guard.clients.get(&holder_id) {
                 Some(c) => c.read().await.account == pending.account,
                 None => false,
             };
-        if !same_account {
+        if same_account && cfg.server.multiclient {
+            tracing::info!(
+                client_id,
+                %nick,
+                user = %holder_id,
+                "Adding a session to an account that is already connected"
+            );
+            attach_to = Some(holder_id);
+        } else if !(same_account && cfg.server.persistent_sessions) {
             reply_to_client(
                 &senders,
                 client_id,
@@ -133,26 +150,26 @@ pub async fn complete_registration(
             )
             .await;
             return Ok(());
-        }
-        tracing::info!(
-            client_id,
-            %nick,
-            replaced = %holder_id,
-            "Resuming a persistent session; disconnecting the earlier one"
-        );
-        state_guard.nick_to_id.remove(&nick.to_uppercase());
-        drop(state_guard);
-        if let Some(sink) = senders.write().await.remove(&holder_id) {
-            sink.close(
+        } else {
+            tracing::info!(
+                client_id,
+                %nick,
+                replaced = %holder_id,
+                "Resuming a persistent session; disconnecting the earlier one"
+            );
+            state_guard.nick_to_id.remove(&nick.to_uppercase());
+            drop(state_guard);
+            senders.write().await.close_user(
+                &holder_id,
                 Message::new(
                     "ERROR",
                     vec!["Closing link: session resumed from another connection".into()],
                 )
                 .with_prefix(&cfg.server.name),
             );
+            state.write().await.remove_client(&holder_id).await;
+            state_guard = state.write().await;
         }
-        state.write().await.remove_client(&holder_id).await;
-        state_guard = state.write().await;
     }
 
     let mut client = Client::new(client_id.to_string(), pending.host);
@@ -196,9 +213,40 @@ pub async fn complete_registration(
         return Ok(());
     }
 
-    let client = state_guard.add_client(client).await;
+    // The capabilities are this connection's. A user's set is the union of its
+    // connections', so a message is built for the superset and trimmed back per
+    // connection as it goes out.
+    senders
+        .write()
+        .await
+        .set_session_caps(client_id, pending.capabilities.clone());
 
-    drop(state_guard);
+    let client = match attach_to {
+        // Another connection for a user that is already here: it takes no new
+        // nick and no new place in any channel, it just starts reading.
+        Some(ref user_id) => {
+            state_guard.attach_session(user_id, client_id).await;
+            let user = state_guard
+                .clients
+                .get(user_id)
+                .cloned()
+                .expect("attached to a user that is here");
+            drop(state_guard);
+            {
+                let mut registry = senders.write().await;
+                registry.reassign_session(user_id, client_id);
+                let union = registry.union_caps(user_id);
+                drop(registry);
+                user.write().await.capabilities = union;
+            }
+            user
+        }
+        None => {
+            let client = state_guard.add_client(client).await;
+            drop(state_guard);
+            client
+        }
+    };
 
     let server = &cfg.server.name;
     let nick_str = &client.read().await.nick.clone().unwrap();
@@ -372,6 +420,13 @@ pub async fn complete_registration(
             }
         }
     }
+    // An extra connection for someone already here is not an arrival: nobody
+    // watching this nick saw it go offline, so there is nothing to announce.
+    let watchers: Vec<String> = if attach_to.is_some() {
+        Vec::new()
+    } else {
+        watchers
+    };
     if !watchers.is_empty() {
         tracing::info!(
             nick = %nick_str,
@@ -394,9 +449,129 @@ pub async fn complete_registration(
         }
     }
 
-    rejoin_account_channels(client_id, &state, &channels, &senders, cfg).await;
+    match attach_to {
+        // The user is already in its channels; this connection has to be told
+        // where it has arrived, and only this connection.
+        Some(_) => {
+            send_channel_state_to_session(client_id, &client, &state, &channels, &senders, cfg)
+                .await
+        }
+        None => rejoin_account_channels(client_id, &state, &channels, &senders, cfg).await,
+    }
 
     Ok(())
+}
+
+/// Tell one connection which channels its user is in, as if it had just joined
+/// them: the JOIN it would have seen, the topic, and who is there.
+async fn send_channel_state_to_session(
+    session_id: &str,
+    client: &Arc<RwLock<Client>>,
+    state: &Arc<RwLock<ServerState>>,
+    channels: &Arc<RwLock<ChannelStore>>,
+    senders: &Senders,
+    cfg: &Config,
+) {
+    let (source, nick, joined, caps, account) = {
+        let g = client.read().await;
+        (
+            g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
+            g.nick_or_id().to_string(),
+            g.channels.keys().cloned().collect::<Vec<_>>(),
+            g.capabilities.clone(),
+            g.account.clone(),
+        )
+    };
+
+    for ch_key in joined {
+        let join_msg = if caps.contains("extended-join") {
+            Message::new(
+                "JOIN",
+                vec![
+                    ch_key.clone(),
+                    account.clone().unwrap_or_else(|| "*".to_string()),
+                    client.read().await.realname.clone().unwrap_or_default(),
+                ],
+            )
+            .with_prefix(&source)
+        } else {
+            Message::new("JOIN", vec![ch_key.clone()]).with_prefix(&source)
+        };
+        reply_to_client(senders, session_id, join_msg, None).await;
+
+        let ch_store = channels.read().await;
+        let Some(ch_ref) = ch_store.channels.get(&ch_key) else {
+            continue;
+        };
+        let (topic, topic_setter, topic_time) = {
+            let ch = ch_ref.read().await;
+            (ch.topic.clone(), ch.topic_setter.clone(), ch.topic_time)
+        };
+        if let Some(topic) = topic {
+            reply_to_client(
+                senders,
+                session_id,
+                Message::new("332", vec![nick.clone(), ch_key.clone(), topic])
+                    .with_prefix(&cfg.server.name),
+                None,
+            )
+            .await;
+            reply_to_client(
+                senders,
+                session_id,
+                Message::new(
+                    "333",
+                    vec![
+                        nick.clone(),
+                        ch_key.clone(),
+                        topic_setter.unwrap_or_else(|| "*".to_string()),
+                        topic_time.unwrap_or(0).to_string(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+                None,
+            )
+            .await;
+        }
+
+        let state_r = state.read().await;
+        // draft/read-marker: where this session should consider itself caught
+        // up to, the same as it would learn on joining.
+        if caps.contains("draft/read-marker") {
+            let key = account.clone().unwrap_or_else(|| session_id.to_string());
+            let ts = state_r
+                .read_markers
+                .get(&key)
+                .and_then(|m| m.get(&ch_key).cloned())
+                .unwrap_or_else(|| "*".to_string());
+            let ts_param = if ts == "*" {
+                "*".to_string()
+            } else {
+                format!("timestamp={}", ts)
+            };
+            reply_to_client(
+                senders,
+                session_id,
+                Message::new("MARKREAD", vec![ch_key.clone(), ts_param])
+                    .with_prefix(&cfg.server.name),
+                None,
+            )
+            .await;
+        }
+        crate::commands::channel_cmds::send_names_for_channel(
+            ch_ref,
+            &ch_key,
+            &nick,
+            &state_r,
+            senders,
+            session_id,
+            &cfg.server.name,
+            &caps,
+            None,
+            None,
+        )
+        .await;
+    }
 }
 
 /// Put a returning client back into the channels its account was in.
@@ -580,11 +755,16 @@ pub async fn handle_cap(
                     conn.capabilities.insert("cap-notify".to_string());
                 }
             } else if version_302 {
-                if let Some(c) = state_guard.clients.get(client_id) {
-                    c.write()
-                        .await
-                        .capabilities
-                        .insert("cap-notify".to_string());
+                if let Some(c) = state_guard.clients.get(client_id).cloned() {
+                    let user_id = state_guard.user_id(client_id);
+                    let union = {
+                        let mut registry = senders.write().await;
+                        let mut session_caps = registry.caps_of(client_id);
+                        session_caps.insert("cap-notify".to_string());
+                        registry.set_session_caps(client_id, session_caps);
+                        registry.union_caps(&user_id)
+                    };
+                    c.write().await.capabilities = union;
                 }
             }
             let client_is_tls = if is_registered {
@@ -686,15 +866,25 @@ pub async fn handle_cap(
 
             if nak.is_empty() && nak_disable.is_empty() {
                 if is_registered {
-                    if let Some(c) = state_guard.clients.get(client_id) {
-                        let mut cg = c.write().await;
-                        for cap in &ack_enable {
-                            cg.capabilities.insert(cap.clone());
-                        }
-                        for cap in &to_disable {
-                            let base = cap.split('=').next().unwrap_or(cap);
-                            cg.capabilities.remove(base);
-                        }
+                    // Capabilities belong to this connection. The user's set is
+                    // the union of its connections', so that a message is built
+                    // for everything any of them asked for.
+                    if let Some(c) = state_guard.clients.get(client_id).cloned() {
+                        let user_id = state_guard.user_id(client_id);
+                        let union = {
+                            let mut registry = senders.write().await;
+                            let mut session_caps = registry.caps_of(client_id);
+                            for cap in &ack_enable {
+                                session_caps.insert(cap.clone());
+                            }
+                            for cap in &to_disable {
+                                let base = cap.split('=').next().unwrap_or(cap);
+                                session_caps.remove(base);
+                            }
+                            registry.set_session_caps(client_id, session_caps);
+                            registry.union_caps(&user_id)
+                        };
+                        c.write().await.capabilities = union;
                     }
                 } else {
                     let conn = state_guard.get_or_create_pending(client_id, host);
@@ -894,10 +1084,13 @@ pub async fn handle_nick(
     if let Some(client) = state_guard.clients.get(client_id) {
         let client_guard = client.write().await;
         if client_guard.registered {
+            // Held by someone else, meaning some *other* user — another of
+            // this user's own connections is not a collision.
+            let self_user = state_guard.user_id(client_id);
             if state_guard
                 .nick_to_id
                 .get(&nick.to_uppercase())
-                .map(|id| id != client_id)
+                .map(|id| *id != self_user)
                 == Some(true)
             {
                 reply_to_client(
@@ -954,9 +1147,13 @@ pub async fn handle_nick(
             if let Some(client) = state_guard.clients.get(client_id) {
                 client.write().await.nick = Some(nick.clone());
             }
+            // The nick belongs to the user, so it must point at the user and
+            // not at whichever of its connections changed it — otherwise a
+            // message addressed to the nick reaches only that one.
+            let user_id = state_guard.user_id(client_id);
             state_guard
                 .nick_to_id
-                .insert(nick.to_uppercase(), client_id.to_string());
+                .insert(nick.to_uppercase(), user_id.clone());
             // monitor: 731 to watchers of old nick, 730 to watchers of new nick.
             // A change of case is the same nick, so nobody went offline or came
             // online and there is nothing to report.
@@ -1351,15 +1548,39 @@ pub async fn handle_quit(
 ) -> anyhow::Result<()> {
     let reason = msg.trailing().unwrap_or("Client quit").to_string();
 
+    let user_id = state.read().await.user_id(client_id);
+
+    // One connection of several going away is not the user leaving: the others
+    // are still reading, still in every channel. Only the last one out closes
+    // the door.
+    let others_remain = state.write().await.detach_session(client_id).await;
+    if others_remain {
+        tracing::info!(
+            client_id,
+            user = %user_id,
+            "Session closed; the account is still connected elsewhere"
+        );
+        if let Some(sink) = senders.write().await.remove(client_id) {
+            sink.close(
+                Message::new("ERROR", vec![format!("Closing link: {}", reason)])
+                    .with_prefix(&cfg.server.name),
+            );
+        }
+        let mut state_w = state.write().await;
+        state_w.pending_multiline.remove(client_id);
+        state_w.pending_client_batches.remove(client_id);
+        state_w.certfps.remove(client_id);
+        return Ok(());
+    }
     let (source, channel_names, had_account, quit_nick, monitor_list) = {
         let mut state_guard = state.write().await;
-        let client = state_guard.clients.get(client_id).cloned();
+        let client = state_guard.clients.get(&user_id).cloned();
         if let Some(client) = client {
             let c = client.read().await;
             let source = c.source().unwrap_or_else(|| c.nick_or_id().to_string());
             let chans: Vec<String> = c.channels.keys().cloned().collect();
             let had_account = c.account.is_some();
-            let nick = c.nick.clone().unwrap_or_else(|| client_id.to_string());
+            let nick = c.nick.clone().unwrap_or_else(|| user_id.to_string());
             let list = c.monitor_list.clone();
             // Record WHOWAS before the client is removed (use display_host to respect cloaking)
             if let Some(ref pool) = cfg.db {
@@ -1402,13 +1623,11 @@ pub async fn handle_quit(
         if let Some(ch_rw) = ch_store.channels.get_mut(ch_name) {
             let mut ch = ch_rw.write().await;
             for (member_id, _) in ch.members.clone().iter() {
-                if member_id != client_id {
-                    if let Some(tx) = senders.read().await.get(member_id) {
-                        tx.send(quit_msg.clone());
-                    }
+                if *member_id != user_id {
+                    senders.read().await.deliver(member_id, &quit_msg);
                 }
             }
-            ch.members.remove(client_id);
+            ch.members.remove(&user_id);
             should_remove = ch.members.is_empty();
         }
         if should_remove {
@@ -1480,7 +1699,7 @@ pub async fn handle_quit(
             .monitor_watchers
             .pattern_watchers_for(&source.to_lowercase())
         {
-            if !watchers_731.contains(&w) && w != client_id {
+            if !watchers_731.contains(&w) && w != user_id {
                 watchers_731.push(w);
             }
         }
@@ -1508,23 +1727,23 @@ pub async fn handle_quit(
         let mut state_w = state.write().await;
         state_w
             .monitor_watchers
-            .remove_client(client_id, &monitor_list);
+            .remove_client(&user_id, &monitor_list);
         state_w
             .monitor_watchers
-            .remove_client_patterns(client_id, &monitor_list);
+            .remove_client_patterns(&user_id, &monitor_list);
         state_w.certfps.remove(client_id);
-        state_w.remove_client(client_id).await;
+        state_w.remove_client(&user_id).await;
     }
 
     // QUIT ends the connection: send ERROR and close it. Dropping the sink is
     // not enough — the connection task holds a sender of its own, so without
     // the kill signal the socket stays open until it times out.
-    if let Some(sink) = senders.write().await.remove(client_id) {
-        sink.close(
-            Message::new("ERROR", vec![format!("Closing link: {}", reason)])
-                .with_prefix(&cfg.server.name),
-        );
-    }
+    senders.write().await.close_user(
+        &user_id,
+        Message::new("ERROR", vec![format!("Closing link: {}", reason)])
+            .with_prefix(&cfg.server.name),
+    );
+    senders.write().await.remove(client_id);
 
     Ok(())
 }
@@ -3554,12 +3773,11 @@ pub async fn handle_ghost(
     };
 
     tracing::info!(client_id, %account, ghost = %ghost_id, "GHOST: closing stale session");
-    if let Some(sink) = senders.read().await.get(&ghost_id) {
-        sink.close(
-            Message::new("ERROR", vec![format!("Closing link: replaced by {}", nick)])
-                .with_prefix(&cfg.server.name),
-        );
-    }
+    senders.write().await.close_user(
+        &ghost_id,
+        Message::new("ERROR", vec![format!("Closing link: replaced by {}", nick)])
+            .with_prefix(&cfg.server.name),
+    );
     reply_to_client(
         &senders,
         client_id,
@@ -4244,6 +4462,7 @@ pub async fn send_chghost_if_changed(
         Message::new("CHGHOST", vec![new_user.into(), new_host.into()]).with_prefix(old_source);
     let quit_msg = Message::new("QUIT", vec!["Changing host".into()]).with_prefix(old_source);
     let mut already_notified = std::collections::HashSet::new();
+    let user_id = state.read().await.user_id(client_id);
     for ch_name in channel_names {
         let (member_ids, member_modes) = {
             let ch_store = channels.read().await;
@@ -4251,7 +4470,7 @@ pub async fn send_chghost_if_changed(
                 Some(ch) => {
                     let ch = ch.read().await;
                     let ids: Vec<String> = ch.members.keys().cloned().collect();
-                    let modes = ch.members.get(client_id).map(|m| m.modes.clone());
+                    let modes = ch.members.get(&user_id).map(|m| m.modes.clone());
                     (ids, modes)
                 }
                 None => continue,

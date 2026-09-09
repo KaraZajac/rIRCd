@@ -299,6 +299,13 @@ pub struct ServerConfig {
     /// with two clients open does not.
     #[serde(default)]
     pub persistent_sessions: bool,
+    /// Let one account hold several connections at once — a desktop and a
+    /// phone, say. They share a nick and a place in every channel; anything
+    /// addressed to the user reaches all of them, while the answer to a command
+    /// goes back to the connection that sent it. Off by default: on a server
+    /// without accounts it does nothing, and it changes what a nick means.
+    #[serde(default)]
+    pub multiclient: bool,
 }
 
 fn default_register_before_connect() -> bool {
@@ -353,6 +360,7 @@ impl Default for ServerConfig {
             description: default_server_description(),
             register_before_connect: default_register_before_connect(),
             persistent_sessions: false,
+            multiclient: false,
         }
     }
 }

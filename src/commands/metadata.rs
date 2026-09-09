@@ -218,9 +218,7 @@ async fn broadcast_metadata_event(
     drop(state_r);
 
     for id in notify_ids {
-        if let Some(tx) = senders.read().await.get(&id) {
-            tx.send(event.clone());
-        }
+        senders.read().await.deliver(&id, &event);
     }
 }
 

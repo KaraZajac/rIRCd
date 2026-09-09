@@ -17,10 +17,12 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
-async fn send_to_client(senders: &Senders, client_id: &str, msg: Message) {
-    if let Some(tx) = senders.read().await.get(client_id) {
-        tx.send(msg);
-    }
+/// Deliver to a user: every connection they have open, not just one.
+///
+/// Channel members and message targets are users, and a user may be reading on
+/// more than one connection at a time.
+async fn send_to_client(senders: &Senders, user_id: &str, msg: Message) {
+    senders.read().await.deliver(user_id, &msg);
 }
 
 /// JOIN answers with several messages — the JOIN itself, the topic, the names —
@@ -115,6 +117,8 @@ async fn handle_join_inner(
         .source()
         .unwrap_or_else(|| client_data.nick_or_id().to_string());
     let nick = client_data.nick_or_id().to_string();
+    // Channel membership is the user's, not this one connection's.
+    let user_id = client_data.id.clone();
 
     let client_caps = client_data.capabilities.clone();
     let account = client_data.account.clone();
@@ -132,6 +136,8 @@ async fn handle_join_inner(
         };
         let joined_channels: Vec<String> =
             client_arc.read().await.channels.keys().cloned().collect();
+        // Channel membership belongs to the user, not to one of its connections.
+        let user_id = client_arc.read().await.id.clone();
         drop(state); // release ServerState read guard
         for ch_key in &joined_channels {
             let part_msg =
@@ -142,17 +148,15 @@ async fn handle_join_inner(
                 if let Some(ch_lock) = ch_store.channels.get(ch_key) {
                     let mut ch = ch_lock.write().await;
                     let ids: Vec<String> = ch.members.keys().cloned().collect();
-                    ch.members.remove(client_id);
-                    ch.invite_list.remove(client_id);
+                    ch.members.remove(&user_id);
+                    ch.invite_list.remove(&user_id);
                     ids
                 } else {
                     vec![]
                 }
             };
             for mid in &member_ids {
-                if let Some(tx) = senders.read().await.get(mid) {
-                    tx.send(part_msg.clone());
-                }
+                senders.read().await.deliver(mid, &part_msg);
             }
         }
         client_arc.write().await.channels.clear();
@@ -217,7 +221,7 @@ async fn handle_join_inner(
             .or_insert_with(|| RwLock::new(Channel::new(ch_name.to_string())));
 
         let mut ch = ch.write().await;
-        if ch.is_member(client_id) {
+        if ch.is_member(&state.user_id(client_id)) {
             continue;
         }
 
@@ -318,10 +322,12 @@ async fn handle_join_inner(
             voice: persisted_voice,
             ..Default::default()
         };
+        // Membership belongs to the user: a second connection on the same
+        // account is the same person in the channel, listed once.
         ch.members.insert(
-            client_id.to_string(),
+            user_id.clone(),
             ChannelMembership {
-                client_id: client_id.to_string(),
+                client_id: user_id.clone(),
                 modes: modes.clone(),
             },
         );
@@ -383,8 +389,8 @@ async fn handle_join_inner(
             // so it goes inside the labeled batch; everyone else's does not.
             if mid == client_id {
                 reply_self!(join_msg);
-            } else if let Some(tx) = senders.read().await.get(mid) {
-                tx.send(join_msg);
+            } else {
+                senders.read().await.deliver(mid, &join_msg);
             }
         }
 
@@ -542,6 +548,7 @@ pub async fn handle_part(
         .await
         .source()
         .unwrap_or_else(|| client_id.to_string());
+    let user_id = client.read().await.id.clone();
     let ch_names = msg.params.first().map(|s| s.as_str()).unwrap_or("");
 
     let parting_account = match state.clients.get(client_id) {
@@ -588,7 +595,7 @@ pub async fn handle_part(
         }
         if let Some(ch_rw) = ch_store.channels.get_mut(&ch_key) {
             let mut ch = ch_rw.write().await;
-            if !ch.is_member(client_id) {
+            if !ch.is_member(&state.user_id(client_id)) {
                 // Not in channel — send 442 ERR_NOTONCHANNEL and skip
                 let nick = client.read().await.nick_or_id().to_string();
                 drop(ch);
@@ -611,11 +618,9 @@ pub async fn handle_part(
                 continue;
             }
             for mid in ch.members.clone().keys() {
-                if let Some(tx) = senders.read().await.get(mid) {
-                    tx.send(part_msg.clone());
-                }
+                senders.read().await.deliver(mid, &part_msg);
             }
-            ch.members.remove(client_id);
+            ch.members.remove(&user_id);
             should_remove = ch.members.is_empty();
         }
         if should_remove {
@@ -747,7 +752,7 @@ pub async fn handle_names(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn send_names_for_channel(
+pub(crate) async fn send_names_for_channel(
     ch: &RwLock<Channel>,
     ch_name: &str,
     nick: &str,
@@ -967,7 +972,7 @@ pub async fn handle_list(
     for (ch_name, ch) in &ch_store.channels {
         let ch = ch.read().await;
         // +s: secret channels are not shown to non-members
-        if ch.modes.secret && !ch.is_member(client_id) {
+        if ch.modes.secret && !ch.is_member(&state.user_id(client_id)) {
             continue;
         }
         let count = ch.member_count();
@@ -1058,7 +1063,7 @@ pub async fn handle_mode(
         };
         {
             let mut ch = ch_entry.write().await;
-            let member = ch.members.get(client_id);
+            let member = ch.members.get(&state.user_id(client_id));
             let is_op = member.map(|m| m.modes.op).unwrap_or(false);
 
             if msg.params.len() == 1 {
@@ -1683,9 +1688,7 @@ pub async fn handle_mode(
             drop(ch_store);
             if let Some(ref mode_msg) = mode_msg {
                 for mid in &member_ids_mode {
-                    if let Some(tx) = senders.read().await.get(mid) {
-                        tx.send(mode_msg.clone());
-                    }
+                    senders.read().await.deliver(mid, &mode_msg);
                 }
             }
             // Persist channel modes to database
@@ -1892,7 +1895,7 @@ pub async fn handle_topic(
         }
 
         // Must be on channel to set topic
-        if !ch.is_member(client_id) {
+        if !ch.is_member(&state.user_id(client_id)) {
             reply_to_client(
                 &senders,
                 client_id,
@@ -1962,9 +1965,7 @@ pub async fn handle_topic(
                 cfg.server.client_tag_deny.as_deref(),
                 &crate::protocol::SenderTags::default(),
             );
-            if let Some(tx) = senders.read().await.get(mid) {
-                tx.send(tagged);
-            }
+            senders.read().await.deliver(mid, &tagged);
         }
 
         // Record TOPIC event for draft/event-playback
@@ -2108,13 +2109,9 @@ pub async fn handle_kick(
                     Message::new("KICK", vec![ch_name.into(), target_nick.into(), reason])
                         .with_prefix(&source);
                 for mid in ch.members.clone().keys() {
-                    if let Some(tx) = senders.read().await.get(mid) {
-                        tx.send(kick_msg.clone());
-                    }
+                    senders.read().await.deliver(mid, &kick_msg);
                 }
-                if let Some(tx) = senders.read().await.get(&tid) {
-                    tx.send(kick_msg);
-                }
+                senders.read().await.deliver(&tid, &kick_msg);
                 should_remove_channel = ch.members.is_empty();
             }
         }
@@ -2197,7 +2194,7 @@ pub async fn handle_invite(
     if let Some(ch) = ch_store.channels.get_mut(&ch_key) {
         let mut ch = ch.write().await;
         // Check sender is on the channel
-        if !ch.is_member(client_id) {
+        if !ch.is_member(&state.user_id(client_id)) {
             let nick = client.read().await.nick_or_id().to_string();
             reply_to_client(
                 &senders,
@@ -2283,9 +2280,7 @@ pub async fn handle_invite(
                 cfg.server.client_tag_deny.as_deref(),
                 &crate::protocol::SenderTags::default(),
             );
-            if let Some(tx) = senders.read().await.get(target_id) {
-                tx.send(tagged_invite);
-            }
+            senders.read().await.deliver(target_id, &tagged_invite);
             reply_to_client(
                 &senders,
                 client_id,
@@ -2443,7 +2438,9 @@ pub async fn handle_rename(
     };
     let (is_member, is_op, member_ids, topic, topic_setter, topic_time) = {
         let ch = ch_ref.read().await;
-        let is_member = ch.members.contains_key(client_id);
+        let is_member = ch
+            .members
+            .contains_key(&state.read().await.user_id(client_id));
         let is_op = ch
             .members
             .get(client_id)

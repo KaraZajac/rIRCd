@@ -9,10 +9,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
-async fn send_to_client(senders: &Senders, client_id: &str, msg: Message) {
-    if let Some(tx) = senders.read().await.get(client_id) {
-        tx.send(msg);
-    }
+/// Deliver to a user: every connection they have open, not just one.
+///
+/// Channel members and message targets are users, and a user may be reading on
+/// more than one connection at a time.
+async fn send_to_client(senders: &Senders, user_id: &str, msg: Message) {
+    senders.read().await.deliver(user_id, &msg);
 }
 
 // ─── LUSERS ───────────────────────────────────────────────────────────────────
@@ -878,7 +880,7 @@ pub async fn handle_knock(
         return Ok(());
     }
 
-    if ch.is_member(client_id) {
+    if ch.is_member(&state.user_id(client_id)) {
         reply_to_client(
             &senders,
             client_id,
@@ -1088,10 +1090,7 @@ pub async fn handle_kill(
         "ERROR",
         vec![format!("Killed ({} ({}))", killer_source, reason)],
     );
-    if let Some(sink) = senders.read().await.get(&tid) {
-        sink.close(error_msg);
-    }
-    senders.write().await.remove(&tid);
+    senders.write().await.close_user(&tid, error_msg);
 
     // Broadcast QUIT to channel members
     let quit_msg = Message::new(
@@ -1541,7 +1540,7 @@ pub async fn handle_die(
         ],
     )
     .with_prefix(&cfg.server.name);
-    for (_, sink) in senders.read().await.iter() {
+    for sink in senders.read().await.all_sinks() {
         sink.send(notice.clone());
     }
 
@@ -1668,8 +1667,9 @@ pub async fn handle_kline(
         }
     }
     for (id, hit_nick) in &hits {
-        if let Some(sink) = senders.read().await.get(id) {
-            sink.close(
+        {
+            senders.write().await.close_user(
+                id,
                 Message::new(
                     "ERROR",
                     vec![format!("Closing link: banned ({})", ban.reason)],

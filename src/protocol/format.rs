@@ -169,6 +169,34 @@ impl SenderTags {
     }
 }
 
+/// Take off a message any tag the recipient did not negotiate.
+///
+/// Tags are not decoration: a client that never asked for them may not be able
+/// to parse a line that carries them. This is applied per connection, because
+/// capabilities belong to a connection — one account may be read from a client
+/// that speaks IRCv3 and another that does not.
+pub fn retain_negotiated_tags(msg: &mut Message, caps: &HashSet<String>) {
+    if !caps.contains("server-time") {
+        msg.tags.remove("time");
+    }
+    if !caps.contains("message-tags") {
+        msg.tags.remove("msgid");
+        msg.tags.retain(|k, _| !k.starts_with('+'));
+    }
+    if !caps.contains("account-tag") {
+        msg.tags.remove("account");
+    }
+    if !caps.contains("batch") {
+        msg.tags.remove("batch");
+    }
+    if !caps.contains("draft/oper-tag") {
+        msg.tags.remove("draft/oper");
+    }
+    if !caps.contains("labeled-response") {
+        msg.tags.remove("label");
+    }
+}
+
 pub fn add_tags_for_recipient(
     mut msg: Message,
     recipient_caps: &HashSet<String>,
@@ -181,13 +209,7 @@ pub fn add_tags_for_recipient(
     // A message may arrive here already carrying tags — a time it was sent at,
     // tags a client attached. A recipient only sees the ones it negotiated, so
     // anything it did not ask for is taken off its copy rather than left on.
-    if !recipient_caps.contains("server-time") {
-        msg.tags.remove("time");
-    }
-    if !recipient_caps.contains("message-tags") {
-        msg.tags.remove("msgid");
-        msg.tags.retain(|k, _| !k.starts_with('+'));
-    }
+    retain_negotiated_tags(&mut msg, recipient_caps);
     if !recipient_caps.is_empty() {
         if recipient_caps.contains("server-time") {
             add_server_time(&mut msg.tags);

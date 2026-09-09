@@ -8,10 +8,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::debug;
 
-async fn send_to_client(senders: &Senders, client_id: &str, msg: Message) {
-    if let Some(tx) = senders.read().await.get(client_id) {
-        tx.send(msg);
-    }
+/// Deliver to a user: every connection they have open, not just one.
+///
+/// Channel members and message targets are users, and a user may be reading on
+/// more than one connection at a time.
+async fn send_to_client(senders: &Senders, user_id: &str, msg: Message) {
+    senders.read().await.deliver(user_id, &msg);
 }
 
 /// Strip mIRC/IRC color and formatting codes from a message.
@@ -464,7 +466,7 @@ pub async fn handle_privmsg(
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
             // +n: reject non-members when no-external-messages is set
-            if !ch.is_member(client_id) && ch.modes.no_external {
+            if !ch.is_member(&state_guard.user_id(client_id)) && ch.modes.no_external {
                 reply_to_client(
                     &senders,
                     client_id,
@@ -852,7 +854,7 @@ pub async fn handle_notice(
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
             // +n: reject non-members when no-external-messages is set
-            if !ch.is_member(client_id) && ch.modes.no_external {
+            if !ch.is_member(&state_guard.user_id(client_id)) && ch.modes.no_external {
                 return Ok(());
             }
             // +m: only voiced/op may send
@@ -1115,7 +1117,7 @@ pub async fn deliver_multiline_batch(
             match ch_store.channels.get(&ch_key) {
                 Some(ch) => {
                     let ch = ch.read().await;
-                    if !ch.is_member(client_id) {
+                    if !ch.is_member(&state_guard.user_id(client_id)) {
                         reply_to_client(
                             &senders,
                             client_id,
@@ -1450,7 +1452,7 @@ pub async fn handle_tagmsg(
             let ch = ch.read().await;
 
             // +n: reject non-members when no-external-messages is set
-            if !ch.is_member(client_id) && ch.modes.no_external {
+            if !ch.is_member(&state_guard.user_id(client_id)) && ch.modes.no_external {
                 reply_to_client(
                     &senders,
                     client_id,
@@ -1534,7 +1536,7 @@ pub async fn handle_tagmsg(
                 return Ok(());
             }
 
-            if ch.is_member(client_id) || !ch.modes.no_external {
+            if ch.is_member(&state_guard.user_id(client_id)) || !ch.modes.no_external {
                 for mid in ch.members.keys() {
                     let caps = match state_guard.clients.get(mid) {
                         Some(c) => c.read().await.capabilities.clone(),
@@ -1664,10 +1666,11 @@ pub async fn handle_redact(
     // saying so is a different answer from "no such message".
     if target_param.starts_with('#') || target_param.starts_with('&') {
         let ch_key = canonical_channel_key(target_param);
+        let user_id = state.read().await.user_id(client_id);
         let is_member = {
             let ch_store = channels.read().await;
             match ch_store.channels.get(&ch_key) {
-                Some(ch) => ch.read().await.members.contains_key(client_id),
+                Some(ch) => ch.read().await.members.contains_key(&user_id),
                 None => false,
             }
         };
@@ -1987,7 +1990,7 @@ pub async fn handle_chathistory(
     // it spoke would otherwise be told its own last messages do not exist.
     cfg.flush_history().await;
     let params = &msg.params;
-    let (requester_nick, requester_identity) = {
+    let (requester_nick, requester_identity, requester_user_id) = {
         let state_r = state.read().await;
         match state_r.clients.get(client_id) {
             Some(c) => {
@@ -1997,7 +2000,7 @@ pub async fn handle_chathistory(
                     Some(ref a) => crate::persist::account_id(a),
                     None => crate::persist::nick_id(&nick),
                 };
-                (nick, identity)
+                (nick, identity, g.id.clone())
             }
             None => return Ok(()),
         }
@@ -2195,7 +2198,7 @@ pub async fn handle_chathistory(
     let is_member = if is_channel_target {
         let ch_store = channels.read().await;
         match ch_store.channels.get(&history_key) {
-            Some(ch) => ch.read().await.members.contains_key(client_id),
+            Some(ch) => ch.read().await.members.contains_key(&requester_user_id),
             None => false,
         }
     } else {
@@ -2514,7 +2517,14 @@ pub async fn handle_markread(
             vec![target.into(), format!("timestamp={}", updated_ts)],
         )
         .with_prefix(&cfg.server.name);
-        reply_to_client(&senders, client_id, m, label).await;
+        // Where the user has read up to is the user's, not one connection's:
+        // every session it has open needs to move its marker too.
+        let user_id = state.read().await.user_id(client_id);
+        let mut m_labelled = m;
+        if let Some(l) = label {
+            m_labelled.add_tag("label", Some(l.to_string()));
+        }
+        send_to_client(&senders, &user_id, m_labelled).await;
     } else {
         let state_r = state.read().await;
         let ts = state_r
@@ -2571,7 +2581,7 @@ pub async fn deliver_client_batch(
             match ch_store.channels.get(&ch_key) {
                 Some(ch) => {
                     let ch = ch.read().await;
-                    if !ch.is_member(client_id) {
+                    if !ch.is_member(&state_r.user_id(client_id)) {
                         return Ok(());
                     }
                     ch.members.keys().cloned().collect()
