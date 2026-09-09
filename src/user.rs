@@ -184,6 +184,9 @@ pub struct PendingConnection {
     /// holds it. REGISTER uses it to say the account is taken rather than that
     /// no nick was given.
     pub nick_in_use: Option<String>,
+    /// draft/metadata before-connect: keys set during registration, moved to
+    /// the user's own store once it has a nick to file them under.
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 impl PendingConnection {
@@ -194,6 +197,7 @@ impl PendingConnection {
             user: None,
             realname: None,
             pass: None,
+            metadata: std::collections::BTreeMap::new(),
             capabilities: HashSet::new(),
             cap_ended: false,
             cap_negotiating: false,

@@ -108,6 +108,8 @@ pub async fn complete_registration(
     let nick = pending.nick.unwrap();
     let user = pending.user.unwrap();
     let realname = pending.realname.unwrap_or_else(|| nick.clone());
+    let pending_metadata: Vec<(String, String)> =
+        std::mem::take(&mut pending.metadata).into_iter().collect();
 
     let mut state_guard = state.write().await;
 
@@ -337,6 +339,36 @@ pub async fn complete_registration(
     }
 
     send_motd(nick_str, server, &senders, cfg, label, client_id).await;
+
+    // draft/metadata before-connect: keys set during registration now belong to
+    // a user with a nick, so they move into its store and come back as part of
+    // the burst.
+    if !pending_metadata.is_empty() {
+        let key = crate::commands::metadata::metadata_key(nick_str);
+        {
+            let mut state_w = state.write().await;
+            let entry = state_w.metadata.entry(key.clone()).or_default();
+            for (k, v) in &pending_metadata {
+                entry.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(ref pool) = cfg.db {
+            for (k, v) in &pending_metadata {
+                crate::persist::save_metadata(pool, &key, k, v).await;
+            }
+        }
+        let caps = client.read().await.capabilities.clone();
+        crate::commands::metadata::send_channel_metadata_on_join(
+            &senders,
+            client_id,
+            nick_str,
+            nick_str,
+            server,
+            caps.contains("batch"),
+            pending_metadata.clone(),
+        )
+        .await;
+    }
 
     // draft/auto-join: send AUTOJOIN with configured channel list
     {

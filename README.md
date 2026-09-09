@@ -514,7 +514,7 @@ still accepted in `CAP REQ` so older clients keep working.
 | **draft/event-playback** | Full | JOIN/PART/QUIT/TOPIC/NICK events stored in DB and replayed in CHATHISTORY |
 | **draft/network-icon** | Full | Optional `ICON=` ISUPPORT token; config `network.icon` |
 | **draft/read-marker** | Full | MARKREAD target [timestamp]; per-account, persisted in MariaDB |
-| **draft/metadata-2** | Full | METADATA GET/LIST/SET/CLEAR; key-value per user/channel, persisted in MariaDB |
+| **draft/metadata-2** / **draft/metadata-3** | Full | METADATA GET/LIST/SET/CLEAR/SUB/UNSUB/SUBS/SYNC; key-value per user and channel, persisted in MariaDB. Both names of the same specification are advertised; replies to a `-3` client come back in a `metadata` batch and subscription notices as RPL_KEYVALUE. `before-connect` lets a client set its own keys during registration; RPL_WHOISKEYVALUE (760) carries them in WHOIS. An invite-only or secret channel does not hand its metadata to non-members |
 | **STATUSMSG** | Full | PRIVMSG/NOTICE to `@#channel` (ops+) or `+#channel` (voiced+); advertised in 005 `STATUSMSG=@+` |
 | **draft/account-registration** | Full | REGISTER \* [email] password; logs the client in on success; optional email verification via VERIFY (`[email]` config) |
 | **draft/multiline** | Full | BATCH draft/multiline; max-bytes=4096, max-lines=20; fallback for non-multiline clients |

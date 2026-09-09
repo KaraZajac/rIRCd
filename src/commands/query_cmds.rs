@@ -556,6 +556,24 @@ pub async fn handle_whois(
         }
     }
 
+    // 760 RPL_WHOISKEYVALUE — the target's metadata, for a client that asked
+    // for metadata at all. A client that did not negotiate it has no idea what
+    // these numerics are.
+    if crate::commands::metadata::wants_metadata(&client.read().await.capabilities) {
+        let entries: Vec<(String, String)> = state
+            .metadata
+            .get(&crate::commands::metadata::metadata_key(target_nick))
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        for (key, value) in entries {
+            send_reply!(Message::new(
+                "760",
+                vec![nick.clone(), target_nick.into(), key, "*".into(), value,],
+            )
+            .with_prefix(&cfg.server.name));
+        }
+    }
+
     send_reply!(Message::new(
         "318",
         vec![nick, target_nick.into(), "End of /WHOIS list".into()],

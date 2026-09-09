@@ -551,7 +551,7 @@ async fn handle_join_inner(
         // #channel`. Sending them on JOIN too puts unasked-for numerics between
         // the JOINs of a multi-channel join, which clients read positionally.
         // draft/metadata-2: push existing channel metadata to the joining client
-        if client_caps.contains("draft/metadata-2") {
+        if crate::commands::metadata::wants_metadata(&client_caps) {
             let ch_meta: Vec<(String, String)> = state
                 .metadata
                 .get(&ch_key)
@@ -567,6 +567,40 @@ async fn handle_join_inner(
                 ch_meta,
             )
             .await;
+
+            // Joining brings the other members into view, so the keys this
+            // client subscribed to are sent for the people it can now see.
+            let subs: std::collections::HashSet<String> = match state.clients.get(client_id) {
+                Some(c) => c.read().await.metadata_subscriptions.clone(),
+                None => Default::default(),
+            };
+            for mid in member_ids
+                .iter()
+                .filter(|m| **m != user_id)
+                .take_while(|_| !subs.is_empty())
+            {
+                let member_nick = match state.clients.get(mid) {
+                    Some(c) => c.read().await.nick_or_id().to_string(),
+                    None => continue,
+                };
+                let entries: Vec<(String, String)> = state
+                    .metadata
+                    .get(&crate::commands::metadata::metadata_key(&member_nick))
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(k, _)| subs.contains(*k))
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (key, value) in entries {
+                    reply_self!(Message::new(
+                        "761",
+                        vec![nick.clone(), member_nick.clone(), key, "*".into(), value,],
+                    )
+                    .with_prefix(&cfg.server.name));
+                }
+            }
         }
     }
 

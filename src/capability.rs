@@ -34,6 +34,7 @@ pub const CAPS: &[&str] = &[
     "draft/chathistory",
     "draft/read-marker",
     "draft/metadata-2",
+    "draft/metadata-3",
     "draft/account-registration",
     "draft/multiline",
     "draft/pre-away",
@@ -110,8 +111,14 @@ pub fn build_cap_list(cfg: &Config, version_302: bool, client_is_tls: bool) -> V
             "sasl" if sasl_external => "sasl=PLAIN,SCRAM-SHA-256,EXTERNAL".to_string(),
             "sasl" => "sasl=PLAIN,SCRAM-SHA-256".to_string(),
             "draft/multiline" => "draft/multiline=max-bytes=4096,max-lines=20".to_string(),
+            // The same specification under both names it has had. A client
+            // that knows only one of them still gets metadata.
             "draft/metadata-2" => {
-                "draft/metadata-2=max-subs=50,max-keys=50,max-value-bytes=4096".to_string()
+                "draft/metadata-2=max-subs=50,max-keys=50,max-value-bytes=400".to_string()
+            }
+            "draft/metadata-3" => {
+                "draft/metadata-3=max-subs=50,max-keys=50,max-value-bytes=400,before-connect"
+                    .to_string()
             }
             "draft/account-registration" => account_registration.to_string(),
             // STS: plaintext clients get port (upgrade), TLS clients get duration (persistence)
