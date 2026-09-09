@@ -165,3 +165,58 @@ fn outgoing_lines_are_kept_within_the_limit() {
     let short = Message::new("PRIVMSG", vec!["#chan".into(), "hi".into()]).with_prefix("a!b@c");
     assert_eq!(format_message_within(&short, 510), format_message(&short));
 }
+
+/// A command the server does not know still has to reach the handler that
+/// answers 421 — but one that would be read back as a prefix or a tag block
+/// must not, because that would let a client choose the apparent source of a
+/// message it sent.
+#[test]
+fn a_command_may_be_unknown_but_not_unreadable() {
+    use rircd::protocol::parse_message;
+
+    // Unknown, oddly spelled, but still a command: these get 421, not silence.
+    for line in [
+        "PRIVMSG #chan :hi",
+        "001 nick :Welcome",
+        ":server 366 nick #chan :End",
+        "NONEXISTENT_COMMAND",
+        "draft/x #chan",
+        "12 nick",
+    ] {
+        assert!(parse_message(line).is_ok(), "{line:?} was refused");
+    }
+
+    for line in [
+        "@tag=1 ", // tags do not make a command out of nothing
+        " ",       // a line of separator is not a message
+        "   ",
+        ":prefix   ",
+        ":prefix", // a prefix with nothing after it is not a message either
+    ] {
+        assert!(
+            parse_message(line).is_err(),
+            "{line:?} was accepted as a message"
+        );
+    }
+}
+
+/// The limit is a promise: LINELEN says what the longest line will be, and a
+/// client is entitled to hold the server to it even when the prefix and
+/// command alone are longer than that.
+#[test]
+fn a_line_never_exceeds_the_limit_it_was_given() {
+    use rircd::protocol::format_message_within;
+
+    let msg = Message::new("PRIVMSG", vec!["#chan".into(), "x".repeat(200)])
+        .with_prefix("averylongnickname!averylongusername@a.very.long.hostname.example.com");
+
+    for limit in [16usize, 32, 64, 100, 512] {
+        let line = format_message_within(&msg, limit);
+        let body = line.trim_end_matches("\r\n");
+        assert!(
+            body.len() <= limit,
+            "{} bytes for a {limit}-byte limit: {line:?}",
+            body.len()
+        );
+    }
+}

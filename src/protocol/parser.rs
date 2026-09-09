@@ -24,7 +24,10 @@ pub fn parse_message_with_limit(line: &str, max_body: usize) -> Result<Message, 
         return Err(ParseError::InputTooLong);
     }
 
-    let mut remaining = line;
+    // Leading spaces are separator, never content: a line may not begin with a
+    // parameter, and trimming here means the prefix and command are found
+    // wherever they actually start.
+    let mut remaining = line.trim_start_matches(' ');
 
     // Parse optional tags
     let mut tags = HashMap::new();
@@ -62,12 +65,18 @@ pub fn parse_message_with_limit(line: &str, max_body: usize) -> Result<Message, 
         remaining = rest;
     }
 
+    // A run of spaces where the command should be is separator, not a command;
+    // a line without one is not a message.
+    remaining = remaining.trim_start_matches(' ');
     if remaining.is_empty() {
         return Err(ParseError::Malformed);
     }
 
     // Parse command and params
     let parts: Vec<&str> = remaining.splitn(2, ' ').collect();
+    if !is_command_token(parts[0]) {
+        return Err(ParseError::Malformed);
+    }
     let command = parts[0].to_uppercase();
     let params = if parts.len() > 1 {
         parse_params(parts[1])?
@@ -114,7 +123,11 @@ fn parse_params(s: &str) -> Result<Vec<String>, ParseError> {
         match rest.find(' ') {
             Some(pos) => {
                 params.push(rest[..pos].to_string());
-                rest = rest[pos + 1..].trim_start();
+                // Only spaces separate parameters. Trimming whitespace here
+                // would eat a tab that belongs to the next one, and a tab is
+                // an ordinary character in an IRC parameter — the run of
+                // spaces is handled at the top of the loop.
+                rest = &rest[pos + 1..];
             }
             None => {
                 params.push(rest.to_string());
@@ -146,6 +159,19 @@ fn unescape_tag_value(s: &str) -> String {
         }
     }
     result
+}
+
+/// Whether a token can be a command without changing meaning on the way back
+/// out.
+///
+/// A command the server does not know is answered with 421, so this is not the
+/// place to be strict about names — it is the place to refuse the two shapes
+/// that would be read as something other than a command when the message is
+/// serialised again. One starting with ':' becomes a prefix to whoever reads
+/// the line, which would let a client choose the apparent source of a message;
+/// one starting with '@' becomes a tag block.
+fn is_command_token(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with(':') && !s.starts_with('@')
 }
 
 #[derive(Debug, Clone)]

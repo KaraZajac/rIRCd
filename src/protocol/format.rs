@@ -28,25 +28,44 @@ pub fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
 /// it — by truncating at a byte that may be mid-character, or by dropping the
 /// line entirely.
 pub fn format_message_within(msg: &Message, max_line: usize) -> String {
-    let line = format_message(msg);
     // The limit is on the message body. Tags are counted separately (and have
     // their own, larger limit), so a message with tags must not be cut short
     // because of them.
-    let tag_len = if msg.tags.is_empty() {
-        0
-    } else {
-        line.find(' ').map(|i| i + 1).unwrap_or(0)
-    };
-    let body_len = line.len().saturating_sub(2 + tag_len); // without tags or CRLF
-    if body_len <= max_line || msg.params.is_empty() {
+    fn split(line: &str, tagged: bool) -> (usize, usize) {
+        let tag_len = if tagged {
+            line.find(' ').map(|i| i + 1).unwrap_or(0)
+        } else {
+            0
+        };
+        (tag_len, line.len().saturating_sub(2 + tag_len))
+    }
+
+    let line = format_message(msg);
+    let (_, body_len) = split(&line, !msg.tags.is_empty());
+    if body_len <= max_line {
         return line;
     }
-    let excess = body_len - max_line;
-    let last = msg.params.len() - 1;
-    let mut shortened = msg.clone();
-    let keep = shortened.params[last].len().saturating_sub(excess);
-    shortened.params[last] = truncate_bytes(&shortened.params[last], keep).to_string();
-    format_message(&shortened)
+
+    // Shorten the last parameter first: it is the message text, and losing the
+    // end of it is what a client expects of a line that was too long.
+    if let Some(last) = msg.params.len().checked_sub(1) {
+        let excess = body_len - max_line;
+        let mut shortened = msg.clone();
+        let keep = shortened.params[last].len().saturating_sub(excess);
+        shortened.params[last] = truncate_bytes(&shortened.params[last], keep).to_string();
+        let line = format_message(&shortened);
+        let (_, body_len) = split(&line, !shortened.tags.is_empty());
+        if body_len <= max_line {
+            return line;
+        }
+    }
+
+    // The prefix and command alone are longer than the limit, so there is
+    // nothing left to give up. Cut the line rather than send more than the
+    // client was promised.
+    let (tag_len, _) = split(&line, !msg.tags.is_empty());
+    let body = &line[tag_len..line.len() - 2];
+    format!("{}{}\r\n", &line[..tag_len], truncate_bytes(body, max_line))
 }
 
 pub fn format_message(msg: &Message) -> String {
