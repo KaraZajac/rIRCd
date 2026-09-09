@@ -4,6 +4,7 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod filehost;
+pub mod link;
 pub mod mail;
 pub mod persist;
 pub mod protocol;

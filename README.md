@@ -129,6 +129,37 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 | `persistent_sessions` | `false` | Treat an account as one continuing session: logging in takes its nick back from an earlier session and rejoins that session's channels. Off by default — it disconnects the earlier session, which is what someone reconnecting after a dropped link wants and what someone with two clients open does not |
 | `password` | _(unset)_ | A password every connection must send with `PASS` before registering. Stored in the clear on purpose: it is shared with everyone allowed on the server, so it is a door key rather than a secret about any one person. A wrong or missing one gets 464 and the link is closed |
 
+### `[[links]]` and server linking
+
+Two or more rIRCd servers form one network. The protocol, and why it is not
+TS6, is in [docs/server-linking.md](docs/server-linking.md).
+
+```toml
+[server]
+sid = "1AA"                      # this server's identity on the network
+listen_links = ["0.0.0.0:7000"]  # server traffic never shares a client port
+
+[[links]]
+name = "irc2.example.org"
+sid = "2BB"
+host = "10.0.0.2"
+port = 7000
+send_password = "what we send"
+receive_password = "what we expect"
+tls = false
+autoconnect = true
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `sid` | _(derived from the name)_ | Three characters, a digit then two alphanumerics, unique on the network. Derived from the server name when unset, which is a coin toss for a network — set it before linking |
+| `listen_links` | `[]` | Addresses to accept links on. A client that reaches one gets nothing, and a server that reaches a client port is treated as a client |
+| `send_password` / `receive_password` | — | Separate on purpose: each direction has its own secret, so one leaked configuration does not let the holder link both ways |
+| `autoconnect` | `false` | Keep the link up, retrying with a widening delay |
+
+`tests/smoke/run-link.sh` brings up two servers with their own databases on
+their own ports, links them, and checks what each one knows about the other.
+
 ### `[network]`
 
 | Key | Default | Description |

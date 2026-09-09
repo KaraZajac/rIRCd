@@ -689,7 +689,33 @@ pub async fn run(
     }
 
     // Wrap config in Arc<RwLock<>> so REHASH can reload it at runtime
+    // ── Server links ───────────────────────────────────────────────────────────
+    let links = Arc::new(RwLock::new(crate::link::LinkRegistry::default()));
+    cfg.links_runtime = Some(links.clone());
+    let sid = crate::link::our_sid(&cfg);
+    if !cfg.links.is_empty() || !cfg.server.listen_links.is_empty() {
+        if cfg.server.sid.is_none() {
+            warn!(
+                sid = %sid,
+                "No [server] sid set; using one derived from the server name. \
+                 Two servers can derive the same one — set it before linking."
+            );
+        } else {
+            info!(sid = %sid, "Server id");
+        }
+    }
+
     let cfg_arc = Arc::new(RwLock::new(cfg));
+
+    {
+        let cfg = cfg_arc.read().await;
+        for addr in &cfg.server.listen_links {
+            crate::link::listen(addr.clone(), cfg_arc.clone(), links.clone()).await?;
+        }
+        for link in cfg.links.iter().filter(|l| l.autoconnect) {
+            crate::link::autoconnect(link.clone(), cfg_arc.clone(), links.clone());
+        }
+    }
 
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

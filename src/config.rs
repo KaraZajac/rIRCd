@@ -20,6 +20,9 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub opers: Vec<OperConfig>,
+    /// Servers this one may link to. See docs/server-linking.md.
+    #[serde(default)]
+    pub links: Vec<LinkConfig>,
     #[serde(default)]
     pub webirc: Option<WebircConfig>,
     /// File hosting endpoint (draft/filehost).
@@ -35,6 +38,11 @@ pub struct Config {
     /// VAPID key and HTTP client for draft/webpush — built at startup, not serialised.
     #[serde(skip)]
     pub webpush_runtime: Option<std::sync::Arc<crate::webpush::WebpushRuntime>>,
+    /// The servers this one is linked to right now. Built at startup, shared
+    /// with every command handler so LINKS and LUSERS can answer for the
+    /// network rather than for this server alone.
+    #[serde(skip)]
+    pub links_runtime: Option<std::sync::Arc<tokio::sync::RwLock<crate::link::LinkRegistry>>>,
     /// MariaDB connection settings.
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -306,6 +314,19 @@ pub struct ServerConfig {
     /// without accounts it does nothing, and it changes what a nick means.
     #[serde(default)]
     pub multiclient: bool,
+    /// This server's identity on a linked network: a digit followed by two
+    /// alphanumerics, unique among the servers that link together. Every user
+    /// this server registers is given an id beginning with it, which is what
+    /// makes a user nameable from another server while its nick is changing.
+    ///
+    /// Derived from the server name when unset, which is fine for one server
+    /// and a coin toss for a network — set it before linking.
+    #[serde(default)]
+    pub sid: Option<String>,
+    /// Addresses to accept server links on. Never share a port with clients:
+    /// the two speak different protocols and answer to different secrets.
+    #[serde(default)]
+    pub listen_links: Vec<String>,
     /// A password every connection must send with PASS before registering.
     /// Stored in the clear on purpose: it is shared with everyone allowed on
     /// the server, so it is a door key, not a secret about any one person.
@@ -367,8 +388,42 @@ impl Default for ServerConfig {
             persistent_sessions: false,
             multiclient: false,
             password: None,
+            sid: None,
+            listen_links: Vec::new(),
         }
     }
+}
+
+/// One server this one may link to.
+///
+/// The two passwords are separate on purpose: each direction has its own
+/// secret, so a leaked configuration does not let whoever holds it link in
+/// both directions.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LinkConfig {
+    /// The peer's server name, as it will announce itself.
+    pub name: String,
+    /// The peer's SID, checked on the handshake.
+    pub sid: String,
+    /// Where to reach the peer. Only needed to connect out.
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default = "default_link_port")]
+    pub port: u16,
+    /// What this server sends.
+    pub send_password: String,
+    /// What this server expects from the peer.
+    pub receive_password: String,
+    /// Connect with TLS.
+    #[serde(default)]
+    pub tls: bool,
+    /// Keep the link up, retrying with a widening delay when it drops.
+    #[serde(default)]
+    pub autoconnect: bool,
+}
+
+fn default_link_port() -> u16 {
+    7000
 }
 
 // ─── Network ──────────────────────────────────────────────────────────────────

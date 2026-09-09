@@ -283,6 +283,8 @@ pub async fn handle_links(
         None => return Ok(()),
     };
 
+    // This server first, then everything it is linked to. A one-server network
+    // is the same answer it always was.
     reply_to_client(
         &senders,
         client_id,
@@ -299,6 +301,34 @@ pub async fn handle_links(
         label,
     )
     .await;
+
+    if let Some(ref links) = cfg.links_runtime {
+        let mut remotes: Vec<(String, u32, String)> = links
+            .read()
+            .await
+            .all()
+            .map(|r| (r.name.clone(), r.hops, r.description.clone()))
+            .collect();
+        remotes.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, hops, description) in remotes {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "364",
+                    vec![
+                        nick.clone(),
+                        name.clone(),
+                        s.to_string(),
+                        format!("{} {}", hops, description),
+                    ],
+                )
+                .with_prefix(s),
+                label,
+            )
+            .await;
+        }
+    }
 
     reply_to_client(
         &senders,
