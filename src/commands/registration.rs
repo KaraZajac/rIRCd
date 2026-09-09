@@ -84,6 +84,7 @@ fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
 pub async fn complete_registration(
     client_id: &str,
     state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
     senders: Senders,
     cfg: &Config,
     label: Option<&str>,
@@ -104,23 +105,54 @@ pub async fn complete_registration(
 
     let mut state_guard = state.write().await;
 
-    if state_guard.nick_to_id.contains_key(&nick.to_uppercase()) {
-        reply_to_client(
-            &senders,
-            client_id,
-            Message::new(
-                "433",
-                vec![
-                    "*".into(),
-                    nick.clone(),
-                    "Nickname is already in use".into(),
-                ],
+    if let Some(holder_id) = state_guard.nick_to_id.get(&nick.to_uppercase()).cloned() {
+        // With persistent sessions an account has one session, so logging in
+        // resumes it: the nick comes back from the connection that had it.
+        // Without this, reconnecting after a dropped link finds your own nick
+        // taken by the connection you just lost, until the server notices.
+        let same_account = cfg.server.persistent_sessions
+            && pending.account.is_some()
+            && match state_guard.clients.get(&holder_id) {
+                Some(c) => c.read().await.account == pending.account,
+                None => false,
+            };
+        if !same_account {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "433",
+                    vec![
+                        "*".into(),
+                        nick.clone(),
+                        "Nickname is already in use".into(),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
             )
-            .with_prefix(&cfg.server.name),
-            label,
-        )
-        .await;
-        return Ok(());
+            .await;
+            return Ok(());
+        }
+        tracing::info!(
+            client_id,
+            %nick,
+            replaced = %holder_id,
+            "Resuming a persistent session; disconnecting the earlier one"
+        );
+        state_guard.nick_to_id.remove(&nick.to_uppercase());
+        drop(state_guard);
+        if let Some(sink) = senders.write().await.remove(&holder_id) {
+            sink.close(
+                Message::new(
+                    "ERROR",
+                    vec!["Closing link: session resumed from another connection".into()],
+                )
+                .with_prefix(&cfg.server.name),
+            );
+        }
+        state.write().await.remove_client(&holder_id).await;
+        state_guard = state.write().await;
     }
 
     let mut client = Client::new(client_id.to_string(), pending.host);
@@ -362,7 +394,60 @@ pub async fn complete_registration(
         }
     }
 
+    rejoin_account_channels(client_id, &state, &channels, &senders, cfg).await;
+
     Ok(())
+}
+
+/// Put a returning client back into the channels its account was in.
+///
+/// A client that reconnects has left nothing behind on the server, so without
+/// this it comes back to an empty session and has to remember its own channels.
+/// Off unless the operator turned it on.
+pub async fn rejoin_account_channels(
+    client_id: &str,
+    state: &Arc<RwLock<ServerState>>,
+    channels: &Arc<RwLock<ChannelStore>>,
+    senders: &Senders,
+    cfg: &Config,
+) {
+    if !cfg.server.persistent_sessions {
+        return;
+    }
+    let Some(pool) = cfg.db.as_ref() else {
+        return;
+    };
+    let account = match state.read().await.clients.get(client_id) {
+        Some(c) => c.read().await.account.clone(),
+        None => None,
+    };
+    let Some(account) = account else {
+        return;
+    };
+
+    for channel in persist::channels_for_account(pool, &account).await {
+        let already_in = match state.read().await.clients.get(client_id) {
+            Some(c) => c.read().await.channels.contains_key(&channel),
+            None => true,
+        };
+        if already_in {
+            continue;
+        }
+        let join = Message::new("JOIN", vec![channel.clone()]);
+        if let Err(e) = crate::commands::channel_cmds::handle_join(
+            client_id,
+            join,
+            state.clone(),
+            channels.clone(),
+            senders.clone(),
+            cfg,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(client_id, %channel, error = %e, "Could not rejoin channel on login");
+        }
+    }
 }
 
 pub async fn handle_isupport(
@@ -454,11 +539,13 @@ pub async fn handle_webirc(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_cap(
     client_id: &str,
     host: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
     senders: Senders,
     cfg: &Config,
     label: Option<&str>,
@@ -699,7 +786,7 @@ pub async fn handle_cap(
     }
 
     if should_complete {
-        complete_registration(client_id, state, senders, cfg, label).await?;
+        complete_registration(client_id, state, channels, senders, cfg, label).await?;
     }
 
     Ok(())
@@ -962,7 +1049,27 @@ pub async fn handle_nick(
         }
     }
 
-    let nick_taken = state_guard.nick_to_id.contains_key(&nick.to_uppercase());
+    // With persistent sessions, a client already authenticated to the account
+    // that holds this nick is that account returning, so the nick is not taken
+    // as far as it is concerned; complete_registration hands it over.
+    let resuming_own_session = cfg.server.persistent_sessions && {
+        let pending_account = state_guard
+            .pending
+            .get(client_id)
+            .and_then(|c| c.account.clone());
+        match (
+            pending_account,
+            state_guard.nick_to_id.get(&nick.to_uppercase()).cloned(),
+        ) {
+            (Some(account), Some(holder)) => match state_guard.clients.get(&holder) {
+                Some(c) => c.read().await.account.as_deref() == Some(account.as_str()),
+                None => false,
+            },
+            _ => false,
+        }
+    };
+    let nick_taken =
+        state_guard.nick_to_id.contains_key(&nick.to_uppercase()) && !resuming_own_session;
     if nick_taken {
         // Remember what was asked for: REGISTER needs to tell someone trying to
         // claim a nick in use that the account is taken, not that they gave no
@@ -997,7 +1104,7 @@ pub async fn handle_nick(
     drop(state_guard);
 
     if should_complete {
-        complete_registration(client_id, state, senders, cfg, label).await?;
+        complete_registration(client_id, state, channels, senders, cfg, label).await?;
     }
 
     Ok(())
@@ -1021,11 +1128,13 @@ fn is_valid_nick(n: &str) -> bool {
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_user(
     client_id: &str,
     host: &str,
     msg: Message,
     state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
     senders: Senders,
     cfg: &Config,
     label: Option<&str>,
@@ -1072,7 +1181,7 @@ pub async fn handle_user(
     drop(state_guard);
 
     if should_complete {
-        complete_registration(client_id, state, senders, cfg, label).await?;
+        complete_registration(client_id, state, channels, senders, cfg, label).await?;
     }
 
     Ok(())
@@ -1707,7 +1816,8 @@ pub async fn handle_authenticate(
                 .get(client_id)
                 .is_some_and(|p| p.ready_to_register());
             if ready {
-                complete_registration(client_id, state, senders, cfg, label).await?;
+                complete_registration(client_id, state, channels.clone(), senders, cfg, label)
+                    .await?;
             }
         }
         return Ok(());
@@ -3181,7 +3291,7 @@ pub async fn handle_register(
                     client_id,
                     &account,
                     state.clone(),
-                    channels,
+                    channels.clone(),
                     senders.clone(),
                     cfg,
                     label,
@@ -3197,7 +3307,8 @@ pub async fn handle_register(
                     .get(client_id)
                     .is_some_and(|p| p.ready_to_register());
                 if ready {
-                    complete_registration(client_id, state, senders, cfg, label).await?;
+                    complete_registration(client_id, state, channels.clone(), senders, cfg, label)
+                        .await?;
                 }
                 return Ok(());
             };
@@ -3614,7 +3725,7 @@ pub async fn handle_verify(
                 client_id,
                 &account,
                 state.clone(),
-                channels,
+                channels.clone(),
                 senders.clone(),
                 cfg,
                 label,
@@ -3630,7 +3741,8 @@ pub async fn handle_verify(
                 .get(client_id)
                 .is_some_and(|p| p.ready_to_register());
             if ready {
-                complete_registration(client_id, state, senders, cfg, label).await?;
+                complete_registration(client_id, state, channels.clone(), senders, cfg, label)
+                    .await?;
             }
         }
         persist::VerifyOutcome::InvalidCode => {

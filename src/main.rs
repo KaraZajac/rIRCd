@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rircd::{config, genpasswd_cmd, init_cmd, run_server, status_cmd, stop_cmd};
+use rircd::{adduser_cmd, config, genpasswd_cmd, init_cmd, run_server, status_cmd, stop_cmd};
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -29,6 +29,13 @@ enum Commands {
     Status,
     /// Generate bcrypt hash for passwords
     Genpasswd,
+    /// Create an account directly, without connecting as a client
+    Adduser {
+        /// Account name (must be a valid nickname)
+        nick: String,
+        /// Password; read from stdin when omitted
+        password: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -56,6 +63,18 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Stop) => stop_cmd(&cli.config)?,
         Some(Commands::Status) => status_cmd(&cli.config)?,
         Some(Commands::Genpasswd) => genpasswd_cmd()?,
+        Some(Commands::Adduser { nick, password }) => {
+            let cfg = config::load(&cli.config)?;
+            let password = match password {
+                Some(p) => p,
+                None => {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line.trim_end_matches(['\r', '\n']).to_string()
+                }
+            };
+            adduser_cmd(cfg, &nick, &password).await?;
+        }
         None => {
             // Default to run
             let cfg = config::load(&cli.config)?;

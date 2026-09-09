@@ -434,6 +434,8 @@ pub async fn handle_privmsg(
     };
 
     let msgid = generate_msgid();
+    // The one time this message was sent, used for every copy of it.
+    let sent_at = crate::protocol::server_time_now();
     {
         let mut state_w = state.write().await;
         state_w.record_msgid(msgid.clone(), target.to_string(), client_id.to_string());
@@ -589,8 +591,11 @@ pub async fn handle_privmsg(
             } else {
                 target.to_string()
             };
-            let base_msg =
+            let mut base_msg =
                 Message::new("PRIVMSG", vec![display_target, text.clone()]).with_prefix(&source);
+            base_msg
+                .tags
+                .insert("time".to_string(), Some(sent_at.clone()));
             for (mid, memb) in &ch.members {
                 // STATUSMSG filter: @ → ops/halfops only; + → voiced/halfop/op only
                 if let Some(pfx) = statusmsg_prefix {
@@ -652,7 +657,7 @@ pub async fn handle_privmsg(
             }
             // Only append new history if this is NOT an edit (edits already updated in-place)
             if pending_edit_msgid.is_none() {
-                cfg.record_history(&ch_key, &source, &text, Some(&msgid), "PRIVMSG");
+                cfg.record_history_at(&ch_key, &source, &text, Some(&msgid), "PRIVMSG", &sent_at);
             }
             push_absent_members(
                 &state_guard,
@@ -678,8 +683,11 @@ pub async fn handle_privmsg(
     } else {
         let target_id = state_guard.nick_to_id.get(&target.to_uppercase()).cloned();
         if let Some(tid) = target_id {
-            let privmsg =
+            let mut privmsg =
                 Message::new("PRIVMSG", vec![target.into(), text.clone()]).with_prefix(&source);
+            privmsg
+                .tags
+                .insert("time".to_string(), Some(sent_at.clone()));
             let target_caps = match state_guard.clients.get(&tid) {
                 Some(c) => c.read().await.capabilities.clone(),
                 None => Default::default(),
@@ -716,7 +724,7 @@ pub async fn handle_privmsg(
                 };
                 let peer = conversation_key_id(&state_guard, target).await;
                 let key = persist::direct_message_key(&me, &peer);
-                cfg.record_history(&key, &source, &text, Some(&msgid), "PRIVMSG");
+                cfg.record_history_at(&key, &source, &text, Some(&msgid), "PRIVMSG", &sent_at);
             }
             // 301 RPL_AWAY if target is away
             let target_away = match state_guard.clients.get(&tid) {
@@ -819,6 +827,8 @@ pub async fn handle_notice(
     };
 
     let msgid = generate_msgid();
+    // The one time this message was sent, used for every copy of it.
+    let sent_at = crate::protocol::server_time_now();
     {
         let mut state_w = state.write().await;
         state_w.record_msgid(msgid.clone(), target.to_string(), client_id.to_string());
@@ -830,7 +840,11 @@ pub async fn handle_notice(
     } else {
         target.to_string()
     };
-    let base_msg = Message::new("NOTICE", vec![display_target, text.clone()]).with_prefix(&source);
+    let mut base_msg =
+        Message::new("NOTICE", vec![display_target, text.clone()]).with_prefix(&source);
+    base_msg
+        .tags
+        .insert("time".to_string(), Some(sent_at.clone()));
 
     if target.starts_with('#') || target.starts_with('&') {
         let ch_key = canonical_channel_key(target);
@@ -919,7 +933,7 @@ pub async fn handle_notice(
                 .await;
             }
             if statusmsg_prefix.is_none() {
-                cfg.record_history(&ch_key, &source, &text, Some(&msgid), "NOTICE");
+                cfg.record_history_at(&ch_key, &source, &text, Some(&msgid), "NOTICE", &sent_at);
             }
         }
     } else {
@@ -961,7 +975,7 @@ pub async fn handle_notice(
                 };
                 let peer = conversation_key_id(&state_guard, target).await;
                 let key = persist::direct_message_key(&me, &peer);
-                cfg.record_history(&key, &source, &text, Some(&msgid), "NOTICE");
+                cfg.record_history_at(&key, &source, &text, Some(&msgid), "NOTICE", &sent_at);
             }
             if echo_message {
                 let sender_caps = match state_guard.clients.get(client_id) {
@@ -1416,13 +1430,18 @@ pub async fn handle_tagmsg(
     drop(state_guard);
 
     let msgid = generate_msgid();
+    // The one time this message was sent, used for every copy of it.
+    let sent_at = crate::protocol::server_time_now();
     {
         let mut state_w = state.write().await;
         state_w.record_msgid(msgid.clone(), target.to_string(), client_id.to_string());
     }
     let state_guard = state.read().await;
 
-    let base_msg = Message::new("TAGMSG", vec![target.into()]).with_prefix(&source);
+    let mut base_msg = Message::new("TAGMSG", vec![target.into()]).with_prefix(&source);
+    base_msg
+        .tags
+        .insert("time".to_string(), Some(sent_at.clone()));
 
     if target.starts_with('#') || target.starts_with('&') {
         let ch_key = canonical_channel_key(target);

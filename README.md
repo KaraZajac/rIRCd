@@ -123,6 +123,9 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 | `admin_name` / `admin_location` / `admin_email` | _(unset)_ | Shown by `ADMIN` (256–259) |
 | `client_tag_deny` | _(unset)_ | List of client-only tags to drop (e.g. `["+typing"]` or `["*"]` to drop all) |
 | `cloak_key` | _(unset)_ | If set, connecting clients receive an HMAC-SHA256-based virtual host cloak (e.g. `"mysecret"`) |
+| `description` | `rIRCd v<version>` | One-line description of this server, shown by `LINKS` |
+| `register_before_connect` | `true` | Allow `REGISTER` before the handshake finishes; advertised as `before-connect` |
+| `persistent_sessions` | `false` | Treat an account as one continuing session: logging in takes its nick back from an earlier session and rejoins that session's channels. Off by default — it disconnects the earlier session, which is what someone reconnecting after a dropped link wants and what someone with two clients open does not |
 
 ### `[network]`
 
@@ -170,6 +173,10 @@ key  = "/etc/rIRCd/key.pem"
 | `max_channels_per_client` | `50` | Max channels a single client may join |
 | `max_connections_per_ip` | `16` | Connections allowed from one address; 0 for no limit |
 | `max_clients` | `0` | Connections allowed in total; 0 for no limit |
+| `max_line_length` | `512` | Longest message body accepted, before tags; advertised as `LINELEN` |
+| `flood_burst` | `10` | Commands a client may send back to back before being throttled |
+| `flood_rate` | `1` | Commands per second the flood allowance refills at |
+| `min_password_length` | `6` | Shortest password `REGISTER` accepts; advertised in `draft/account-registration` |
 
 ### `[[opers]]`
 
@@ -358,6 +365,7 @@ key_file = "/etc/rIRCd/vapid.key"
 | `rircd [--config /etc/rIRCd/config.toml] stop` | Send SIGTERM to the running server (Unix only) |
 | `rircd [--config /etc/rIRCd/config.toml] status` | Check if the server is running via PID file |
 | `rircd genpasswd` | Interactively hash a password for use in `[[opers]]` |
+| `rircd adduser <nick> [password]` | Create an account without connecting as a client; reads the password from stdin when omitted |
 
 `--config` is a global flag, so it goes **before** the subcommand.
 

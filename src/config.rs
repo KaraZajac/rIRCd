@@ -292,6 +292,13 @@ pub struct ServerConfig {
     /// `before-connect` in the draft/account-registration capability.
     #[serde(default = "default_register_before_connect")]
     pub register_before_connect: bool,
+    /// Treat an account as having one continuing session: logging in takes the
+    /// account's nick back from an earlier session and rejoins the channels it
+    /// was in. Off by default — it disconnects the earlier session, which is
+    /// what someone reconnecting after a dropped link wants and what someone
+    /// with two clients open does not.
+    #[serde(default)]
+    pub persistent_sessions: bool,
 }
 
 fn default_register_before_connect() -> bool {
@@ -345,6 +352,7 @@ impl Default for ServerConfig {
             auto_join: None,
             description: default_server_description(),
             register_before_connect: default_register_before_connect(),
+            persistent_sessions: false,
         }
     }
 }
@@ -511,6 +519,32 @@ impl Config {
         msgid: Option<&str>,
         command: &str,
     ) {
+        self.record_history_at(
+            target,
+            source,
+            text,
+            msgid,
+            command,
+            &crate::protocol::server_time_now(),
+        );
+    }
+
+    /// Record history with the timestamp the message was already stamped with.
+    ///
+    /// A message is sent once, so it happened at one time. Taking a fresh
+    /// reading here would give the copy in history a different `time` from the
+    /// copy the clients received, whenever the two readings fall either side of
+    /// a millisecond — and a client replaying history would see a message it
+    /// already has, at a time it never had.
+    pub fn record_history_at(
+        &self,
+        target: &str,
+        source: &str,
+        text: &str,
+        msgid: Option<&str>,
+        command: &str,
+        ts: &str,
+    ) {
         if let Some(ref writer) = self.history {
             writer.append(crate::persist::HistoryWrite {
                 target: target.to_string(),
@@ -518,7 +552,7 @@ impl Config {
                 text: text.to_string(),
                 msgid: msgid.map(String::from),
                 command: command.to_string(),
-                ts: crate::protocol::server_time_now(),
+                ts: ts.to_string(),
             });
         }
     }

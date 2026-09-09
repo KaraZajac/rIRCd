@@ -17,6 +17,7 @@ See tests/irctest/run.sh, which sets all of this up.
 import os
 import re
 import subprocess
+from pathlib import Path
 from typing import Any, Optional, Type
 
 from irctest import patma
@@ -109,6 +110,8 @@ listen_ws = [{listen_ws}]
 motd = "irctest"
 description = "test server"
 register_before_connect = {register_before_connect}
+# The read-marker tests reconnect and expect to resume their session.
+persistent_sessions = true
 # irctest asserts on exact 005 values, and a cloak would change the host
 # halfway through registration.
 nick_protection = {nick_protection}
@@ -200,6 +203,7 @@ class RircdController(BaseServerController, DirectoryBasedController):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._db_name: Optional[str] = None
+        self._config_path: Optional[Path] = None
 
     def run(
         self,
@@ -243,6 +247,7 @@ class RircdController(BaseServerController, DirectoryBasedController):
             listen_ws = f'"{websocket_hostname}:{websocket_port}"'
 
         config_path = self.directory / "config.toml"
+        self._config_path = config_path
         config_path.write_text(
             CONFIG.format(
                 listen=listen,
@@ -291,20 +296,17 @@ class RircdController(BaseServerController, DirectoryBasedController):
                 "Attempted to register a nick, but `run_services` is not True."
             )
         assert password
-        client = case.addClient(show_io=False)
-        case.sendLine(client, "CAP LS 302")
-        case.sendLine(client, "NICK " + username)
-        case.sendLine(client, "USER r e g :user")
-        case.sendLine(client, "CAP END")
-        while case.getRegistrationMessage(client).command != "001":
-            pass
-        case.getMessages(client)
-        case.sendLine(client, f"REGISTER {username} * {password}")
-        msg = case.getMessage(client)
-        assert msg.command == "REGISTER", msg
-        assert msg.params[0] == "SUCCESS", msg
-        case.sendLine(client, "QUIT")
-        case.assertDisconnected(client)
+        # Created straight in the database rather than over IRC: a REGISTER
+        # carrying one of the long passwords these tests use does not fit in a
+        # 512-byte line, and this is setup, not the thing under test.
+        assert self._config_path, "server must be running"
+        proc = subprocess.run(
+            [RIRCD_BIN, "--config", str(self._config_path), "adduser", username, password],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"could not create account {username}: {proc.stderr.strip()}")
 
     def wait_for_services(self) -> None:
         # Accounts are handled by the server itself, so there is nothing extra

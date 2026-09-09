@@ -1194,6 +1194,17 @@ pub async fn forget_account_channel(pool: &sqlx::MySqlPool, account: &str, chann
 }
 
 /// Every remembered membership, as (channel, account).
+/// Channels this account was in, so a returning client can be put back in them.
+pub async fn channels_for_account(pool: &sqlx::MySqlPool, account: &str) -> Vec<String> {
+    use sqlx::Row;
+    sqlx::query("SELECT channel FROM account_channels WHERE account = ?")
+        .bind(account)
+        .fetch_all(pool)
+        .await
+        .map(|rows| rows.iter().map(|r| r.get("channel")).collect())
+        .unwrap_or_default()
+}
+
 pub async fn load_account_channels(pool: &sqlx::MySqlPool) -> Vec<(String, String)> {
     use sqlx::Row;
     sqlx::query("SELECT account, channel FROM account_channels")

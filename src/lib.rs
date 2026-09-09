@@ -106,6 +106,45 @@ pub fn genpasswd_cmd() -> anyhow::Result<()> {
     config::genpasswd()
 }
 
+/// Create an account without going through a connected client.
+///
+/// Registering over IRC means fitting the whole REGISTER into one 512-byte
+/// line, which a long passphrase does not; and an operator setting up a server
+/// should not have to connect to it first to make the first account.
+pub async fn adduser_cmd(cfg: Config, nick: &str, password: &str) -> anyhow::Result<()> {
+    let url = cfg.database.connection_url();
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&url)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to the database: {}", e))?;
+    persist::init_schema(&pool).await?;
+
+    match persist::register_user(
+        &pool,
+        nick,
+        password,
+        None,
+        None,
+        cfg.limits.min_password_length,
+    )
+    .await
+    {
+        Ok(()) => {
+            println!("Created account {}.", nick);
+            Ok(())
+        }
+        Err(persist::RegisterError::AccountExists) => {
+            anyhow::bail!("An account named {} already exists.", nick)
+        }
+        Err(persist::RegisterError::WeakPassword) => anyhow::bail!(
+            "Password is shorter than the configured minimum of {} characters.",
+            cfg.limits.min_password_length
+        ),
+        Err(e) => anyhow::bail!("Could not create the account: {:?}", e),
+    }
+}
+
 pub fn stop_cmd(config_path: &Path) -> anyhow::Result<()> {
     config::stop_cmd(config_path)
 }

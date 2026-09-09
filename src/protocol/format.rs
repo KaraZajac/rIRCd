@@ -178,6 +178,16 @@ pub fn add_tags_for_recipient(
     client_tag_deny: Option<&[String]>,
     sender: &SenderTags,
 ) -> Message {
+    // A message may arrive here already carrying tags — a time it was sent at,
+    // tags a client attached. A recipient only sees the ones it negotiated, so
+    // anything it did not ask for is taken off its copy rather than left on.
+    if !recipient_caps.contains("server-time") {
+        msg.tags.remove("time");
+    }
+    if !recipient_caps.contains("message-tags") {
+        msg.tags.remove("msgid");
+        msg.tags.retain(|k, _| !k.starts_with('+'));
+    }
     if !recipient_caps.is_empty() {
         if recipient_caps.contains("server-time") {
             add_server_time(&mut msg.tags);

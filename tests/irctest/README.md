@@ -55,6 +55,20 @@ Sable, and those tests assert their behaviour, not the specification's.
 draft, and `not strict` drops tests asserting a stricter reading than the
 specification requires. Override with `IRCTEST_MARKERS` to see them.
 
+## What is left
+
+Two tests do not pass, and neither is a conformance defect:
+
+- `testReadMarkerPropagatedToOtherSessions` needs two live connections sharing
+  one nick and account. That is session multiplexing — one user, several
+  sockets — which rIRCd does not have: a nick belongs to a connection.
+  `persistent_sessions` gives the neighbouring behaviour (logging in resumes
+  your session rather than joining it), which is not what this test asks for.
+- `testLinksWithServices` expects services to appear in `LINKS` as a linked
+  server named `My.Little.Services`. rIRCd's services are built into the
+  server, so there is no second server; reporting one would put a false claim
+  about the network's shape on the wire.
+
 ## Failures are findings
 
 A failure here is a claim about rIRCd, not about the harness — but check which
