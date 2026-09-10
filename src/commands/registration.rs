@@ -1995,6 +1995,21 @@ pub async fn handle_authenticate(
         }
     }
 
+    // Naming a mechanism starts a fresh attempt, so nothing the last one left
+    // behind belongs to it: a part-received response, the middle of a SCRAM
+    // exchange, the fact that it failed. Left in place, the second half of the
+    // old attempt answers the first half of the new one — a client retrying
+    // SCRAM after a wrong password had its opening message read as a reply to
+    // a question it was never asked.
+    if is_mechanism_selection {
+        let mut sg = state.write().await;
+        let conn = sg.get_or_create_pending(client_id, host);
+        conn.sasl_failed = false;
+        conn.sasl_scram = None;
+        conn.sasl_plain_buffer.clear();
+        conn.sasl_chunk_count = 0;
+    }
+
     // Route SCRAM-SHA-256: initial selection or continuation
     if mechanism == "SCRAM-SHA-256" || stored_mechanism.as_deref() == Some("SCRAM-SHA-256") {
         if mechanism == "SCRAM-SHA-256" {
