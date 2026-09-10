@@ -555,6 +555,59 @@ else:
     )
 check("and it is still serving afterwards", still_alive("a flood of logins", f"h19{RUN}"))
 
+section("a client renaming itself as fast as it can")
+# A nick change is cheap to send and expensive to deliver: every member of
+# every channel the client is in hears about it, and so does every other
+# server. NICK is part of registration, so it used to be exempt from flood
+# control for the whole life of the connection.
+watchers = []
+flood_channel = f"#rename{RUN}"
+try:
+    for i in range(8):
+        w = Client(f"h20{i}{RUN}")
+        w.join(flood_channel)
+        watchers.append(w)
+    renamer = Client(f"h21{RUN}")
+    renamer.join(flood_channel)
+    quiet_rename = round_trip_ms(f"h22{RUN}")
+
+    renamer.sock.setblocking(False)
+    stop_at = time.time() + 5
+    lines = 0
+    while time.time() < stop_at:
+        try:
+            renamer.sock.sendall(
+                b"".join(f"NICK r{(lines + n) % 9000:04d}{RUN[:2]}\r\n".encode() for n in range(50))
+            )
+            lines += 50
+        except (BlockingIOError, OSError):
+            time.sleep(0.005)
+        for w in watchers:
+            w.sock.setblocking(False)
+            try:
+                w.sock.recv(1 << 20)
+            except (BlockingIOError, OSError):
+                pass
+            w.sock.setblocking(True)
+    under_rename = round_trip_ms(f"h23{RUN}")
+finally:
+    for w in watchers:
+        try:
+            w.close()
+        except OSError:
+            pass
+
+if quiet_rename is None or under_rename is None:
+    check("a client can still be served during a rename flood", False,
+          f"quiet={quiet_rename} under flood={under_rename}")
+else:
+    check(
+        f"{lines} nick changes do not stall everyone else",
+        under_rename < 1000,
+        f"slowest answer {quiet_rename:.1f} ms quiet, {under_rename:.1f} ms under the flood",
+    )
+check("and it is still serving afterwards", still_alive("a rename flood", f"h24{RUN}"))
+
 section("still standing")
 check("the server is still accepting and serving clients", still_alive("everything", f"h12{RUN}"))
 

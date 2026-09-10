@@ -188,6 +188,27 @@ pub async fn handle_client(
     .await;
 }
 
+/// Whether a command is exempt from flood control.
+///
+/// Registration is exempt because a client has to get through it before it can
+/// usefully be told to slow down, and PING because dropping it makes a
+/// responsive server look dead: the client is waiting for a PONG that will
+/// never come.
+///
+/// NICK belongs to registration only until the client has said who it is.
+/// After that it is an ordinary command and an expensive one — every member of
+/// every channel the client is in hears about a nick change, and so does every
+/// other server on the network. Left exempt, one connection renaming itself as
+/// fast as it can decides how much of this server everybody else gets, and the
+/// backlog it builds outlives the connection that sent it.
+fn flood_exempt(command: &str, has_said_who_they_are: bool) -> bool {
+    match command {
+        "CAP" | "USER" | "PASS" | "AUTHENTICATE" | "PING" | "PONG" | "QUIT" | "BATCH" => true,
+        "NICK" => !has_said_who_they_are,
+        _ => false,
+    }
+}
+
 /// Format queued messages onto a socket, batching whatever is already waiting
 /// into one write.
 ///
@@ -294,6 +315,9 @@ async fn handle_client_stream<S>(
     let mut last_activity = tokio::time::Instant::now();
     let mut ping_sent = false;
     let mut registered = false; // switches to normal keepalive after first server-bound message
+                                // NICK before USER is a client choosing its name; after it, a client
+                                // changing it. Only the second is charged for.
+    let mut said_who_they_are = false;
     let tx_clone = tx.clone();
     let mut quit_reason = "Connection closed";
 
@@ -368,6 +392,9 @@ async fn handle_client_stream<S>(
                                 // Any data from client resets keepalive
                                 last_activity = tokio::time::Instant::now();
                                 registered = true;
+                                if msg.command == "USER" {
+                                    said_who_they_are = true;
+                                }
                                 if msg.command == "PONG" {
                                     ping_sent = false;
                                 }
@@ -389,13 +416,6 @@ async fn handle_client_stream<S>(
                                     (flood_tokens + elapsed * flood_refill_rate).min(flood_capacity);
                                 flood_last_refill = now;
 
-                                // PING is exempt because dropping it makes a
-                                // responsive server look dead: the client is
-                                // waiting for a PONG that will never come.
-                                const FLOOD_EXEMPT: &[&str] = &[
-                                    "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PING", "PONG",
-                                    "QUIT", "BATCH",
-                                ];
                                 // Lines inside an open batch form one logical message.
                                 // Charging a token each makes the advertised multiline
                                 // limits unusable, because max-lines is twice the bucket.
@@ -404,7 +424,7 @@ async fn handle_client_stream<S>(
                                 let in_open_batch = open_batch.is_some()
                                     && msg.tags.get("batch").and_then(|v| v.as_deref())
                                         == open_batch.as_deref();
-                                if !FLOOD_EXEMPT.contains(&msg.command.as_str()) && !in_open_batch {
+                                if !flood_exempt(&msg.command, said_who_they_are) && !in_open_batch {
                                     if flood_tokens < 1.0 {
                                         tracing::warn!(client = %client_id, command = %msg.command, "Flood control triggered");
                                         let reply = Message::new(
@@ -577,6 +597,9 @@ pub async fn handle_client_ws(
     let mut last_activity = tokio::time::Instant::now();
     let mut ping_sent = false;
     let mut registered = false;
+    // NICK before USER is a client choosing its name; after it, a client
+    // changing it. Only the second is charged for.
+    let mut said_who_they_are = false;
     let mut quit_reason = "Connection closed";
     // A WebSocket frame carries no CRLF, but the limit is the same one, and a
     // client that can reach this server both ways should not find that the same
@@ -629,6 +652,9 @@ pub async fn handle_client_ws(
 
                                 last_activity = tokio::time::Instant::now();
                                 registered = true;
+                                if msg.command == "USER" {
+                                    said_who_they_are = true;
+                                }
                                 if msg.command == "PONG" {
                                     ping_sent = false;
                                 }
@@ -649,13 +675,6 @@ pub async fn handle_client_ws(
                                     (flood_tokens + elapsed * flood_refill_rate).min(flood_capacity);
                                 flood_last_refill = now;
 
-                                // PING is exempt because dropping it makes a
-                                // responsive server look dead: the client is
-                                // waiting for a PONG that will never come.
-                                const FLOOD_EXEMPT: &[&str] = &[
-                                    "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PING", "PONG",
-                                    "QUIT", "BATCH",
-                                ];
                                 // Lines inside an open batch form one logical message.
                                 // Charging a token each makes the advertised multiline
                                 // limits unusable, because max-lines is twice the bucket.
@@ -664,7 +683,7 @@ pub async fn handle_client_ws(
                                 let in_open_batch = open_batch.is_some()
                                     && msg.tags.get("batch").and_then(|v| v.as_deref())
                                         == open_batch.as_deref();
-                                if !FLOOD_EXEMPT.contains(&msg.command.as_str()) && !in_open_batch {
+                                if !flood_exempt(&msg.command, said_who_they_are) && !in_open_batch {
                                     if flood_tokens < 1.0 {
                                         tracing::warn!(client = %client_id, command = %msg.command, "Flood control triggered (WS)");
                                         let reply = Message::new(
@@ -740,6 +759,9 @@ pub async fn handle_client_ws(
 
                                 last_activity = tokio::time::Instant::now();
                                 registered = true;
+                                if msg.command == "USER" {
+                                    said_who_they_are = true;
+                                }
                                 if msg.command == "PONG" {
                                     ping_sent = false;
                                 }
@@ -760,10 +782,6 @@ pub async fn handle_client_ws(
                                     (flood_tokens + elapsed * flood_refill_rate).min(flood_capacity);
                                 flood_last_refill = now;
 
-                                const FLOOD_EXEMPT_B: &[&str] = &[
-                                    "CAP", "NICK", "USER", "PASS", "AUTHENTICATE", "PONG", "QUIT",
-                                    "BATCH",
-                                ];
                                 // Lines inside an open batch form one logical message.
                                 // Charging a token each makes the advertised multiline
                                 // limits unusable, because max-lines is twice the bucket.
@@ -772,7 +790,7 @@ pub async fn handle_client_ws(
                                 let in_open_batch = open_batch.is_some()
                                     && msg.tags.get("batch").and_then(|v| v.as_deref())
                                         == open_batch.as_deref();
-                                if !FLOOD_EXEMPT_B.contains(&msg.command.as_str()) && !in_open_batch {
+                                if !flood_exempt(&msg.command, said_who_they_are) && !in_open_batch {
                                     if flood_tokens < 1.0 {
                                         let reply = Message::new(
                                             "NOTICE",
