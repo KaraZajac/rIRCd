@@ -812,6 +812,11 @@ pub async fn handle_part(
             for (ch_key, account) in &forgotten_memberships {
                 if let Some(set) = state_w.channel_accounts.get_mut(ch_key) {
                     set.remove(&account.to_lowercase());
+                    // An empty set is a channel nobody is remembered in. Left
+                    // behind, every channel that ever existed keeps a row here.
+                    if set.is_empty() {
+                        state_w.channel_accounts.remove(ch_key);
+                    }
                 }
             }
         }
@@ -2600,13 +2605,15 @@ pub async fn handle_kick(
             .await;
     }
     if let Some(account) = kicked_account {
-        if let Some(set) = state_arc
-            .write()
-            .await
-            .channel_accounts
-            .get_mut(&canonical_channel_key(ch_name))
         {
-            set.remove(&account.to_lowercase());
+            let key = canonical_channel_key(ch_name);
+            let mut state_w = state_arc.write().await;
+            if let Some(set) = state_w.channel_accounts.get_mut(&key) {
+                set.remove(&account.to_lowercase());
+                if set.is_empty() {
+                    state_w.channel_accounts.remove(&key);
+                }
+            }
         }
         if let Some(ref pool) = cfg.db {
             crate::persist::forget_account_channel(
@@ -2620,6 +2627,10 @@ pub async fn handle_kick(
 
     Ok(())
 }
+
+/// Invitations one channel may have standing at once before the ones nobody is
+/// behind any more are swept up.
+const MAX_STANDING_INVITES: usize = 256;
 
 pub async fn handle_invite(
     client_id: &str,
@@ -2770,6 +2781,14 @@ pub async fn handle_invite(
                 )
                 .await;
                 return Ok(());
+            }
+            // An invitation is spent when the guest joins, and forgotten when
+            // they do not. Nothing else removes one, so every invitee who never
+            // turned up and has since gone stays on the list for as long as the
+            // channel does. Dropping the ones nobody is behind any more leaves a
+            // list bounded by who is actually connected.
+            if ch.invite_list.len() >= MAX_STANDING_INVITES {
+                ch.invite_list.retain(|id| state.clients.contains_key(id));
             }
             ch.invite_list.insert(target_id.clone());
             tracing::debug!(client_id, channel = %ch_name, target = %target_nick, "INVITE");

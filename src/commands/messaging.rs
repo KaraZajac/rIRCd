@@ -2625,6 +2625,9 @@ pub async fn handle_chathistory(
     Ok(())
 }
 
+/// Targets one user may hold a read marker for at once.
+const MAX_READ_MARKERS: usize = 500;
+
 /// MARKREAD target [timestamp] — draft/read-marker. Set or get last read timestamp per target.
 pub async fn handle_markread(
     client_id: &str,
@@ -2714,17 +2717,38 @@ pub async fn handle_markread(
             return Ok(());
         }
         tracing::debug!(client_id, target, timestamp = %ts, "MARKREAD set");
-        let updated_ts = {
+        let (updated_ts, forgotten) = {
             let mut state_w = state.write().await;
             let entry = state_w.read_markers.entry(key.clone()).or_default();
             let current = entry.get(target).cloned();
+            // A marker belongs to a conversation, and nobody is in five hundred
+            // at once. The target is whatever word the client sent and nothing
+            // else here removes one, so without a ceiling this is a table a
+            // client fills a command at a time — and for an account, one that
+            // is written to disk and read back at every start. The marker
+            // furthest behind is the one least worth keeping.
+            let forgotten = if current.is_none() && entry.len() >= MAX_READ_MARKERS {
+                let oldest = entry
+                    .iter()
+                    .min_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+                    .map(|(t, _)| t.clone());
+                if let Some(ref old) = oldest {
+                    entry.remove(old);
+                }
+                oldest
+            } else {
+                None
+            };
             if current.as_deref() < Some(ts.as_str()) {
                 entry.insert(target.to_string(), ts.clone());
             }
-            entry.get(target).cloned().unwrap_or(ts)
+            (entry.get(target).cloned().unwrap_or(ts), forgotten)
         };
         // Persist to database
         if let (Some(pool), true) = (cfg.db.as_ref(), account.is_some()) {
+            if let Some(ref old) = forgotten {
+                persist::forget_read_marker(pool, &key, old).await;
+            }
             persist::save_read_marker(pool, &key, target, &updated_ts).await;
         }
         let m = Message::new(

@@ -650,6 +650,19 @@ pub async fn save_read_marker(
     .await;
 }
 
+/// Drop one account's marker for one target.
+///
+/// A marker is only kept while the conversation it belongs to is one of the
+/// ones the user is following; the row goes when the marker does, or the table
+/// grows by one row for every target a client ever named.
+pub async fn forget_read_marker(pool: &sqlx::MySqlPool, account: &str, target: &str) {
+    let _ = sqlx::query("DELETE FROM read_markers WHERE account = ? AND target = ?")
+        .bind(account)
+        .bind(target)
+        .execute(pool)
+        .await;
+}
+
 /// Load all read markers from the database into a nested HashMap.
 pub async fn load_read_markers(
     pool: &sqlx::MySqlPool,
