@@ -2676,6 +2676,45 @@ pub async fn route_to_user(cfg: &Config, from_uid: &str, target_uid: &str, msg: 
     }
 }
 
+/// Whether this peer is allowed to say this at all.
+///
+/// A link only speaks for what it carries. Introducing a user was already
+/// checked that way; everything afterwards was not, so a peer could send a
+/// `QUIT`, a `NICK` or a `KILL` prefixed with the id of somebody on the far
+/// side of the network and this server would act on it. One compromised server
+/// on a network would then be every server on it.
+///
+/// The prefix on a link is a user id or a server id and nothing else, so this
+/// is one check rather than one per command. A message with no prefix is the
+/// peer speaking for itself — a `PING`, the handshake — and has nothing to
+/// check.
+async fn speaks_for_its_prefix(ctx: &LinkContext, msg: &Message, peer_sid: &str) -> bool {
+    let Some(ref prefix) = msg.prefix else {
+        return true;
+    };
+    let claimed = match prefix.len() {
+        3 => prefix.as_str(),
+        _ if valid_uid(prefix) => &prefix[..3],
+        // Not a shape this protocol uses. Refusing is safer than guessing which
+        // server it meant.
+        _ => {
+            warn!(peer = %peer_sid, prefix = %prefix, command = %msg.command,
+                  "Refusing a link message whose prefix is neither a user nor a server");
+            return false;
+        }
+    };
+    if ctx.links.read().await.carried_by(claimed, peer_sid) {
+        return true;
+    }
+    warn!(
+        peer = %peer_sid,
+        claimed = %claimed,
+        command = %msg.command,
+        "Refusing to let a link speak for a server it does not carry"
+    );
+    false
+}
+
 /// What to do with one message from a linked server.
 ///
 /// Anything this server does not understand is ignored rather than guessed at:
@@ -2687,6 +2726,9 @@ async fn handle_link_message(
     peer_sid: &str,
     peer: &tokio::sync::mpsc::Sender<Message>,
 ) -> std::ops::ControlFlow<()> {
+    if !speaks_for_its_prefix(ctx, msg, peer_sid).await {
+        return std::ops::ControlFlow::Continue(());
+    }
     match msg.command.as_str() {
         "PING" => {
             let token = msg.params.last().cloned().unwrap_or_default();

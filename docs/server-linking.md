@@ -172,6 +172,21 @@ got, so that nobody has to read the source to find out:
 | `WHOIS` forwarded, for the idle time only that server knows | yes |
 | Services commands (`GHOST`, `SANICK`) acting on a remote user | not yet |
 
+### What a link is allowed to say
+
+A link is the most trusted connection a server has: whatever a peer says about
+its users is believed, because there is nothing to check it against. The
+boundary of that trust is that **a link speaks for the servers it carries and
+for nothing else**. Every message that arrives with a prefix — a user id or a
+server id — is checked against what that link is known to carry before anything
+is done with it.
+
+Without that, one compromised server on a network is every server on it. Local
+users are keyed by this server's own ids, so a peer allowed to name any id could
+send `:1AAAAAAAB QUIT` and disconnect somebody on the server it had just linked
+to. `tests/smoke/test_link_hostile.py` does exactly that, three hundred ids at a
+time, and checks that everybody is still there afterwards.
+
 ### Asking, rather than announcing
 
 Everything above is an announcement: something happened here and the network is

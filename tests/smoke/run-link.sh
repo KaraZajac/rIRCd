@@ -251,6 +251,10 @@ if [ "$SERVE_ONLY" = 0 ]; then
   fi
   say "Running test_link.py"
   python3 "$HERE/test_link.py" || status=1
+  # Last, because it takes the place of server B — which test_link.py has just
+  # killed to watch the split — and speaks the link protocol by hand.
+  say "Running test_link_hostile.py"
+  python3 "$HERE/test_link_hostile.py" || status=1
 fi
 
 if [ "$KEEP" = 1 ]; then

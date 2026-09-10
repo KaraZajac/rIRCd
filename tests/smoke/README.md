@@ -132,6 +132,24 @@ accumulate briefly would trade some of the single-message latency above for
 several messages per write. That is a choice about which of the two numbers
 matters, not a free improvement, and it has not been made.
 
+## A peer that lies
+
+`test_link_hostile.py` runs last in `run-link.sh`, after `test_link.py` has
+killed server B — so B's place on the network is free and the test takes it,
+speaking the link protocol by hand.
+
+It covers both sides of the trust boundary. Before a peer has proved anything: a
+wrong password, a server there is no link block for, the right password with the
+wrong server id, a greeting that never finishes. And once it is on the network
+and believed: acting on users of a server the link does not carry, a prefix that
+names neither a user nor a server, an answer to a question nobody asked, and
+sixty thousand lines of nonsense.
+
+The one that matters most is that a peer cannot disconnect the users of the
+server it linked to. That is not hypothetical — with the check removed the test
+fails, because local users are keyed by this server's own ids and a peer allowed
+to name any id can name theirs.
+
 ## Writing a new suite
 
 ```python
