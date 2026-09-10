@@ -477,6 +477,27 @@ check("a nick does not inherit the last holder's metadata",
       not second.find("The First Holder", lines=second.since(mark)), second.since(mark))
 second.close()
 
+# Nor when the last holder is still here under another name: the keys describe
+# the person, so they go with them rather than staying on the name they let go.
+mover = Client("metamover")
+mover.send("METADATA * SET display-name :Still The Same Person")
+mover.read(1.0)
+mover.send("NICK metamoved")
+mover.read(1.0)
+mark = mover.mark()
+mover.send("METADATA * LIST")
+mover.read(1.5)
+check("metadata follows a nick change",
+      bool(mover.find("Still The Same Person", lines=mover.since(mark))), mover.since(mark))
+taker = Client("metamover")
+mark = taker.mark()
+taker.send("METADATA * LIST")
+taker.read(1.5)
+check("and does not stay on the name that was let go",
+      not taker.find("Still The Same Person", lines=taker.since(mark)), taker.since(mark))
+taker.close()
+mover.close()
+
 section("draft/channel-rename")
 ren = Client("renamer2", caps=["draft/channel-rename"])
 ren.join("#before")

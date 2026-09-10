@@ -281,6 +281,26 @@ alice.send("METADATA * SET display-name :Alice Across")
 got = arrives(meta, "METADATA", mark)
 check("a key set on A reaches a subscriber on B",
       bool(got) and "Alice Across" in got[0], got)
+
+# A rename on A moves the keys on B too: they describe the person, and the name
+# they let go belongs to whoever asks for it next.
+alice_renamed = f"ar{RUN}"
+alice.send(f"NICK {alice_renamed}")
+meta.read(1.5)
+mark = meta.mark()
+meta.send(f"METADATA {alice_renamed} GET display-name")
+meta.read(1.5)
+check("metadata follows a rename across the link",
+      bool(meta.find("Alice Across", lines=meta.since(mark))), meta.since(mark))
+mark = meta.mark()
+meta.send(f"METADATA {renamed} GET display-name")
+meta.read(1.5)
+check("and does not stay on the name that was let go",
+      not meta.find("Alice Across", lines=meta.since(mark)), meta.since(mark))
+# Put the name back: the rest of this file addresses her by it.
+alice.send(f"NICK {renamed}")
+meta.read(1.0)
+alice.read(1.0)
 meta.close()
 
 watcher.close()

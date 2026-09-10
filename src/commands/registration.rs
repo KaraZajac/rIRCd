@@ -1286,9 +1286,27 @@ pub async fn handle_nick(
                 }
                 state_guard.push_whowas(entry);
             }
+            let mut moved_metadata: Vec<(String, String)> = Vec::new();
+            let mut metadata_left_behind: Option<String> = None;
             if let Some(ref o) = old_nick {
                 tracing::info!(client_id, old_nick = %o, new_nick = %nick, "Nick change");
                 state_guard.nick_to_id.remove(&crate::casefold::upper(o));
+                // Metadata is filed under the nick, and the nick is about to
+                // belong to whoever asks for it next. It describes the person,
+                // though — their display name, their avatar — so it goes with
+                // them. Left where it was, the next holder of the old name
+                // wears it, and every name anybody ever used keeps a row.
+                let (from, to) = (
+                    crate::commands::metadata::metadata_key(o),
+                    crate::commands::metadata::metadata_key(&nick),
+                );
+                if from != to {
+                    if let Some(keys) = state_guard.metadata.remove(&from) {
+                        moved_metadata = keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        metadata_left_behind = Some(from);
+                        state_guard.metadata.insert(to, keys);
+                    }
+                }
             }
             // One nick change happened at one time, and every server has to
             // agree on when: it is what settles a collision.
@@ -1329,6 +1347,15 @@ pub async fn handle_nick(
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default();
             drop(state_guard);
+            // What was moved in memory has to move on disk too, or the old name
+            // gets it back at the next start.
+            if let (Some(pool), Some(from)) = (cfg.db.as_ref(), metadata_left_behind.as_ref()) {
+                let to = crate::commands::metadata::metadata_key(&nick);
+                persist::clear_metadata(pool, from).await;
+                for (k, v) in &moved_metadata {
+                    persist::save_metadata(pool, &to, k, v).await;
+                }
+            }
             // The rest of the network is told once the local tables are
             // settled, and never while a lock over them is held.
             crate::link::announce_nick(cfg, &user_id, &nick, nick_ts).await;

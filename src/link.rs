@@ -1113,6 +1113,19 @@ async fn accept_remote_nick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
         let mut state = ctx.state.write().await;
         if let Some(ref o) = old {
             state.nick_to_id.remove(&crate::casefold::upper(o));
+            // Metadata is filed under the nick here as well, and it describes
+            // the person rather than the name. It moves with them, or the next
+            // holder of the name they let go wears it — a copy of the same
+            // thing the server they are on does with theirs.
+            let (from, to) = (
+                crate::commands::metadata::metadata_key(o),
+                crate::commands::metadata::metadata_key(new_nick),
+            );
+            if from != to {
+                if let Some(keys) = state.metadata.remove(&from) {
+                    state.metadata.insert(to, keys);
+                }
+            }
         }
         if let Some(c) = state.clients.get(uid) {
             let mut g = c.write().await;
