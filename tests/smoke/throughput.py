@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Throughput: how many messages, and how many deliveries, per second.
+"""Throughput: how many messages, how many deliveries, and how long each took.
 
     python3 tests/smoke/throughput.py <receivers> <senders>
 
 Every client sits in one channel, so each message a sender posts is delivered to
 every receiver. Senders keep inside the flood allowance by pausing between
 rounds, so the numbers measure the server, not its rate limiter.
+
+Each message carries the clock reading it was sent at, so the time from posting
+to arriving is measured per delivery rather than averaged over the batch. The
+tail is the number that matters: a server can hold its rate up while one client
+in a hundred waits a second, and the average will not say so.
 """
 
 import asyncio
@@ -47,6 +52,7 @@ class Client:
     def __init__(self, nick):
         self.nick = nick
         self.received = 0
+        self.latencies = []
 
     async def connect(self):
         self.reader, self.writer = await asyncio.open_connection(HOST, PORT)
@@ -75,6 +81,14 @@ class Client:
                     return
                 if b"burst" in line:
                     self.received += 1
+                    # The last field is the sender's clock reading, so the
+                    # difference is the whole way round: in, through the one
+                    # dispatch loop, fanned out, and back down this socket.
+                    try:
+                        sent_at = int(line.rsplit(b" ", 1)[1])
+                        self.latencies.append((time.perf_counter_ns() - sent_at) / 1e6)
+                    except (IndexError, ValueError):
+                        pass
                 elif line.startswith(b"PING"):
                     self.writer.write(b"PONG" + line[4:])
         except (ConnectionError, asyncio.CancelledError):
@@ -103,13 +117,16 @@ async def main(receivers, senders):
     total_messages = per_sender * senders
     for c in clients:
         c.received = 0
+        c.latencies.clear()
     expected = total_messages * (len(clients) - 1)
 
     cpu_before = cpu_seconds(pid)
     start = time.time()
     for i in range(per_sender):
         for s in sending:
-            s.writer.write(f"PRIVMSG {CHANNEL} :burst {i}\r\n".encode())
+            s.writer.write(
+                f"PRIVMSG {CHANNEL} :burst {i} {time.perf_counter_ns()}\r\n".encode()
+            )
     await asyncio.gather(*(s.writer.drain() for s in sending))
 
     deadline = time.time() + 180
@@ -128,6 +145,57 @@ async def main(receivers, senders):
     print(f"message rate:       {total_messages / elapsed:,.0f}/s")
     print(f"delivery rate:      {delivered / elapsed:,.0f}/s")
     print(f"server CPU:         {cpu:.2f}s ({cpu / max(delivered, 1) * 1e6:.1f} µs per delivery)")
+
+    def percentiles(samples, label):
+        if not samples:
+            return
+        samples = sorted(samples)
+
+        def at(fraction):
+            return samples[min(int(len(samples) * fraction), len(samples) - 1)]
+
+        print(
+            f"{label:<22}p50 {at(0.50):.1f} ms   p95 {at(0.95):.1f} ms   "
+            f"p99 {at(0.99):.1f} ms   worst {samples[-1]:.1f} ms"
+        )
+
+    # Under the burst, latency is how long the queue took to drain: every
+    # message was posted before any of them had been delivered.
+    percentiles([l for c in clients for l in c.latencies], "latency, saturated:")
+
+    # And once more without saturating it: one message, waited for, before the
+    # next is sent. That is the number that says whether the server is healthy —
+    # how long one thing somebody said takes to reach everybody listening.
+    for c in clients:
+        c.latencies.clear()
+        c.received = 0
+    # The burst just spent every sender's flood allowance, which refills at a
+    # token a second. Wait for it, then rotate the senders slowly enough that
+    # each has one in hand by the time its turn comes round again — otherwise
+    # this measures the rate limiter and calls it latency.
+    await asyncio.sleep(2.0)
+    rounds = 40
+    per_round = 1.2 / max(len(sending), 1)
+    missed = 0
+    for i in range(rounds):
+        sender = sending[i % len(sending)]
+        started = time.time()
+        sender.writer.write(
+            f"PRIVMSG {CHANNEL} :burst one{i} {time.perf_counter_ns()}\r\n".encode()
+        )
+        await sender.writer.drain()
+        want = (len(clients) - 1) * (i + 1 - missed)
+        settle = time.time() + 2
+        while sum(c.received for c in clients) < want and time.time() < settle:
+            await asyncio.sleep(0.002)
+        if sum(c.received for c in clients) < want:
+            missed += 1
+        remaining = per_round - (time.time() - started)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+    if missed:
+        print(f"({missed} of {rounds} single messages did not reach everybody)")
+    percentiles([l for c in clients for l in c.latencies], "latency, one message:")
 
     for t in tasks:
         t.cancel()

@@ -58,6 +58,43 @@ trigger fired, the subscription was loaded and the payload encrypted — the par
 this project owns. The encryption itself is checked against the RFC 8291 test
 vector in `cargo test`.
 
+## Measuring
+
+Two tools that are measurements rather than pass/fail checks, so they are not
+part of `run.sh`. Both want a **release** build: a debug one is several times
+slower and the numbers mean nothing.
+
+```
+cargo build --release
+tests/smoke/run.sh --serve-only          # database and a server
+python3 tests/smoke/throughput.py 200 20 # 200 listening, 20 talking
+python3 tests/smoke/loadtest.py 2000     # how many clients it holds
+```
+
+`throughput.py` reports two latencies and they answer different questions.
+*Saturated* is every sender posting at once and is how long the queue takes to
+drain. *One message* sends one and waits for it to reach everybody before
+sending the next, which is what a person actually experiences.
+
+Numbers from one run, so that a change which makes things worse is visible
+rather than merely unmeasured. Release build, 16-core desktop, 10 September
+2026, everything on loopback:
+
+| | |
+|---|---|
+| Deliveries per second, saturated | ~100,000 |
+| Server CPU per delivery | ~21 µs |
+| Latency of one message to 219 recipients | 4.6 ms median, 12.0 ms p99 |
+| 2,000 clients connected, registered and joined | 5.9 s (340/s) |
+| Memory per client | ~22 KB (76 MB at 2,000) |
+| Idle round trip at 2,000 clients | 0.61 ms median |
+
+Loopback flatters latency and a desktop flatters CPU, so treat these as a
+before-and-after for this machine rather than as a claim about anyone else's.
+What they are for is noticing that a change cost 30% — every one of the
+denial-of-service problems fixed in 1.4.0 showed up first as a latency that
+went from under a millisecond to hundreds.
+
 ## Writing a new suite
 
 ```python
