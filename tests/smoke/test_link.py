@@ -125,8 +125,14 @@ def arrives(client, needle, mark, seconds=8):
 found = eventually(lambda: [l for l in whois(b, burst_nick) if " 311 " in l])
 check(f"B knows {burst_nick}, who registered on A", bool(found), found)
 
-server_line = [l for l in whois(b, burst_nick) if " 312 " in l]
+answer = whois(b, burst_nick)
+server_line = [l for l in answer if " 312 " in l]
 check("B says which server they are on", any(A_NAME in l for l in server_line), server_line)
+# How long somebody has been quiet is known to the server they type at. A
+# number invented here would look exactly like a real one.
+check("B does not invent an idle time for them",
+      not [l for l in answer if " 317 " in l],
+      [l for l in answer if " 317 " in l])
 
 late = Client(late_nick, port=A_PORT)
 found = eventually(lambda: [l for l in whois(b, late_nick) if " 311 " in l])

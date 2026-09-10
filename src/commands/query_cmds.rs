@@ -448,8 +448,14 @@ pub async fn handle_whois(
                 ],
             )
             .with_prefix(&cfg.server.name));
-            // 317 RPL_WHOISIDLE: seconds idle, signon time
-            {
+            // 317 RPL_WHOISIDLE: seconds idle, signon time.
+            //
+            // Only for a user on this server. How long somebody has been quiet
+            // is known to the server they are typing at and to nobody else, and
+            // an idle time made up here would be a plausible-looking lie —
+            // where leaving the line out says plainly that this server does not
+            // know.
+            if c.server.is_none() {
                 let idle_secs = chrono::Utc::now().timestamp().saturating_sub(c.last_active);
                 send_reply!(Message::new(
                     "317",
