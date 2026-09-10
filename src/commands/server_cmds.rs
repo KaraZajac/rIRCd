@@ -93,14 +93,14 @@ pub async fn handle_lusers(
     )
     .with_prefix(s));
 
-    if ops > 0 {
-        // 252 RPL_LUSEROP
-        send_reply!(Message::new(
-            "252",
-            vec![nick.clone(), ops.to_string(), "IRC Operators online".into()],
-        )
-        .with_prefix(s));
-    }
+    // 252 RPL_LUSEROP. Sent even when the answer is none: leaving it out is the
+    // older habit, and it makes "no operators are online" indistinguishable
+    // from "this server does not say".
+    send_reply!(Message::new(
+        "252",
+        vec![nick.clone(), ops.to_string(), "IRC Operators online".into()],
+    )
+    .with_prefix(s));
 
     // 254 RPL_LUSERCHANNELS
     send_reply!(Message::new(
@@ -229,6 +229,7 @@ pub async fn handle_time(
 /// Reply: 371 RPL_INFO * n, then 374 RPL_ENDOFINFO
 pub async fn handle_info(
     client_id: &str,
+    target: &str,
     state: Arc<RwLock<ServerState>>,
     senders: Senders,
     cfg: &Config,
@@ -240,6 +241,29 @@ pub async fn handle_info(
         Some(c) => c.read().await.nick_or_id().to_string(),
         None => return Ok(()),
     };
+
+    // `INFO <server>` asks a particular server. Answering for one that is not
+    // on the network with this server's own information would be a quiet lie.
+    if !target.is_empty() && !target.eq_ignore_ascii_case(s) {
+        let known = match cfg.links_runtime {
+            Some(ref links) => links.read().await.by_name(target).is_some(),
+            None => false,
+        };
+        if !known {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "402",
+                    vec![nick, target.to_string(), "No such server".into()],
+                )
+                .with_prefix(s),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    }
 
     let uptime_secs = chrono::Utc::now().timestamp() - started;
     let days = uptime_secs / 86400;

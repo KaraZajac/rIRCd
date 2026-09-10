@@ -308,6 +308,34 @@ pub async fn handle_message(
                     pending.lines.push((concat, text));
                     return Ok(());
                 }
+                // A batch tag naming something else while a multiline batch is
+                // open. Sending the line on as an ordinary message would put a
+                // fragment of one conversation into another, so the batch goes
+                // and the client is told why.
+                let mismatched = state_w
+                    .pending_client_batches
+                    .get(&client_id)
+                    .is_none_or(|b| b.ref_tag != *ref_val);
+                if mismatched {
+                    state_w.pending_multiline.remove(&client_id);
+                    drop(state_w);
+                    crate::commands::reply_to_client(
+                        &senders,
+                        &client_id,
+                        Message::new(
+                            "FAIL",
+                            vec![
+                                "BATCH".into(),
+                                "MULTILINE_INVALID".into(),
+                                "Invalid multiline batch".into(),
+                            ],
+                        )
+                        .with_prefix(&cfg.server.name),
+                        label.as_deref(),
+                    )
+                    .await;
+                    return Ok(());
+                }
             }
         }
     }
@@ -847,7 +875,17 @@ pub async fn handle_message(
             server_cmds::handle_version(&client_id, state, senders, cfg, label.as_deref()).await
         }
         "TIME" => server_cmds::handle_time(&client_id, state, senders, cfg, label.as_deref()).await,
-        "INFO" => server_cmds::handle_info(&client_id, state, senders, cfg, label.as_deref()).await,
+        "INFO" => {
+            server_cmds::handle_info(
+                &client_id,
+                msg.params.first().map(|s| s.as_str()).unwrap_or(""),
+                state,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
         "LINKS" => {
             server_cmds::handle_links(&client_id, state, senders, cfg, label.as_deref()).await
         }

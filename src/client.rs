@@ -263,6 +263,9 @@ async fn handle_client_stream<S>(
     let client_id_clone = client_id.clone();
     // Two bytes of the limit belong to the CRLF.
     let out_line_limit = keepalive.max_line_length.saturating_sub(2);
+    // The limit counts the CRLF that ends the line, so what a message may
+    // actually carry is two bytes less than the number the limit is written as.
+    let in_line_limit = out_line_limit;
     let mut writer_task = tokio::spawn(async move {
         write_loop(&mut writer, &mut send_rx, out_line_limit, &client_id_clone).await;
     });
@@ -327,10 +330,7 @@ async fn handle_client_stream<S>(
                                 // the client can still be told what was refused.
                                 let command = {
                                     let lossy = String::from_utf8_lossy(&buf);
-                                    parse_message_with_limit(
-                                        &lossy,
-                                        keepalive.max_line_length,
-                                    )
+                                    parse_message_with_limit(&lossy, in_line_limit)
                                     .map(|m| m.command)
                                     .unwrap_or_else(|_| "*".to_string())
                                 };
@@ -350,7 +350,7 @@ async fn handle_client_stream<S>(
                             }
                         };
 
-                        match parse_message_with_limit(line, keepalive.max_line_length) {
+                        match parse_message_with_limit(line, in_line_limit) {
                             Ok(msg) => {
                                 debug!(client = %client_id, command = %msg.command, "received");
 
@@ -569,6 +569,10 @@ pub async fn handle_client_ws(
     let mut ping_sent = false;
     let mut registered = false;
     let mut quit_reason = "Connection closed";
+    // A WebSocket frame carries no CRLF, but the limit is the same one, and a
+    // client that can reach this server both ways should not find that the same
+    // message fits over one and not the other.
+    let ws_line_limit = keepalive.max_line_length.saturating_sub(2);
 
     loop {
         let deadline = if ping_sent {
@@ -587,7 +591,8 @@ pub async fn handle_client_ws(
             }
             // Write outgoing IRC messages to WebSocket as text frames (no CRLF)
             Some(msg) = send_rx.recv() => {
-                let mut line = format_message_within(&msg, keepalive.max_line_length.saturating_sub(2));
+                let mut line =
+                    format_message_within(&msg, keepalive.max_line_length.saturating_sub(2));
                 while line.ends_with('\n') || line.ends_with('\r') {
                     line.pop();
                 }
@@ -609,7 +614,7 @@ pub async fn handle_client_ws(
                         if line.is_empty() {
                             continue;
                         }
-                        match parse_message_with_limit(line, keepalive.max_line_length) {
+                        match parse_message_with_limit(line, ws_line_limit) {
                             Ok(msg) => {
                                 debug!(client = %client_id, command = %msg.command, "received (ws)");
 
@@ -720,7 +725,7 @@ pub async fn handle_client_ws(
                         if line.is_empty() {
                             continue;
                         }
-                        match parse_message_with_limit(line, keepalive.max_line_length) {
+                        match parse_message_with_limit(line, ws_line_limit) {
                             Ok(msg) => {
                                 debug!(client = %client_id, command = %msg.command, "received (ws/bin)");
 

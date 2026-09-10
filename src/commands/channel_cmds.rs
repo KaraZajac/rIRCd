@@ -295,8 +295,15 @@ async fn handle_join_inner(
             continue;
         }
 
+        // An invitation is permission to come in. Refusing the person you just
+        // invited is not a safer channel, it is a broken invitation.
+        //
+        // This is only safe because INVITE needs the op: if any member could
+        // invite, a ban would be one message away from being lifted by anyone
+        // it did not apply to.
         if ch.is_banned(account.as_deref(), &source)
             && !ch.is_ban_exempt(account.as_deref(), &source)
+            && !ch.invite_list.contains(&user_id)
         {
             reply_self!(Message::new(
                 "474",
@@ -341,7 +348,9 @@ async fn handle_join_inner(
 
         if let Some(ref key) = ch.key {
             // Constant-time comparison to prevent timing attacks on channel keys
-            if !ct_eq(provided_key.as_bytes(), key.as_bytes()) {
+            if !ct_eq(provided_key.as_bytes(), key.as_bytes())
+                && !ch.invite_list.contains(&user_id)
+            {
                 reply_self!(Message::new(
                     "475",
                     vec![
@@ -403,6 +412,10 @@ async fn handle_join_inner(
                 modes: modes.clone(),
             },
         );
+        // An invitation is spent by walking through the door it opened. Left
+        // standing, it would be a permanent exemption from a ban that whoever
+        // set the ban never granted.
+        ch.invite_list.remove(&user_id);
         tracing::debug!(client_id, nick = %nick, channel = %ch_key, op = is_first, "JOIN");
 
         if let Some(client) = state.clients.get(client_id) {
@@ -1604,16 +1617,15 @@ pub async fn handle_mode(
                                         label,
                                     )
                                     .await;
-                                } else if !ch.bans.contains(mask) {
+                                } else if !ch.list_contains('b', mask) {
                                     ch.bans.push(mask.clone());
                                     list_changes.push(('b', mask.clone(), true));
                                     ch.list_meta
                                         .insert(format!("b{}", mask), (setter.clone(), set_at));
                                 }
                             } else {
-                                ch.bans.retain(|b| b != mask);
+                                ch.remove_from_list('b', mask);
                                 list_changes.push(('b', mask.clone(), false));
-                                ch.list_meta.remove(&format!("b{}", mask));
                             }
                             param_idx += 1;
                         } else {
@@ -1679,16 +1691,15 @@ pub async fn handle_mode(
                                         label,
                                     )
                                     .await;
-                                } else if !ch.quiet_list.contains(mask) {
+                                } else if !ch.list_contains('q', mask) {
                                     ch.quiet_list.push(mask.clone());
                                     list_changes.push(('q', mask.clone(), true));
                                     ch.list_meta
                                         .insert(format!("q{}", mask), (setter.clone(), set_at));
                                 }
                             } else {
-                                ch.quiet_list.retain(|q| q != mask);
+                                ch.remove_from_list('q', mask);
                                 list_changes.push(('q', mask.clone(), false));
-                                ch.list_meta.remove(&format!("q{}", mask));
                             }
                             param_idx += 1;
                         } else {
@@ -1862,16 +1873,15 @@ pub async fn handle_mode(
                                         label,
                                     )
                                     .await;
-                                } else if !ch.ban_exceptions.contains(mask) {
+                                } else if !ch.list_contains('e', mask) {
                                     ch.ban_exceptions.push(mask.clone());
                                     list_changes.push(('e', mask.clone(), true));
                                     ch.list_meta
                                         .insert(format!("e{}", mask), (setter.clone(), set_at));
                                 }
                             } else {
-                                ch.ban_exceptions.retain(|b| b != mask);
+                                ch.remove_from_list('e', mask);
                                 list_changes.push(('e', mask.clone(), false));
-                                ch.list_meta.remove(&format!("e{}", mask));
                             }
                             param_idx += 1;
                         } else {
@@ -1944,16 +1954,15 @@ pub async fn handle_mode(
                                         label,
                                     )
                                     .await;
-                                } else if !ch.invite_exceptions.contains(mask) {
+                                } else if !ch.list_contains('I', mask) {
                                     ch.invite_exceptions.push(mask.clone());
                                     list_changes.push(('I', mask.clone(), true));
                                     ch.list_meta
                                         .insert(format!("I{}", mask), (setter.clone(), set_at));
                                 }
                             } else {
-                                ch.invite_exceptions.retain(|b| b != mask);
+                                ch.remove_from_list('I', mask);
                                 list_changes.push(('I', mask.clone(), false));
-                                ch.list_meta.remove(&format!("I{}", mask));
                             }
                             param_idx += 1;
                         } else {
@@ -2103,6 +2112,9 @@ pub async fn handle_mode(
                 if g.wallops {
                     modes.push('w');
                 }
+                if g.registered_only {
+                    modes.push('R');
+                }
                 if g.bot {
                     modes.push('B');
                 }
@@ -2150,6 +2162,40 @@ pub async fn handle_mode(
                     )
                     .with_prefix(&nick);
                     reply_to_client(&senders, client_id, m, label).await;
+                }
+                'R' => {
+                    if let Some(client_ref) = state.clients.get(client_id) {
+                        client_ref.write().await.registered_only = plus;
+                    }
+                    let m = Message::new(
+                        "MODE",
+                        vec![nick.clone(), format!("{}R", if plus { "+" } else { "-" })],
+                    )
+                    .with_prefix(&nick);
+                    reply_to_client(&senders, client_id, m, label).await;
+                }
+                // Nobody makes themselves an operator with MODE — that is what
+                // OPER and a password are for — but anybody may stop being one.
+                // An operator who wants to put the power down should not have to
+                // reconnect to do it.
+                'o' if !plus => {
+                    let was_oper = match state.clients.get(client_id) {
+                        Some(client_ref) => {
+                            let mut g = client_ref.write().await;
+                            let was = g.oper;
+                            g.oper = false;
+                            g.oper_name = None;
+                            g.oper_privileges = None;
+                            was
+                        }
+                        None => false,
+                    };
+                    if was_oper {
+                        tracing::info!(client_id, nick = %nick, "Operator status given up");
+                        let m = Message::new("MODE", vec![nick.clone(), "-o".to_string()])
+                            .with_prefix(&nick);
+                        reply_to_client(&senders, client_id, m, label).await;
+                    }
                 }
                 _ => {}
             }

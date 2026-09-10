@@ -172,6 +172,21 @@ fn is_nick_char(c: char) -> bool {
 ///
 /// A push is the only way a mention reaches someone who is away, and the message
 /// itself is waiting for them in the channel's history when they return.
+/// Whether a direct message may be delivered to this person.
+///
+/// User mode `+R` says only people with an account may write to them, which is
+/// the one thing that makes an inbox usable when somebody has decided to fill
+/// it. The sender is told, rather than being left to believe it went.
+async fn refuses_unregistered(state: &ServerState, target_id: &str, sender_account: Option<&str>) -> bool {
+    if sender_account.is_some() {
+        return false;
+    }
+    match state.clients.get(target_id) {
+        Some(c) => c.read().await.registered_only,
+        None => false,
+    }
+}
+
 /// A user on another server is reached over the link it came from, not through
 /// a connection here. Returns whether the message went that way, so the caller
 /// delivers locally only when it did not.
@@ -762,6 +777,27 @@ pub async fn handle_privmsg(
     } else {
         let target_id = state_guard.nick_to_id.get(&crate::casefold::upper(target)).cloned();
         if let Some(tid) = target_id {
+            if refuses_unregistered(&state_guard, &tid, sender_account.as_deref()).await {
+                drop(state_guard);
+                reply_to_sender(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "477",
+                        vec![
+                            sender_nick.clone(),
+                            target.to_string(),
+                            "You must be identified to a registered account to message this user"
+                                .into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                    parent_batch,
+                )
+                .await;
+                return Ok(());
+            }
             let mut privmsg =
                 Message::new("PRIVMSG", vec![target.into(), text.clone()]).with_prefix(&source);
             privmsg
@@ -824,20 +860,29 @@ pub async fn handle_privmsg(
                 )
                 .await;
             }
+            // The sender's other connections are that same person, writing from
+            // somewhere else. A message sent from a phone belongs in the
+            // conversation on the desktop, whether or not the phone asked to see
+            // its own messages back.
+            let sender_caps = match state_guard.clients.get(client_id) {
+                Some(c) => c.read().await.capabilities.clone(),
+                None => Default::default(),
+            };
+            let tagged = add_tags_for_recipient(
+                privmsg,
+                &sender_caps,
+                sender_account.as_deref(),
+                Some(&msgid),
+                Some(&msg.tags),
+                cfg.server.client_tag_deny.as_deref(),
+                &sender_tags,
+            );
+            let self_id = state_guard.user_id(client_id);
+            senders
+                .read()
+                .await
+                .deliver_except(&self_id, client_id, &tagged);
             if echo_message {
-                let sender_caps = match state_guard.clients.get(client_id) {
-                    Some(c) => c.read().await.capabilities.clone(),
-                    None => Default::default(),
-                };
-                let tagged = add_tags_for_recipient(
-                    privmsg,
-                    &sender_caps,
-                    sender_account.as_deref(),
-                    Some(&msgid),
-                    Some(&msg.tags),
-                    cfg.server.client_tag_deny.as_deref(),
-                    &sender_tags,
-                );
                 reply_to_sender(&senders, client_id, tagged, label, parent_batch).await;
             }
         } else {
@@ -1818,10 +1863,21 @@ pub async fn handle_redact(
     tracing::info!(client_id, target_param, msgid, "REDACT received");
 
     // A channel the client is not in is not a target it can redact in, and
-    // saying so is a different answer from "no such message".
+    // saying so is a different answer from "no such message". An operator is
+    // the exception: taking a message down is most of what the power is for,
+    // and needing to join the channel first would announce the moderation to
+    // everyone in it.
     if target_param.starts_with('#') || target_param.starts_with('&') {
         let ch_key = canonical_channel_key(target_param);
-        let user_id = state.read().await.user_id(client_id);
+        let (user_id, is_oper) = {
+            let state_r = state.read().await;
+            let uid = state_r.user_id(client_id);
+            let oper = match state_r.clients.get(client_id) {
+                Some(c) => c.read().await.oper,
+                None => false,
+            };
+            (uid, oper)
+        };
         let is_member = {
             let ch_store = channels.read().await;
             match ch_store.channels.get(&ch_key) {
@@ -1829,7 +1885,7 @@ pub async fn handle_redact(
                 None => false,
             }
         };
-        if !is_member {
+        if !is_member && !is_oper {
             reply_to_client(
                 &senders,
                 client_id,
@@ -2074,11 +2130,26 @@ pub async fn handle_redact(
                     send_to_client(&senders, mid, redact_relay.clone()).await;
                 }
             }
+            // An operator taking a message down from a channel they are not in
+            // is not in that list, and would be left wondering whether the
+            // command had done anything.
+            let uid = state_r.user_id(client_id);
+            let watching = member_ids.contains(&uid);
+            let has_cap = state_r
+                .clients
+                .get(client_id)
+                .and_then(|c| c.try_read().ok())
+                .map(|g| g.capabilities.contains("draft/message-redaction"))
+                .unwrap_or(false);
+            if !watching && has_cap {
+                drop(state_r);
+                send_to_client(&senders, client_id, redact_relay.clone()).await;
+            }
         }
     } else {
         // DM: send to the redacting client and the other party if they have the cap
         let state_r = state.read().await;
-        let tid_opt = state_r.nick_to_id.get(&target.to_uppercase()).cloned();
+        let tid_opt = state_r.nick_to_id.get(&crate::casefold::upper(&target)).cloned();
         let sender_has_cap = state_r
             .clients
             .get(client_id)
