@@ -341,11 +341,18 @@ pub async fn complete_registration(
     let server = &cfg.server.name;
     let nick_str = &client.read().await.nick_or_id().to_string();
 
+    // Read what is being logged before logging it: awaiting inside the macro's
+    // arguments leaves a formatting borrow held across the await, which is
+    // enough to stop this whole call being sendable to a task of its own.
+    let (logged_host, logged_tls) = {
+        let guard = client.read().await;
+        (guard.display_host().to_string(), guard.is_tls)
+    };
     tracing::info!(
         client_id,
         nick = %nick_str,
-        host = %client.read().await.display_host(),
-        tls = client.read().await.is_tls,
+        host = %logged_host,
+        tls = logged_tls,
         "Client registered"
     );
 
@@ -1055,7 +1062,15 @@ pub async fn handle_cap(
                 // Ending negotiation with an exchange still in flight abandons
                 // it: say so and let registration finish, rather than holding
                 // the connection open for a response that is not coming.
-                if conn.sasl_mechanism.is_some() && conn.account.is_none() {
+                //
+                // A check that is running is a response that *is* coming, and
+                // an attempt that already failed was answered with 904 — the
+                // client is not waiting on either, so neither is abandoned.
+                if conn.sasl_mechanism.is_some()
+                    && conn.account.is_none()
+                    && !conn.sasl_failed
+                    && !conn.sasl_checking()
+                {
                     let nick = conn.nick.clone().unwrap_or_else(|| "*".to_string());
                     conn.sasl_mechanism = None;
                     conn.sasl_plain_buffer.clear();
@@ -2596,146 +2611,264 @@ pub async fn handle_authenticate(
         return Ok(());
     }
 
-    let verified = match cfg.db.as_ref() {
-        Some(pool) => persist::verify_user(pool, authcid, passwd).await,
-        None => false,
+    // Checking a password is deliberately slow — a fifth of a second of CPU —
+    // and every command in this server is handled by one loop. Waiting here for
+    // the answer is waiting on behalf of every other client: one connection
+    // offering credentials as fast as it can type would decide when anybody
+    // else got served, and the backlog outlives the connection that sent it.
+    //
+    // So the check goes to a task of its own and this loop moves on. The client
+    // hears nothing until the answer arrives, which is what it was waiting for
+    // anyway, and `ready_to_register` already holds its registration open while
+    // SASL is in flight.
+    let wait_first = {
+        let mut state_w = state.write().await;
+        // One credential at a time. SASL is a conversation, and a client that
+        // sends the next answer before hearing the last one is not having it —
+        // without this, a connection could start a check per line and leave
+        // this server holding all of them at once.
+        if state_w
+            .pending
+            .get(client_id)
+            .is_some_and(|conn| conn.sasl_checking())
+        {
+            tracing::info!(
+                client_id = %client_id,
+                "SASL AUTHENTICATE: a check for this connection is already running, ignoring"
+            );
+            return Ok(());
+        }
+        let wait = state_w.auth_cost.spend(host);
+        if let Some(conn) = state_w.pending.get_mut(client_id) {
+            // Long enough for the wait and the check, and no longer: if the
+            // answer never comes the connection still gets to finish
+            // registering rather than hanging on it.
+            conn.sasl_check_until =
+                Some(std::time::Instant::now() + wait + std::time::Duration::from_secs(15));
+        }
+        wait
     };
-    if !verified {
-        tracing::info!(client_id = %client_id, authcid = %authcid, "SASL AUTHENTICATE: invalid credentials, sending 904");
-        sasl_fail(
-            state,
-            &senders,
-            client_id,
-            cfg,
-            label,
-            &nick,
-            "SASL authentication failed",
-        )
-        .await;
-        return Ok(());
+    if !wait_first.is_zero() {
+        tracing::warn!(
+            client_id = %client_id,
+            host = %host,
+            wait_ms = wait_first.as_millis() as u64,
+            "SASL AUTHENTICATE: this address has been failing, making it wait"
+        );
     }
-
-    // Authorization identity: presented authzid or derived from authcid (RFC 4616)
-    let account = if authzid.is_empty() { authcid } else { authzid };
-
-    // Set account immediately so any concurrent AUTHENTICATE (e.g. client sending same line 2–3x) is ignored.
-    {
-        let mut state = state.write().await;
-        if let Some(client) = state.clients.get_mut(client_id) {
-            client.write().await.account = Some(account.to_string());
-        } else if let Some(conn) = state.pending.get_mut(client_id) {
-            conn.account = Some(account.to_string());
+    let owned = (
+        client_id.to_string(),
+        host.to_string(),
+        nick.clone(),
+        authzid.to_string(),
+        authcid.to_string(),
+        passwd.to_string(),
+        cfg.clone(),
+        label.map(str::to_string),
+    );
+    let (task_state, task_channels, task_senders) =
+        (state.clone(), channels.clone(), senders.clone());
+    tokio::spawn(async move {
+        if !wait_first.is_zero() {
+            tokio::time::sleep(wait_first).await;
         }
-    }
-
-    tracing::info!(client_id = %client_id, account = %account, "SASL PLAIN authentication successful");
-
-    // Auto-associate TLS certfp with the account for SASL EXTERNAL
-    if let Some(ref pool) = cfg.db {
-        let certfp = state.read().await.certfps.get(client_id).cloned();
-        if let Some(fp) = certfp {
-            tracing::info!(client_id = %client_id, account = %account, "Auto-associating certfp with account");
-            crate::persist::set_certfp(pool, account, &fp).await;
-        }
-    }
-
-    let (channel_list, source, user_ident_host) = {
-        let mut state = state.write().await;
-        if let Some(client) = state.clients.get_mut(client_id) {
-            let ch_list = client
-                .read()
-                .await
-                .channels
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            let src = client
-                .read()
-                .await
-                .source()
-                .unwrap_or_else(|| client_id.to_string());
-            let uih = src.clone();
-            (ch_list, src, uih)
-        } else if let Some(conn) = state.pending.get(client_id) {
-            let uih = conn
-                .user
-                .as_ref()
-                .map(|u| format!("{}!{}@{}", nick, u, conn.host))
-                // USER has not arrived yet, but 900's second parameter is a
-                // mask; the internal connection id is not one and means
-                // nothing to a client.
-                .unwrap_or_else(|| format!("{}!*@{}", nick, conn.host));
-            (Vec::new(), client_id.to_string(), uih)
-        } else {
-            (Vec::new(), client_id.to_string(), format!("{}!*@*", nick))
-        }
-    };
-
-    // IRCv3: on success send 900 (RPL_LOGGEDIN) then 903 (RPL_SASLSUCCESS)
-    let server_name = &cfg.server.name;
-    reply_to_client(
-        &senders,
-        client_id,
-        Message::new(
-            "900",
-            vec![
-                nick.to_string(),
-                user_ident_host,
-                account.to_string(),
-                "You are now logged in as ".to_string() + account,
-            ],
-        )
-        .with_prefix(server_name),
-        label,
-    )
-    .await;
-    reply_to_client(
-        &senders,
-        client_id,
-        Message::new(
-            "903",
-            vec![nick.to_string(), "SASL authentication successful".into()],
-        )
-        .with_prefix(server_name),
-        label,
-    )
-    .await;
-    tracing::info!(client_id = %client_id, nick = %nick, account = %account, "SASL AUTHENTICATE: success, sent 900 and 903");
-
-    // account-notify: tell channel peers that have the cap (prefix = user whose account changed)
-    let account_msg = Message::new("ACCOUNT", vec![account.to_string()]).with_prefix(&source);
-    crate::link::announce_account(cfg, &state.read().await.user_id(client_id), Some(account)).await;
-    let mut already_notified = std::collections::HashSet::new();
-    for ch_name in &channel_list {
-        let ch_store = channels.read().await;
-        let ch_guard = match ch_store.channels.get(ch_name) {
-            Some(ch) => ch,
-            None => continue,
+        let (
+            owned_client_id,
+            owned_host,
+            nick,
+            owned_authzid,
+            owned_authcid,
+            owned_passwd,
+            owned_cfg,
+            owned_label,
+        ) = owned;
+        let client_id: &str = &owned_client_id;
+        let host: &str = &owned_host;
+        let authzid: &str = &owned_authzid;
+        let authcid: &str = &owned_authcid;
+        let passwd: &str = &owned_passwd;
+        let cfg: &Config = &owned_cfg;
+        let label: Option<&str> = owned_label.as_deref();
+        let (state, channels, senders) = (task_state, task_channels, task_senders);
+        let verified = match cfg.db.as_ref() {
+            Some(pool) => persist::verify_user(pool, authcid, passwd).await,
+            None => false,
         };
-        let member_ids: Vec<String> = ch_guard.read().await.members.keys().cloned().collect();
-        let _ = ch_guard;
-        drop(ch_store);
-        let state = state.read().await;
-        for mid in &member_ids {
-            let skip = state.is_self(mid, client_id).then_some(client_id);
-            send_to_others_requiring(&senders, mid, "account-notify", skip, &account_msg).await;
-            already_notified.insert(mid.clone());
+        {
+            let mut state_w = state.write().await;
+            if verified {
+                state_w.auth_cost.refund(host);
+            }
+            // The answer is here, so the attempt is no longer in flight.
+            if let Some(conn) = state_w.pending.get_mut(client_id) {
+                conn.sasl_check_until = None;
+            }
         }
-    }
-    // extended-monitor: notify monitor watchers with account-notify + extended-monitor
-    {
-        let state_r = state.read().await;
-        notify_extended_monitor_watchers(
-            &state_r,
+        if !verified {
+            tracing::info!(client_id = %client_id, authcid = %authcid, "SASL AUTHENTICATE: invalid credentials, sending 904");
+            sasl_fail(
+                state.clone(),
+                &senders,
+                client_id,
+                cfg,
+                label,
+                &nick,
+                "SASL authentication failed",
+            )
+            .await;
+            return finish_registration_if_ready(client_id, state, channels, senders, cfg, label)
+                .await;
+        }
+
+        // Authorization identity: presented authzid or derived from authcid (RFC 4616)
+        let account = if authzid.is_empty() { authcid } else { authzid };
+
+        // Set account immediately so any concurrent AUTHENTICATE (e.g. client sending same line 2–3x) is ignored.
+        {
+            let mut state = state.write().await;
+            if let Some(client) = state.clients.get_mut(client_id) {
+                client.write().await.account = Some(account.to_string());
+            } else if let Some(conn) = state.pending.get_mut(client_id) {
+                conn.account = Some(account.to_string());
+            }
+        }
+
+        tracing::info!(client_id = %client_id, account = %account, "SASL PLAIN authentication successful");
+
+        // Auto-associate TLS certfp with the account for SASL EXTERNAL
+        if let Some(ref pool) = cfg.db {
+            let certfp = state.read().await.certfps.get(client_id).cloned();
+            if let Some(fp) = certfp {
+                tracing::info!(client_id = %client_id, account = %account, "Auto-associating certfp with account");
+                crate::persist::set_certfp(pool, account, &fp).await;
+            }
+        }
+
+        let (channel_list, source, user_ident_host) = {
+            let mut state = state.write().await;
+            if let Some(client) = state.clients.get_mut(client_id) {
+                let ch_list = client
+                    .read()
+                    .await
+                    .channels
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let src = client
+                    .read()
+                    .await
+                    .source()
+                    .unwrap_or_else(|| client_id.to_string());
+                let uih = src.clone();
+                (ch_list, src, uih)
+            } else if let Some(conn) = state.pending.get(client_id) {
+                let uih = conn
+                    .user
+                    .as_ref()
+                    .map(|u| format!("{}!{}@{}", nick, u, conn.host))
+                    // USER has not arrived yet, but 900's second parameter is a
+                    // mask; the internal connection id is not one and means
+                    // nothing to a client.
+                    .unwrap_or_else(|| format!("{}!*@{}", nick, conn.host));
+                (Vec::new(), client_id.to_string(), uih)
+            } else {
+                (Vec::new(), client_id.to_string(), format!("{}!*@*", nick))
+            }
+        };
+
+        // IRCv3: on success send 900 (RPL_LOGGEDIN) then 903 (RPL_SASLSUCCESS)
+        let server_name = &cfg.server.name;
+        reply_to_client(
             &senders,
-            &nick,
-            &source,
-            account_msg,
-            "account-notify",
-            &already_notified,
             client_id,
+            Message::new(
+                "900",
+                vec![
+                    nick.to_string(),
+                    user_ident_host,
+                    account.to_string(),
+                    "You are now logged in as ".to_string() + account,
+                ],
+            )
+            .with_prefix(server_name),
+            label,
         )
         .await;
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "903",
+                vec![nick.to_string(), "SASL authentication successful".into()],
+            )
+            .with_prefix(server_name),
+            label,
+        )
+        .await;
+        tracing::info!(client_id = %client_id, nick = %nick, account = %account, "SASL AUTHENTICATE: success, sent 900 and 903");
+
+        // account-notify: tell channel peers that have the cap (prefix = user whose account changed)
+        let account_msg = Message::new("ACCOUNT", vec![account.to_string()]).with_prefix(&source);
+        crate::link::announce_account(cfg, &state.read().await.user_id(client_id), Some(account))
+            .await;
+        let mut already_notified = std::collections::HashSet::new();
+        for ch_name in &channel_list {
+            let ch_store = channels.read().await;
+            let ch_guard = match ch_store.channels.get(ch_name) {
+                Some(ch) => ch,
+                None => continue,
+            };
+            let member_ids: Vec<String> = ch_guard.read().await.members.keys().cloned().collect();
+            let _ = ch_guard;
+            drop(ch_store);
+            let state = state.read().await;
+            for mid in &member_ids {
+                let skip = state.is_self(mid, client_id).then_some(client_id);
+                send_to_others_requiring(&senders, mid, "account-notify", skip, &account_msg).await;
+                already_notified.insert(mid.clone());
+            }
+        }
+        // extended-monitor: notify monitor watchers with account-notify + extended-monitor
+        {
+            let state_r = state.read().await;
+            notify_extended_monitor_watchers(
+                &state_r,
+                &senders,
+                &nick,
+                &source,
+                account_msg,
+                "account-notify",
+                &already_notified,
+                client_id,
+            )
+            .await;
+        }
+        finish_registration_if_ready(client_id, state, channels, senders, cfg, label).await
+    });
+    Ok(())
+}
+
+/// Finish registering a connection whose last piece has arrived.
+///
+/// A SASL answer can now come back after the client has said everything else it
+/// meant to say, so whoever produces that answer is the last one able to notice
+/// that the connection is ready.
+async fn finish_registration_if_ready(
+    client_id: &str,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let ready = state
+        .read()
+        .await
+        .pending
+        .get(client_id)
+        .is_some_and(|p| p.ready_to_register());
+    if ready {
+        complete_registration(client_id, state, channels, senders, cfg, label).await?;
     }
     Ok(())
 }
@@ -3199,59 +3332,97 @@ pub async fn handle_oper(
         .await;
         return Ok(());
     }
-    for oper in &cfg.opers {
-        if oper.name == name && crate::persist::bcrypt_verify(password, &oper.password_hash).await {
-            let found = if let Some(c) = state.read().await.clients.get(client_id) {
-                let mut g = c.write().await;
-                g.oper = true;
-                g.oper_name = Some(oper.name.clone());
-                g.oper_privileges = oper.privileges.clone();
-                true
-            } else {
-                false
-            };
-            if found {
-                tracing::warn!(client_id, oper_name = %name, "OPER login successful");
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    Message::new(
-                        "381",
-                        vec![oper_nick.clone(), "You are now an IRC operator".into()],
-                    )
+    // An operator's password is checked the same expensive way anyone's is, and
+    // it is checked on the one loop that serves every client. Flood control
+    // holds a single connection to a guess a second, which four connections
+    // between them is enough to spend the whole server; so an address that
+    // keeps getting it wrong is told no without anything being checked.
+    //
+    // Unlike SASL this cannot be made to wait instead: an answer that arrives
+    // after the replies to whatever the client said next is an answer in the
+    // wrong place. A name with no operator block costs nothing and is refused
+    // straight away, which is also what stops this being a lever for anyone who
+    // does not know one.
+    let matched = match cfg.opers.iter().find(|o| o.name == name) {
+        Some(oper) => oper,
+        None => {
+            tracing::warn!(client_id, oper_name = %name, "OPER login failed: no such operator");
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("464", vec![oper_nick, "Password incorrect".into()])
                     .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
-                // Becoming an operator is a user mode change, and clients track
-                // their modes from MODE rather than from the numeric.
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    Message::new("MODE", vec![oper_nick.clone(), "+o".into()])
-                        .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
-            } else {
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    Message::new("451", vec!["*".into(), "You have not registered".into()])
-                        .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
-            }
+                label,
+            )
+            .await;
             return Ok(());
         }
+    };
+    let oper_host = match state.read().await.clients.get(client_id) {
+        Some(c) => c.read().await.host.clone(),
+        None => client_id.to_string(),
+    };
+    let over_budget = !state.write().await.auth_cost.spend(&oper_host).is_zero();
+    if over_budget {
+        tracing::warn!(
+            client_id,
+            oper_name = %name,
+            host = %oper_host,
+            "OPER: too many failed attempts from this address, not checking"
+        );
     }
-    tracing::warn!(client_id, oper_name = %name, "OPER login failed: bad password");
+    if over_budget || !crate::persist::bcrypt_verify(password, &matched.password_hash).await {
+        tracing::warn!(client_id, oper_name = %name, "OPER login failed: bad password");
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("464", vec![oper_nick, "Password incorrect".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    state.write().await.auth_cost.refund(&oper_host);
+    let (oper_name, oper_privileges) = (matched.name.clone(), matched.privileges.clone());
+    let found = if let Some(c) = state.read().await.clients.get(client_id) {
+        let mut g = c.write().await;
+        g.oper = true;
+        g.oper_name = Some(oper_name.clone());
+        g.oper_privileges = oper_privileges;
+        true
+    } else {
+        false
+    };
+    if !found {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("451", vec!["*".into(), "You have not registered".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    tracing::warn!(client_id, oper_name = %name, "OPER login successful");
     reply_to_client(
         &senders,
         client_id,
-        Message::new("464", vec![oper_nick, "Password incorrect".into()])
-            .with_prefix(&cfg.server.name),
+        Message::new(
+            "381",
+            vec![oper_nick.clone(), "You are now an IRC operator".into()],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    // Becoming an operator is a user mode change, and clients track their modes
+    // from MODE rather than from the numeric.
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new("MODE", vec![oper_nick, "+o".into()]).with_prefix(&cfg.server.name),
         label,
     )
     .await;

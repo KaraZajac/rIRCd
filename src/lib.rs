@@ -1,3 +1,4 @@
+pub mod authcost;
 pub mod capability;
 pub mod casefold;
 pub mod channel;

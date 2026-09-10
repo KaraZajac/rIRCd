@@ -489,6 +489,72 @@ else:
     )
     check("and it is still serving afterwards", still_alive("the flood", f"h14{RUN}"))
 
+section("credentials offered as fast as they can be typed")
+# Checking a password is deliberately slow, and every client's commands go
+# through one dispatch loop. A connection that offers credentials back to back
+# must not decide when everybody else gets served — and AUTHENTICATE is exempt
+# from flood control, because a long SASL response arrives in several lines.
+import base64  # noqa: E402  (only this section needs it)
+
+
+def round_trip_ms(nick):
+    """How long the server takes to answer a client that is doing nothing odd."""
+    c = Client(nick)
+    worst = 0.0
+    for i in range(6):
+        started = time.time()
+        c.send(f"PING :beat{i}")
+        if not c.wait_for(f"beat{i}", seconds=20):
+            c.close()
+            return None
+        worst = max(worst, (time.time() - started) * 1000)
+        time.sleep(0.05)
+    c.close()
+    return worst
+
+
+quiet = round_trip_ms(f"h17{RUN}")
+flooders = []
+payload = base64.b64encode(b"\0nosuchaccount\0wrongpassword").decode()
+try:
+    for i in range(2):
+        f = raw(timeout=10)
+        f.sendall(f"CAP LS 302\r\nNICK sf{i}{RUN}\r\nUSER s 0 * :s\r\n".encode())
+        flooders.append(f)
+    time.sleep(0.5)
+    stop = time.time() + 8
+    while time.time() < stop:
+        for f in flooders:
+            try:
+                f.sendall(f"AUTHENTICATE PLAIN\r\nAUTHENTICATE {payload}\r\n".encode() * 4)
+                f.setblocking(False)
+                try:
+                    f.recv(1 << 20)
+                except (BlockingIOError, OSError):
+                    pass
+                f.setblocking(True)
+            except OSError:
+                pass
+        under = round_trip_ms(f"h18{RUN}")
+        break
+finally:
+    for f in flooders:
+        try:
+            f.close()
+        except OSError:
+            pass
+
+if quiet is None or under is None:
+    check("a client can still be served during a flood of logins", False,
+          f"quiet={quiet} under flood={under}")
+else:
+    check(
+        "credentials offered as fast as possible do not stall everyone else",
+        under < 1000,
+        f"slowest answer {quiet:.1f} ms quiet, {under:.1f} ms under the flood",
+    )
+check("and it is still serving afterwards", still_alive("a flood of logins", f"h19{RUN}"))
+
 section("still standing")
 check("the server is still accepting and serving clients", still_alive("everything", f"h12{RUN}"))
 

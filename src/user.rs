@@ -201,6 +201,15 @@ pub struct PendingConnection {
     pub sasl_chunk_count: u32,
     /// True after we sent 904 for this connection; ignore further AUTHENTICATE so we don't later "succeed".
     pub sasl_failed: bool,
+    /// When the credential check now running stops counting as in flight.
+    ///
+    /// Checking a password does not happen on the loop that serves everybody,
+    /// so the answer arrives after the client has said whatever else it meant
+    /// to say. Until then the attempt is still live: ending capability
+    /// negotiation must not abandon it, and registration must not finish
+    /// without it. It is a deadline rather than a flag so that a check which
+    /// somehow never reports back cannot hold a connection open for ever.
+    pub sasl_check_until: Option<std::time::Instant>,
     /// Current SASL mechanism ("PLAIN" or "SCRAM-SHA-256"); set on first AUTHENTICATE
     pub sasl_mechanism: Option<String>,
     /// SCRAM-SHA-256: intermediate server state (set after step 1, consumed in step 2)
@@ -233,11 +242,19 @@ impl PendingConnection {
             sasl_plain_buffer: String::new(),
             sasl_chunk_count: 0,
             sasl_failed: false,
+            sasl_check_until: None,
             sasl_mechanism: None,
             sasl_scram: None,
             is_tls: false,
             nick_in_use: None,
         }
+    }
+
+    /// True while a credential check for this connection is still expected to
+    /// report back.
+    pub fn sasl_checking(&self) -> bool {
+        self.sasl_check_until
+            .is_some_and(|until| std::time::Instant::now() < until)
     }
 
     /// Ready to complete registration: have NICK+USER, either legacy client or CAP END, and SASL
@@ -246,10 +263,11 @@ impl PendingConnection {
         // Only wait for SASL if the client asked for it. An AUTHENTICATE from a
         // client that never negotiated the capability must not hold its
         // registration open for ever.
-        let sasl_in_progress = self.capabilities.contains("sasl")
-            && self.sasl_mechanism.is_some()
-            && self.account.is_none()
-            && !self.sasl_failed;
+        let sasl_in_progress = self.sasl_checking()
+            || (self.capabilities.contains("sasl")
+                && self.sasl_mechanism.is_some()
+                && self.account.is_none()
+                && !self.sasl_failed);
         self.nick.is_some()
             && self.user.is_some()
             && (!self.cap_negotiating || self.cap_ended)
@@ -742,6 +760,10 @@ pub struct ServerState {
     /// Server bans, matched on connection. Kept in memory so a connection never
     /// waits on the database.
     pub server_bans: Vec<crate::persist::ServerBan>,
+    /// What each address has spent failing to log in. Checking a password is
+    /// expensive on purpose, so an address that keeps getting it wrong is told
+    /// no before anything is checked.
+    pub auth_cost: crate::authcost::AuthCost,
     /// Most clients connected at once since start, for the `max` field of
     /// RPL_LOCALUSERS/RPL_GLOBALUSERS. Clients come and go, so the current
     /// count is not a high-water mark.
@@ -1298,4 +1320,5 @@ mod session_tests {
         let registry = SessionRegistry::default();
         assert_eq!(registry.sessions_of("nobody"), vec!["nobody".to_string()]);
     }
+
 }
