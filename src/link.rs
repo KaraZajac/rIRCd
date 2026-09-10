@@ -1266,6 +1266,73 @@ async fn accept_remote_nick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
+/// `:<asker> WHOISREQ <target> <token>` — somebody on another server wants to
+/// know how long one of ours has been quiet.
+///
+/// Passed along if the user is not ours, because the question is for one server
+/// and this may not be it.
+async fn accept_whois_question(ctx: &LinkContext, msg: &Message) {
+    let (Some(asker), Some(target), Some(token)) = (
+        msg.prefix.clone(),
+        msg.params.first().cloned(),
+        msg.params.get(1).cloned(),
+    ) else {
+        return;
+    };
+    if pass_along(ctx, msg, &target).await {
+        return;
+    }
+    let cfg = ctx.cfg.read().await.clone();
+    crate::commands::whois_remote::answer(&ctx.state, &cfg, &asker, &target, &token).await;
+}
+
+/// `:<target> WHOISREP <asker> <token> <idle> <signon>` — the answer coming
+/// back to whoever asked.
+async fn accept_whois_answer(ctx: &LinkContext, msg: &Message) {
+    let Some(asker) = msg.params.first().cloned() else {
+        return;
+    };
+    if pass_along(ctx, msg, &asker).await {
+        return;
+    }
+    let (Some(token), Some(idle), Some(signon)) = (
+        msg.params.get(1).cloned(),
+        msg.params.get(2).and_then(|v| v.parse::<i64>().ok()),
+        msg.params.get(3).and_then(|v| v.parse::<i64>().ok()),
+    ) else {
+        return;
+    };
+    let server_name = ctx.cfg.read().await.server.name.clone();
+    crate::commands::whois_remote::accept(
+        &ctx.state,
+        &ctx.senders,
+        &server_name,
+        &asker,
+        &token,
+        idle,
+        signon,
+    )
+    .await;
+}
+
+/// Send a message on towards the server that holds `uid`, when that is not this
+/// one. Returns whether it was somebody else's to deal with.
+///
+/// A question addressed to a server this one cannot reach is dropped: there is
+/// nowhere for it to go, and the asker gives up on its own.
+async fn pass_along(ctx: &LinkContext, msg: &Message, uid: &str) -> bool {
+    let Some(sid) = owning_sid(uid) else {
+        return true;
+    };
+    if sid == ctx.state.read().await.sid {
+        return false;
+    }
+    if let Some(tx) = ctx.links.read().await.route(sid) {
+        let _ = tx.try_send(msg.clone());
+    }
+    true
+}
+
 /// Take a user off this server altogether: out of every channel it was in, out
 /// of the client tables, and out of the watch lists — telling the people who
 /// shared a channel with it, because from here it has quit.
@@ -2638,6 +2705,14 @@ async fn handle_link_message(
         }
         "NICK" => {
             accept_remote_nick(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "WHOISREQ" => {
+            accept_whois_question(ctx, msg).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "WHOISREP" => {
+            accept_whois_answer(ctx, msg).await;
             std::ops::ControlFlow::Continue(())
         }
         "QUIT" => {

@@ -804,6 +804,8 @@ pub struct ServerState {
     /// Server bans, matched on connection. Kept in memory so a connection never
     /// waits on the database.
     pub server_bans: Vec<crate::persist::ServerBan>,
+    /// `WHOIS` answers this server has asked another one for and not yet had.
+    pub pending_whois: PendingWhois,
     /// What each address has spent failing to log in. Checking a password is
     /// expensive on purpose, so an address that keeps getting it wrong is told
     /// no before anything is checked.
@@ -812,6 +814,78 @@ pub struct ServerState {
     /// RPL_LOCALUSERS/RPL_GLOBALUSERS. Clients come and go, so the current
     /// count is not a high-water mark.
     pub max_clients: usize,
+}
+
+/// An answer this server is waiting for from another one.
+///
+/// How long somebody has been quiet is known to the server they are typing at
+/// and to nobody else, so a `WHOIS` for a user on another server has to ask it
+/// and wait. What is kept here is everything needed to finish the reply when
+/// the answer arrives — or when it becomes clear it is not going to.
+#[derive(Debug)]
+pub struct WhoisWait {
+    /// The connection that asked, which is what the rest of the reply goes to.
+    pub asker: String,
+    /// And the user behind it, so an answer meant for somebody else cannot
+    /// finish this one.
+    pub asker_uid: String,
+    pub asker_nick: String,
+    pub target_nick: String,
+    pub label: Option<String>,
+    pub batch_ref: Option<String>,
+}
+
+/// The `WHOIS` answers outstanding, and the tokens they are waiting under.
+///
+/// A token is made here and comes back on the answer, so a peer cannot name one
+/// this server did not issue. The table is bounded because a peer that never
+/// answers must not be able to grow it: past the ceiling a `WHOIS` is finished
+/// the way it was before any of this, without an idle line.
+#[derive(Debug, Default)]
+pub struct PendingWhois {
+    waiting: HashMap<String, WhoisWait>,
+    issued: u64,
+}
+
+/// How many answers this server will wait for at once.
+const MAX_PENDING_WHOIS: usize = 1024;
+
+impl PendingWhois {
+    /// Take a token for a question about to be asked, or `None` when too many
+    /// are already outstanding.
+    pub fn issue(&mut self, wait: WhoisWait) -> Option<String> {
+        if self.waiting.len() >= MAX_PENDING_WHOIS {
+            return None;
+        }
+        self.issued = self.issued.wrapping_add(1);
+        let token = format!("{:x}", self.issued);
+        self.waiting.insert(token.clone(), wait);
+        Some(token)
+    }
+
+    /// Put a question back under the token it was already waiting on.
+    ///
+    /// Used when an answer arrives that does not belong to it: the right one
+    /// may still be coming, and giving it a new token would strand it — the
+    /// timeout is holding the old one and would never find it again.
+    pub fn put_back(&mut self, token: String, wait: WhoisWait) {
+        self.waiting.insert(token, wait);
+    }
+
+    /// Finish with a question, whether the answer came or the time did.
+    ///
+    /// Returns the waiting reply exactly once: the answer and the giving up
+    /// race each other, and whichever arrives first is the one that finishes
+    /// it.
+    pub fn take(&mut self, token: &str) -> Option<WhoisWait> {
+        self.waiting.remove(token)
+    }
+
+    /// How many are outstanding. For tests.
+    #[cfg(test)]
+    pub fn outstanding(&self) -> usize {
+        self.waiting.len()
+    }
 }
 
 /// In-flight draft/multiline batch for one client
@@ -1386,6 +1460,73 @@ mod session_tests {
     async fn an_unknown_user_falls_back_to_the_id_itself() {
         let registry = SessionRegistry::default();
         assert_eq!(registry.sessions_of("nobody"), vec!["nobody".to_string()]);
+    }
+
+    fn a_question(asker_uid: &str) -> super::WhoisWait {
+        super::WhoisWait {
+            asker: "client-1".into(),
+            asker_uid: asker_uid.into(),
+            asker_nick: "asker".into(),
+            target_nick: "target".into(),
+            label: None,
+            batch_ref: None,
+        }
+    }
+
+    /// A peer that never answers must not be able to leave anything behind, so
+    /// the table of questions has a ceiling. Past it a `WHOIS` is answered the
+    /// way it was before there was anywhere to ask.
+    #[test]
+    fn unanswered_questions_do_not_pile_up_for_ever() {
+        let mut pending = super::PendingWhois::default();
+        let mut issued = 0;
+        for _ in 0..super::MAX_PENDING_WHOIS * 2 {
+            if pending.issue(a_question("1AAAAAAAA")).is_some() {
+                issued += 1;
+            }
+        }
+        assert_eq!(issued, super::MAX_PENDING_WHOIS);
+        assert_eq!(pending.outstanding(), super::MAX_PENDING_WHOIS);
+    }
+
+    /// The answer and the giving up race each other, and a reply must be sent
+    /// once however that race goes.
+    #[test]
+    fn a_question_is_finished_exactly_once() {
+        let mut pending = super::PendingWhois::default();
+        let token = pending.issue(a_question("1AAAAAAAA")).expect("issued");
+        assert!(pending.take(&token).is_some(), "the first one gets it");
+        assert!(
+            pending.take(&token).is_none(),
+            "and the second gets nothing"
+        );
+        assert_eq!(pending.outstanding(), 0);
+    }
+
+    /// Two questions never share a token, or one answer would finish the other.
+    #[test]
+    fn every_question_gets_its_own_token() {
+        let mut pending = super::PendingWhois::default();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let token = pending.issue(a_question("1AAAAAAAA")).expect("issued");
+            assert!(seen.insert(token.clone()), "token {token} was issued twice");
+            pending.take(&token);
+        }
+    }
+
+    /// Putting a question back keeps its token, because something else is
+    /// already waiting to give up on that one.
+    #[test]
+    fn a_question_put_back_keeps_the_token_it_was_waiting_under() {
+        let mut pending = super::PendingWhois::default();
+        let token = pending.issue(a_question("1AAAAAAAA")).expect("issued");
+        let wait = pending.take(&token).expect("taken");
+        pending.put_back(token.clone(), wait);
+        assert!(
+            pending.take(&token).is_some(),
+            "it must still be findable under the token the timeout is holding"
+        );
     }
 
     /// A connection that leaves takes everything filed under it with it.

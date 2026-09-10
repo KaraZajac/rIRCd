@@ -6,6 +6,7 @@ mod registration;
 mod reply;
 mod server_cmds;
 mod webpush_cmds;
+pub mod whois_remote;
 
 pub use reply::{
     end_labeled_batch, reply_in_batch, reply_to_client, reply_to_sender, send_labeled_ack,

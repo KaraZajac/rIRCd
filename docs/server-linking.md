@@ -169,14 +169,37 @@ got, so that nobody has to read the source to find out:
 | `ACCOUNT`, `CHGHOST`, `SETNAME`, `INVITE`, `METADATA` | yes |
 | Chathistory: both ends of a conversation keep it | yes |
 | TLS, with each side pinned to the other's certificate | yes |
+| `WHOIS` forwarded, for the idle time only that server knows | yes |
 | Services commands (`GHOST`, `SANICK`) acting on a remote user | not yet |
-| `WHOIS` forwarded, for the idle time only that server knows | not yet |
 
-A `WHOIS` for somebody on another server is answered from what this one was
-told: their nick, their name, their account, their server. The one thing it
-does not answer is how long they have been quiet, because that is known to the
-server they are typing at and a number invented here would look exactly like a
-real one.
+### Asking, rather than announcing
+
+Everything above is an announcement: something happened here and the network is
+told. A `WHOIS` is the first thing that is a question. Almost all of the answer
+comes from what this server was already told — nick, name, account, server —
+but how long somebody has been quiet is known only to the server they are
+typing at, changes every time they say anything, and is not worth telling
+anybody about until asked.
+
+    :<asker> WHOISREQ <target> <token>
+    :<target> WHOISREP <asker> <token> <idle seconds> <signon>
+
+The asking server issues the token, so a peer cannot name one that was never
+given out, and the answer is only accepted for the user who asked. The question
+goes to the one server that can answer it rather than to the whole network, and
+is passed along by any server in between.
+
+Nothing waits for the answer: the rest of the reply is sent when it arrives, or
+after three seconds, whichever happens first — and whichever of the two gets
+there first is the one that finishes the reply, so a client sees the line that
+ends the list exactly once. The questions outstanding are bounded, because a
+peer that never answers must not be able to leave anything behind; past the
+ceiling a `WHOIS` is answered the way it was before there was anywhere to ask,
+without an idle line.
+
+That shape — a token the asker chose, one addressed recipient, a bounded wait
+that gives up on its own — is the one anything else that needs an answer from
+another server should follow.
 
 ## Testing
 

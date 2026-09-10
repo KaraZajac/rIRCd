@@ -135,11 +135,32 @@ check(f"B knows {burst_nick}, who registered on A", bool(found), found)
 answer = whois(b, burst_nick)
 server_line = [l for l in answer if " 312 " in l]
 check("B says which server they are on", any(A_NAME in l for l in server_line), server_line)
-# How long somebody has been quiet is known to the server they type at. A
-# number invented here would look exactly like a real one.
-check("B does not invent an idle time for them",
-      not [l for l in answer if " 317 " in l],
-      [l for l in answer if " 317 " in l])
+# How long somebody has been quiet is known to the server they type at, so B
+# has to ask A and wait. A number invented here would look exactly like a real
+# one, so the answer either comes from A or is left out.
+idle = [l for l in answer if " 317 " in l]
+check("B asks A how long they have been quiet, and says so", bool(idle), answer[-4:])
+if idle:
+    fields = idle[0].split()
+    seconds = fields[4] if len(fields) > 4 else ""
+    signon = fields[5] if len(fields) > 5 else ""
+    check("the idle time is a number of seconds", seconds.isdigit(), idle[0])
+    check("and it is a plausible one", seconds.isdigit() and int(seconds) < 3600, idle[0])
+    check("the signon time is a timestamp", signon.isdigit() and int(signon) > 1_600_000_000,
+          idle[0])
+# The line that ends the list must still come last, and exactly once, however
+# long the answer took to arrive.
+ends = [l for l in answer if " 318 " in l]
+check("and the list still ends, once", len(ends) == 1, ends)
+
+# A user who is not anywhere gets no idle line and no waiting: the reply ends
+# straight away rather than hanging until the question times out.
+import time as _time  # noqa: E402
+started = _time.time()
+missing = whois(b, f"nobody{RUN}")
+check("a WHOIS for nobody ends without waiting for an answer",
+      _time.time() - started < 2.5, f"{_time.time() - started:.1f}s")
+check("and says there is no such nick", bool([l for l in missing if " 401 " in l]), missing[-3:])
 
 late = Client(late_nick, port=A_PORT)
 found = eventually(lambda: [l for l in whois(b, late_nick) if " 311 " in l])

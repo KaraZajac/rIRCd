@@ -328,6 +328,7 @@ pub async fn handle_whois(
     // made `WHOIS irc.example.com alice` a lookup for the server name.
     let target_nick = msg.params.last().map(|s| s.as_str()).unwrap_or("");
 
+    let state_arc = state.clone();
     let state = state.read().await;
     let client = match state.clients.get(client_id) {
         Some(c) => c.clone(),
@@ -385,6 +386,11 @@ pub async fn handle_whois(
             }
         };
     }
+
+    // Set when the user is on another server: that server is the only one that
+    // knows how long they have been quiet, so the reply is finished after it
+    // answers rather than here.
+    let mut ask_elsewhere: Option<String> = None;
 
     if let Some(tid) = target_id {
         if let Some(c) = state.clients.get(&tid) {
@@ -469,11 +475,13 @@ pub async fn handle_whois(
             .with_prefix(&cfg.server.name));
             // 317 RPL_WHOISIDLE: seconds idle, signon time.
             //
-            // Only for a user on this server. How long somebody has been quiet
-            // is known to the server they are typing at and to nobody else, and
-            // an idle time made up here would be a plausible-looking lie —
-            // where leaving the line out says plainly that this server does not
-            // know.
+            // How long somebody has been quiet is known to the server they are
+            // typing at and to nobody else. For a user on this server that is
+            // this server; for anybody else it has to be asked for, which
+            // happens below once the guards here are given up.
+            if c.server.is_some() {
+                ask_elsewhere = Some(tid.clone());
+            }
             if c.server.is_none() {
                 let idle_secs = chrono::Utc::now().timestamp().saturating_sub(c.last_active);
                 send_reply!(Message::new(
@@ -604,6 +612,30 @@ pub async fn handle_whois(
                 vec![nick.clone(), target_nick.into(), key, "*".into(), value,],
             )
             .with_prefix(&cfg.server.name));
+        }
+    }
+
+    // Everything this server knows has been said. If somebody else knows the
+    // rest, ask them and let the answer finish the reply; the loop that serves
+    // every other client does not wait for it.
+    if let Some(target_uid) = ask_elsewhere {
+        let asker_uid = state.user_id(client_id);
+        drop(state);
+        if crate::commands::whois_remote::ask(
+            client_id,
+            &asker_uid,
+            &nick,
+            target_nick,
+            &target_uid,
+            &state_arc,
+            &senders,
+            cfg,
+            label,
+            batch_ref.clone(),
+        )
+        .await
+        {
+            return Ok(());
         }
     }
 
