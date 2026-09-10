@@ -1,5 +1,7 @@
 use crate::channel::ChannelStore;
-use crate::commands::{end_labeled_batch, reply_in_batch, reply_to_client, start_labeled_batch};
+use crate::commands::{
+    end_labeled_batch, reply_in_batch, reply_to_client, session_caps, start_labeled_batch,
+};
 use crate::config::Config;
 use crate::protocol::Message;
 use crate::user::{Senders, ServerState};
@@ -112,10 +114,7 @@ pub async fn handle_who(
         None => return Ok(()),
     };
     let nick = client.read().await.nick_or_id().to_string();
-    let client_caps = match state.clients.get(client_id) {
-        Some(c) => c.read().await.capabilities.clone(),
-        None => Default::default(),
-    };
+    let client_caps = session_caps(&senders, client_id).await;
     let use_multi_prefix = client_caps.contains("multi-prefix");
     // WHOX has no capability: support is advertised with the WHOX ISUPPORT token,
     // so any client that sends %fields gets the extended reply.
@@ -347,7 +346,10 @@ pub async fn handle_whois(
         return Ok(());
     }
 
-    let target_id = state.nick_to_id.get(&crate::casefold::upper(target_nick)).cloned();
+    let target_id = state
+        .nick_to_id
+        .get(&crate::casefold::upper(target_nick))
+        .cloned();
     if target_id.is_none() {
         reply_to_client(
             &senders,
@@ -389,16 +391,17 @@ pub async fn handle_whois(
             let c = c.read().await;
             // Filter channel list: hide secret (+s) and private (+p) channels
             // from non-members
-            let (requester_channels, use_multi_prefix) = match state.clients.get(client_id) {
-                Some(rc) => {
-                    let rc = rc.read().await;
-                    (
-                        rc.channels.keys().cloned().collect(),
-                        rc.capabilities.contains("multi-prefix"),
-                    )
-                }
-                None => (std::collections::HashSet::new(), false),
-            };
+            // The channels are the user's; `multi-prefix` is this connection's.
+            let requester_channels: std::collections::HashSet<String> =
+                match state.clients.get(client_id) {
+                    Some(rc) => rc.read().await.channels.keys().cloned().collect(),
+                    None => std::collections::HashSet::new(),
+                };
+            let use_multi_prefix = senders
+                .read()
+                .await
+                .caps_of(client_id)
+                .contains("multi-prefix");
             let ch_store = channels.read().await;
             // RPL_WHOISCHANNELS carries the same status prefix as NAMES: '@' for
             // an operator, '%' halfop, '+' voice, and every applicable one when
@@ -589,7 +592,7 @@ pub async fn handle_whois(
     // 760 RPL_WHOISKEYVALUE — the target's metadata, for a client that asked
     // for metadata at all. A client that did not negotiate it has no idea what
     // these numerics are.
-    if crate::commands::metadata::wants_metadata(&client.read().await.capabilities) {
+    if crate::commands::metadata::wants_metadata(&session_caps(&senders, client_id).await) {
         let entries: Vec<(String, String)> = state
             .metadata
             .get(&crate::commands::metadata::metadata_key(target_nick))
@@ -677,7 +680,9 @@ pub async fn handle_monitor(
 
     match param0 {
         "+" => {
-            let has_extended_monitor = client.read().await.has_cap("extended-monitor");
+            let has_extended_monitor = session_caps(&senders, client_id)
+                .await
+                .contains("extended-monitor");
             let mut state_w = state.write().await;
             let client_arc = match state_w.clients.get(client_id) {
                 Some(c) => c.clone(),
@@ -709,9 +714,7 @@ pub async fn handle_monitor(
                 guard.monitor_list = current_list;
             }
             for n in &added_nicks {
-                state_w
-                    .monitor_watchers
-                    .add(n.clone(), watcher_id.clone());
+                state_w.monitor_watchers.add(n.clone(), watcher_id.clone());
             }
             for p in &added_patterns {
                 state_w

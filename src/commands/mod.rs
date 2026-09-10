@@ -9,7 +9,7 @@ mod webpush_cmds;
 
 pub use reply::{
     end_labeled_batch, reply_in_batch, reply_to_client, reply_to_sender, send_labeled_ack,
-    start_labeled_batch,
+    session_caps, start_labeled_batch,
 };
 
 use crate::channel::ChannelStore;

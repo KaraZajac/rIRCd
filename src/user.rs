@@ -570,6 +570,78 @@ impl SessionRegistry {
         self.deliver_to(user_id, Some(except), msg)
     }
 
+    /// Send to a user's connections, giving each the form it asked for.
+    ///
+    /// A capability is negotiated by a connection, not by the person behind it.
+    /// One client may have asked for `away-notify` and another not, and a user's
+    /// capabilities are the union of its connections' — so deciding from that
+    /// whether to send at all would hand the second client a message it never
+    /// agreed to parse. `with` goes to the connections that negotiated `cap`,
+    /// `without` to the rest, and either may be nothing at all.
+    pub fn deliver_by_cap(
+        &self,
+        user_id: &str,
+        cap: &str,
+        with: Option<&Message>,
+        without: Option<&Message>,
+    ) {
+        self.deliver_by_cap_except(user_id, cap, None, with, without)
+    }
+
+    /// The same, skipping the connection that caused the event.
+    pub fn deliver_by_cap_except(
+        &self,
+        user_id: &str,
+        cap: &str,
+        except: Option<&str>,
+        with: Option<&Message>,
+        without: Option<&Message>,
+    ) {
+        for session in self.sessions_of(user_id) {
+            if Some(session.as_str()) == except {
+                continue;
+            }
+            let Some(sink) = self.sinks.get(&session) else {
+                continue;
+            };
+            let caps = self.caps_of(&session);
+            let Some(msg) = (if caps.contains(cap) { with } else { without }) else {
+                continue;
+            };
+            let mut copy = msg.clone();
+            if !copy.tags.is_empty() {
+                crate::protocol::retain_negotiated_tags(&mut copy, &caps);
+            }
+            sink.send(copy);
+        }
+    }
+
+    /// Send only to the connections that asked for a capability. The shorthand
+    /// for an event that exists because of one.
+    pub fn deliver_requiring(&self, user_id: &str, cap: &str, msg: &Message) {
+        self.deliver_by_cap(user_id, cap, Some(msg), None)
+    }
+
+    /// The same, skipping the connection that caused the event.
+    pub fn deliver_requiring_except(
+        &self,
+        user_id: &str,
+        cap: &str,
+        except: Option<&str>,
+        msg: &Message,
+    ) {
+        self.deliver_by_cap_except(user_id, cap, except, Some(msg), None)
+    }
+
+    /// Which of a user's connections negotiated a capability, for the few
+    /// events that are more than one message either way.
+    pub fn sessions_with_cap(&self, user_id: &str, cap: &str, want: bool) -> Vec<String> {
+        self.sessions_of(user_id)
+            .into_iter()
+            .filter(|s| self.caps_of(s).contains(cap) == want)
+            .collect()
+    }
+
     fn deliver_to(&self, user_id: &str, except: Option<&str>, msg: &Message) {
         for session in self.sessions_of(user_id) {
             if Some(session.as_str()) == except {

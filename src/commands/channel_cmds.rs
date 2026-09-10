@@ -1,7 +1,9 @@
 use crate::channel::{
     canonical_channel_key, Channel, ChannelMemberModeSet, ChannelMembership, ChannelStore,
 };
-use crate::commands::{end_labeled_batch, reply_in_batch, reply_to_client, start_labeled_batch};
+use crate::commands::{
+    end_labeled_batch, reply_in_batch, reply_to_client, session_caps, start_labeled_batch,
+};
 use crate::config::Config;
 use crate::protocol::{add_batch_tag, generate_msgid, Message};
 use crate::user::{Senders, ServerState};
@@ -38,10 +40,7 @@ pub async fn handle_join(
     label: Option<&str>,
 ) -> anyhow::Result<()> {
     let wants_batch = match label {
-        Some(_) => match state.read().await.clients.get(client_id) {
-            Some(c) => c.read().await.has_cap("batch"),
-            None => false,
-        },
+        Some(_) => session_caps(&senders, client_id).await.contains("batch"),
         None => false,
     };
     let batch_ref = match (label, wants_batch) {
@@ -120,9 +119,11 @@ async fn handle_join_inner(
     // Channel membership is the user's, not this one connection's.
     let user_id = client_data.id.clone();
 
-    let client_caps = client_data.capabilities.clone();
     let account = client_data.account.clone();
     drop(client_data);
+    // What this connection negotiated, not what the person behind it did on
+    // some other client: a reply belongs to the one that asked.
+    let client_caps = session_caps(&senders, client_id).await;
 
     // Collected while the state read guard is held, applied once it is released.
     let mut remembered_memberships: Vec<(String, String)> = Vec::new();
@@ -348,8 +349,7 @@ async fn handle_join_inner(
 
         if let Some(ref key) = ch.key {
             // Constant-time comparison to prevent timing attacks on channel keys
-            if !ct_eq(provided_key.as_bytes(), key.as_bytes())
-                && !ch.invite_list.contains(&user_id)
+            if !ct_eq(provided_key.as_bytes(), key.as_bytes()) && !ch.invite_list.contains(&user_id)
             {
                 reply_self!(Message::new(
                     "475",
@@ -472,40 +472,45 @@ async fn handle_join_inner(
         // gives two people in the same channel two different times for the
         // same join, and history a third.
         let happened_at = crate::protocol::server_time_now();
+        // `extended-join` changes what a JOIN looks like, and it is negotiated
+        // by a connection rather than by the person behind it: each client is
+        // shown the form it asked for, even when two of them are the same user.
+        let mut long_join = Message::new(
+            "JOIN",
+            vec![
+                ch_key.clone(),
+                joining_account.clone(),
+                joining_realname.clone(),
+            ],
+        )
+        .with_prefix(&source);
+        let mut short_join = Message::new("JOIN", vec![ch_key.clone()]).with_prefix(&source);
+        for m in [&mut long_join, &mut short_join] {
+            m.tags.insert("time".to_string(), Some(happened_at.clone()));
+        }
         for mid in &member_ids {
-            let caps = match state.clients.get(mid) {
-                Some(c) => c.read().await.capabilities.clone(),
-                None => Default::default(),
-            };
-            let join_msg = if caps.contains("extended-join") {
-                Message::new(
-                    "JOIN",
-                    vec![
-                        ch_key.clone(),
-                        joining_account.clone(),
-                        joining_realname.clone(),
-                    ],
-                )
-                .with_prefix(&source)
-            } else {
-                Message::new("JOIN", vec![ch_key.clone()]).with_prefix(&source)
-            };
-            let mut join_msg = join_msg;
-            join_msg
-                .tags
-                .insert("time".to_string(), Some(happened_at.clone()));
+            let registry = senders.read().await;
             // The joining client's own copy is part of the answer to its JOIN,
             // so it goes inside the labeled batch; everyone else's does not —
             // including the user's own other connections, which are watching
             // someone join a channel rather than answering for it.
             if *mid == user_id {
-                reply_self!(join_msg.clone());
-                senders
-                    .read()
-                    .await
-                    .deliver_except(mid, client_id, &join_msg);
+                let own = if registry.caps_of(client_id).contains("extended-join") {
+                    long_join.clone()
+                } else {
+                    short_join.clone()
+                };
+                drop(registry);
+                reply_self!(own);
+                senders.read().await.deliver_by_cap_except(
+                    mid,
+                    "extended-join",
+                    Some(client_id),
+                    Some(&long_join),
+                    Some(&short_join),
+                );
             } else {
-                senders.read().await.deliver(mid, &join_msg);
+                registry.deliver_by_cap(mid, "extended-join", Some(&long_join), Some(&short_join));
             }
         }
 
@@ -516,17 +521,12 @@ async fn handle_join_inner(
         };
         if let Some(ref away_msg) = joining_away {
             let away_notify = Message::new("AWAY", vec![away_msg.clone()]).with_prefix(&source);
+            let registry = senders.read().await;
             for mid in &member_ids {
                 if *mid == user_id {
                     continue;
                 }
-                let has_cap = match state.clients.get(mid) {
-                    Some(c) => c.read().await.capabilities.contains("away-notify"),
-                    None => false,
-                };
-                if has_cap {
-                    send_to_client(&senders, mid, away_notify.clone()).await;
-                }
+                registry.deliver_requiring(mid, "away-notify", &away_notify);
             }
         }
 
@@ -840,10 +840,7 @@ pub async fn handle_names(
         None => return Ok(()),
     };
     let nick = client.read().await.nick_or_id().to_string();
-    let client_caps = match state.clients.get(client_id) {
-        Some(c) => c.read().await.capabilities.clone(),
-        None => Default::default(),
-    };
+    let client_caps = session_caps(&senders, client_id).await;
 
     let ch_names: Vec<&str> = msg
         .params
@@ -1533,7 +1530,10 @@ pub async fn handle_mode(
                             continue;
                         };
                         param_idx += 1;
-                        let target_id = state.nick_to_id.get(&crate::casefold::upper(&target_nick)).cloned();
+                        let target_id = state
+                            .nick_to_id
+                            .get(&crate::casefold::upper(&target_nick))
+                            .cloned();
                         // A mode change naming someone who is not here does not
                         // half-apply: it is refused, and no MODE is echoed.
                         let Some(target_id) = target_id else {
@@ -2501,7 +2501,10 @@ pub async fn handle_kick(
         .source()
         .unwrap_or_else(|| client_id.to_string());
 
-    let target_id = state.nick_to_id.get(&crate::casefold::upper(target_nick)).cloned();
+    let target_id = state
+        .nick_to_id
+        .get(&crate::casefold::upper(target_nick))
+        .cloned();
 
     let ch_key = canonical_channel_key(ch_name);
     let mut ch_store = channels.write().await;
@@ -2813,18 +2816,14 @@ pub async fn handle_invite(
             let notify_member_ids: Vec<String> = ch.members.keys().cloned().collect();
             drop(ch);
             drop(ch_store);
+            let registry = senders.read().await;
             for mid in &notify_member_ids {
                 if state.is_self(mid, client_id) || *mid == *target_id {
                     continue;
                 }
-                let caps = match state.clients.get(mid) {
-                    Some(c) => c.read().await.capabilities.clone(),
-                    None => Default::default(),
-                };
-                if caps.contains("invite-notify") {
-                    send_to_client(&senders, mid, invite_msg.clone()).await;
-                }
+                registry.deliver_requiring(mid, "invite-notify", &invite_msg);
             }
+            drop(registry);
             crate::link::announce_invite(
                 cfg,
                 &state.user_id(client_id),
@@ -3057,14 +3056,21 @@ pub async fn handle_rename(
         vec![old_name.into(), new_name.into(), reason.clone()],
     )
     .with_prefix(&source);
+    // Per connection, not per person: `draft/channel-rename` is negotiated by a
+    // client, and a user's other client may not have asked for it. The one that
+    // did gets RENAME; the one that did not gets the part-and-rejoin it can
+    // understand.
     let mut use_rename_per_client: Vec<(String, bool)> = Vec::new();
-    for mid in &member_ids {
-        let client_arc = state.read().await.clients.get(mid).cloned();
-        let use_rename = match &client_arc {
-            Some(c) => c.read().await.has_cap("draft/channel-rename"),
-            None => false,
-        };
-        use_rename_per_client.push((mid.clone(), use_rename || case_only));
+    {
+        let registry = senders.read().await;
+        for mid in &member_ids {
+            for session in registry.sessions_with_cap(mid, "draft/channel-rename", true) {
+                use_rename_per_client.push((session, true));
+            }
+            for session in registry.sessions_with_cap(mid, "draft/channel-rename", false) {
+                use_rename_per_client.push((session, case_only));
+            }
+        }
     }
 
     drop(ch_store);

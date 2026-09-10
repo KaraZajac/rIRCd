@@ -1111,7 +1111,10 @@ pub async fn handle_kill(
 
     let target_id = {
         let state_r = state.read().await;
-        state_r.nick_to_id.get(&crate::casefold::upper(target_nick)).cloned()
+        state_r
+            .nick_to_id
+            .get(&crate::casefold::upper(target_nick))
+            .cloned()
     };
 
     let tid = match target_id {
@@ -1156,10 +1159,7 @@ pub async fn handle_kill(
                 client_id,
                 Message::new(
                     "NOTICE",
-                    vec![
-                        killer_nick,
-                        format!("Killed {}: {}", target_nick, reason),
-                    ],
+                    vec![killer_nick, format!("Killed {}: {}", target_nick, reason)],
                 )
                 .with_prefix(s),
                 label,
@@ -1522,33 +1522,27 @@ pub async fn handle_rehash(
         // Once per user: the client table also answers to the id of every
         // connection that reaches one, and CAP NEW twice is CAP NEW wrong.
         let client_ids: Vec<String> = state_r.users().map(|(id, _)| id.clone()).collect();
+        // `cap-notify` is negotiated by a connection, so the answer is per
+        // connection too: a client that never asked is not told.
+        let registry = senders.read().await;
         for cid in &client_ids {
-            let has_cap_notify = match state_r.clients.get(cid) {
-                Some(c) => c.read().await.has_cap("cap-notify"),
-                None => false,
-            };
-            if !has_cap_notify {
-                continue;
-            }
             if !cap_new.is_empty() {
                 let cap_line = cap_new.join(" ");
-                send_to_client(
-                    &senders,
+                registry.deliver_requiring(
                     cid,
-                    Message::new("CAP", vec!["*".into(), "NEW".into(), cap_line])
+                    "cap-notify",
+                    &Message::new("CAP", vec!["*".into(), "NEW".into(), cap_line])
                         .with_prefix(&server_name),
-                )
-                .await;
+                );
             }
             if !cap_del.is_empty() {
                 let cap_line = cap_del.join(" ");
-                send_to_client(
-                    &senders,
+                registry.deliver_requiring(
                     cid,
-                    Message::new("CAP", vec!["*".into(), "DEL".into(), cap_line])
+                    "cap-notify",
+                    &Message::new("CAP", vec!["*".into(), "DEL".into(), cap_line])
                         .with_prefix(&server_name),
-                )
-                .await;
+                );
             }
         }
     }

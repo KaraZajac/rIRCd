@@ -153,14 +153,12 @@ impl Channel {
     pub fn persisted_modes_for(&self, nick: &str, account: Option<&str>) -> (bool, bool) {
         let nick_lower = crate::casefold::lower(nick);
         let account_str = crate::casefold::lower(account.unwrap_or(""));
-        let is_op = self
-            .persisted_operators
-            .iter()
-            .any(|s| crate::casefold::lower(s) == nick_lower || crate::casefold::lower(s) == account_str);
-        let is_voice = self
-            .persisted_voice
-            .iter()
-            .any(|s| crate::casefold::lower(s) == nick_lower || crate::casefold::lower(s) == account_str);
+        let is_op = self.persisted_operators.iter().any(|s| {
+            crate::casefold::lower(s) == nick_lower || crate::casefold::lower(s) == account_str
+        });
+        let is_voice = self.persisted_voice.iter().any(|s| {
+            crate::casefold::lower(s) == nick_lower || crate::casefold::lower(s) == account_str
+        });
         (is_op, is_voice)
     }
 

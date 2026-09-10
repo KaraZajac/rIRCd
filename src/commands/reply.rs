@@ -1,6 +1,16 @@
 use crate::protocol::{generate_msgid, Message};
 use crate::user::Senders;
 
+/// What the connection that sent a command negotiated.
+///
+/// Not the user's capabilities: those are the union of its connections', and a
+/// reply belongs to the one that asked. A client that never asked for
+/// `extended-join` must not be answered in its form because another client on
+/// the same account did.
+pub async fn session_caps(senders: &Senders, client_id: &str) -> std::collections::HashSet<String> {
+    senders.read().await.caps_of(client_id)
+}
+
 /// Sends a reply to the requesting client. If `label` is Some (labeled-response),
 /// the message is sent with a `label` tag so the client can correlate the reply.
 pub async fn reply_to_client(
@@ -12,7 +22,13 @@ pub async fn reply_to_client(
     if let Some(l) = label {
         msg.add_tag("label", Some(l.to_string()));
     }
-    if let Some(tx) = senders.read().await.get(client_id) {
+    let registry = senders.read().await;
+    if let Some(tx) = registry.get(client_id) {
+        // Last gate before the socket: a reply carries only the tags this
+        // connection asked for, whatever the code that built it believed.
+        if !msg.tags.is_empty() {
+            crate::protocol::retain_negotiated_tags(&mut msg, &registry.caps_of(client_id));
+        }
         tx.send(msg);
     }
 }

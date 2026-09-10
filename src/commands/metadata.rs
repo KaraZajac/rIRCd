@@ -274,7 +274,11 @@ pub(crate) async fn broadcast_metadata_event(
     } else {
         // User target: clients sharing a channel with them, plus the user themselves
         let state_r = state.read().await;
-        let target_id = match state_r.nick_to_id.get(&crate::casefold::upper(target)).cloned() {
+        let target_id = match state_r
+            .nick_to_id
+            .get(&crate::casefold::upper(target))
+            .cloned()
+        {
             Some(id) => id,
             None => return,
         };
@@ -300,7 +304,11 @@ pub(crate) async fn broadcast_metadata_event(
     // Step 2: not the setter, wants metadata, and subscribed to this key.
     // The two versions of the specification notify differently, so each
     // recipient is told in the shape it negotiated.
+    // Per connection, not per person: which version of the specification a
+    // client speaks is what it negotiated for itself, and a user's other client
+    // may not have asked for metadata at all.
     let state_r = state.read().await;
+    let registry = senders.read().await;
     let mut notify: Vec<(String, String, bool)> = Vec::new();
     for id in &candidate_ids {
         if id == setter_id {
@@ -308,15 +316,20 @@ pub(crate) async fn broadcast_metadata_event(
         }
         if let Some(client) = state_r.clients.get(id) {
             let g = client.read().await;
-            if wants_metadata(&g.capabilities) && g.metadata_subscriptions.contains(key) {
-                notify.push((
-                    id.clone(),
-                    g.nick_or_id().to_string(),
-                    g.capabilities.contains("draft/metadata-3"),
-                ));
+            if !g.metadata_subscriptions.contains(key) {
+                continue;
+            }
+            let nick = g.nick_or_id().to_string();
+            drop(g);
+            for session in registry.sessions_of(id) {
+                let caps = registry.caps_of(&session);
+                if wants_metadata(&caps) {
+                    notify.push((session, nick.clone(), caps.contains("draft/metadata-3")));
+                }
             }
         }
     }
+    drop(registry);
     drop(state_r);
 
     for (id, nick, as_numeric) in notify {
@@ -453,7 +466,7 @@ pub async fn handle_metadata(
         };
         let g = client.read().await;
         let src = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
-        let has_batch = g.capabilities.contains("batch");
+        let has_batch = senders.read().await.caps_of(client_id).contains("batch");
         (
             g.nick_or_id().to_string(),
             g.oper,

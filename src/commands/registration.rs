@@ -1,6 +1,6 @@
 use crate::capability::{build_cap_list, filter_requested};
 use crate::channel::ChannelStore;
-use crate::commands::reply_to_client;
+use crate::commands::{reply_to_client, session_caps};
 use crate::config::Config;
 use crate::persist::{self, RegisterError};
 use crate::protocol::Message;
@@ -48,16 +48,23 @@ async fn send_to_client(senders: &Senders, user_id: &str, msg: Message) -> bool 
     delivered
 }
 
-/// Deliver to a user, skipping one connection when that one caused the event
-/// and has already been answered for. A user's other connections are watching
-/// their own account, away message or name change happen somewhere else, and
-/// asked for the capability that reports it.
-async fn send_to_others(senders: &Senders, user_id: &str, except: Option<&str>, msg: Message) {
-    let registry = senders.read().await;
-    match except {
-        Some(session) => registry.deliver_except(user_id, session, &msg),
-        None => registry.deliver(user_id, &msg),
-    }
+/// Deliver to a user, skipping the connection that caused the event, and only
+/// to the connections that asked for the capability that carries it.
+///
+/// A capability belongs to a connection. Deciding from the user's set — which
+/// is the union of its connections' — would send `ACCOUNT` or `AWAY` to a
+/// client that never agreed to read one.
+async fn send_to_others_requiring(
+    senders: &Senders,
+    user_id: &str,
+    cap: &str,
+    except: Option<&str>,
+    msg: &Message,
+) {
+    senders
+        .read()
+        .await
+        .deliver_requiring_except(user_id, cap, except, msg);
 }
 
 /// Deliver to a user's other connections, skipping the one that sent the
@@ -171,7 +178,11 @@ pub async fn complete_registration(
     // becoming one of its own.
     let mut attach_to: Option<String> = None;
 
-    if let Some(holder_id) = state_guard.nick_to_id.get(&crate::casefold::upper(&nick)).cloned() {
+    if let Some(holder_id) = state_guard
+        .nick_to_id
+        .get(&crate::casefold::upper(&nick))
+        .cloned()
+    {
         // The nick is in use. If it is in use by this same account, this is the
         // same person arriving on another connection, and what happens next is
         // the operator's choice: join the existing user as another session, or
@@ -213,7 +224,9 @@ pub async fn complete_registration(
                 replaced = %holder_id,
                 "Resuming a persistent session; disconnecting the earlier one"
             );
-            state_guard.nick_to_id.remove(&crate::casefold::upper(&nick));
+            state_guard
+                .nick_to_id
+                .remove(&crate::casefold::upper(&nick));
             drop(state_guard);
             senders.write().await.close_user(
                 &holder_id,
@@ -393,7 +406,12 @@ pub async fn complete_registration(
     )
     .await;
 
-    let isupport = isupport_tokens(cfg, client.read().await.has_cap("draft/webpush"));
+    let isupport = isupport_tokens(
+        cfg,
+        session_caps(&senders, client_id)
+            .await
+            .contains("draft/webpush"),
+    );
     let tokens: Vec<&str> = isupport.split(' ').collect();
     for chunk in tokens.chunks(ISUPPORT_TOKENS_PER_LINE) {
         reply_to_client(
@@ -435,7 +453,7 @@ pub async fn complete_registration(
                 crate::persist::save_metadata(pool, &key, k, v).await;
             }
         }
-        let caps = client.read().await.capabilities.clone();
+        let caps = session_caps(&senders, client_id).await;
         crate::commands::metadata::send_channel_metadata_on_join(
             &senders,
             client_id,
@@ -450,7 +468,7 @@ pub async fn complete_registration(
 
     // draft/auto-join: send AUTOJOIN with configured channel list
     {
-        let caps = client.read().await.capabilities.clone();
+        let caps = session_caps(&senders, client_id).await;
         if caps.contains("draft/auto-join") {
             if let Some(ref auto_join) = cfg.server.auto_join {
                 let channels: Vec<&str> = auto_join
@@ -583,16 +601,18 @@ async fn send_channel_state_to_session(
     senders: &Senders,
     cfg: &Config,
 ) {
-    let (source, nick, joined, caps, account) = {
+    let (source, nick, joined, account) = {
         let g = client.read().await;
         (
             g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
             g.nick_or_id().to_string(),
             g.channels.keys().cloned().collect::<Vec<_>>(),
-            g.capabilities.clone(),
             g.account.clone(),
         )
     };
+    // The burst goes to this connection, so it is shaped by what this
+    // connection negotiated rather than by the account's union.
+    let caps = session_caps(senders, session_id).await;
 
     for ch_key in joined {
         let join_msg = if caps.contains("extended-join") {
@@ -747,7 +767,14 @@ pub async fn handle_isupport(
         let state = state.read().await;
         if let Some(c) = state.clients.get(client_id) {
             let g = c.read().await;
-            (g.nick_or_id().to_string(), g.has_cap("draft/webpush"))
+            (
+                g.nick_or_id().to_string(),
+                senders
+                    .read()
+                    .await
+                    .caps_of(client_id)
+                    .contains("draft/webpush"),
+            )
         } else if let Some(p) = state.pending.get(client_id) {
             (
                 p.nick.as_deref().unwrap_or("*").to_string(),
@@ -906,15 +933,11 @@ pub async fn handle_cap(
         }
         "LIST" => {
             let cap_line = if is_registered {
-                match state_guard.clients.get(client_id) {
-                    Some(c) => {
-                        let cg = c.read().await;
-                        cg.capabilities
-                            .iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    }
+                // `CAP LIST` answers for this connection. Listing the account's
+                // union would tell a client it had negotiated things it never
+                // asked for, and it would then act on them.
+                match Some(senders.read().await.caps_of(client_id)) {
+                    Some(cg) => cg.iter().cloned().collect::<Vec<_>>().join(" "),
                     None => String::new(),
                 }
             } else {
@@ -951,10 +974,7 @@ pub async fn handle_cap(
             let (ack_enable, nak) = filter_requested(&to_enable, &std::collections::HashSet::new());
             // Gather current client caps to check cap-notify protection
             let client_caps: std::collections::HashSet<String> = if is_registered {
-                match state_guard.clients.get(client_id) {
-                    Some(c) => c.read().await.capabilities.clone(),
-                    None => Default::default(),
-                }
+                senders.read().await.caps_of(client_id)
             } else {
                 state_guard
                     .pending
@@ -1385,7 +1405,10 @@ pub async fn handle_nick(
             .and_then(|c| c.account.clone());
         match (
             pending_account,
-            state_guard.nick_to_id.get(&crate::casefold::upper(&nick)).cloned(),
+            state_guard
+                .nick_to_id
+                .get(&crate::casefold::upper(&nick))
+                .cloned(),
         ) {
             (Some(account), Some(holder)) => match state_guard.clients.get(&holder) {
                 Some(c) => c.read().await.account.as_deref() == Some(account.as_str()),
@@ -1394,8 +1417,10 @@ pub async fn handle_nick(
             _ => false,
         }
     };
-    let nick_taken =
-        state_guard.nick_to_id.contains_key(&crate::casefold::upper(&nick)) && !resuming_own_session;
+    let nick_taken = state_guard
+        .nick_to_id
+        .contains_key(&crate::casefold::upper(&nick))
+        && !resuming_own_session;
     if nick_taken {
         // Remember what was asked for: REGISTER needs to tell someone trying to
         // claim a nick in use that the account is taken, not that they gave no
@@ -1804,15 +1829,9 @@ pub async fn handle_quit(
             let member_ids: Vec<String> = ch_guard.read().await.members.keys().cloned().collect();
             let _ = ch_guard;
             drop(ch_store);
-            let state = state.read().await;
             for mid in &member_ids {
-                let caps = match state.clients.get(mid) {
-                    Some(c) => c.read().await.capabilities.clone(),
-                    None => Default::default(),
-                };
-                if caps.contains("account-notify") {
-                    send_to_client(&senders, mid, account_star.clone()).await;
-                }
+                send_to_others_requiring(&senders, mid, "account-notify", None, &account_star)
+                    .await;
             }
         }
     }
@@ -2699,14 +2718,8 @@ pub async fn handle_authenticate(
         let state = state.read().await;
         for mid in &member_ids {
             let skip = state.is_self(mid, client_id).then_some(client_id);
-            let caps = match state.clients.get(mid) {
-                Some(c) => c.read().await.capabilities.clone(),
-                None => Default::default(),
-            };
-            if caps.contains("account-notify") {
-                send_to_others(&senders, mid, skip, account_msg.clone()).await;
-                already_notified.insert(mid.clone());
-            }
+            send_to_others_requiring(&senders, mid, "account-notify", skip, &account_msg).await;
+            already_notified.insert(mid.clone());
         }
     }
     // extended-monitor: notify monitor watchers with account-notify + extended-monitor
@@ -3145,11 +3158,8 @@ async fn handle_authenticate_scram_step(
                 let sg = state.read().await;
                 for mid in &member_ids {
                     let skip = sg.is_self(mid, client_id).then_some(client_id);
-                    if let Some(c) = sg.clients.get(mid) {
-                        if c.read().await.has_cap("account-notify") {
-                            send_to_others(&senders, mid, skip, account_msg.clone()).await;
-                        }
-                    }
+                    send_to_others_requiring(&senders, mid, "account-notify", skip, &account_msg)
+                        .await;
                 }
             }
         }
@@ -3338,14 +3348,8 @@ pub async fn login_client(
         let state_r = state.read().await;
         for mid in &member_ids {
             let skip = state_r.is_self(mid, client_id).then_some(client_id);
-            let has_cap = match state_r.clients.get(mid) {
-                Some(c) => c.read().await.has_cap("account-notify"),
-                None => continue,
-            };
-            if has_cap {
-                send_to_others(&senders, mid, skip, account_msg.clone()).await;
-                already_notified.insert(mid.clone());
-            }
+            send_to_others_requiring(&senders, mid, "account-notify", skip, &account_msg).await;
+            already_notified.insert(mid.clone());
         }
     }
 
@@ -4217,14 +4221,8 @@ pub async fn handle_away(
         let state = state.read().await;
         for mid in &member_ids {
             let skip = state.is_self(mid, client_id).then_some(client_id);
-            let caps = match state.clients.get(mid) {
-                Some(c) => c.read().await.capabilities.clone(),
-                None => Default::default(),
-            };
-            if caps.contains("away-notify") {
-                send_to_others(&senders, mid, skip, away_message.clone()).await;
-                already_notified.insert(mid.clone());
-            }
+            send_to_others_requiring(&senders, mid, "away-notify", skip, &away_message).await;
+            already_notified.insert(mid.clone());
         }
     }
 
@@ -4260,13 +4258,9 @@ pub async fn handle_setname(
     label: Option<&str>,
 ) -> anyhow::Result<()> {
     let realname = msg.trailing().unwrap_or("").to_string();
-    let has_standard_replies = {
-        let state = state.read().await;
-        match state.clients.get(client_id) {
-            Some(c) => c.read().await.has_cap("standard-replies"),
-            None => false,
-        }
-    };
+    let has_standard_replies = session_caps(&senders, client_id)
+        .await
+        .contains("standard-replies");
 
     // An empty realname is as invalid as an over-long one: SETNAME with no
     // parameter must be rejected, not applied.
@@ -4326,12 +4320,9 @@ pub async fn handle_setname(
     let setname_msg = Message::new("SETNAME", vec![realname.clone()]).with_prefix(&source);
     crate::link::announce_setname(cfg, &state.read().await.user_id(client_id), &realname).await;
 
-    // Send to self if they have setname
+    // Send to self if this connection asked for setname
+    let self_has_setname = session_caps(&senders, client_id).await.contains("setname");
     let state = state.read().await;
-    let self_has_setname = match state.clients.get(client_id) {
-        Some(c) => c.read().await.has_cap("setname"),
-        None => false,
-    };
     if self_has_setname {
         reply_to_client(&senders, client_id, setname_msg.clone(), label).await;
     }
@@ -4347,14 +4338,8 @@ pub async fn handle_setname(
         drop(ch_store);
         for mid in &member_ids {
             let skip = state.is_self(mid, client_id).then_some(client_id);
-            let has_setname = match state.clients.get(mid) {
-                Some(c) => c.read().await.has_cap("setname"),
-                None => false,
-            };
-            if has_setname {
-                send_to_others(&senders, mid, skip, setname_msg.clone()).await;
-                already_notified.insert(mid.clone());
-            }
+            send_to_others_requiring(&senders, mid, "setname", skip, &setname_msg).await;
+            already_notified.insert(mid.clone());
         }
     }
 
@@ -4627,18 +4612,25 @@ pub async fn send_chghost_if_changed(
                 None => continue,
             }
         };
-        let state = state.read().await;
         for mid in member_ids {
             let skip = (mid == user_id).then_some(client_id);
-            if let Some(c) = state.clients.get(&mid) {
-                let has_chghost = c.read().await.capabilities.contains("chghost");
-                if has_chghost {
-                    send_to_others(&senders, &mid, skip, chghost_msg.clone()).await;
-                } else if skip.is_none() {
-                    send_to_client(&senders, &mid, quit_msg.clone()).await;
+            // `chghost` is negotiated by a connection. The ones that asked for
+            // it are told in a word; the ones that did not are shown the user
+            // leaving and coming back, which is the only way they can see it.
+            send_to_others_requiring(&senders, &mid, "chghost", skip, &chghost_msg).await;
+            let plain: Vec<String> = senders
+                .read()
+                .await
+                .sessions_with_cap(&mid, "chghost", false)
+                .into_iter()
+                .filter(|s| Some(s.as_str()) != skip)
+                .collect();
+            for mid in &plain {
+                {
+                    send_to_client(&senders, mid, quit_msg.clone()).await;
                     let join_msg =
                         Message::new("JOIN", vec![ch_name.clone()]).with_prefix(&new_source);
-                    send_to_client(&senders, &mid, join_msg).await;
+                    send_to_client(&senders, mid, join_msg).await;
                     if let Some(ref modes) = member_modes {
                         let mut mode_chars = String::new();
                         let mut mode_args = Vec::new();
@@ -4658,12 +4650,12 @@ pub async fn send_chghost_if_changed(
                             let mut params = vec![ch_name.clone(), format!("+{}", mode_chars)];
                             params.extend(mode_args);
                             let mode_msg = Message::new("MODE", params).with_prefix(&new_source);
-                            send_to_client(&senders, &mid, mode_msg).await;
+                            send_to_client(&senders, mid, mode_msg).await;
                         }
                     }
                 }
-                already_notified.insert(mid.clone());
             }
+            already_notified.insert(mid.clone());
         }
     }
 
@@ -4714,12 +4706,15 @@ async fn notify_extended_monitor_watchers(
         if state.is_self(wid, client_id) || already_notified.contains(wid) {
             continue;
         }
-        let caps = match state.clients.get(wid) {
-            Some(c) => c.read().await.capabilities.clone(),
-            None => continue,
-        };
-        if caps.contains("extended-monitor") && caps.contains(required_cap) {
-            send_to_client(senders, wid, msg.clone()).await;
+        // Both capabilities on the same connection: a watcher whose other
+        // client asked for one of them has not asked for this.
+        let registry = senders.read().await;
+        for session in registry.sessions_with_cap(wid, "extended-monitor", true) {
+            if registry.caps_of(&session).contains(required_cap) {
+                if let Some(sink) = registry.get(&session) {
+                    sink.send(msg.clone());
+                }
+            }
         }
     }
 }

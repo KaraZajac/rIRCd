@@ -32,7 +32,7 @@ def make_account():
     return out.returncode == 0, (out.stdout + out.stderr).strip()
 
 
-def session(nick=None):
+def session(nick=None, caps="sasl message-tags server-time echo-message account-tag"):
     """Another connection for the shared account.
 
     Same nick and same account is what makes it another session rather than
@@ -42,7 +42,7 @@ def session(nick=None):
     c = Client()
     c.send("CAP LS 302")
     c.read(0.5)
-    c.send("CAP REQ :sasl message-tags server-time echo-message account-tag")
+    c.send("CAP REQ :" + caps)
     c.read(0.3)
     c.sasl_plain(ACCOUNT, PASSWORD)
     c.send(f"NICK {nick}")
@@ -216,6 +216,71 @@ talker.send(f"PRIVMSG {CHAN} :still there?")
 first.read(1.5)
 check("the remaining connections still receive channel traffic", bool(first.find("still there?")))
 
+section("a capability belongs to a connection, not to the account")
+# A user's capabilities are the union of its connections', which is right for
+# deciding which tags a message may carry and wrong for deciding whether to
+# send it at all: a client that never asked for `away-notify` must not be sent
+# an AWAY because the phone in the same pocket did.
+rich = session(caps="sasl message-tags server-time echo-message extended-join away-notify")
+plain = session(caps="sasl")
+rich.join(CHAN)
+plain.read(0.5)
+talker.join(CHAN)
+rich.read(0.5)
+plain.read(0.5)
+
+m_rich, m_plain = rich.mark(), plain.mark()
+talker.send("AWAY :stepping out")
+rich.read(1.0)
+plain.read(1.0)
+check(
+    "AWAY reaches the connection that asked for away-notify",
+    bool([l for l in rich.since(m_rich) if " AWAY " in l or l.endswith(" AWAY")]),
+    rich.since(m_rich)[-3:],
+)
+check(
+    "and not the one on the same account that did not",
+    not [l for l in plain.since(m_plain) if " AWAY " in l or l.endswith(" AWAY")],
+    plain.since(m_plain)[-3:],
+)
+talker.send("AWAY")
+talker.read(0.5)
+
+# echo-message: the same, for a client's own message coming back.
+m_plain = plain.mark()
+plain.send(f"PRIVMSG {CHAN} :from the plain connection")
+plain.read(1.0)
+check(
+    "no echo to a connection that did not ask for echo-message",
+    not [l for l in plain.since(m_plain) if "from the plain connection" in l],
+    plain.since(m_plain)[-3:],
+)
+
+# extended-join changes the shape of a reply, so it has to follow the
+# connection that asked rather than the account.
+m_plain = plain.mark()
+plain.send(f"JOIN {CHAN}")
+plain.read(1.0)
+joins = [l for l in plain.since(m_plain) if " JOIN " in l]
+check(
+    "a JOIN reply is in the form this connection negotiated",
+    bool(joins) and all(len(l.split()) == 3 for l in joins),
+    joins,
+)
+
+# CAP LIST answers for the connection, not for everything the account holds.
+m_plain = plain.mark()
+plain.send("CAP LIST")
+plain.wait_for(" CAP ", seconds=5)
+listed = " ".join(l for l in plain.since(m_plain) if " CAP " in l)
+check(
+    "CAP LIST names only what this connection negotiated",
+    "away-notify" not in listed and "extended-join" not in listed,
+    listed,
+)
+
+rich.close()
+plain.close()
 talker.close()
 second.close()
 first.close()

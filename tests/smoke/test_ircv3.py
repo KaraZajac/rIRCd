@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """IRCv3 conformance: every capability the server advertises, exercised on the wire."""
 
+import os
+import re
 import time
 
 from harness import (
@@ -43,6 +45,19 @@ check("redaction is advertised with the draft/ prefix the spec requires",
 for token_only in ["whox", "utf8only", "bot", "account-extban"]:
     check(f"{token_only} is not advertised as a capability (it is an ISUPPORT token)",
           token_only not in advertised, sorted(advertised))
+
+# Everything the server says it supports has to reach the wire. The list lives
+# in src/capability.rs, and a capability added there but never advertised is a
+# feature nobody can turn on.
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_caps_rs = open(os.path.join(REPO, "src", "capability.rs")).read()
+_block = _caps_rs.split("pub const CAPS: &[&str] = &[", 1)[1].split("];", 1)[0]
+declared = {m.group(1) for m in re.finditer(r'"([^"]+)"', _block)}
+# Negotiation itself is not a capability a client can ask for, and STS needs a
+# TLS port this server does not have.
+declared -= {"capability-negotiation", "sts"}
+missing = sorted(declared - advertised)
+check("every capability the server supports is advertised in CAP LS", not missing, missing)
 
 # Clients written against an earlier release must not be left worse off.
 mark = names.mark()

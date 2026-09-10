@@ -688,7 +688,10 @@ async fn split_users(ctx: &LinkContext, gone: &[RemoteServer]) {
     if lost.is_empty() {
         return;
     }
-    info!(users = lost.len(), "Netsplit: forgetting users behind the split");
+    info!(
+        users = lost.len(),
+        "Netsplit: forgetting users behind the split"
+    );
     // What everybody left behind sees is a room emptying: the reason names the
     // two servers that stopped being able to reach each other, which is the
     // convention every client already knows how to read.
@@ -862,7 +865,10 @@ async fn send_burst(
 async fn monitor_notify(ctx: &LinkContext, nick: &str, online: bool, source: &str) {
     let watchers: Vec<String> = {
         let state = ctx.state.read().await;
-        match state.monitor_watchers.watchers(&crate::casefold::lower(nick)) {
+        match state
+            .monitor_watchers
+            .watchers(&crate::casefold::lower(nick))
+        {
             Some(set) => set.iter().cloned().collect(),
             None => Vec::new(),
         }
@@ -923,7 +929,10 @@ async fn accept_remote_user(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
             warn!(peer = %peer_sid, origin = %origin, "Refusing a user for a server this link does not carry");
             return;
         }
-        let named = links.all().find(|s| s.sid == origin).map(|s| s.name.clone());
+        let named = links
+            .all()
+            .find(|s| s.sid == origin)
+            .map(|s| s.name.clone());
         named.unwrap_or_else(|| origin.clone())
     };
 
@@ -1118,7 +1127,11 @@ async fn accept_remote_quit(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     let Some(uid) = msg.prefix.clone() else {
         return;
     };
-    let reason = msg.params.first().cloned().unwrap_or_else(|| "Quit".to_string());
+    let reason = msg
+        .params
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Quit".to_string());
     forget_remote_user(ctx, &uid, &reason).await;
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
@@ -1363,10 +1376,10 @@ async fn accept_remote_kill(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     // Every server hears about it as a QUIT, which is what it is to them — the
     // one that asked for the kill included, since that is how it learns the
     // user is gone.
-    ctx.links.read().await.relay(
-        &Message::new("QUIT", vec![text]).with_prefix(&target),
-        None,
-    );
+    ctx.links
+        .read()
+        .await
+        .relay(&Message::new("QUIT", vec![text]).with_prefix(&target), None);
 }
 
 /// A user on another server went away, or came back.
@@ -1492,6 +1505,49 @@ async fn unseat_member(ctx: &LinkContext, key: &str, uid: &str) {
     }
 }
 
+/// The two shapes a JOIN takes: `extended-join` carries the account and the real
+/// name, and is negotiated by a connection rather than by the person behind it.
+async fn extended_join_forms(
+    ctx: &LinkContext,
+    uid: &str,
+    name: &str,
+    source: &str,
+) -> (Message, Message) {
+    let (account, realname) = {
+        let state = ctx.state.read().await;
+        match state.clients.get(uid) {
+            Some(c) => {
+                let g = c.read().await;
+                (
+                    g.account.clone().unwrap_or_else(|| "*".to_string()),
+                    g.realname.clone().unwrap_or_else(|| "*".to_string()),
+                )
+            }
+            None => ("*".to_string(), "*".to_string()),
+        }
+    };
+    (
+        Message::new("JOIN", vec![name.to_string(), account, realname]).with_prefix(source),
+        Message::new("JOIN", vec![name.to_string()]).with_prefix(source),
+    )
+}
+
+/// Show each member the join in the form its own client asked for.
+async fn deliver_join(
+    ctx: &LinkContext,
+    members: &[String],
+    forms: &(Message, Message),
+    except: Option<&str>,
+) {
+    let registry = ctx.senders.read().await;
+    for member in members {
+        if Some(member.as_str()) == except {
+            continue;
+        }
+        registry.deliver_by_cap(member, "extended-join", Some(&forms.0), Some(&forms.1));
+    }
+}
+
 /// A channel as another server has it. Two servers that both have a channel of
 /// this name have to end up with one channel, and the older timestamp decides
 /// whose it is — the rule every TS network uses, and the only one that
@@ -1596,8 +1652,8 @@ async fn accept_remote_sjoin(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
         let Some(source) = source_of(ctx, uid).await else {
             continue;
         };
-        let join = Message::new("JOIN", vec![name.clone()]).with_prefix(&source);
-        to_members(ctx, &members, &join, Some(uid)).await;
+        let join = extended_join_forms(ctx, uid, &name, &source).await;
+        deliver_join(ctx, &members, &join, Some(uid)).await;
         let prefixes = modes.prefixes_ordered();
         if !prefixes.is_empty() {
             let nick = {
@@ -1661,8 +1717,8 @@ async fn accept_remote_join(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
         return;
     };
     let members = members_of(ctx, &key).await;
-    let join = Message::new("JOIN", vec![name.clone()]).with_prefix(&source);
-    to_members(ctx, &members, &join, Some(&uid)).await;
+    let join = extended_join_forms(ctx, &uid, &name, &source).await;
+    deliver_join(ctx, &members, &join, Some(&uid)).await;
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
@@ -1716,7 +1772,11 @@ async fn accept_remote_kick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
             None => target.clone(),
         }
     };
-    let reason = msg.params.get(2).cloned().unwrap_or_else(|| target_nick.clone());
+    let reason = msg
+        .params
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| target_nick.clone());
     to_members(
         ctx,
         &members,
@@ -1746,7 +1806,11 @@ async fn accept_remote_topic(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
             return;
         };
         let mut ch = entry.write().await;
-        ch.topic = if topic.is_empty() { None } else { Some(topic.clone()) };
+        ch.topic = if topic.is_empty() {
+            None
+        } else {
+            Some(topic.clone())
+        };
         ch.topic_setter = Some(setter);
         ch.topic_time = Some(now);
     }
@@ -1831,9 +1895,12 @@ async fn accept_remote_mode(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     };
     let key = crate::channel::canonical_channel_key(&name);
     let args: Vec<String> = msg.params[2..].to_vec();
-    let source = source_of(ctx, &by)
-        .await
-        .unwrap_or_else(|| ctx.cfg.try_read().map(|c| c.server.name.clone()).unwrap_or(by));
+    let source = source_of(ctx, &by).await.unwrap_or_else(|| {
+        ctx.cfg
+            .try_read()
+            .map(|c| c.server.name.clone())
+            .unwrap_or(by)
+    });
 
     let mut shown = Vec::new();
     {
@@ -1934,16 +2001,12 @@ async fn to_shared_channels(ctx: &LinkContext, uid: &str, cap: &str, msg: &Messa
             if !told.insert(member.clone()) {
                 continue;
             }
-            let wants = {
-                let state = ctx.state.read().await;
-                match state.clients.get(&member) {
-                    Some(c) => c.read().await.capabilities.contains(cap),
-                    None => false,
-                }
-            };
-            if wants {
-                ctx.senders.read().await.deliver(&member, msg);
-            }
+            // Per connection: a member's other client may not have asked for
+            // the capability that carries this.
+            ctx.senders
+                .read()
+                .await
+                .deliver_requiring(&member, cap, msg);
         }
     }
 }
@@ -2203,7 +2266,13 @@ pub async fn announce_away(cfg: &Config, uid: &str, away: Option<&str>) {
 /// A channel is announced whole — its timestamp, its modes and the person in
 /// it — because the timestamp is what settles which channel it is when the
 /// other side already has one of that name.
-pub async fn announce_channel(cfg: &Config, ts: i64, name: &str, modes: (String, Vec<String>), member: &str) {
+pub async fn announce_channel(
+    cfg: &Config,
+    ts: i64,
+    name: &str,
+    modes: (String, Vec<String>),
+    member: &str,
+) {
     let (letters, args) = modes;
     let mut params = vec![ts.to_string(), name.to_string(), letters];
     params.extend(args);
@@ -2246,7 +2315,13 @@ pub async fn announce_kick(cfg: &Config, uid: &str, name: &str, target: &str, re
 ///
 /// The arguments to `+o`, `+h` and `+v` are user ids, not nicks: a nick change
 /// crossing a link would otherwise be able to hand somebody else the op.
-pub async fn announce_channel_mode(cfg: &Config, uid: &str, name: &str, letters: &str, args: &[String]) {
+pub async fn announce_channel_mode(
+    cfg: &Config,
+    uid: &str,
+    name: &str,
+    letters: &str,
+    args: &[String],
+) {
     if letters.is_empty() || letters == "+" || letters == "-" {
         return;
     }
@@ -2788,10 +2863,7 @@ mod tests {
             behind: Some("2AA".into()),
         });
         assert!(reg.route("2AA").is_some(), "the peer itself is reachable");
-        assert!(
-            reg.route("3AA").is_some(),
-            "and so is what sits behind it"
-        );
+        assert!(reg.route("3AA").is_some(), "and so is what sits behind it");
         assert!(reg.route("9ZZ").is_none(), "a server nobody carries is not");
     }
 }

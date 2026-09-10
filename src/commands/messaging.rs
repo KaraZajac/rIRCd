@@ -177,7 +177,11 @@ fn is_nick_char(c: char) -> bool {
 /// User mode `+R` says only people with an account may write to them, which is
 /// the one thing that makes an inbox usable when somebody has decided to fill
 /// it. The sender is told, rather than being left to believe it went.
-async fn refuses_unregistered(state: &ServerState, target_id: &str, sender_account: Option<&str>) -> bool {
+async fn refuses_unregistered(
+    state: &ServerState,
+    target_id: &str,
+    sender_account: Option<&str>,
+) -> bool {
     if sender_account.is_some() {
         return false;
     }
@@ -210,7 +214,8 @@ async fn deliver_across_link(
     // recipient is shown of that is their own server's decision, made against
     // the capabilities they negotiated with it.
     let mut out = msg.clone();
-    out.tags.insert("msgid".to_string(), Some(msgid.to_string()));
+    out.tags
+        .insert("msgid".to_string(), Some(msgid.to_string()));
     crate::link::route_to_user(cfg, &state.user_id(sender_id), target_id, &out).await
 }
 
@@ -405,7 +410,11 @@ pub async fn handle_privmsg(
     let sender_nick = sender_data.nick_or_id().to_string();
     let sender_account = sender_data.account.clone();
     let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
-    let echo_message = sender_data.has_cap("echo-message");
+    let echo_message = senders
+        .read()
+        .await
+        .caps_of(client_id)
+        .contains("echo-message");
     drop(sender_data);
     drop(state_guard);
 
@@ -703,10 +712,7 @@ pub async fn handle_privmsg(
                     }
                     // The sender's other connections did not send anything, so
                     // they see it as any other member of the channel does.
-                    senders
-                        .read()
-                        .await
-                        .deliver_except(mid, client_id, &tagged);
+                    senders.read().await.deliver_except(mid, client_id, &tagged);
                     continue;
                 }
                 let recipient_caps = match state_guard.clients.get(mid) {
@@ -775,7 +781,10 @@ pub async fn handle_privmsg(
             .await;
         }
     } else {
-        let target_id = state_guard.nick_to_id.get(&crate::casefold::upper(target)).cloned();
+        let target_id = state_guard
+            .nick_to_id
+            .get(&crate::casefold::upper(target))
+            .cloned();
         if let Some(tid) = target_id {
             if refuses_unregistered(&state_guard, &tid, sender_account.as_deref()).await {
                 drop(state_guard);
@@ -864,10 +873,7 @@ pub async fn handle_privmsg(
             // somewhere else. A message sent from a phone belongs in the
             // conversation on the desktop, whether or not the phone asked to see
             // its own messages back.
-            let sender_caps = match state_guard.clients.get(client_id) {
-                Some(c) => c.read().await.capabilities.clone(),
-                None => Default::default(),
-            };
+            let sender_caps = senders.read().await.caps_of(client_id);
             let tagged = add_tags_for_recipient(
                 privmsg,
                 &sender_caps,
@@ -942,7 +948,11 @@ pub async fn handle_notice(
         .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
     let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
-    let echo_message = sender_data.has_cap("echo-message");
+    let echo_message = senders
+        .read()
+        .await
+        .caps_of(client_id)
+        .contains("echo-message");
     drop(sender_data);
     drop(state_guard);
 
@@ -1043,10 +1053,7 @@ pub async fn handle_notice(
                     }
                     // The sender's other connections did not send anything, so
                     // they see it as any other member of the channel does.
-                    senders
-                        .read()
-                        .await
-                        .deliver_except(mid, client_id, &tagged);
+                    senders.read().await.deliver_except(mid, client_id, &tagged);
                     continue;
                 }
                 let recipient_caps = match state_guard.clients.get(mid) {
@@ -1091,7 +1098,10 @@ pub async fn handle_notice(
             .await;
         }
     } else {
-        let target_id = state_guard.nick_to_id.get(&crate::casefold::upper(target)).cloned();
+        let target_id = state_guard
+            .nick_to_id
+            .get(&crate::casefold::upper(target))
+            .cloned();
         if let Some(tid) = target_id {
             let target_caps = match state_guard.clients.get(&tid) {
                 Some(c) => c.read().await.capabilities.clone(),
@@ -1134,10 +1144,7 @@ pub async fn handle_notice(
                 cfg.record_history_at(&key, &source, &text, Some(&msgid), "NOTICE", &sent_at);
             }
             if echo_message {
-                let sender_caps = match state_guard.clients.get(client_id) {
-                    Some(c) => c.read().await.capabilities.clone(),
-                    None => Default::default(),
-                };
+                let sender_caps = senders.read().await.caps_of(client_id);
                 let tagged = add_tags_for_recipient(
                     base_msg,
                     &sender_caps,
@@ -1243,7 +1250,7 @@ pub async fn deliver_multiline_batch(
         return Ok(());
     }
 
-    let (source, sender_account, sender_tags, echo_message) = {
+    let (source, sender_account, sender_tags) = {
         let state_guard = state.read().await;
         let client = match state_guard.clients.get(client_id) {
             Some(c) => c.clone(),
@@ -1253,9 +1260,15 @@ pub async fn deliver_multiline_batch(
         let source = g.source().unwrap_or_else(|| client_id.to_string());
         let account = g.account.clone();
         let tags = SenderTags::new(g.bot, g.oper_name.clone());
-        let echo = g.has_cap("echo-message");
-        (source, account, tags, echo)
+        (source, account, tags)
     };
+    // Negotiated by this connection: another client on the same account asking
+    // for its own messages back does not mean this one did.
+    let echo_message = senders
+        .read()
+        .await
+        .caps_of(client_id)
+        .contains("echo-message");
 
     let msgid = generate_msgid();
     {
@@ -1301,7 +1314,10 @@ pub async fn deliver_multiline_batch(
                 }
             }
         } else {
-            match state_guard.nick_to_id.get(&crate::casefold::upper(&batch.target)) {
+            match state_guard
+                .nick_to_id
+                .get(&crate::casefold::upper(&batch.target))
+            {
                 Some(tid) => vec![tid.clone()],
                 None => {
                     reply_to_client(
@@ -1428,15 +1444,7 @@ pub async fn deliver_multiline_batch(
     }
 
     if echo_message {
-        let sender_caps = {
-            let state_r = state.read().await;
-            let client_arc = state_r.clients.get(client_id).cloned();
-            drop(state_r);
-            match client_arc {
-                Some(c) => c.read().await.capabilities.clone(),
-                None => Default::default(),
-            }
-        };
+        let sender_caps = senders.read().await.caps_of(client_id);
         let has_multiline = sender_caps.contains("draft/multiline");
         // The label came in on the opening BATCH, not the closing one.
         let label = batch.label.as_deref().or(label);
@@ -1594,7 +1602,11 @@ pub async fn handle_tagmsg(
     let sender_account = sender_data.account.clone();
     let sender_nick = sender_data.nick_or_id().to_string();
     let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
-    let echo_message = sender_data.has_cap("echo-message");
+    let echo_message = senders
+        .read()
+        .await
+        .caps_of(client_id)
+        .contains("echo-message");
     drop(sender_data);
     drop(state_guard);
 
@@ -1744,10 +1756,7 @@ pub async fn handle_tagmsg(
                             )
                             .await;
                         }
-                        senders
-                            .read()
-                            .await
-                            .deliver_except(mid, client_id, &tagged);
+                        senders.read().await.deliver_except(mid, client_id, &tagged);
                         continue;
                     }
                     send_to_client_with_caps(
@@ -1784,7 +1793,10 @@ pub async fn handle_tagmsg(
             }
         }
     } else {
-        let target_id = state_guard.nick_to_id.get(&crate::casefold::upper(target)).cloned();
+        let target_id = state_guard
+            .nick_to_id
+            .get(&crate::casefold::upper(target))
+            .cloned();
         if let Some(tid) = target_id {
             let target_caps = match state_guard.clients.get(&tid) {
                 Some(c) => c.read().await.capabilities.clone(),
@@ -1807,10 +1819,7 @@ pub async fn handle_tagmsg(
                 .await;
             }
             if echo_message {
-                let sender_caps = match state_guard.clients.get(client_id) {
-                    Some(c) => c.read().await.capabilities.clone(),
-                    None => Default::default(),
-                };
+                let sender_caps = senders.read().await.caps_of(client_id);
                 if sender_caps.contains("message-tags") {
                     let tagged = add_tags_for_recipient(
                         base_msg,
@@ -2117,59 +2126,47 @@ pub async fn handle_redact(
             let member_ids: Vec<String> = ch.read().await.members.keys().cloned().collect();
             drop(ch_store);
             let state_r = state.read().await;
+            let registry = senders.read().await;
             for mid in &member_ids {
-                let has_cap = match state_r.clients.get(mid) {
-                    Some(c) => c
-                        .read()
-                        .await
-                        .capabilities
-                        .contains("draft/message-redaction"),
-                    None => false,
-                };
-                if has_cap {
-                    send_to_client(&senders, mid, redact_relay.clone()).await;
-                }
+                registry.deliver_requiring(mid, "draft/message-redaction", &redact_relay);
             }
             // An operator taking a message down from a channel they are not in
             // is not in that list, and would be left wondering whether the
             // command had done anything.
             let uid = state_r.user_id(client_id);
-            let watching = member_ids.contains(&uid);
-            let has_cap = state_r
-                .clients
-                .get(client_id)
-                .and_then(|c| c.try_read().ok())
-                .map(|g| g.capabilities.contains("draft/message-redaction"))
-                .unwrap_or(false);
-            if !watching && has_cap {
-                drop(state_r);
-                send_to_client(&senders, client_id, redact_relay.clone()).await;
+            if !member_ids.contains(&uid)
+                && registry
+                    .caps_of(client_id)
+                    .contains("draft/message-redaction")
+            {
+                if let Some(sink) = registry.get(client_id) {
+                    sink.send(redact_relay.clone());
+                }
             }
         }
     } else {
         // DM: send to the redacting client and the other party if they have the cap
         let state_r = state.read().await;
-        let tid_opt = state_r.nick_to_id.get(&crate::casefold::upper(&target)).cloned();
-        let sender_has_cap = state_r
-            .clients
-            .get(client_id)
-            .and_then(|c| c.try_read().ok())
-            .map(|g| g.capabilities.contains("draft/message-redaction"))
-            .unwrap_or(false);
-        let recipient_has_cap = tid_opt
-            .as_deref()
-            .and_then(|tid| state_r.clients.get(tid))
-            .and_then(|c| c.try_read().ok())
-            .map(|g| g.capabilities.contains("draft/message-redaction"))
-            .unwrap_or(false);
+        let tid_opt = state_r
+            .nick_to_id
+            .get(&crate::casefold::upper(&target))
+            .cloned();
         drop(state_r);
-
-        if sender_has_cap {
-            send_to_client(&senders, client_id, redact_relay.clone()).await;
+        let registry = senders.read().await;
+        // The connection that asked, and the person written to — each of their
+        // connections judged on what it negotiated for itself.
+        if registry
+            .caps_of(client_id)
+            .contains("draft/message-redaction")
+        {
+            if let Some(sink) = registry.get(client_id) {
+                sink.send(redact_relay.clone());
+            }
         }
         if let Some(ref tid) = tid_opt {
-            if !state.read().await.is_self(tid, client_id) && recipient_has_cap {
-                send_to_client(&senders, tid, redact_relay.clone()).await;
+            let is_self = state.read().await.is_self(tid, client_id);
+            if !is_self {
+                registry.deliver_requiring(tid, "draft/message-redaction", &redact_relay);
             }
         }
     }
@@ -2267,13 +2264,7 @@ pub async fn handle_chathistory(
         }
         let targets =
             persist::list_history_targets(pool, from_ts, to_ts, limit, &requester_identity).await;
-        let caps = {
-            let state_r = state.read().await;
-            match state_r.clients.get(client_id) {
-                Some(c) => c.read().await.capabilities.clone(),
-                None => std::collections::HashSet::new(),
-            }
-        };
+        let caps = senders.read().await.caps_of(client_id);
         let use_batch = caps.contains("batch") && caps.contains("message-tags");
         let batch_ref = if use_batch {
             Some(crate::protocol::generate_msgid())
@@ -2454,13 +2445,7 @@ pub async fn handle_chathistory(
         return Ok(());
     }
 
-    let caps = {
-        let state_r = state.read().await;
-        match state_r.clients.get(client_id) {
-            Some(c) => c.read().await.capabilities.clone(),
-            None => std::collections::HashSet::new(),
-        }
-    };
+    let caps = senders.read().await.caps_of(client_id);
     let include_events = caps.contains("draft/event-playback");
     tracing::debug!(client_id, subcommand = %subcommand, target, cursor, limit, "CHATHISTORY query");
 
@@ -2789,7 +2774,7 @@ pub async fn deliver_client_batch(
         return Ok(());
     }
 
-    let (source, sender_account, sender_tags, echo_message) = {
+    let (source, sender_account, sender_tags) = {
         let state_r = state.read().await;
         let client = match state_r.clients.get(client_id) {
             Some(c) => c.clone(),
@@ -2799,9 +2784,15 @@ pub async fn deliver_client_batch(
         let source = g.source().unwrap_or_else(|| client_id.to_string());
         let account = g.account.clone();
         let tags = SenderTags::new(g.bot, g.oper_name.clone());
-        let echo = g.has_cap("echo-message");
-        (source, account, tags, echo)
+        (source, account, tags)
     };
+    // Negotiated by this connection: another client on the same account asking
+    // for its own messages back does not mean this one did.
+    let echo_message = senders
+        .read()
+        .await
+        .caps_of(client_id)
+        .contains("echo-message");
 
     let state_r = state.read().await;
     let recipient_ids: Vec<String> =
@@ -2819,7 +2810,10 @@ pub async fn deliver_client_batch(
                 None => return Ok(()),
             }
         } else {
-            match state_r.nick_to_id.get(&crate::casefold::upper(&batch.target)) {
+            match state_r
+                .nick_to_id
+                .get(&crate::casefold::upper(&batch.target))
+            {
                 Some(tid) => vec![tid.clone()],
                 None => return Ok(()),
             }
