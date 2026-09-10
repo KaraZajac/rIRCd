@@ -37,6 +37,10 @@ NEGOTIATE = os.environ.get("SMOKE_CAPS", "1") != "0"
 
 
 def server_pid():
+    # Set SMOKE_SERVER_PID to measure something that is not rircd — another
+    # server, to compare against, or one started by hand on another port.
+    if os.environ.get("SMOKE_SERVER_PID"):
+        return int(os.environ["SMOKE_SERVER_PID"])
     # -x matches the executable name, so the shell that launched it is excluded.
     out = subprocess.run(["pgrep", "-x", "rircd"], capture_output=True, text=True)
     pids = [int(p) for p in out.stdout.split()]
@@ -44,7 +48,12 @@ def server_pid():
 
 
 def cpu_seconds(pid):
-    fields = open(f"/proc/{pid}/stat").read().split()
+    if not pid:
+        return 0.0
+    try:
+        fields = open(f"/proc/{pid}/stat").read().split()
+    except OSError:
+        return 0.0
     return (int(fields[13]) + int(fields[14])) / os.sysconf("SC_CLK_TCK")
 
 

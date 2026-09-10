@@ -95,6 +95,36 @@ What they are for is noticing that a change cost 30% — every one of the
 denial-of-service problems fixed in 1.4.0 showed up first as a latency that
 went from under a millisecond to hundreds.
 
+### Against another server
+
+The same tool runs against anything that speaks IRC; `SMOKE_SERVER_PID` tells
+it which process to read the CPU of. Ergo is the closest comparison — modern,
+IRCv3 first, accounts and history built in — and it is a Go binary with a
+default config, so it takes a few minutes to set up.
+
+Same machine, same tool, both with rate limiting turned off so the numbers are
+the servers rather than their throttles, 200 receivers and 20 senders in one
+channel, 10 September 2026:
+
+| | rIRCd 1.4.0 | Ergo 2.19.1 |
+|---|---|---|
+| Deliveries per second | 110,632 | **451,479** |
+| Server CPU per delivery | 21.0 µs | **3.0 µs** |
+| Latency of one message, p50 | **4.5 ms** | 7.4 ms |
+| Latency of one message, p99 | 12.1 ms | **11.2 ms** |
+
+rIRCd answers one message a shade faster and delivers four times fewer of them.
+The two numbers are not in tension: a message reaches everybody quickly when the
+server is not busy, and the server becomes busy four times sooner.
+
+Where the difference is: rIRCd copies the message once per recipient and formats
+it once per recipient, because each connection may have negotiated different
+tags. With clients that negotiated nothing it costs 14.2 µs a delivery instead
+of 21.0, so the tag machinery is about a third of it and the copying is the
+rest. Rendering one line per distinct capability set and sharing it — most
+people in a channel have negotiated the same things — is the change that would
+close the gap, and it has not been made yet.
+
 ## Writing a new suite
 
 ```python

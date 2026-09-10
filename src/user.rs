@@ -547,6 +547,43 @@ impl SessionRegistry {
         }
     }
 
+    /// A user's connections, without copying their ids.
+    ///
+    /// The delivering loops below walk this once per recipient per message, so
+    /// handing back a `Vec` means an allocation for every person a message
+    /// reaches — a hundred thousand of them a second on a busy channel.
+    fn each_session<'a>(&'a self, user_id: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        let listed = self.sessions.get(user_id);
+        let alone = if listed.is_none() {
+            Some(user_id)
+        } else {
+            None
+        };
+        listed
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .chain(alone)
+    }
+
+    /// What one connection negotiated, without copying it.
+    ///
+    /// Same reason: a copy is a `String` allocated per capability, and a client
+    /// that negotiated eighteen of them costs eighteen allocations for every
+    /// message it is sent.
+    fn caps_ref(&self, session_id: &str) -> Option<&std::collections::HashSet<String>> {
+        self.session_caps.get(session_id)
+    }
+
+    /// An empty set, for a connection that negotiated nothing: it has agreed to
+    /// no tags, so every negotiated one is stripped, which is what an absent
+    /// entry meant when this copied the set.
+    fn no_caps() -> &'static std::collections::HashSet<String> {
+        static NONE: std::sync::OnceLock<std::collections::HashSet<String>> =
+            std::sync::OnceLock::new();
+        NONE.get_or_init(Default::default)
+    }
+
     /// What one connection negotiated.
     pub fn caps_of(&self, session_id: &str) -> std::collections::HashSet<String> {
         self.session_caps
@@ -564,8 +601,8 @@ impl SessionRegistry {
     /// capability one connection asked for is not lost because another did not.
     pub fn union_caps(&self, user_id: &str) -> std::collections::HashSet<String> {
         let mut union = std::collections::HashSet::new();
-        for session in self.sessions_of(user_id) {
-            if let Some(caps) = self.session_caps.get(&session) {
+        for session in self.each_session(user_id) {
+            if let Some(caps) = self.caps_ref(session) {
                 union.extend(caps.iter().cloned());
             }
         }
@@ -615,20 +652,23 @@ impl SessionRegistry {
         with: Option<&Message>,
         without: Option<&Message>,
     ) {
-        for session in self.sessions_of(user_id) {
-            if Some(session.as_str()) == except {
+        for session in self.each_session(user_id) {
+            if Some(session) == except {
                 continue;
             }
-            let Some(sink) = self.sinks.get(&session) else {
+            let Some(sink) = self.sinks.get(session) else {
                 continue;
             };
-            let caps = self.caps_of(&session);
+            let caps = match self.caps_ref(session) {
+                Some(caps) => caps,
+                None => Self::no_caps(),
+            };
             let Some(msg) = (if caps.contains(cap) { with } else { without }) else {
                 continue;
             };
             let mut copy = msg.clone();
             if !copy.tags.is_empty() {
-                crate::protocol::retain_negotiated_tags(&mut copy, &caps);
+                crate::protocol::retain_negotiated_tags(&mut copy, caps);
             }
             sink.send(copy);
         }
@@ -654,18 +694,18 @@ impl SessionRegistry {
     /// Which of a user's connections negotiated a capability, for the few
     /// events that are more than one message either way.
     pub fn sessions_with_cap(&self, user_id: &str, cap: &str, want: bool) -> Vec<String> {
-        self.sessions_of(user_id)
-            .into_iter()
-            .filter(|s| self.caps_of(s).contains(cap) == want)
+        self.each_session(user_id)
+            .filter(|s| self.caps_ref(s).is_some_and(|caps| caps.contains(cap)) == want)
+            .map(str::to_string)
             .collect()
     }
 
     fn deliver_to(&self, user_id: &str, except: Option<&str>, msg: &Message) {
-        for session in self.sessions_of(user_id) {
-            if Some(session.as_str()) == except {
+        for session in self.each_session(user_id) {
+            if Some(session) == except {
                 continue;
             }
-            let Some(sink) = self.sinks.get(&session) else {
+            let Some(sink) = self.sinks.get(session) else {
                 continue;
             };
             if msg.tags.is_empty() {
@@ -673,7 +713,11 @@ impl SessionRegistry {
                 continue;
             }
             let mut copy = msg.clone();
-            crate::protocol::retain_negotiated_tags(&mut copy, &self.caps_of(&session));
+            let caps = match self.caps_ref(session) {
+                Some(caps) => caps,
+                None => Self::no_caps(),
+            };
+            crate::protocol::retain_negotiated_tags(&mut copy, caps);
             sink.send(copy);
         }
     }

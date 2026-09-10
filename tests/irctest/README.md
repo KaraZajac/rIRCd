@@ -69,6 +69,45 @@ by default. Both change what an account means — one connection or several, and
 whether logging in takes a nick back — so they are the operator's decision, not
 the server's.
 
+## Against another server
+
+irctest is the only measure that compares IRC servers on the same terms, so it
+is worth pointing it at one. Ergo is the closest comparison — modern, IRCv3
+first, with accounts and history built in the way rIRCd has them.
+
+```
+curl -sL https://github.com/ergochat/ergo/releases/download/v2.19.1/ergo-2.19.1-linux-x86_64.tar.gz | tar xz
+cd target/irctest && PATH=$PWD/../../ergo-2.19.1-linux-x86_64:$PATH \
+  ../irctest-venv/bin/pytest --controller irctest.controllers.ergo \
+  -m 'not implementation-specific and not deprecated and not strict' \
+  --deselect 'irctest/server_tests/links.py::ServicesLinksTestCase::testLinksWithServices' \
+  --timeout 600 -n 4 -q -rs
+```
+
+Same checkout, same markers, same machine, 10 September 2026:
+
+| | rIRCd 1.4.0 | Ergo 2.19.1 |
+|---|---|---|
+| passed | **544** | 527 |
+| failed | 0 | 0 |
+| skipped | **10** | 26 |
+
+Neither fails anything. The difference is all in the skips, and a skip is the
+harness being told the server does not do that at all: Ergo skips
+`ACCOUNTEXTBAN`, all four `ELIST` search tokens, `INVITE_LIST`, `MULTI_NAMES`,
+`LINKS`, `WALLOPS` and SASL re-authentication. rIRCd runs every test Ergo runs
+and sixteen more, and passes them.
+
+The ten rIRCd skips are the ones neither server runs: `CASEMAPPING=rfc1459`,
+non-UTF-8 messages, and four `WHO` tests irctest marks "not consistently
+implemented".
+
+Read it for what it is. It is one comparison against one server on one
+selection of tests, it says nothing about the several servers irctest supports
+that are not measured here, and Ergo does things irctest has no test for. What
+it does say is that on the tests both servers are asked, rIRCd answers more of
+them.
+
 ## Failures are findings
 
 A failure here is a claim about rIRCd, not about the harness — but check which
