@@ -115,6 +115,28 @@ When a link drops, every user behind it quits with `*.net *.split` and every
 server behind it is forgotten. Channels left empty are removed. A link with
 `autoconnect` set is retried with a widening delay.
 
+## What is carried today
+
+The protocol above is what a link is for. This is how far the implementation has
+got, so that nobody has to read the source to find out:
+
+| | |
+|---|---|
+| The link, its handshake and its keepalive | yes |
+| `SERVER`, so the network's shape is known past the peer | yes |
+| The user burst, and users announced as they register | yes |
+| `NICK`, `QUIT`, `AWAY`, `KILL` | yes |
+| Nick collisions, settled by timestamp | yes |
+| `PRIVMSG`, `NOTICE`, `TAGMSG` between users on different servers | yes |
+| Splits: the users behind a dropped link quit | yes |
+| Channels: `SJOIN`, `MODE`, `TOPIC`, `KICK`, and messages to a channel | not yet |
+| `ACCOUNT`, `CHGHOST`, `SETNAME`, `INVITE`, `METADATA` | not yet |
+| Chathistory answered across the network | not yet |
+
+Until channels are carried, a channel on one server is a different channel from
+one with the same name on another. Two servers linked today share their people,
+not their rooms.
+
 ## Testing
 
     tests/smoke/run-link.sh

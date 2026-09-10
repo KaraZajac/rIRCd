@@ -80,6 +80,127 @@ check("a client on the link port is not registered", " 001 " not in text, text[:
 check("it is told why, or simply dropped",
       text == "" or "ERROR" in text, text[:200])
 
+section("users are shared across the link")
+# A user on A must be a user on B: the burst carries everyone who was already
+# there, and everyone who arrives afterwards is announced.
+burst_nick = f"burst{RUN}"
+late_nick = f"late{RUN}"
+alice = Client(burst_nick, port=A_PORT)
+
+
+def whois(client, nick, seconds=5):
+    mark = client.mark()
+    client.send(f"WHOIS {nick}")
+    client.wait_for(" 318 ", " 401 ", seconds=seconds)
+    return client.since(mark)
+
+
+def eventually(fn, seconds=8):
+    """Retry until it returns something. For anything that asks the server."""
+    deadline = time.time() + seconds
+    last = None
+    while time.time() < deadline:
+        last = fn()
+        if last:
+            return last
+        time.sleep(0.3)
+    return last
+
+
+def arrives(client, needle, mark, seconds=8):
+    """Wait for a line to turn up unprompted — a message from somebody else.
+
+    Nothing here asks the server a question, so there is no reply to wait for:
+    the socket has to be read until the line shows up or the time is gone.
+    """
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        client.read(0.5)
+        hits = [l for l in client.since(mark) if needle in l]
+        if hits:
+            return hits
+    return []
+
+
+found = eventually(lambda: [l for l in whois(b, burst_nick) if " 311 " in l])
+check(f"B knows {burst_nick}, who registered on A", bool(found), found)
+
+server_line = [l for l in whois(b, burst_nick) if " 312 " in l]
+check("B says which server they are on", any(A_NAME in l for l in server_line), server_line)
+
+late = Client(late_nick, port=A_PORT)
+found = eventually(lambda: [l for l in whois(b, late_nick) if " 311 " in l])
+check(f"B learns about {late_nick}, who arrived after the link", bool(found), found)
+
+check("A does not know a nick nobody took",
+      not [l for l in whois(a, f"ghost{RUN}") if " 311 " in l])
+
+section("LUSERS counts the whole network")
+mark = b.mark()
+b.send("LUSERS")
+b.wait_for(" 266 ", seconds=5)
+lusers = b.since(mark)
+check("B reports two servers", any(" 2 servers" in l for l in lusers if " 251 " in l),
+      [l for l in lusers if " 251 " in l])
+global_line = [l for l in lusers if " 266 " in l]
+local_line = [l for l in lusers if " 265 " in l]
+check("global users outnumber local ones",
+      bool(global_line) and bool(local_line), global_line + local_line)
+
+section("messages cross the link")
+mark = alice.mark()
+b.send(f"PRIVMSG {burst_nick} :hello from the other side")
+got = arrives(alice, "hello from the other side", mark)
+check("a message from B reaches a user on A", bool(got), got)
+check("it comes from the sender, not from a server",
+      bool(got) and got[0].startswith(f":lb{RUN}!"), got)
+check("it is addressed to the name the recipient answers to",
+      bool(got) and f"PRIVMSG {burst_nick} " in got[0], got)
+
+mark = b.mark()
+alice.send(f"PRIVMSG lb{RUN} :and back again")
+got = arrives(b, "and back again", mark)
+check("a message from A reaches a user on B", bool(got), got)
+
+section("a nick change is seen on both sides")
+renamed = f"moved{RUN}"
+alice.send(f"NICK {renamed}")
+alice.wait_for(" NICK ", seconds=5)
+found = eventually(lambda: [l for l in whois(b, renamed) if " 311 " in l])
+check(f"B knows the new nick {renamed}", bool(found), found)
+gone = eventually(lambda: [l for l in whois(b, burst_nick) if " 401 " in l])
+check("B has let the old nick go", bool(gone), gone)
+
+section("a quit is seen on both sides")
+late.send("QUIT :done")
+late.close()
+gone = eventually(lambda: [l for l in whois(b, late_nick) if " 401 " in l])
+check(f"B saw {late_nick} leave", bool(gone), gone)
+
+section("a rehash does not take the link down")
+# REHASH replaces the whole configuration. The servers already attached are not
+# re-linked by it, so what the running server knows about them has to survive —
+# otherwise the link would still be up with nothing able to reach it.
+oper = Client(f"op{RUN}", port=A_PORT)
+oper.send(f"OPER linkoper {os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+oper.wait_for(" 381 ", " 464 ", seconds=5)
+check("the operator logged in", bool(oper.find(" 381 ")), oper.lines[-3:])
+mark = oper.mark()
+oper.send("REHASH")
+oper.wait_for(" 382 ", seconds=5)
+
+mark = a.mark()
+a.send("LINKS")
+a.wait_for(" 365 ", seconds=5)
+rehashed = " ".join(a.find(" 364 ", lines=a.since(mark)))
+check("A still lists B after a rehash", B_NAME in rehashed, rehashed)
+
+mark = alice.mark()
+b.send(f"PRIVMSG {renamed} :still talking after the rehash")
+got = arrives(alice, "still talking after the rehash", mark)
+check("messages still cross the link after a rehash", bool(got), got)
+oper.close()
+
 section("a split is noticed")
 # Stop B and watch A report the split rather than carrying on as if nothing
 # happened.
@@ -102,6 +223,9 @@ if os.path.exists(pid_path):
     check("A no longer lists B", B_NAME not in after, after)
     check("A still lists itself", A_NAME in after, after)
     check("A is still serving", bool(Client(f"after{RUN}", port=A_PORT).find(" 001 ")))
+
+    gone = eventually(lambda: [l for l in whois(a, f"lb{RUN}") if " 401 " in l])
+    check("the users behind the split are gone from A", bool(gone), gone)
 else:
     check("server B's pid file was written", False, pid_path)
 

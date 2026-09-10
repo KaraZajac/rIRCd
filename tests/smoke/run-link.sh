@@ -87,6 +87,9 @@ mariadb --socket="$DB_SOCK" -e "SELECT 1" >/dev/null 2>&1 || {
   echo "No MariaDB on $DB_SOCK; see $LINK_DIR/smoke-up.log" >&2
   exit 1
 }
+# run.sh builds its own directory from scratch, and this one lives inside it, so
+# it is made again here rather than only before.
+mkdir -p "$LINK_DIR"
 
 for db in rircdb_a rircdb_b; do
   mariadb --socket="$DB_SOCK" -e "DROP DATABASE IF EXISTS $db"
@@ -96,6 +99,12 @@ say "Databases rircdb_a and rircdb_b ready"
 
 say "Building rircd"
 (cd "$REPO" && cargo build --quiet)
+
+# An operator on both sides, so the tests can ask a server to do something only
+# an operator may — REHASH, which must not take a live link down.
+OPER_PASSWORD="${SMOKE_OPER_PASSWORD:-smoke-oper-password}"
+OPER_HASH="$(printf '%s\n%s\n' "$OPER_PASSWORD" "$OPER_PASSWORD" | "$REPO/target/debug/rircd" genpasswd 2>/dev/null | grep -o '\$2[aby]\$[^ ]*')"
+[ -n "$OPER_HASH" ] || { echo "could not hash the oper password" >&2; exit 1; }
 
 write_config() {
   # write_config <side> <name> <sid> <client port> <link port> <db> <peer name> <peer sid> <peer link port> <send> <receive> <autoconnect>
@@ -123,6 +132,11 @@ database = "$6"
 max_line_length = 8191
 flood_burst = 1000
 flood_rate = 1000
+
+[[opers]]
+name = "linkoper"
+hostmask = "*"
+password_hash = "$OPER_HASH"
 
 [[links]]
 name = "$7"
@@ -180,6 +194,7 @@ export LINK_B_NAME="$B_NAME"
 export LINK_A_LINK_PORT="$A_LINK_PORT"
 export LINK_B_LINK_PORT="$B_LINK_PORT"
 export LINK_DIR="$LINK_DIR"
+export SMOKE_OPER_PASSWORD="$OPER_PASSWORD"
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 
 status=0
