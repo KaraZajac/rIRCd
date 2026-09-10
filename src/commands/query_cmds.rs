@@ -231,7 +231,7 @@ pub async fn handle_who(
         for target_id in &matching_ids {
             if let Some(c) = state.clients.get(target_id) {
                 let c = c.read().await;
-                if c.invisible && is_mask_query && target_id != client_id {
+                if c.invisible && is_mask_query && !state.is_self(target_id, client_id) {
                     let shares_channel =
                         c.channels.keys().any(|ch| requester_channels.contains(ch));
                     if !shares_channel {

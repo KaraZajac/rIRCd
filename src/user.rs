@@ -543,9 +543,25 @@ impl SessionRegistry {
     /// Send to every connection a user has, each seeing only the tags it
     /// negotiated.
     pub fn deliver(&self, user_id: &str, msg: &Message) {
-        let sessions = self.sessions_of(user_id);
-        for session in &sessions {
-            let Some(sink) = self.sinks.get(session) else {
+        self.deliver_to(user_id, None, msg)
+    }
+
+    /// Send to every connection a user has except one.
+    ///
+    /// The connection that sent a command is answered for separately — with the
+    /// label it asked under, and only if it asked to see its own message at all.
+    /// Its owner's other connections did not send anything, so they see the
+    /// event the way everybody else in the channel does.
+    pub fn deliver_except(&self, user_id: &str, except: &str, msg: &Message) {
+        self.deliver_to(user_id, Some(except), msg)
+    }
+
+    fn deliver_to(&self, user_id: &str, except: Option<&str>, msg: &Message) {
+        for session in self.sessions_of(user_id) {
+            if Some(session.as_str()) == except {
+                continue;
+            }
+            let Some(sink) = self.sinks.get(&session) else {
                 continue;
             };
             if msg.tags.is_empty() {
@@ -553,7 +569,7 @@ impl SessionRegistry {
                 continue;
             }
             let mut copy = msg.clone();
-            crate::protocol::retain_negotiated_tags(&mut copy, &self.caps_of(session));
+            crate::protocol::retain_negotiated_tags(&mut copy, &self.caps_of(&session));
             sink.send(copy);
         }
     }
@@ -739,6 +755,16 @@ impl ServerState {
                 None => break,
             }
         }
+    }
+
+    /// Whether a member id names the same user as the connection that sent a
+    /// command.
+    ///
+    /// The two are different strings: a user has an id of its own, and may hold
+    /// several connections. Comparing them directly was right only while every
+    /// user had exactly one connection whose id it borrowed.
+    pub fn is_self(&self, member_id: &str, session_id: &str) -> bool {
+        self.user_id(session_id) == member_id
     }
 
     /// The user a connection belongs to. An id that names no known connection

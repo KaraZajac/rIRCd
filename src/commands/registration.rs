@@ -48,6 +48,33 @@ async fn send_to_client(senders: &Senders, user_id: &str, msg: Message) -> bool 
     delivered
 }
 
+/// Deliver to a user, skipping one connection when that one caused the event
+/// and has already been answered for. A user's other connections are watching
+/// their own account, away message or name change happen somewhere else, and
+/// asked for the capability that reports it.
+async fn send_to_others(senders: &Senders, user_id: &str, except: Option<&str>, msg: Message) {
+    let registry = senders.read().await;
+    match except {
+        Some(session) => registry.deliver_except(user_id, session, &msg),
+        None => registry.deliver(user_id, &msg),
+    }
+}
+
+/// Deliver to a user's other connections, skipping the one that sent the
+/// command. That one is answered directly, with the label it asked under; the
+/// rest see the same event without one.
+async fn send_to_other_sessions(senders: &Senders, user_id: &str, except: &str, msg: Message) {
+    let registry = senders.read().await;
+    for session in registry.sessions_of(user_id) {
+        if session == except {
+            continue;
+        }
+        if let Some(sink) = registry.get(&session) {
+            sink.send(msg.clone());
+        }
+    }
+}
+
 /// Maximum ISUPPORT tokens per 005 line (RFC recommends ≤13).
 const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 
@@ -496,8 +523,9 @@ pub async fn complete_registration(
             "Monitor: notifying watchers that nick came online (730)"
         );
     }
+    let self_id = state.read().await.user_id(client_id);
     for w in &watchers {
-        if *w == client_id {
+        if *w == self_id {
             continue;
         }
         let client_arc = state.read().await.clients.get(w).cloned();
@@ -1247,7 +1275,7 @@ pub async fn handle_nick(
                 None => nick.clone(),
             };
             for w in &watchers_old {
-                if *w == client_id || case_change_only {
+                if *w == user_id || case_change_only {
                     continue;
                 }
                 let client_arc = state.read().await.clients.get(w).cloned();
@@ -1263,7 +1291,7 @@ pub async fn handle_nick(
                 send_to_client(&senders, w, m).await;
             }
             for w in &watchers_new {
-                if *w == client_id || case_change_only {
+                if *w == user_id || case_change_only {
                     continue;
                 }
                 let client_arc = state.read().await.clients.get(w).cloned();
@@ -1288,12 +1316,15 @@ pub async fn handle_nick(
             // The sender's own copy is the answer to their NICK, so it carries
             // the label; the copies other members see do not.
             reply_to_client(&senders, client_id, nick_msg.clone(), label).await;
+            // The user's other connections are watching the same nick change.
+            let self_id = state.read().await.user_id(client_id);
+            send_to_other_sessions(&senders, &self_id, client_id, nick_msg.clone()).await;
             let channel_names: Vec<String> = match state.read().await.clients.get(client_id) {
                 Some(c) => c.read().await.channels.keys().cloned().collect(),
                 None => Vec::new(),
             };
             let mut notified = std::collections::HashSet::new();
-            notified.insert(client_id.to_string());
+            notified.insert(self_id);
             for ch_name in &channel_names {
                 let ch_store = channels.read().await;
                 let member_ids: Vec<String> = match ch_store.channels.get(ch_name.as_str()) {
@@ -2633,15 +2664,13 @@ pub async fn handle_authenticate(
         drop(ch_store);
         let state = state.read().await;
         for mid in &member_ids {
-            if *mid == client_id {
-                continue;
-            }
+            let skip = state.is_self(mid, client_id).then_some(client_id);
             let caps = match state.clients.get(mid) {
                 Some(c) => c.read().await.capabilities.clone(),
                 None => Default::default(),
             };
             if caps.contains("account-notify") {
-                send_to_client(&senders, mid, account_msg.clone()).await;
+                send_to_others(&senders, mid, skip, account_msg.clone()).await;
                 already_notified.insert(mid.clone());
             }
         }
@@ -3079,12 +3108,10 @@ async fn handle_authenticate_scram_step(
                 drop(ch_store);
                 let sg = state.read().await;
                 for mid in &member_ids {
-                    if *mid == client_id {
-                        continue;
-                    }
+                    let skip = sg.is_self(mid, client_id).then_some(client_id);
                     if let Some(c) = sg.clients.get(mid) {
                         if c.read().await.has_cap("account-notify") {
-                            send_to_client(&senders, mid, account_msg.clone()).await;
+                            send_to_others(&senders, mid, skip, account_msg.clone()).await;
                         }
                     }
                 }
@@ -3273,15 +3300,13 @@ pub async fn login_client(
         };
         let state_r = state.read().await;
         for mid in &member_ids {
-            if mid == client_id {
-                continue;
-            }
+            let skip = state_r.is_self(mid, client_id).then_some(client_id);
             let has_cap = match state_r.clients.get(mid) {
                 Some(c) => c.read().await.has_cap("account-notify"),
                 None => continue,
             };
             if has_cap {
-                send_to_client(&senders, mid, account_msg.clone()).await;
+                send_to_others(&senders, mid, skip, account_msg.clone()).await;
                 already_notified.insert(mid.clone());
             }
         }
@@ -3825,7 +3850,10 @@ pub async fn handle_ghost(
         .nick_to_id
         .get(&target.to_uppercase())
         .cloned();
-    let Some(ghost_id) = ghost_id.filter(|id| id != client_id) else {
+    // GHOST disconnects the user holding a nick, and a user is not allowed to
+    // ghost itself — which is a comparison of users, not of connections.
+    let self_id = state.read().await.user_id(client_id);
+    let Some(ghost_id) = ghost_id.filter(|id| **id != self_id) else {
         reply_to_client(
             &senders,
             client_id,
@@ -4145,15 +4173,13 @@ pub async fn handle_away(
 
         let state = state.read().await;
         for mid in &member_ids {
-            if *mid == client_id {
-                continue;
-            }
+            let skip = state.is_self(mid, client_id).then_some(client_id);
             let caps = match state.clients.get(mid) {
                 Some(c) => c.read().await.capabilities.clone(),
                 None => Default::default(),
             };
             if caps.contains("away-notify") {
-                send_to_client(&senders, mid, away_message.clone()).await;
+                send_to_others(&senders, mid, skip, away_message.clone()).await;
                 already_notified.insert(mid.clone());
             }
         }
@@ -4276,15 +4302,13 @@ pub async fn handle_setname(
         let _ = ch_guard;
         drop(ch_store);
         for mid in &member_ids {
-            if *mid == client_id {
-                continue;
-            }
+            let skip = state.is_self(mid, client_id).then_some(client_id);
             let has_setname = match state.clients.get(mid) {
                 Some(c) => c.read().await.has_cap("setname"),
                 None => false,
             };
             if has_setname {
-                send_to_client(&senders, mid, setname_msg.clone()).await;
+                send_to_others(&senders, mid, skip, setname_msg.clone()).await;
                 already_notified.insert(mid.clone());
             }
         }
@@ -4551,14 +4575,12 @@ pub async fn send_chghost_if_changed(
         };
         let state = state.read().await;
         for mid in member_ids {
-            if mid == client_id {
-                continue;
-            }
+            let skip = (mid == user_id).then_some(client_id);
             if let Some(c) = state.clients.get(&mid) {
                 let has_chghost = c.read().await.capabilities.contains("chghost");
                 if has_chghost {
-                    send_to_client(&senders, &mid, chghost_msg.clone()).await;
-                } else {
+                    send_to_others(&senders, &mid, skip, chghost_msg.clone()).await;
+                } else if skip.is_none() {
                     send_to_client(&senders, &mid, quit_msg.clone()).await;
                     let join_msg =
                         Message::new("JOIN", vec![ch_name.clone()]).with_prefix(&new_source);
@@ -4635,7 +4657,7 @@ async fn notify_extended_monitor_watchers(
 
     for wid in &watcher_ids {
         // Skip the user themselves and anyone already notified via channel
-        if wid == client_id || already_notified.contains(wid) {
+        if state.is_self(wid, client_id) || already_notified.contains(wid) {
             continue;
         }
         let caps = match state.clients.get(wid) {

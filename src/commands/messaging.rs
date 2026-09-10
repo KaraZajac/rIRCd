@@ -16,6 +16,18 @@ async fn send_to_client(senders: &Senders, user_id: &str, msg: Message) {
     senders.read().await.deliver(user_id, &msg);
 }
 
+/// One line to a recipient, skipping a connection when it is named.
+///
+/// The connection that sent a batch sees it back only if it asked to; the
+/// user's other connections did not send it and see it like anybody else.
+async fn deliver_skipping(senders: &Senders, user_id: &str, skip: Option<&str>, msg: Message) {
+    let registry = senders.read().await;
+    match skip {
+        Some(session) => registry.deliver_except(user_id, session, &msg),
+        None => registry.deliver(user_id, &msg),
+    }
+}
+
 /// Strip mIRC/IRC color and formatting codes from a message.
 /// Removes: \x03[n][,m] (colors), \x02 (bold), \x1d (italic), \x1f (underline),
 ///          \x1e (strikethrough), \x0f (reset), \x16 (reverse)
@@ -628,23 +640,30 @@ pub async fn handle_privmsg(
                         continue;
                     }
                 }
-                if *mid == client_id {
+                if state_guard.is_self(mid, client_id) {
+                    let caps = match state_guard.clients.get(mid) {
+                        Some(c) => c.read().await.capabilities.clone(),
+                        None => Default::default(),
+                    };
+                    let tagged = add_tags_for_recipient(
+                        base_msg.clone(),
+                        &caps,
+                        sender_account.as_deref(),
+                        Some(&msgid),
+                        Some(&msg.tags),
+                        cfg.server.client_tag_deny.as_deref(),
+                        &sender_tags,
+                    );
                     if echo_message {
-                        let caps = match state_guard.clients.get(mid) {
-                            Some(c) => c.read().await.capabilities.clone(),
-                            None => Default::default(),
-                        };
-                        let tagged = add_tags_for_recipient(
-                            base_msg.clone(),
-                            &caps,
-                            sender_account.as_deref(),
-                            Some(&msgid),
-                            Some(&msg.tags),
-                            cfg.server.client_tag_deny.as_deref(),
-                            &sender_tags,
-                        );
-                        reply_to_sender(&senders, client_id, tagged, label, parent_batch).await;
+                        reply_to_sender(&senders, client_id, tagged.clone(), label, parent_batch)
+                            .await;
                     }
+                    // The sender's other connections did not send anything, so
+                    // they see it as any other member of the channel does.
+                    senders
+                        .read()
+                        .await
+                        .deliver_except(mid, client_id, &tagged);
                     continue;
                 }
                 let recipient_caps = match state_guard.clients.get(mid) {
@@ -917,23 +936,30 @@ pub async fn handle_notice(
                         continue;
                     }
                 }
-                if *mid == client_id {
+                if state_guard.is_self(mid, client_id) {
+                    let caps = match state_guard.clients.get(mid) {
+                        Some(c) => c.read().await.capabilities.clone(),
+                        None => Default::default(),
+                    };
+                    let tagged = add_tags_for_recipient(
+                        base_msg.clone(),
+                        &caps,
+                        sender_account.as_deref(),
+                        Some(&msgid),
+                        Some(&msg.tags),
+                        cfg.server.client_tag_deny.as_deref(),
+                        &sender_tags,
+                    );
                     if echo_message {
-                        let caps = match state_guard.clients.get(mid) {
-                            Some(c) => c.read().await.capabilities.clone(),
-                            None => Default::default(),
-                        };
-                        let tagged = add_tags_for_recipient(
-                            base_msg.clone(),
-                            &caps,
-                            sender_account.as_deref(),
-                            Some(&msgid),
-                            Some(&msg.tags),
-                            cfg.server.client_tag_deny.as_deref(),
-                            &sender_tags,
-                        );
-                        reply_to_sender(&senders, client_id, tagged, label, parent_batch).await;
+                        reply_to_sender(&senders, client_id, tagged.clone(), label, parent_batch)
+                            .await;
                     }
+                    // The sender's other connections did not send anything, so
+                    // they see it as any other member of the channel does.
+                    senders
+                        .read()
+                        .await
+                        .deliver_except(mid, client_id, &tagged);
                     continue;
                 }
                 let recipient_caps = match state_guard.clients.get(mid) {
@@ -1209,13 +1235,22 @@ pub async fn deliver_multiline_batch(
     // flattened, carries the time the message was sent.
     let batch_time = crate::protocol::server_time_now();
 
+    // Taken before the guard goes: the recipients are users, and the connection
+    // that sent this is not one.
+    let self_id = state_guard.user_id(client_id);
     drop(state_guard);
 
     for mid in &recipient_ids {
-        // The sender's own copy is the echo-message block below: sending it here
-        // too would deliver the whole batch twice, and would reach senders that
-        // never asked for an echo.
-        if mid == client_id {
+        // The sender's own connection is answered by the echo-message block
+        // below: sending it here too would deliver the whole batch twice, and
+        // would reach senders that never asked for an echo. Its owner's other
+        // connections did not send anything and see it like anybody else.
+        let skip = if *mid == self_id {
+            Some(client_id)
+        } else {
+            None
+        };
+        if skip.is_some() && senders.read().await.sessions_of(mid).len() < 2 {
             continue;
         }
         let caps = {
@@ -1246,7 +1281,7 @@ pub async fn deliver_multiline_batch(
                 cfg.server.client_tag_deny.as_deref(),
                 &sender_tags,
             );
-            send_to_client(&senders, mid, tagged_start).await;
+            deliver_skipping(&senders, mid, skip, tagged_start).await;
             for (concat, text) in &batch.lines {
                 let mut line_msg = Message::new(
                     batch.command.clone(),
@@ -1261,11 +1296,11 @@ pub async fn deliver_multiline_batch(
                         .tags
                         .insert("draft/multiline-concat".to_string(), None);
                 }
-                send_to_client(&senders, mid, line_msg).await;
+                deliver_skipping(&senders, mid, skip, line_msg).await;
             }
             let batch_end = Message::new("BATCH", vec![format!("-{}", batch.ref_tag)])
                 .with_prefix(&cfg.server.name);
-            send_to_client(&senders, mid, batch_end).await;
+            deliver_skipping(&senders, mid, skip, batch_end).await;
         } else {
             for (i, text) in flatten_multiline(&batch.lines).iter().enumerate() {
                 let mut line_msg = Message::new(
@@ -1288,7 +1323,7 @@ pub async fn deliver_multiline_batch(
                     cfg.server.client_tag_deny.as_deref(),
                     &sender_tags,
                 );
-                send_to_client(&senders, mid, tagged).await;
+                deliver_skipping(&senders, mid, skip, tagged).await;
             }
         }
     }
@@ -1589,10 +1624,7 @@ pub async fn handle_tagmsg(
                     if !caps.contains("message-tags") {
                         continue;
                     }
-                    if *mid == client_id {
-                        if !echo_message {
-                            continue;
-                        }
+                    if state_guard.is_self(mid, client_id) {
                         let tagged = add_tags_for_recipient(
                             base_msg.clone(),
                             &caps,
@@ -1602,7 +1634,20 @@ pub async fn handle_tagmsg(
                             cfg.server.client_tag_deny.as_deref(),
                             &sender_tags,
                         );
-                        reply_to_sender(&senders, client_id, tagged, label, parent_batch).await;
+                        if echo_message {
+                            reply_to_sender(
+                                &senders,
+                                client_id,
+                                tagged.clone(),
+                                label,
+                                parent_batch,
+                            )
+                            .await;
+                        }
+                        senders
+                            .read()
+                            .await
+                            .deliver_except(mid, client_id, &tagged);
                         continue;
                     }
                     send_to_client_with_caps(
@@ -1986,7 +2031,7 @@ pub async fn handle_redact(
             send_to_client(&senders, client_id, redact_relay.clone()).await;
         }
         if let Some(ref tid) = tid_opt {
-            if tid != client_id && recipient_has_cap {
+            if !state.read().await.is_self(tid, client_id) && recipient_has_cap {
                 send_to_client(&senders, tid, redact_relay.clone()).await;
             }
         }
@@ -2642,14 +2687,21 @@ pub async fn deliver_client_batch(
                 None => return Ok(()),
             }
         };
+    let self_id = state_r.user_id(client_id);
     drop(state_r);
 
     // Generate a server-side batch ref for each recipient (they can't share the client's ref tag)
     let server_ref = generate_msgid();
 
     for mid in &recipient_ids {
-        // Senders only get their own batch back if they asked for echo-message.
-        if mid == client_id && !echo_message {
+        // The connection that sent the batch gets it back only if it asked to.
+        // Its owner's other connections always do.
+        let skip = if *mid == self_id && !echo_message {
+            Some(client_id)
+        } else {
+            None
+        };
+        if skip.is_some() && senders.read().await.sessions_of(mid).len() < 2 {
             continue;
         }
         let caps = {
@@ -2671,7 +2723,7 @@ pub async fn deliver_client_batch(
                 ],
             )
             .with_prefix(&source);
-            send_to_client(&senders, mid, batch_start).await;
+            deliver_skipping(&senders, mid, skip, batch_start).await;
             for mut inner in batch.messages.clone() {
                 // Rewrite source prefix and strip the original batch tag
                 inner.prefix = Some(source.clone());
@@ -2687,11 +2739,11 @@ pub async fn deliver_client_batch(
                     cfg.server.client_tag_deny.as_deref(),
                     &sender_tags,
                 );
-                send_to_client(&senders, mid, tagged).await;
+                deliver_skipping(&senders, mid, skip, tagged).await;
             }
             let batch_end =
                 Message::new("BATCH", vec![format!("-{}", server_ref)]).with_prefix(&source);
-            send_to_client(&senders, mid, batch_end).await;
+            deliver_skipping(&senders, mid, skip, batch_end).await;
         } else {
             for mut inner in batch.messages.clone() {
                 inner.prefix = Some(source.clone());
@@ -2705,7 +2757,7 @@ pub async fn deliver_client_batch(
                     cfg.server.client_tag_deny.as_deref(),
                     &sender_tags,
                 );
-                send_to_client(&senders, mid, tagged).await;
+                deliver_skipping(&senders, mid, skip, tagged).await;
             }
         }
     }

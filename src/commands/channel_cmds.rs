@@ -466,9 +466,15 @@ async fn handle_join_inner(
                 .tags
                 .insert("time".to_string(), Some(happened_at.clone()));
             // The joining client's own copy is part of the answer to its JOIN,
-            // so it goes inside the labeled batch; everyone else's does not.
-            if mid == client_id {
-                reply_self!(join_msg);
+            // so it goes inside the labeled batch; everyone else's does not —
+            // including the user's own other connections, which are watching
+            // someone join a channel rather than answering for it.
+            if *mid == user_id {
+                reply_self!(join_msg.clone());
+                senders
+                    .read()
+                    .await
+                    .deliver_except(mid, client_id, &join_msg);
             } else {
                 senders.read().await.deliver(mid, &join_msg);
             }
@@ -482,7 +488,7 @@ async fn handle_join_inner(
         if let Some(ref away_msg) = joining_away {
             let away_notify = Message::new("AWAY", vec![away_msg.clone()]).with_prefix(&source);
             for mid in &member_ids {
-                if *mid == client_id {
+                if *mid == user_id {
                     continue;
                 }
                 let has_cap = match state.clients.get(mid) {
@@ -2684,7 +2690,7 @@ pub async fn handle_invite(
             drop(ch);
             drop(ch_store);
             for mid in &notify_member_ids {
-                if *mid == client_id || *mid == *target_id {
+                if state.is_self(mid, client_id) || *mid == *target_id {
                     continue;
                 }
                 let caps = match state.clients.get(mid) {
