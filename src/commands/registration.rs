@@ -403,7 +403,7 @@ pub async fn complete_registration(
             vec![
                 nick_str.clone(),
                 server.clone(),
-                "rIRCd-0.1".into(),
+                concat!("rIRCd-", env!("CARGO_PKG_VERSION")).into(),
                 "BioRrw".into(),
                 "bceIklmnopqRstvC".into(),
             ],

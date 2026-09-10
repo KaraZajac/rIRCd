@@ -680,6 +680,18 @@ impl Config {
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     let content = fs::read_to_string(path)?;
     let config: Config = toml::from_str(&content)?;
+    // A link carries every private message that crosses it, and its password.
+    // `tls` is in the shape of a link block but nothing reads it yet, so a
+    // server that started anyway would be telling its operator the traffic was
+    // encrypted when it was not.
+    if let Some(link) = config.links.iter().find(|l| l.tls) {
+        anyhow::bail!(
+            "[[links]] {}: tls = true is not implemented yet, and a link that \
+             asked for it would run in the clear. Set tls = false to link \
+             without it.",
+            link.name
+        );
+    }
     Ok(config)
 }
 
