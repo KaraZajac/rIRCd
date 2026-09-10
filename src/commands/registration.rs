@@ -228,7 +228,18 @@ pub async fn complete_registration(
         }
     }
 
-    let mut client = Client::new(client_id.to_string(), pending.host);
+    // A user's own id, distinct from the connection it arrived on. On a linked
+    // network this is what the other servers know it by, and it stays the same
+    // as the user opens and closes connections.
+    let uid = {
+        let sid = if state_guard.sid.is_empty() {
+            crate::link::our_sid(cfg)
+        } else {
+            state_guard.sid.clone()
+        };
+        crate::link::next_uid(&sid, &state_guard.uid_counter)
+    };
+    let mut client = Client::new_on(uid.clone(), client_id.to_string(), pending.host);
     client.nick = Some(nick.clone());
     client.user = Some(user);
     client.realname = Some(realname);
@@ -300,6 +311,9 @@ pub async fn complete_registration(
         None => {
             let client = state_guard.add_client(client, client_id).await;
             drop(state_guard);
+            // The connection was its own user until now. File it under the user
+            // id instead, so anything addressed to the user reaches it.
+            senders.write().await.reassign_session(&uid, client_id);
             client
         }
     };
@@ -1234,8 +1248,13 @@ pub async fn handle_nick(
                 tracing::info!(client_id, old_nick = %o, new_nick = %nick, "Nick change");
                 state_guard.nick_to_id.remove(&o.to_uppercase());
             }
+            // One nick change happened at one time, and every server has to
+            // agree on when: it is what settles a collision.
+            let nick_ts = chrono::Utc::now().timestamp();
             if let Some(client) = state_guard.clients.get(client_id) {
-                client.write().await.nick = Some(nick.clone());
+                let mut g = client.write().await;
+                g.nick = Some(nick.clone());
+                g.nick_ts = nick_ts;
             }
             // The nick belongs to the user, so it must point at the user and
             // not at whichever of its connections changed it — otherwise a

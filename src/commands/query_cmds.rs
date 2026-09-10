@@ -203,25 +203,25 @@ pub async fn handle_who(
                 .collect()
         } else {
             let target_lower = target.to_lowercase();
+            // Users, not entries: the client table answers to a user's own id
+            // and to every connection that reaches it, so walking it would list
+            // somebody once per connection they have open.
             state
-                .clients
-                .keys()
-                .filter(|id| {
-                    if let Some(c) = state.clients.get(*id) {
-                        if let Ok(g) = c.try_read() {
-                            let match_str = format!(
-                                "{}!{}@{}",
-                                g.nick_or_id().to_lowercase(),
-                                g.display_user().to_lowercase(),
-                                g.display_host().to_lowercase()
-                            );
-                            return crate::user::glob_match(&target_lower, &match_str)
-                                || crate::user::glob_match(&target_lower, g.nick_or_id());
-                        }
+                .users()
+                .filter(|(_, c)| {
+                    if let Ok(g) = c.try_read() {
+                        let match_str = format!(
+                            "{}!{}@{}",
+                            g.nick_or_id().to_lowercase(),
+                            g.display_user().to_lowercase(),
+                            g.display_host().to_lowercase()
+                        );
+                        return crate::user::glob_match(&target_lower, &match_str)
+                            || crate::user::glob_match(&target_lower, g.nick_or_id());
                     }
                     false
                 })
-                .cloned()
+                .map(|(id, _)| id.clone())
                 .collect()
         };
 
@@ -503,7 +503,14 @@ pub async fn handle_whois(
                 .with_prefix(&cfg.server.name));
             }
             // 276 RPL_WHOISCERTFP — TLS certificate fingerprint
-            if let Some(ref fp) = state.certfps.get(&c.id) {
+            // Fingerprints are filed per connection; a user's own id is not one
+            // of them, so look through the connections it holds.
+            let certfp = c
+                .sessions
+                .iter()
+                .find_map(|session| state.certfps.get(session))
+                .or_else(|| state.certfps.get(&c.id));
+            if let Some(fp) = certfp {
                 send_reply!(Message::new(
                     "276",
                     vec![
@@ -620,6 +627,9 @@ pub async fn handle_monitor(
             return Ok(());
         }
     };
+    // Who is watching is the user, not the connection that asked: the list is
+    // kept on the user and the notifications go to all of its connections.
+    let watcher_id = state_guard.user_id(client_id);
     // Support is advertised with the MONITOR ISUPPORT token, which every client
     // sees, so the command must work without negotiating a capability first —
     // real clients drive MONITOR off ISUPPORT alone.
@@ -678,12 +688,12 @@ pub async fn handle_monitor(
             for n in &added_nicks {
                 state_w
                     .monitor_watchers
-                    .add(n.clone(), client_id.to_string());
+                    .add(n.clone(), watcher_id.clone());
             }
             for p in &added_patterns {
                 state_w
                     .monitor_watchers
-                    .add_pattern(p.clone(), client_id.to_string());
+                    .add_pattern(p.clone(), watcher_id.clone());
             }
             if !failed.is_empty() {
                 let fail_msg = Message::new(
@@ -754,9 +764,9 @@ pub async fn handle_monitor(
                     let n = t.to_lowercase();
                     if guard.monitor_list.remove(&n) {
                         if n.contains('!') || n.contains('@') {
-                            state_w.monitor_watchers.remove_pattern(&n, client_id);
+                            state_w.monitor_watchers.remove_pattern(&n, &watcher_id);
                         } else {
-                            state_w.monitor_watchers.remove(&n, client_id);
+                            state_w.monitor_watchers.remove(&n, &watcher_id);
                         }
                     }
                 }
@@ -769,9 +779,9 @@ pub async fn handle_monitor(
                 let list = c.write().await.monitor_list.drain().collect::<Vec<_>>();
                 for n in &list {
                     if n.contains('!') || n.contains('@') {
-                        state_w.monitor_watchers.remove_pattern(n, client_id);
+                        state_w.monitor_watchers.remove_pattern(n, &watcher_id);
                     } else {
-                        state_w.monitor_watchers.remove(n, client_id);
+                        state_w.monitor_watchers.remove(n, &watcher_id);
                     }
                 }
             }

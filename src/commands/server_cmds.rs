@@ -1156,7 +1156,10 @@ pub async fn handle_kill(
     {
         let mut state_w = state.write().await;
         state_w.record_whowas_for_kill(&tid, s);
-        state_w.clients.remove(&tid);
+        // Every connection the user held goes, not just the entry under its own
+        // id: a killed user with a second session open would otherwise stay
+        // reachable through it.
+        state_w.remove_client(&tid).await;
         state_w.nick_to_id.remove(&target_nick_upper);
     }
     tracing::warn!(client_id, killer = %killer_nick, target = %target_nick, reason = %reason, "KILL");

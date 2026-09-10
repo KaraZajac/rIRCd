@@ -89,6 +89,19 @@ check(
     members,
 )
 
+# A mask search walks the whole client table, which answers to a user's own id
+# and to every connection reaching it. Somebody with two clients open is still
+# one person to WHO.
+mark = second.mark()
+second.send(f"WHO {ACCOUNT}*")
+second.wait_for(" 315 ", seconds=5)
+who_lines = second.find(" 352 ", lines=second.since(mark))
+check(
+    "WHO on a mask lists the user once, not once per connection",
+    len(who_lines) == 1,
+    who_lines,
+)
+
 section("privileges belong to the user, not the connection")
 # `first` created the channel, so the *user* is an operator. Every op check has
 # to agree, whichever connection asks.

@@ -76,7 +76,15 @@ pub struct Client {
     /// True if this connection is over TLS (used for STS policy and WHOIS secure line)
     pub is_tls: bool,
     /// Connections this user is reading on. Its own id is the first of them.
+    /// A user on another server has none.
     pub sessions: Vec<String>,
+    /// When this user took the nick it holds. A nick collision across a link is
+    /// settled by this: the older claim keeps the name.
+    pub nick_ts: i64,
+    /// The server this user is on, when it is not this one. Remote users are
+    /// carried in the same tables as local ones — a nick is a nick wherever it
+    /// is — and this is what tells them apart.
+    pub server: Option<String>,
 }
 
 impl Client {
@@ -117,6 +125,8 @@ impl Client {
             metadata_subscriptions: std::collections::HashSet::new(),
             is_tls: false,
             sessions: vec![id_for_sessions],
+            nick_ts: Utc::now().timestamp(),
+            server: None,
         }
     }
 

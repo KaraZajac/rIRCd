@@ -458,7 +458,8 @@ pub async fn handle_privmsg(
     let sent_at = crate::protocol::server_time_now();
     {
         let mut state_w = state.write().await;
-        state_w.record_msgid(msgid.clone(), target.to_string(), client_id.to_string());
+        let sender = state_w.user_id(client_id);
+        state_w.record_msgid(msgid.clone(), target.to_string(), sender);
     }
     // If this is an edit, update the channel history entry in the DB.
     if let Some(ref orig_msgid) = pending_edit_msgid {
@@ -875,7 +876,8 @@ pub async fn handle_notice(
     let sent_at = crate::protocol::server_time_now();
     {
         let mut state_w = state.write().await;
-        state_w.record_msgid(msgid.clone(), target.to_string(), client_id.to_string());
+        let sender = state_w.user_id(client_id);
+        state_w.record_msgid(msgid.clone(), target.to_string(), sender);
     }
     let state_guard = state.read().await;
 
@@ -1162,7 +1164,8 @@ pub async fn deliver_multiline_batch(
     let msgid = generate_msgid();
     {
         let mut state_w = state.write().await;
-        state_w.record_msgid(msgid.clone(), batch.target.clone(), client_id.to_string());
+        let sender = state_w.user_id(client_id);
+        state_w.record_msgid(msgid.clone(), batch.target.clone(), sender);
     }
 
     let state_guard = state.read().await;
@@ -1504,7 +1507,8 @@ pub async fn handle_tagmsg(
     let sent_at = crate::protocol::server_time_now();
     {
         let mut state_w = state.write().await;
-        state_w.record_msgid(msgid.clone(), target.to_string(), client_id.to_string());
+        let sender = state_w.user_id(client_id);
+        state_w.record_msgid(msgid.clone(), target.to_string(), sender);
     }
     let state_guard = state.read().await;
 

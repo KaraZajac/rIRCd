@@ -410,7 +410,7 @@ async fn handle_join_inner(
             c.channels.insert(
                 ch_key.clone(),
                 ChannelMembership {
-                    client_id: client_id.to_string(),
+                    client_id: user_id.clone(),
                     modes,
                 },
             );
@@ -527,7 +527,7 @@ async fn handle_join_inner(
         // draft/read-marker: the marker has to reach the client before
         // RPL_ENDOFNAMES, so it is sent ahead of the NAMES burst.
         if client_caps.contains("draft/read-marker") {
-            let key = account.clone().unwrap_or_else(|| client_id.to_string());
+            let key = account.clone().unwrap_or_else(|| user_id.clone());
             let ts = state
                 .read_markers
                 .get(&key)
