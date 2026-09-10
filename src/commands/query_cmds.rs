@@ -71,6 +71,28 @@ fn build_354_params(
     params
 }
 
+/// Whether a `WHO` mask names this user.
+///
+/// "The <name> passed to WHO is matched against users' host, server, real name
+/// and nickname" — RFC 1459, and the modern spec after it. Matching the nick
+/// alone is the common shortcut, and it makes `WHO 127.0.0.1` and
+/// `WHO :*Real Name*` — both of which a person will type — find nobody.
+fn who_mask_matches(mask: &str, user: &crate::user::Client, here: &str) -> bool {
+    use crate::user::glob_match;
+    let source = format!(
+        "{}!{}@{}",
+        user.nick_or_id(),
+        user.display_user(),
+        user.display_host()
+    );
+    glob_match(mask, &source)
+        || glob_match(mask, user.nick_or_id())
+        || glob_match(mask, user.display_user())
+        || glob_match(mask, user.display_host())
+        || glob_match(mask, user.server.as_deref().unwrap_or(here))
+        || glob_match(mask, user.realname.as_deref().unwrap_or(""))
+}
+
 pub async fn handle_who(
     client_id: &str,
     msg: Message,
@@ -192,42 +214,36 @@ pub async fn handle_who(
                 None => Default::default(),
             };
         let has_wildcards = target.contains('*') || target.contains('?');
-        let target_upper = target.to_uppercase();
+        let target_upper = crate::casefold::upper(target);
 
-        let matching_ids: Vec<String> = if !has_wildcards && target != "*" {
-            state
-                .nick_to_id
-                .get(&target_upper)
-                .cloned()
-                .into_iter()
-                .collect()
+        // A `WHO` for a nick that is here is that one person. Anything else is a
+        // search — including a plain `127.0.0.1`, which has no wildcard in it
+        // and is still nobody's nick.
+        let exact = if !has_wildcards && target != "*" {
+            state.nick_to_id.get(&target_upper).cloned()
         } else {
-            let target_lower = target.to_lowercase();
+            None
+        };
+        // +i hides a user from a search, not from somebody who already knows
+        // the nick and asks for it directly.
+        let is_mask_query = exact.is_none();
+        let matching_ids: Vec<String> = match exact {
+            Some(id) => vec![id],
             // Users, not entries: the client table answers to a user's own id
             // and to every connection that reaches it, so walking it would list
             // somebody once per connection they have open.
-            state
-                .users()
-                .filter(|(_, c)| {
-                    if let Ok(g) = c.try_read() {
-                        let match_str = format!(
-                            "{}!{}@{}",
-                            g.nick_or_id().to_lowercase(),
-                            g.display_user().to_lowercase(),
-                            g.display_host().to_lowercase()
-                        );
-                        return crate::user::glob_match(&target_lower, &match_str)
-                            || crate::user::glob_match(&target_lower, g.nick_or_id());
-                    }
-                    false
-                })
-                .map(|(id, _)| id.clone())
-                .collect()
+            None => {
+                let here = cfg.server.name.clone();
+                state
+                    .users()
+                    .filter(|(_, c)| match c.try_read() {
+                        Ok(g) => who_mask_matches(target, &g, &here),
+                        Err(_) => false,
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            }
         };
-
-        // +i hides a user from mask searches, not from someone who already knows
-        // the nick and asks for it directly.
-        let is_mask_query = target.contains('*') || target.contains('?');
         for target_id in &matching_ids {
             if let Some(c) = state.clients.get(target_id) {
                 let c = c.read().await;

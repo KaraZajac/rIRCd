@@ -112,6 +112,44 @@ alice.read(1.5)
 check("352 WHO reply", bool(alice.find(" 352 ")))
 check("315 end of WHO", bool(alice.find(" 315 ")))
 
+# "The <name> passed to WHO is matched against users' host, server, real name
+# and nickname" — RFC 1459, and the modern spec after it. Matching the nick
+# alone makes the searches a person actually types find nobody.
+searcher = Client("whofind", user="wfinduser", realname="A Findable Person")
+
+
+def who_hits(mask, nick="whofind"):
+    mark = searcher.mark()
+    searcher.send(f"WHO {mask}")
+    searcher.wait_for(" 315 ", seconds=5)
+    return [l for l in searcher.find(" 352 ", lines=searcher.since(mark)) if nick in l]
+
+
+check("WHO finds a user by their nick", bool(who_hits("whofin*")))
+check("WHO finds a user by their username", bool(who_hits("*finduser")))
+check("WHO finds a user by their real name", bool(who_hits("*Findable*")))
+check("WHO finds a user by a real name with a space in it",
+      bool(who_hits(":*A Findable*")))
+check("WHO finds a user by their host", bool(who_hits("*.IP")))
+check("WHO finds a user by the server they are on", bool(who_hits("*.test")))
+# No wildcard in it, and still nobody's nick: a plain hostname is a search.
+host_line = [l for l in searcher.find(" 352 ", lines=searcher.lines) if "whofind" in l]
+if host_line:
+    host = host_line[0].split()[4]
+    check("WHO finds a user by a host with no wildcard in it",
+          bool(who_hits(host)), host)
+else:
+    check("a 352 for the searcher was seen", False)
+check("WHO on a mask that matches nobody answers with only 315",
+      not who_hits("*nobodyhasthisname*"))
+mark = searcher.mark()
+searcher.send("WHO *Findable*")
+searcher.wait_for(" 315 ", seconds=5)
+check("the 315 echoes the mask as it was sent",
+      any("*Findable*" in l for l in searcher.find(" 315 ", lines=searcher.since(mark))),
+      searcher.since(mark)[-2:])
+searcher.close()
+
 alice.send("LIST")
 alice.read(1.5)
 check("322 LIST entry for #smoke", bool(alice.find(" 322 ", "#smoke")))

@@ -53,7 +53,10 @@ class Client:
         if caps:
             self.send("CAP REQ :" + " ".join(caps))
         self.send(f"NICK {nick}")
-        self.send(f"USER {nick} 0 * :{realname or nick}")
+        # The username and the real name are the caller's when they gave one:
+        # a test that searches by either needs them to be different from the
+        # nick, or it would be searching by the nick without knowing it.
+        self.send(f"USER {user or nick} 0 * :{realname or nick}")
         self.send("CAP END")
         self.wait_for(" 376 ", " 422 ", " 001 ", seconds=5)
         return self
