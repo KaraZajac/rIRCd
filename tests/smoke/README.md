@@ -132,6 +132,30 @@ accumulate briefly would trade some of the single-message latency above for
 several messages per write. That is a choice about which of the two numbers
 matters, not a free improvement, and it has not been made.
 
+## Hours, rather than minutes
+
+```
+tests/smoke/run-link.sh --serve-only
+python3 tests/smoke/soak.py 14400          # seconds
+```
+
+The other runs ask whether the server survives something. `soak.py` asks a
+different question: does anything grow that should not? A few hundred bytes leaked
+per connection is invisible in four minutes and unmissable in four hours, and so
+is a queue that never quite drains.
+
+So the load is deliberately unremarkable — a couple of dozen people talking in
+channels across two linked servers, others coming and going, the occasional
+command that means nothing — and what is measured is whether the server looks
+the same at the end as it did once it had warmed up: memory, open files, and how
+long it takes to answer a stranger.
+
+It prints a line every thirty seconds so a run going wrong can be stopped
+early, and a verdict at the end. It will not give a verdict on drift for a run
+shorter than twenty minutes past warm-up: a megabyte either way over a minute is
+the allocator breathing, and multiplying that up to an hour turns breathing into
+an alarm.
+
 ## A peer that lies
 
 `test_link_hostile.py` runs last in `run-link.sh`, after `test_link.py` has
