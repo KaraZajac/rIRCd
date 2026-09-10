@@ -805,6 +805,23 @@ impl ServerState {
         client
     }
 
+    /// Record a user that is on another server. It has no connection here, so
+    /// nothing writes to it directly — anything addressed to it goes out over
+    /// the link it came from — but it holds a nick, and everything that asks
+    /// about nicks has to find it.
+    pub async fn add_remote_user(&mut self, client: Client) -> Arc<RwLock<Client>> {
+        let id = client.id.clone();
+        let nick = client.nick.clone();
+        let client = Arc::new(RwLock::new(client));
+        self.clients.insert(id.clone(), client.clone());
+        self.session_to_user.insert(id.clone(), id.clone());
+        if let Some(nick) = nick {
+            self.nick_to_id.insert(nick.to_uppercase(), id);
+        }
+        self.max_clients = self.max_clients.max(self.user_count());
+        client
+    }
+
     /// Every user here, once each.
     ///
     /// The client table answers to a user's own id and to every connection id

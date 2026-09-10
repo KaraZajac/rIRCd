@@ -172,6 +172,33 @@ fn is_nick_char(c: char) -> bool {
 ///
 /// A push is the only way a mention reaches someone who is away, and the message
 /// itself is waiting for them in the channel's history when they return.
+/// A user on another server is reached over the link it came from, not through
+/// a connection here. Returns whether the message went that way, so the caller
+/// delivers locally only when it did not.
+async fn deliver_across_link(
+    state: &ServerState,
+    cfg: &Config,
+    sender_id: &str,
+    target_id: &str,
+    msg: &Message,
+    msgid: &str,
+) -> bool {
+    let remote = match state.clients.get(target_id) {
+        Some(c) => c.read().await.server.is_some(),
+        None => false,
+    };
+    if !remote {
+        return false;
+    }
+    // The message keeps its identity across the link: one msgid and one time,
+    // whichever server the recipient turns out to be reading from. What the
+    // recipient is shown of that is their own server's decision, made against
+    // the capabilities they negotiated with it.
+    let mut out = msg.clone();
+    out.tags.insert("msgid".to_string(), Some(msgid.to_string()));
+    crate::link::route_to_user(cfg, &state.user_id(sender_id), target_id, &out).await
+}
+
 async fn push_absent_members(
     state: &ServerState,
     cfg: &Config,
@@ -733,29 +760,31 @@ pub async fn handle_privmsg(
                 Some(c) => c.read().await.capabilities.clone(),
                 None => Default::default(),
             };
-            send_to_client_with_caps(
-                &senders,
-                &tid,
-                privmsg.clone(),
-                &target_caps,
-                sender_account.as_deref(),
-                Some(&msgid),
-                Some(&msg.tags),
-                cfg.server.client_tag_deny.as_deref(),
-                &sender_tags,
-            )
-            .await;
-            push_notify(
-                &state_guard,
-                cfg,
-                &tid,
-                &privmsg,
-                &msgid,
-                sender_account.as_deref(),
-                &sender_tags,
-                None,
-            )
-            .await;
+            if !deliver_across_link(&state_guard, cfg, client_id, &tid, &privmsg, &msgid).await {
+                send_to_client_with_caps(
+                    &senders,
+                    &tid,
+                    privmsg.clone(),
+                    &target_caps,
+                    sender_account.as_deref(),
+                    Some(&msgid),
+                    Some(&msg.tags),
+                    cfg.server.client_tag_deny.as_deref(),
+                    &sender_tags,
+                )
+                .await;
+                push_notify(
+                    &state_guard,
+                    cfg,
+                    &tid,
+                    &privmsg,
+                    &msgid,
+                    sender_account.as_deref(),
+                    &sender_tags,
+                    None,
+                )
+                .await;
+            }
 
             // Keep direct conversations in history so CHATHISTORY can replay them.
             if pending_edit_msgid.is_none() {
@@ -1003,29 +1032,31 @@ pub async fn handle_notice(
                 Some(c) => c.read().await.capabilities.clone(),
                 None => Default::default(),
             };
-            send_to_client_with_caps(
-                &senders,
-                &tid,
-                base_msg.clone(),
-                &target_caps,
-                sender_account.as_deref(),
-                Some(&msgid),
-                Some(&msg.tags),
-                cfg.server.client_tag_deny.as_deref(),
-                &sender_tags,
-            )
-            .await;
-            push_notify(
-                &state_guard,
-                cfg,
-                &tid,
-                &base_msg,
-                &msgid,
-                sender_account.as_deref(),
-                &sender_tags,
-                None,
-            )
-            .await;
+            if !deliver_across_link(&state_guard, cfg, client_id, &tid, &base_msg, &msgid).await {
+                send_to_client_with_caps(
+                    &senders,
+                    &tid,
+                    base_msg.clone(),
+                    &target_caps,
+                    sender_account.as_deref(),
+                    Some(&msgid),
+                    Some(&msg.tags),
+                    cfg.server.client_tag_deny.as_deref(),
+                    &sender_tags,
+                )
+                .await;
+                push_notify(
+                    &state_guard,
+                    cfg,
+                    &tid,
+                    &base_msg,
+                    &msgid,
+                    sender_account.as_deref(),
+                    &sender_tags,
+                    None,
+                )
+                .await;
+            }
 
             {
                 let sender_nick = source.split('!').next().unwrap_or(&source);
@@ -1685,7 +1716,9 @@ pub async fn handle_tagmsg(
                 Some(c) => c.read().await.capabilities.clone(),
                 None => Default::default(),
             };
-            if target_caps.contains("message-tags") {
+            if !deliver_across_link(&state_guard, cfg, client_id, &tid, &base_msg, &msgid).await
+                && target_caps.contains("message-tags")
+            {
                 send_to_client_with_caps(
                     &senders,
                     &tid,

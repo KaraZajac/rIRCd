@@ -710,12 +710,19 @@ pub async fn run(
     let cfg_arc = Arc::new(RwLock::new(cfg));
 
     {
+        let link_ctx = crate::link::LinkContext {
+            cfg: cfg_arc.clone(),
+            state: state.clone(),
+            channels: channels.clone(),
+            senders: senders.clone(),
+            links: links.clone(),
+        };
         let cfg = cfg_arc.read().await;
         for addr in &cfg.server.listen_links {
-            crate::link::listen(addr.clone(), cfg_arc.clone(), links.clone()).await?;
+            crate::link::listen(addr.clone(), link_ctx.clone()).await?;
         }
         for link in cfg.links.iter().filter(|l| l.autoconnect) {
-            crate::link::autoconnect(link.clone(), cfg_arc.clone(), links.clone());
+            crate::link::autoconnect(link.clone(), link_ctx.clone());
         }
     }
 

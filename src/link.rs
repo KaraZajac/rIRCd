@@ -6,8 +6,10 @@
 //! reaches it is refused, so a mistake in one configuration cannot become an
 //! authentication bypass in the other.
 
+use crate::channel::ChannelStore;
 use crate::config::{Config, LinkConfig};
 use crate::protocol::{parse_message_with_limit, Message};
+use crate::user::{Senders, ServerState};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
@@ -246,6 +248,21 @@ pub fn read_greeting(lines: &[String], expected_password: &str) -> Result<LinkGr
     Err(LinkError::Io("the peer stopped before SERVER".into()))
 }
 
+/// Everything a link needs from the rest of the server.
+///
+/// A link is not a client: it reads and writes the same tables every command
+/// handler does, and it does so on its own task for as long as the link is up.
+/// Carrying them together keeps the shape of a link's signature from growing
+/// every time it learns to relay something new.
+#[derive(Clone)]
+pub struct LinkContext {
+    pub cfg: Arc<RwLock<Config>>,
+    pub state: Arc<RwLock<ServerState>>,
+    pub channels: Arc<RwLock<ChannelStore>>,
+    pub senders: Senders,
+    pub links: Arc<RwLock<LinkRegistry>>,
+}
+
 /// One server on the network, as this one knows it.
 #[derive(Debug, Clone)]
 pub struct RemoteServer {
@@ -330,6 +347,33 @@ impl LinkRegistry {
             }
             let _ = tx.try_send(msg.clone());
         }
+    }
+
+    /// Whether a given peer is the one that carries a server: either it is that
+    /// server, or that server was introduced from behind it.
+    ///
+    /// A link only speaks for what it carries. Without this a peer could
+    /// announce users for a server on the far side of the network, and they
+    /// would still be here after that link dropped, because nothing that went
+    /// with it would name them.
+    pub fn carried_by(&self, sid: &str, peer: &str) -> bool {
+        if sid == peer {
+            return true;
+        }
+        self.servers
+            .get(sid)
+            .and_then(|s| s.behind.as_deref())
+            .is_some_and(|behind| behind == peer)
+    }
+
+    /// The queue that reaches a given server: its own if it is attached here,
+    /// otherwise the queue of the peer it sits behind.
+    pub fn route(&self, sid: &str) -> Option<&tokio::sync::mpsc::Sender<Message>> {
+        if let Some(tx) = self.peers.get(sid) {
+            return Some(tx);
+        }
+        let behind = self.servers.get(sid)?.behind.as_deref()?;
+        self.peers.get(behind)
     }
 }
 
@@ -460,8 +504,7 @@ where
 pub async fn serve_link<S>(
     stream: S,
     peer_addr: String,
-    cfg_arc: Arc<RwLock<Config>>,
-    links: Arc<RwLock<LinkRegistry>>,
+    ctx: LinkContext,
     // Set when this server dialled out: which link it was, so the answer can
     // be checked against the server it meant to reach.
     expect: Option<LinkConfig>,
@@ -476,7 +519,7 @@ pub async fn serve_link<S>(
     // for its duration would let an unauthenticated peer stall a REHASH, and
     // through it every command handler waiting to read the configuration.
     let intro = {
-        let cfg = cfg_arc.read().await;
+        let cfg = ctx.cfg.read().await;
         Introduction {
             greeting: greeting_lines(&cfg),
             links: cfg.links.clone(),
@@ -517,7 +560,7 @@ pub async fn serve_link<S>(
         }
     };
 
-    if links.read().await.is_linked(&greeting.sid) {
+    if ctx.links.read().await.is_linked(&greeting.sid) {
         warn!(
             peer = %greeting.name,
             sid = %greeting.sid,
@@ -537,7 +580,7 @@ pub async fn serve_link<S>(
         hops: 1,
         behind: None,
     };
-    links.write().await.attach(remote, tx.clone());
+    ctx.links.write().await.attach(remote, tx.clone());
     info!(
         peer = %greeting.name,
         sid = %greeting.sid,
@@ -576,6 +619,17 @@ pub async fn serve_link<S>(
         }
     });
 
+    // Everything we know goes out on its own task. Both sides burst at once,
+    // and a burst big enough to fill the queue would otherwise stop this server
+    // reading from the peer — while the peer, doing the same, waits for it.
+    let burst_task = {
+        let ctx = ctx.clone();
+        let tx = tx.clone();
+        let peer_sid = greeting.sid.clone();
+        let our_sid = ctx.state.read().await.sid.clone();
+        tokio::spawn(async move { send_burst(&ctx, &our_sid, &peer_sid, &tx).await })
+    };
+
     let mut line = String::new();
     loop {
         line.clear();
@@ -593,7 +647,7 @@ pub async fn serve_link<S>(
         }
         match parse_message_with_limit(trimmed, MAX_LINK_LINE) {
             Ok(msg) => {
-                if handle_link_message(&msg, &greeting.sid, &tx)
+                if handle_link_message(&ctx, &msg, &greeting.sid, &tx)
                     .await
                     .is_break()
                 {
@@ -606,21 +660,637 @@ pub async fn serve_link<S>(
         }
     }
 
+    burst_task.abort();
     ping_task.abort();
     writer_task.abort();
-    let gone = links.write().await.detach(&greeting.sid);
+    let gone = ctx.links.write().await.detach(&greeting.sid);
     for server in &gone {
         warn!(server = %server.name, "Netsplit: server is gone");
+    }
+    split_users(&ctx, &gone).await;
+}
+
+/// The users behind a link that dropped. They quit, because from here that is
+/// what has happened to them.
+async fn split_users(ctx: &LinkContext, gone: &[RemoteServer]) {
+    if gone.is_empty() {
+        return;
+    }
+    let sids: std::collections::HashSet<&str> = gone.iter().map(|s| s.sid.as_str()).collect();
+    let lost: Vec<String> = {
+        let state = ctx.state.read().await;
+        state
+            .users()
+            .map(|(id, _)| id.clone())
+            .filter(|id| owning_sid(id).is_some_and(|sid| sids.contains(sid)))
+            .collect()
+    };
+    if lost.is_empty() {
+        return;
+    }
+    info!(users = lost.len(), "Netsplit: forgetting users behind the split");
+    for uid in lost {
+        let client = ctx.state.write().await.remove_client(&uid).await;
+        if let Some(client) = client {
+            if let Some(nick) = client.read().await.nick.clone() {
+                monitor_notify(ctx, &nick, false, &nick).await;
+            }
+        }
+    }
+}
+
+/// The server a user id belongs to: the first three characters of it.
+fn owning_sid(uid: &str) -> Option<&str> {
+    if valid_uid(uid) {
+        Some(&uid[..3])
+    } else {
+        None
+    }
+}
+
+/// How a user is announced to the rest of the network.
+fn uid_message(sid: &str, c: &crate::user::Client) -> Message {
+    Message::new(
+        "UID",
+        vec![
+            c.nick.clone().unwrap_or_else(|| c.id.clone()),
+            "1".to_string(),
+            c.nick_ts.to_string(),
+            c.display_user().to_string(),
+            c.display_host().to_string(),
+            c.id.clone(),
+            c.account.clone().unwrap_or_else(|| "*".to_string()),
+            c.realname.clone().unwrap_or_default(),
+        ],
+    )
+    .with_prefix(sid)
+}
+
+/// Everything this server knows, sent as soon as a link is up.
+///
+/// Both sides burst at once and neither waits for the other: `EOB` says a side
+/// has finished sending, not that it has finished receiving, and the state each
+/// ends up with is the union of the two.
+async fn send_burst(
+    ctx: &LinkContext,
+    our_sid: &str,
+    peer_sid: &str,
+    tx: &tokio::sync::mpsc::Sender<Message>,
+) {
+    // The servers we carry, so the peer learns the shape of the network beyond
+    // us. The peer itself is not one of them.
+    let servers: Vec<RemoteServer> = ctx
+        .links
+        .read()
+        .await
+        .all()
+        .filter(|s| s.sid != peer_sid)
+        .cloned()
+        .collect();
+    for server in servers {
+        let _ = tx
+            .send(
+                Message::new(
+                    "SERVER",
+                    vec![
+                        server.name.clone(),
+                        (server.hops + 1).to_string(),
+                        server.sid.clone(),
+                        server.description.clone(),
+                    ],
+                )
+                .with_prefix(our_sid),
+            )
+            .await;
+    }
+
+    // Every user, named by the server it is really on rather than by whoever
+    // passed it along — and never back to the peer that told us about it.
+    let users: Vec<Arc<RwLock<crate::user::Client>>> = {
+        let state = ctx.state.read().await;
+        state.users().map(|(_, c)| c.clone()).collect()
+    };
+    for user in users {
+        let guard = user.read().await;
+        if !guard.registered || guard.nick.is_none() {
+            continue;
+        }
+        let origin = owning_sid(&guard.id).unwrap_or(our_sid);
+        if origin == peer_sid {
+            continue;
+        }
+        let _ = tx.send(uid_message(origin, &guard)).await;
+    }
+
+    let _ = tx
+        .send(Message::new("EOB", vec![]).with_prefix(our_sid))
+        .await;
+}
+
+/// Tell the local watchers of a nick that it came online or went offline.
+async fn monitor_notify(ctx: &LinkContext, nick: &str, online: bool, source: &str) {
+    let watchers: Vec<String> = {
+        let state = ctx.state.read().await;
+        match state.monitor_watchers.watchers(&nick.to_lowercase()) {
+            Some(set) => set.iter().cloned().collect(),
+            None => Vec::new(),
+        }
+    };
+    if watchers.is_empty() {
+        return;
+    }
+    let server = ctx.cfg.read().await.server.name.clone();
+    let state = ctx.state.read().await;
+    let registry = ctx.senders.read().await;
+    let code = if online { "730" } else { "731" };
+    let subject = if online { source } else { nick };
+    for watcher in watchers {
+        let watcher_nick = match state.clients.get(&watcher) {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => continue,
+        };
+        registry.deliver(
+            &watcher,
+            &Message::new(code, vec![watcher_nick, subject.to_string()]).with_prefix(&server),
+        );
+    }
+}
+
+/// A user arrived from another server. It goes in the same tables as a local
+/// one — a nick is a nick wherever it is held — with no connection behind it.
+async fn accept_remote_user(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(nick), Some(nick_ts), Some(user), Some(host), Some(uid)) = (
+        msg.params.first(),
+        msg.params.get(2),
+        msg.params.get(3),
+        msg.params.get(4),
+        msg.params.get(5),
+    ) else {
+        warn!(peer = %peer_sid, "Malformed UID from a linked server");
+        return;
+    };
+    if !valid_uid(uid) {
+        warn!(peer = %peer_sid, uid = %uid, "Refusing a user with an unusable id");
+        return;
+    }
+    if ctx.state.read().await.clients.contains_key(uid) {
+        // Already known. A burst and an announcement of the same user can cross
+        // on a link that came up while somebody was registering, and the second
+        // one to arrive is not a new person.
+        return;
+    }
+    let account = msg.params.get(6).filter(|a| a.as_str() != "*").cloned();
+    let realname = msg.params.get(7).cloned().unwrap_or_default();
+    let origin = msg.prefix.clone().unwrap_or_else(|| peer_sid.to_string());
+    if origin != uid[..3] {
+        warn!(peer = %peer_sid, uid = %uid, origin = %origin, "A user's id does not match the server introducing it");
+        return;
+    }
+    let server_name = {
+        let links = ctx.links.read().await;
+        if !links.carried_by(&origin, peer_sid) {
+            warn!(peer = %peer_sid, origin = %origin, "Refusing a user for a server this link does not carry");
+            return;
+        }
+        let named = links.all().find(|s| s.sid == origin).map(|s| s.name.clone());
+        named.unwrap_or_else(|| origin.clone())
+    };
+
+    let mut client = crate::user::Client::new(uid.clone(), host.clone());
+    client.nick = Some(nick.clone());
+    client.user = Some(user.clone());
+    client.realname = Some(realname);
+    client.registered = true;
+    client.account = account;
+    client.nick_ts = nick_ts
+        .parse()
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp());
+    client.signon_at = client.nick_ts;
+    client.server = Some(server_name);
+    // Nothing on this server reads for it, so it has no connections.
+    client.sessions.clear();
+    let source = client.source().unwrap_or_else(|| nick.clone());
+
+    let holder = ctx
+        .state
+        .read()
+        .await
+        .nick_to_id
+        .get(&nick.to_uppercase())
+        .cloned();
+    if let Some(holder) = holder {
+        if holder != *uid {
+            resolve_nick_collision(ctx, &holder, uid, nick, client.nick_ts).await;
+        }
+    }
+
+    let kept_nick = {
+        let mut state = ctx.state.write().await;
+        let kept = !state.nick_to_id.contains_key(&nick.to_uppercase());
+        if !kept {
+            // The collision was settled against the arriving user: it answers to
+            // its own id until it picks another name.
+            client.nick = Some(uid.clone());
+        }
+        state.add_remote_user(client).await;
+        kept
+    };
+    // Nobody is watching for a user that arrived under its own id, and telling
+    // them the nick came online when somebody else is holding it would be a lie.
+    if kept_nick {
+        monitor_notify(ctx, nick, true, &source).await;
+    }
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// Two users hold one nick. The older claim keeps it; the newer is renamed to
+/// its own id, and told so if it is ours.
+///
+/// Both servers run this on their own copy of the same two timestamps, so they
+/// reach the same answer without having to agree on one first.
+async fn resolve_nick_collision(
+    ctx: &LinkContext,
+    holder_id: &str,
+    arriving_id: &str,
+    nick: &str,
+    arriving_ts: i64,
+) {
+    let holder_ts = {
+        let state = ctx.state.read().await;
+        match state.clients.get(holder_id) {
+            Some(c) => c.read().await.nick_ts,
+            None => return,
+        }
+    };
+    if holder_ts <= arriving_ts {
+        // The one already here is older and keeps the nick. The caller finds it
+        // still taken and renames the arriving user.
+        warn!(nick = %nick, kept = %holder_id, renamed = %arriving_id, "Nick collision");
+        return;
+    }
+    warn!(nick = %nick, kept = %arriving_id, renamed = %holder_id, "Nick collision");
+    let (source, is_local) = {
+        let state = ctx.state.read().await;
+        match state.clients.get(holder_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (
+                    g.source().unwrap_or_else(|| nick.to_string()),
+                    g.server.is_none(),
+                )
+            }
+            None => return,
+        }
+    };
+    {
+        let mut state = ctx.state.write().await;
+        state.nick_to_id.remove(&nick.to_uppercase());
+        if let Some(c) = state.clients.get(holder_id) {
+            c.write().await.nick = Some(holder_id.to_string());
+        }
+        state
+            .nick_to_id
+            .insert(holder_id.to_uppercase(), holder_id.to_string());
+    }
+    if is_local {
+        ctx.senders.read().await.deliver(
+            holder_id,
+            &Message::new("NICK", vec![holder_id.to_string()]).with_prefix(&source),
+        );
+        // The rest of the network hears about our user's rename from us.
+        let ts = chrono::Utc::now().timestamp();
+        ctx.links.read().await.relay(
+            &Message::new("NICK", vec![holder_id.to_string(), ts.to_string()])
+                .with_prefix(holder_id),
+            None,
+        );
+    }
+}
+
+/// A user changed its nick on another server.
+async fn accept_remote_nick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(uid), Some(new_nick)) = (msg.prefix.as_ref(), msg.params.first()) else {
+        return;
+    };
+    let ts = msg
+        .params
+        .get(1)
+        .and_then(|t| t.parse::<i64>().ok())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let old = {
+        let state = ctx.state.read().await;
+        match state.clients.get(uid) {
+            Some(c) => c.read().await.nick.clone(),
+            None => {
+                warn!(peer = %peer_sid, uid = %uid, "NICK for a user we do not know");
+                return;
+            }
+        }
+    };
+    {
+        let mut state = ctx.state.write().await;
+        if let Some(ref o) = old {
+            state.nick_to_id.remove(&o.to_uppercase());
+        }
+        if let Some(c) = state.clients.get(uid) {
+            let mut g = c.write().await;
+            g.nick = Some(new_nick.clone());
+            g.nick_ts = ts;
+        }
+        state
+            .nick_to_id
+            .insert(new_nick.to_uppercase(), uid.clone());
+    }
+    if let Some(o) = old {
+        monitor_notify(ctx, &o, false, &o).await;
+    }
+    monitor_notify(ctx, new_nick, true, new_nick).await;
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A user on another server left the network.
+async fn accept_remote_quit(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let Some(uid) = msg.prefix.clone() else {
+        return;
+    };
+    let gone = ctx.state.write().await.remove_client(&uid).await;
+    if let Some(client) = gone {
+        if let Some(nick) = client.read().await.nick.clone() {
+            monitor_notify(ctx, &nick, false, &nick).await;
+        }
+    }
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A message from a user on another server. Ours to deliver if it is addressed
+/// to one of our users, otherwise ours to pass along.
+async fn accept_remote_message(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(from), Some(target)) = (msg.prefix.clone(), msg.params.first().cloned()) else {
+        return;
+    };
+    let Some(target_sid) = owning_sid(&target) else {
+        return;
+    };
+    let our_sid = ctx.state.read().await.sid.clone();
+    if target_sid != our_sid {
+        // The server that holds the target is the one that delivers it.
+        if let Some(tx) = ctx.links.read().await.route(target_sid) {
+            let _ = tx.try_send(msg.clone());
+        }
+        return;
+    }
+    let (source, sender_account, sender_tags) = {
+        let state = ctx.state.read().await;
+        match state.clients.get(&from) {
+            Some(c) => {
+                let g = c.read().await;
+                (
+                    g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
+                    g.account.clone(),
+                    crate::protocol::SenderTags::new(g.bot, g.oper_name.clone()),
+                )
+            }
+            None => {
+                warn!(peer = %peer_sid, from = %from, "Message from a user we do not know");
+                return;
+            }
+        }
+    };
+    let (target_nick, target_caps) = {
+        let state = ctx.state.read().await;
+        match state.clients.get(&target) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.nick_or_id().to_string(), g.capabilities.clone())
+            }
+            None => return,
+        }
+    };
+
+    // The recipient sees a message from a person, not from a user id, addressed
+    // to the name they answer to here.
+    let mut out = msg.clone();
+    out.prefix = Some(source);
+    out.params[0] = target_nick;
+    // The msgid and the time came with it and are kept; everything else about
+    // how the message looks is decided here, against what this recipient
+    // negotiated with this server.
+    let msgid = out.tags.get("msgid").cloned().flatten();
+    let client_tag_deny = ctx.cfg.read().await.server.client_tag_deny.clone();
+    let client_only: std::collections::HashMap<String, Option<String>> = out
+        .tags
+        .iter()
+        .filter(|(k, _)| k.starts_with('+'))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let out = crate::protocol::add_tags_for_recipient(
+        out,
+        &target_caps,
+        sender_account.as_deref(),
+        msgid.as_deref(),
+        Some(&client_only),
+        client_tag_deny.as_deref(),
+        &sender_tags,
+    );
+    ctx.senders.read().await.deliver(&target, &out);
+}
+
+/// An operator on another server killed one of our users.
+async fn accept_remote_kill(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(from), Some(target)) = (msg.prefix.clone(), msg.params.first().cloned()) else {
+        return;
+    };
+    let reason = msg.params.get(1).cloned().unwrap_or_default();
+    let Some(target_sid) = owning_sid(&target) else {
+        return;
+    };
+    let our_sid = ctx.state.read().await.sid.clone();
+    if target_sid != our_sid {
+        // Not ours to carry out; the server that holds them does it.
+        if let Some(tx) = ctx.links.read().await.route(target_sid) {
+            let _ = tx.try_send(msg.clone());
+        }
+        return;
+    }
+    let killer = {
+        let state = ctx.state.read().await;
+        match state.clients.get(&from) {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => from.clone(),
+        }
+    };
+    let (source, channel_names) = {
+        let state = ctx.state.read().await;
+        match state.clients.get(&target) {
+            Some(c) => {
+                let g = c.read().await;
+                (
+                    g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
+                    g.channels.keys().cloned().collect::<Vec<_>>(),
+                )
+            }
+            None => return,
+        }
+    };
+    warn!(peer = %peer_sid, killer = %killer, target = %target, "Killed from another server");
+
+    ctx.senders.write().await.close_user(
+        &target,
+        Message::new(
+            "ERROR",
+            vec![format!("Closing link: Killed ({} ({}))", killer, reason)],
+        ),
+    );
+
+    let text = format!("Killed by {} ({})", killer, reason);
+    let quit = Message::new("QUIT", vec![text.clone()]).with_prefix(&source);
+    for ch_name in &channel_names {
+        let mut store = ctx.channels.write().await;
+        let mut empty = false;
+        if let Some(ch) = store.channels.get_mut(ch_name) {
+            let mut ch = ch.write().await;
+            let members: Vec<String> = ch
+                .members
+                .keys()
+                .filter(|m| **m != target)
+                .cloned()
+                .collect();
+            ch.members.remove(&target);
+            empty = ch.members.is_empty();
+            drop(ch);
+            let registry = ctx.senders.read().await;
+            for member in members {
+                registry.deliver(&member, &quit);
+            }
+        }
+        if empty {
+            store.channels.remove(ch_name);
+        }
+    }
+    ctx.state.write().await.remove_client(&target).await;
+    // Every server hears about it as a QUIT, which is what it is to them — the
+    // one that asked for the kill included, since that is how it learns the
+    // user is gone.
+    ctx.links.read().await.relay(
+        &Message::new("QUIT", vec![text]).with_prefix(&target),
+        None,
+    );
+}
+
+/// A user on another server went away, or came back.
+async fn accept_remote_away(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let Some(uid) = msg.prefix.as_ref() else {
+        return;
+    };
+    let away = msg.params.first().filter(|m| !m.is_empty()).cloned();
+    {
+        let state = ctx.state.read().await;
+        match state.clients.get(uid) {
+            Some(c) => c.write().await.away_message = away,
+            None => return,
+        }
+    }
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A server introduced behind the peer.
+async fn accept_remote_server(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(name), Some(hops), Some(sid)) =
+        (msg.params.first(), msg.params.get(1), msg.params.get(2))
+    else {
+        return;
+    };
+    if !valid_sid(sid) {
+        warn!(peer = %peer_sid, sid = %sid, "Refusing a server with an unusable id");
+        return;
+    }
+    let our_sid = ctx.state.read().await.sid.clone();
+    if *sid == our_sid {
+        warn!(peer = %peer_sid, sid = %sid, "A linked server is using our own id");
+        return;
+    }
+    ctx.links.write().await.introduce(RemoteServer {
+        name: name.clone(),
+        sid: sid.clone(),
+        description: msg.params.get(3).cloned().unwrap_or_default(),
+        hops: hops.parse().unwrap_or(2),
+        behind: Some(peer_sid.to_string()),
+    });
+    info!(peer = %peer_sid, server = %name, sid = %sid, "Server introduced");
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// Send a message to every link. Does nothing on a server that has none, which
+/// is what lets the command handlers call these without asking first.
+async fn broadcast(cfg: &Config, msg: Message) {
+    let Some(ref links) = cfg.links_runtime else {
+        return;
+    };
+    links.read().await.relay(&msg, None);
+}
+
+/// Tell the network about a user that just registered here.
+pub async fn announce_user(cfg: &Config, client: &crate::user::Client) {
+    if cfg.links_runtime.is_none() {
+        return;
+    }
+    broadcast(cfg, uid_message(&our_sid(cfg), client)).await;
+}
+
+/// Tell the network that one of our users took a new nick.
+pub async fn announce_nick(cfg: &Config, uid: &str, nick: &str, ts: i64) {
+    broadcast(
+        cfg,
+        Message::new("NICK", vec![nick.to_string(), ts.to_string()]).with_prefix(uid),
+    )
+    .await;
+}
+
+/// Tell the network that one of our users has gone.
+pub async fn announce_quit(cfg: &Config, uid: &str, reason: &str) {
+    broadcast(
+        cfg,
+        Message::new("QUIT", vec![reason.to_string()]).with_prefix(uid),
+    )
+    .await;
+}
+
+/// Tell the network whether one of our users is away.
+pub async fn announce_away(cfg: &Config, uid: &str, away: Option<&str>) {
+    let params = away.map(|m| vec![m.to_string()]).unwrap_or_default();
+    broadcast(cfg, Message::new("AWAY", params).with_prefix(uid)).await;
+}
+
+/// Send a message to a user on another server. Returns whether there was a way
+/// to reach it — false means the target is not somewhere this server can get to,
+/// and the caller answers as it would for a nick that is not here.
+pub async fn route_to_user(cfg: &Config, from_uid: &str, target_uid: &str, msg: &Message) -> bool {
+    let Some(ref links) = cfg.links_runtime else {
+        return false;
+    };
+    let Some(sid) = owning_sid(target_uid) else {
+        return false;
+    };
+    let mut out = msg.clone();
+    out.prefix = Some(from_uid.to_string());
+    if out.params.is_empty() {
+        out.params.push(target_uid.to_string());
+    } else {
+        out.params[0] = target_uid.to_string();
+    }
+    match links.read().await.route(sid) {
+        Some(tx) => tx.try_send(out).is_ok(),
+        None => false,
     }
 }
 
 /// What to do with one message from a linked server.
 ///
-/// Stage one carries the link itself: users, channels and traffic come next,
-/// and anything else is ignored rather than guessed at — a message this server
-/// does not understand is one a newer peer sent, and dropping it is better than
-/// acting on half of it.
+/// Anything this server does not understand is ignored rather than guessed at:
+/// a message it does not know is one a newer peer sent, and dropping it is
+/// better than acting on half of it.
 async fn handle_link_message(
+    ctx: &LinkContext,
     msg: &Message,
     peer_sid: &str,
     peer: &tokio::sync::mpsc::Sender<Message>,
@@ -633,6 +1303,38 @@ async fn handle_link_message(
             std::ops::ControlFlow::Continue(())
         }
         "PONG" => std::ops::ControlFlow::Continue(()),
+        "SERVER" => {
+            accept_remote_server(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "UID" => {
+            accept_remote_user(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "NICK" => {
+            accept_remote_nick(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "QUIT" => {
+            accept_remote_quit(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "KILL" => {
+            accept_remote_kill(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "AWAY" => {
+            accept_remote_away(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "PRIVMSG" | "NOTICE" | "TAGMSG" => {
+            accept_remote_message(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "EOB" => {
+            info!(peer = %peer_sid, "Burst complete");
+            std::ops::ControlFlow::Continue(())
+        }
         "SQUIT" | "ERROR" => {
             warn!(
                 peer = %peer_sid,
@@ -649,11 +1351,7 @@ async fn handle_link_message(
 }
 
 /// Accept links on this server's link ports.
-pub async fn listen(
-    addr: String,
-    cfg_arc: Arc<RwLock<Config>>,
-    links: Arc<RwLock<LinkRegistry>>,
-) -> std::io::Result<()> {
+pub async fn listen(addr: String, ctx: LinkContext) -> std::io::Result<()> {
     let bind = if let Some(port) = addr.strip_prefix(':') {
         format!("0.0.0.0:{}", port)
     } else {
@@ -665,10 +1363,9 @@ pub async fn listen(
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
-                    let cfg_arc = cfg_arc.clone();
-                    let links = links.clone();
+                    let ctx = ctx.clone();
                     tokio::spawn(async move {
-                        serve_link(stream, peer.ip().to_string(), cfg_arc, links, None).await;
+                        serve_link(stream, peer.ip().to_string(), ctx, None).await;
                     });
                 }
                 Err(e) => {
@@ -687,11 +1384,7 @@ pub async fn listen(
 /// once; the second link to arrive is refused as already linked, and whichever
 /// one survives is the one the network uses. That is why the delay grows —
 /// two servers retrying in lockstep would refuse each other for ever.
-pub fn autoconnect(
-    link: LinkConfig,
-    cfg_arc: Arc<RwLock<Config>>,
-    links: Arc<RwLock<LinkRegistry>>,
-) {
+pub fn autoconnect(link: LinkConfig, ctx: LinkContext) {
     let Some(host) = link.host.clone() else {
         warn!(link = %link.name, "No host configured; waiting to be connected to instead");
         return;
@@ -699,7 +1392,7 @@ pub fn autoconnect(
     tokio::spawn(async move {
         let mut delay = std::time::Duration::from_secs(2);
         loop {
-            if links.read().await.is_linked(&link.sid) {
+            if ctx.links.read().await.is_linked(&link.sid) {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -708,14 +1401,7 @@ pub fn autoconnect(
                 Ok(stream) => {
                     info!(link = %link.name, target = %target, "Connecting");
                     delay = std::time::Duration::from_secs(2);
-                    serve_link(
-                        stream,
-                        target.clone(),
-                        cfg_arc.clone(),
-                        links.clone(),
-                        Some(link.clone()),
-                    )
-                    .await;
+                    serve_link(stream, target.clone(), ctx.clone(), Some(link.clone())).await;
                     warn!(link = %link.name, "Link closed");
                 }
                 Err(e) => {
@@ -892,5 +1578,96 @@ mod tests {
         assert_eq!(names, ["2AA", "3AA"].into_iter().collect());
         assert!(reg.is_linked("4AA"), "an unrelated server should remain");
         assert_eq!(reg.count(), 1);
+    }
+
+    /// The burst line is the only thing the other server ever learns about a
+    /// user, so every field has to survive being written and read back —
+    /// including a realname with spaces in it, which is most of them.
+    #[test]
+    fn a_user_survives_the_wire() {
+        let mut client = crate::user::Client::new("1AAAAAAAB".into(), "10.0.0.9".into());
+        client.nick = Some("kara".into());
+        client.user = Some("k".into());
+        client.realname = Some("Kara of the Wire".into());
+        client.account = Some("kara".into());
+        client.nick_ts = 1_700_000_000;
+        client.registered = true;
+
+        let line = crate::protocol::format_message(&uid_message("1AA", &client));
+        let parsed = parse_message_with_limit(line.trim_end_matches(['\r', '\n']), MAX_LINK_LINE)
+            .expect("a burst line must parse");
+
+        assert_eq!(parsed.prefix.as_deref(), Some("1AA"));
+        assert_eq!(parsed.command, "UID");
+        assert_eq!(parsed.params.first().map(String::as_str), Some("kara"));
+        assert_eq!(
+            parsed.params.get(2).map(String::as_str),
+            Some("1700000000"),
+            "the nick timestamp is what settles a collision"
+        );
+        assert_eq!(parsed.params.get(3).map(String::as_str), Some("k"));
+        assert_eq!(parsed.params.get(4).map(String::as_str), Some("10.0.0.9"));
+        assert_eq!(parsed.params.get(5).map(String::as_str), Some("1AAAAAAAB"));
+        assert_eq!(parsed.params.get(6).map(String::as_str), Some("kara"));
+        assert_eq!(
+            parsed.params.get(7).map(String::as_str),
+            Some("Kara of the Wire")
+        );
+    }
+
+    /// A user with no account still has to produce eight parameters, or the
+    /// realname would arrive where the account belongs.
+    #[test]
+    fn a_user_with_no_account_keeps_its_shape() {
+        let mut client = crate::user::Client::new("1AAAAAAAC".into(), "host".into());
+        client.nick = Some("nobody".into());
+        client.user = Some("n".into());
+        client.realname = Some("no account here".into());
+
+        let msg = uid_message("1AA", &client);
+        assert_eq!(msg.params.len(), 8);
+        assert_eq!(msg.params[6], "*", "an absent account is a star, not a gap");
+    }
+
+    #[test]
+    fn a_user_id_names_the_server_it_is_on() {
+        assert_eq!(owning_sid("1AAAAAAAB"), Some("1AA"));
+        // Connection ids are not user ids, and must never be mistaken for one:
+        // routing on the first three characters of "client-12" would send a
+        // message to a server called "cli".
+        assert_eq!(owning_sid("client-12"), None);
+        assert_eq!(owning_sid("ws-7"), None);
+        assert_eq!(owning_sid(""), None);
+    }
+
+    /// A message for a server two links away goes out through the peer it sits
+    /// behind, because that is the only queue this server has to it.
+    #[test]
+    fn a_route_follows_the_link_a_server_is_behind() {
+        let mut reg = LinkRegistry::default();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(4);
+        reg.attach(
+            RemoteServer {
+                name: "irc2.example.org".into(),
+                sid: "2AA".into(),
+                description: "peer".into(),
+                hops: 1,
+                behind: None,
+            },
+            tx,
+        );
+        reg.introduce(RemoteServer {
+            name: "irc3.example.org".into(),
+            sid: "3AA".into(),
+            description: "behind the peer".into(),
+            hops: 2,
+            behind: Some("2AA".into()),
+        });
+        assert!(reg.route("2AA").is_some(), "the peer itself is reachable");
+        assert!(
+            reg.route("3AA").is_some(),
+            "and so is what sits behind it"
+        );
+        assert!(reg.route("9ZZ").is_none(), "a server nobody carries is not");
     }
 }

@@ -154,7 +154,7 @@ pub async fn handle_who(
                             c.display_user(),
                             &c.host,
                             c.display_host(),
-                            &cfg.server.name,
+                            c.server.as_deref().unwrap_or(&cfg.server.name),
                             c.nick_or_id(),
                             &flags,
                             hopcount,
@@ -174,7 +174,7 @@ pub async fn handle_who(
                                 ch_key.clone(),
                                 c.display_user().to_string(),
                                 c.display_host().to_string(),
-                                cfg.server.name.clone(),
+                                c.server.clone().unwrap_or_else(|| cfg.server.name.clone()),
                                 c.nick_or_id().to_string(),
                                 flags_field,
                                 format!("{} {}", hopcount, realname),
@@ -255,7 +255,7 @@ pub async fn handle_who(
                         c.display_user(),
                         &c.host,
                         c.display_host(),
-                        &cfg.server.name,
+                        c.server.as_deref().unwrap_or(&cfg.server.name),
                         c.nick_or_id(),
                         &flags,
                         hopcount,
@@ -275,7 +275,7 @@ pub async fn handle_who(
                             "*".to_string(),
                             c.display_user().to_string(),
                             c.display_host().to_string(),
-                            cfg.server.name.clone(),
+                            c.server.clone().unwrap_or_else(|| cfg.server.name.clone()),
                             c.nick_or_id().to_string(),
                             flags_field,
                             format!("{} {}", hopcount, realname),
@@ -436,13 +436,14 @@ pub async fn handle_whois(
                         .with_prefix(&cfg.server.name)
                 );
             }
-            // 312 RPL_WHOISSERVER
+            // 312 RPL_WHOISSERVER — the server the user is actually on, which
+            // on a linked network is not always this one.
             send_reply!(Message::new(
                 "312",
                 vec![
                     nick.clone(),
                     target_nick.into(),
-                    cfg.server.name.clone(),
+                    c.server.clone().unwrap_or_else(|| cfg.server.name.clone()),
                     "rIRCd server".into(),
                 ],
             )

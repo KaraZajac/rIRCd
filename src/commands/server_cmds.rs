@@ -41,6 +41,9 @@ pub async fn handle_lusers(
     let peak_users = state.max_clients.max(total_users);
     let mut ops = 0usize;
     let mut invisible_users = 0usize;
+    // Local and global are different numbers once there is a network: the
+    // client tables hold everyone, and only some of them are here.
+    let mut local_users = 0usize;
     for (_, c) in state.users() {
         let g = c.read().await;
         if g.oper {
@@ -49,8 +52,16 @@ pub async fn handle_lusers(
         if g.invisible {
             invisible_users += 1;
         }
+        if g.server.is_none() {
+            local_users += 1;
+        }
     }
     let visible_users = total_users.saturating_sub(invisible_users);
+    let servers = match cfg.links_runtime {
+        Some(ref links) => links.read().await.count() + 1,
+        None => 1,
+    };
+    let peak_local = state.max_clients.max(local_users);
     let channels_count = channels.read().await.channels.len();
 
     // labeled-response: LUSERS produces multiple messages, wrap in batch
@@ -75,8 +86,8 @@ pub async fn handle_lusers(
         vec![
             nick.clone(),
             format!(
-                "There are {} users and {} invisible on 1 servers",
-                visible_users, invisible_users
+                "There are {} users and {} invisible on {} servers",
+                visible_users, invisible_users, servers
             ),
         ],
     )
@@ -107,7 +118,7 @@ pub async fn handle_lusers(
         "255",
         vec![
             nick.clone(),
-            format!("I have {} clients and 1 servers", total_users),
+            format!("I have {} clients and {} servers", local_users, servers),
         ],
     )
     .with_prefix(s));
@@ -117,9 +128,9 @@ pub async fn handle_lusers(
         "265",
         vec![
             nick.clone(),
-            total_users.to_string(),
-            peak_users.to_string(),
-            format!("Current local users {}, max {}", total_users, peak_users),
+            local_users.to_string(),
+            peak_local.to_string(),
+            format!("Current local users {}, max {}", local_users, peak_local),
         ],
     )
     .with_prefix(s));
@@ -1101,6 +1112,39 @@ pub async fn handle_kill(
         }
     };
 
+    // A user on another server is killed by the server that holds them: this one
+    // asks, and hears about the result as a QUIT like everybody else.
+    {
+        let state_r = state.read().await;
+        let remote = match state_r.clients.get(&tid) {
+            Some(c) => c.read().await.server.is_some(),
+            None => false,
+        };
+        let killer_id = state_r.user_id(client_id);
+        drop(state_r);
+        if remote {
+            let ask = Message::new("KILL", vec![tid.clone(), reason.clone()]);
+            if crate::link::route_to_user(cfg, &killer_id, &tid, &ask).await {
+                tracing::warn!(client_id, killer = %killer_nick, target = %target_nick, "KILL sent across the link");
+            }
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "NOTICE",
+                    vec![
+                        killer_nick,
+                        format!("Killed {}: {}", target_nick, reason),
+                    ],
+                )
+                .with_prefix(s),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
     let (target_source, target_channels, target_nick_upper) = {
         let state_r = state.read().await;
         match state_r.clients.get(&tid) {
@@ -1162,6 +1206,12 @@ pub async fn handle_kill(
         state_w.remove_client(&tid).await;
         state_w.nick_to_id.remove(&target_nick_upper);
     }
+    crate::link::announce_quit(
+        cfg,
+        &tid,
+        &format!("Killed by {} ({})", killer_nick, reason),
+    )
+    .await;
     tracing::warn!(client_id, killer = %killer_nick, target = %target_nick, reason = %reason, "KILL");
 
     // Notify the killer
@@ -1342,15 +1392,24 @@ pub async fn handle_rehash(
     let old_caps: std::collections::HashSet<String> =
         old_caps_raw[0].split(' ').map(|s| s.to_string()).collect();
 
-    // Preserve the live database pool and history writer — REHASH does not reconnect
-    let (existing_db, existing_history, existing_tls) = {
+    // Preserve the live database pool and history writer — REHASH does not
+    // reconnect. Nor does it re-link: the servers already attached stay
+    // attached, so the registry they are in has to survive the new config, or
+    // every link would still be up with nothing able to reach it.
+    let (existing_db, existing_history, existing_tls, existing_links) = {
         let c = cfg.read().await;
-        (c.db.clone(), c.history.clone(), c.tls_acceptor.clone())
+        (
+            c.db.clone(),
+            c.history.clone(),
+            c.tls_acceptor.clone(),
+            c.links_runtime.clone(),
+        )
     };
     let mut new_cfg = new_cfg;
     new_cfg.db = existing_db;
     new_cfg.history = existing_history;
     new_cfg.tls_acceptor = existing_tls.clone();
+    new_cfg.links_runtime = existing_links;
 
     // Reload the certificate: renewals happen on a schedule, and restarting to
     // pick one up would drop every connection.

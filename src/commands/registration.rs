@@ -224,6 +224,10 @@ pub async fn complete_registration(
                 .with_prefix(&cfg.server.name),
             );
             state.write().await.remove_client(&holder_id).await;
+            // To the rest of the network the earlier session is a user that has
+            // gone; the one resuming it arrives with an id of its own.
+            crate::link::announce_quit(cfg, &holder_id, "session resumed from another connection")
+                .await;
             state_guard = state.write().await;
         }
     }
@@ -314,6 +318,9 @@ pub async fn complete_registration(
             // The connection was its own user until now. File it under the user
             // id instead, so anything addressed to the user reaches it.
             senders.write().await.reassign_session(&uid, client_id);
+            // A new person on the network. A second connection for someone who
+            // is already here is not — the network has met them already.
+            crate::link::announce_user(cfg, &*client.read().await).await;
             client
         }
     };
@@ -1287,6 +1294,9 @@ pub async fn handle_nick(
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default();
             drop(state_guard);
+            // The rest of the network is told once the local tables are
+            // settled, and never while a lock over them is held.
+            crate::link::announce_nick(cfg, &user_id, &nick, nick_ts).await;
             let server = &cfg.server.name;
             let client_arc = state.read().await.clients.get(client_id).cloned();
             let new_source = match client_arc {
@@ -1857,6 +1867,9 @@ pub async fn handle_quit(
         state_w.certfps.remove(client_id);
         state_w.remove_client(&user_id).await;
     }
+    // The last connection is gone, so the person is gone from the network, not
+    // just from this server.
+    crate::link::announce_quit(cfg, &user_id, &reason).await;
 
     // QUIT ends the connection: send ERROR and close it. Dropping the sink is
     // not enough — the connection task holds a sender of its own, so without
@@ -4179,6 +4192,12 @@ pub async fn handle_away(
             .unwrap_or_default(),
     )
     .with_prefix(&source);
+    // Whether someone is away is part of who they are, so the whole network is
+    // told: a 301 on another server has to be right too.
+    {
+        let user_id = state.read().await.user_id(client_id);
+        crate::link::announce_away(cfg, &user_id, away_msg.as_deref()).await;
+    }
     let mut already_notified = std::collections::HashSet::new();
     for ch_name in &channel_list {
         let ch_store = channels.read().await;
