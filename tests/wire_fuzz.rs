@@ -163,3 +163,84 @@ fn nothing_that_parses_can_smuggle_a_second_line() {
         );
     }
 }
+
+/// The link protocol reads bytes a peer chose, and a peer is only as trusted as
+/// its password. These are the functions that look at those bytes first.
+///
+/// `valid_uid` used to cut the first three bytes off a nine-byte string without
+/// asking where its characters were, so `1A€DEFG` — nine bytes, six characters
+/// — panicked. That panic unwound past the end of the link's read loop, so the
+/// link was never detached: the registry kept a peer that had gone, its users
+/// stayed, and the server refused to let it back because it was already there.
+/// One malformed line, one server wedged until a restart.
+#[test]
+fn what_a_peer_sends_never_panics_the_link() {
+    use rircd::link::{valid_sid, valid_uid, LinkRegistry};
+
+    let mut rng = Rng(0x5eed_0f00_d00d_0007);
+    let mut accepted = 0u32;
+    for _ in 0..200_000u32 {
+        let s = gibberish(&mut rng, 5);
+
+        // Whatever it says, deciding is all these may do.
+        let is_sid = valid_sid(&s);
+        let is_uid = valid_uid(&s);
+        assert!(!is_sid || s.len() == 3, "a sid of {} bytes: {s:?}", s.len());
+        assert!(!is_uid || s.len() == 9, "a uid of {} bytes: {s:?}", s.len());
+        if is_uid {
+            // The promise the rest of the link code relies on: the first three
+            // bytes are a sid, and cutting there is safe.
+            assert!(s.is_char_boundary(3), "uid {s:?} cannot be cut at three");
+            assert!(valid_sid(&s[..3]), "uid {s:?} does not start with a sid");
+            accepted += 1;
+        }
+
+        // Routing looks a server up by whatever it was told.
+        let reg = LinkRegistry::default();
+        assert!(reg.route(&s).is_none());
+        assert!(!reg.is_linked(&s));
+        assert!(reg.by_name(&s).is_none());
+    }
+    assert!(
+        accepted > 0,
+        "the generator never produced a usable id, so nothing was tested"
+    );
+}
+
+/// Channel modes come off a link as a string of letters and a list of
+/// arguments, and neither has to make sense. Applying them may change the
+/// channel; it may not fall over.
+#[test]
+fn channel_modes_off_a_link_never_panic() {
+    use rircd::channel::Channel;
+
+    let mut rng = Rng(0x5eed_c0de_1111_0009);
+    for _ in 0..100_000u32 {
+        let letters = gibberish(&mut rng, 4);
+        let args: Vec<String> = (0..rng.below(4)).map(|_| gibberish(&mut rng, 2)).collect();
+
+        let mut ch = Channel::new("#fuzz".to_string());
+        ch.set_mode_string(&letters, &args);
+        ch.merge_mode_string(&letters, &args);
+
+        // What comes back out has to be something that goes back in.
+        let (out, out_args) = ch.mode_string();
+        assert!(out.starts_with('+'), "mode string without a sign: {out:?}");
+        let mut round = Channel::new("#fuzz".to_string());
+        round.set_mode_string(&out, &out_args);
+        assert_eq!(
+            round.mode_string(),
+            (out.clone(), out_args.clone()),
+            "modes changed on the way round: {letters:?} {args:?}"
+        );
+
+        // And the lists, which a mask is added to and taken off by name.
+        for letter in ['b', 'e', 'I', 'q', 'x', '\u{0}'] {
+            let mask = gibberish(&mut rng, 2);
+            let had = ch.list_contains(letter, &mask);
+            let removed = ch.remove_from_list(letter, &mask);
+            assert_eq!(had, removed, "removing {mask:?} from +{letter} disagreed");
+            assert!(!ch.list_contains(letter, &mask));
+        }
+    }
+}

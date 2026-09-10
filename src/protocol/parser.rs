@@ -6,7 +6,10 @@ use std::collections::HashMap;
 /// so it is the default rather than a hard ceiling.
 pub const DEFAULT_MAX_MESSAGE_BODY: usize = 512;
 const MAX_TAG_DATA: usize = 4094;
-const MAX_TOTAL_TAGGED: usize = 8191;
+/// The longest a whole line may be, tags included. Tags are counted separately
+/// from the body and have far more room, so this is the only bound on what one
+/// line can cost to read.
+pub const MAX_TOTAL_TAGGED: usize = 8191;
 
 /// Parse an IRC message from a line (without CRLF).
 /// Returns error if line exceeds limits or is malformed.

@@ -199,6 +199,13 @@ export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 
 status=0
 if [ "$SERVE_ONLY" = 0 ]; then
+  # The stress run goes first, because test_link.py ends by killing server B to
+  # watch the split, and nothing after that has two servers to stress.
+  # Set SMOKE_STRESS_SECONDS=0 to skip it.
+  if [ "${SMOKE_STRESS_SECONDS:-20}" != "0" ]; then
+    say "Running test_stress.py"
+    python3 "$HERE/test_stress.py" || status=1
+  fi
   say "Running test_link.py"
   python3 "$HERE/test_link.py" || status=1
 fi

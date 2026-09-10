@@ -1,7 +1,7 @@
 use crate::protocol::{format_message_within, parse_message_with_limit, Message, ParseError};
 use crate::server::ClientMessage;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -266,6 +266,11 @@ async fn handle_client_stream<S>(
     // The limit counts the CRLF that ends the line, so what a message may
     // actually carry is two bytes less than the number the limit is written as.
     let in_line_limit = out_line_limit;
+    // What one line may cost to read. Tags are counted separately from the body
+    // and are allowed far more room, so the body limit is not a bound on the
+    // line — this is.
+    let mut lines =
+        crate::linereader::BoundedLines::new(crate::protocol::MAX_TOTAL_TAGGED.max(in_line_limit));
     let mut writer_task = tokio::spawn(async move {
         write_loop(&mut writer, &mut send_rx, out_line_limit, &client_id_clone).await;
     });
@@ -292,7 +297,6 @@ async fn handle_client_stream<S>(
     let tx_clone = tx.clone();
     let mut quit_reason = "Connection closed";
 
-    let mut buf = Vec::new();
     loop {
         // Compute the next keepalive deadline
         // Before registration completes, use the registration timeout as the initial deadline
@@ -311,25 +315,33 @@ async fn handle_client_stream<S>(
                 quit_reason = "SendQ exceeded";
                 break;
             }
-            result = reader.read_until(b'\n', &mut buf) => {
+            result = lines.next(&mut reader) => {
                 match result {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        while buf.ends_with(b"\r") || buf.ends_with(b"\n") {
-                            buf.pop();
-                        }
+                    Ok(crate::linereader::Line::Eof) => break,
+                    // Refused before it was held: a peer that never ends its
+                    // line does not get to decide how much memory this server
+                    // spends on it.
+                    Ok(crate::linereader::Line::TooLong) => {
+                        let _ = send_tx.try_send(
+                            Message::new("417", vec!["*".into(), "Input line was too long".into()])
+                                .with_prefix(&server_name),
+                        );
+                        last_activity = tokio::time::Instant::now();
+                        continue;
+                    }
+                    Ok(crate::linereader::Line::Read) => {
+                        let buf = lines.line();
                         if buf.is_empty() {
-                            buf.clear();
                             continue;
                         }
-                        let line = match std::str::from_utf8(&buf) {
+                        let line = match std::str::from_utf8(buf) {
                             Ok(s) => s,
                             Err(_) => {
                                 // The line cannot be handled, but the command
                                 // word is ASCII in any message that has one, so
                                 // the client can still be told what was refused.
                                 let command = {
-                                    let lossy = String::from_utf8_lossy(&buf);
+                                    let lossy = String::from_utf8_lossy(buf);
                                     parse_message_with_limit(&lossy, in_line_limit)
                                     .map(|m| m.command)
                                     .unwrap_or_else(|_| "*".to_string())
@@ -345,7 +357,6 @@ async fn handle_client_stream<S>(
                                     )
                                     .with_prefix(&server_name),
                                 );
-                                buf.clear();
                                 continue;
                             }
                         };
@@ -405,8 +416,7 @@ async fn handle_client_stream<S>(
                                         )
                                         .with_prefix(&server_name);
                                         let _ = send_tx.try_send(reply);
-                                        buf.clear();
-                                        continue;
+                                                continue;
                                     }
                                     flood_tokens -= 1.0;
                                 }
@@ -449,7 +459,6 @@ async fn handle_client_stream<S>(
                                 let _ = send_tx.try_send(reply);
                             }
                         }
-                        buf.clear();
                     }
                     Err(e) => {
                         error!("Read error for {}: {}", client_id, e);

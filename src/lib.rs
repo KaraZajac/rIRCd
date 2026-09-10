@@ -5,6 +5,7 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod filehost;
+pub mod linereader;
 pub mod link;
 pub mod mail;
 pub mod persist;

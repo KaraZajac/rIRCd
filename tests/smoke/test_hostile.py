@@ -7,6 +7,7 @@ everybody else, because rIRCd runs every client's commands through a single
 dispatch loop.
 """
 
+import os
 import socket
 import time
 
@@ -392,6 +393,53 @@ check(
 )
 victim.close()
 attacker.close()
+
+section("a peer that never finishes its line")
+# Reading up to the newline means a peer that never sends one decides how much
+# memory this server spends on it. The bytes cost the sender a socket; they
+# must not cost the server anything it keeps.
+PIDFILE = os.environ.get("SMOKE_RIRCD_PID", "")
+
+
+def server_rss_kb():
+    if not PIDFILE or not os.path.exists(PIDFILE):
+        return None
+    try:
+        pid = int(open(PIDFILE).read().strip())
+        for line in open(f"/proc/{pid}/status"):
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+before = server_rss_kb()
+if before is None:
+    check("the server's memory could be measured", False, PIDFILE)
+else:
+    hogs = [socket.create_connection((IRC_HOST, IRC_PORT), timeout=5) for _ in range(4)]
+    chunk = b"x" * 65536
+    sent = 0
+    deadline = time.time() + 6
+    try:
+        while time.time() < deadline:
+            for h in hogs:
+                h.sendall(chunk)
+                sent += len(chunk)
+    except OSError:
+        pass
+    time.sleep(0.5)
+    after = server_rss_kb() or before
+    for h in hogs:
+        h.close()
+    grew = (after - before) / 1024.0
+    check(
+        f"{sent // 1000000} MB with no newline does not grow the server",
+        grew < 32,
+        f"RSS {before} kB -> {after} kB ({grew:.1f} MiB)",
+    )
+    check("and it is still serving afterwards", still_alive("the flood", f"h14{RUN}"))
 
 section("still standing")
 check("the server is still accepting and serving clients", still_alive("everything", f"h12{RUN}"))

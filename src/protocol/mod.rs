@@ -7,4 +7,7 @@ pub use format::{
     retain_negotiated_tags, server_time_now, to_server_time, truncate_bytes, SenderTags,
 };
 pub use message::Message;
-pub use parser::{parse_message, parse_message_with_limit, ParseError, DEFAULT_MAX_MESSAGE_BODY};
+pub use parser::{
+    parse_message, parse_message_with_limit, ParseError, DEFAULT_MAX_MESSAGE_BODY,
+    MAX_TOTAL_TAGGED,
+};

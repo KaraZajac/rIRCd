@@ -11,7 +11,7 @@ use crate::config::{Config, LinkConfig};
 use crate::protocol::{parse_message_with_limit, Message};
 use crate::user::{Senders, ServerState};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -104,11 +104,18 @@ pub fn next_uid(sid: &str, counter: &std::sync::atomic::AtomicU64) -> String {
 
 /// Whether a string looks like a user id this network would have issued.
 pub fn valid_uid(uid: &str) -> bool {
-    uid.len() == 9
-        && valid_sid(&uid[..3])
-        && uid[3..]
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    // Bytes, not characters, and the length is checked before anything is cut
+    // off it. `&uid[..3]` on a nine-byte string is not safe when a character
+    // straddles the third byte: it panics, and a peer chooses these bytes.
+    let b = uid.as_bytes();
+    b.len() == 9
+        && b[0].is_ascii_digit()
+        && b[1..3]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() && !c.is_ascii_lowercase())
+        && b[3..]
+            .iter()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 /// What a peer said about itself during the handshake.
@@ -377,6 +384,31 @@ impl LinkRegistry {
     }
 }
 
+/// One line from a peer, refusing to hold more of it than a line may be.
+///
+/// The handshake happens before the peer has proved it is allowed to talk, so
+/// everything it sends before then has to cost it more than it costs this
+/// server. A line with no end to it is refused as it arrives rather than kept.
+async fn read_link_line<S>(
+    stream: &mut BufReader<S>,
+    lines: &mut crate::linereader::BoundedLines,
+) -> Result<String, LinkError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, lines.next(stream))
+        .await
+        .map_err(|_| LinkError::Io("the peer did not finish its greeting".into()))?
+        .map_err(|e| LinkError::Io(e.to_string()))?;
+    match outcome {
+        crate::linereader::Line::Eof => Err(LinkError::Io("the peer closed the link".into())),
+        crate::linereader::Line::TooLong => Err(LinkError::Io("greeting line too long".into())),
+        crate::linereader::Line::Read => std::str::from_utf8(lines.line())
+            .map(|s| s.to_string())
+            .map_err(|_| LinkError::Io("greeting was not text".into())),
+    }
+}
+
 /// Accept a link on the server port: read the greeting, check it against a
 /// configured link, and hand back which one it was.
 pub async fn accept_greeting<S>(
@@ -387,19 +419,9 @@ where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut lines: Vec<String> = Vec::new();
+    let mut lines_in = crate::linereader::BoundedLines::new(MAX_LINK_LINE);
     loop {
-        let mut line = String::new();
-        let read = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_line(&mut line))
-            .await
-            .map_err(|_| LinkError::Io("the peer did not finish its greeting".into()))?
-            .map_err(|e| LinkError::Io(e.to_string()))?;
-        if read == 0 {
-            return Err(LinkError::Io("the peer closed the link".into()));
-        }
-        if line.len() > MAX_LINK_LINE {
-            return Err(LinkError::Io("greeting line too long".into()));
-        }
-        let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+        let trimmed = read_link_line(stream, &mut lines_in).await?;
         if trimmed.is_empty() {
             continue;
         }
@@ -451,19 +473,9 @@ where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut lines: Vec<String> = Vec::new();
+    let mut lines_in = crate::linereader::BoundedLines::new(MAX_LINK_LINE);
     loop {
-        let mut line = String::new();
-        let read = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_line(&mut line))
-            .await
-            .map_err(|_| LinkError::Io("the peer did not answer".into()))?
-            .map_err(|e| LinkError::Io(e.to_string()))?;
-        if read == 0 {
-            return Err(LinkError::Io("the peer closed the link".into()));
-        }
-        if line.len() > MAX_LINK_LINE {
-            return Err(LinkError::Io("greeting line too long".into()));
-        }
-        let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+        let trimmed = read_link_line(stream, &mut lines_in).await?;
         if trimmed.is_empty() {
             continue;
         }
@@ -630,28 +642,58 @@ pub async fn serve_link<S>(
         tokio::spawn(async move { send_burst(&ctx, &our_sid, &peer_sid, &tx).await })
     };
 
-    let mut line = String::new();
+    let mut lines = crate::linereader::BoundedLines::new(MAX_LINK_LINE);
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {}
+        match lines.next(&mut reader).await {
+            Ok(crate::linereader::Line::Eof) => break,
+            // A linked server is trusted with what it says, not with how much
+            // of it to hold before it says anything.
+            Ok(crate::linereader::Line::TooLong) => {
+                warn!(peer = %peer_name, "Refusing an over-long line from a linked server");
+                continue;
+            }
+            Ok(crate::linereader::Line::Read) => {}
             Err(e) => {
                 error!(peer = %peer_name, "Link read error: {}", e);
                 break;
             }
         }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let Ok(trimmed) = std::str::from_utf8(lines.line()) else {
+            warn!(peer = %peer_name, "Refusing a line that is not text");
+            continue;
+        };
         if trimmed.is_empty() {
             continue;
         }
         match parse_message_with_limit(trimmed, MAX_LINK_LINE) {
             Ok(msg) => {
-                if handle_link_message(&ctx, &msg, &greeting.sid, &tx)
-                    .await
-                    .is_break()
-                {
-                    break;
+                // A panic here would unwind past the end of this loop, and the
+                // link would never be detached: the registry would keep a peer
+                // that is gone, its users would stay, and the server would
+                // refuse to link it again because it was already linked. One
+                // message is worth losing; the link's own funeral is not.
+                use futures_util::future::FutureExt;
+                let handled = std::panic::AssertUnwindSafe(handle_link_message(
+                    &ctx,
+                    &msg,
+                    &greeting.sid,
+                    &tx,
+                ))
+                .catch_unwind()
+                .await;
+                match handled {
+                    Ok(flow) => {
+                        if flow.is_break() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        error!(
+                            peer = %peer_name,
+                            command = %msg.command,
+                            "Panic while handling a message from a linked server"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -707,7 +749,7 @@ async fn split_users(ctx: &LinkContext, gone: &[RemoteServer]) {
 /// The server a user id belongs to: the first three characters of it.
 fn owning_sid(uid: &str) -> Option<&str> {
     if valid_uid(uid) {
-        Some(&uid[..3])
+        uid.get(..3)
     } else {
         None
     }
@@ -919,7 +961,7 @@ async fn accept_remote_user(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     let account = msg.params.get(6).filter(|a| a.as_str() != "*").cloned();
     let realname = msg.params.get(7).cloned().unwrap_or_default();
     let origin = msg.prefix.clone().unwrap_or_else(|| peer_sid.to_string());
-    if origin != uid[..3] {
+    if Some(origin.as_str()) != uid.get(..3) {
         warn!(peer = %peer_sid, uid = %uid, origin = %origin, "A user's id does not match the server introducing it");
         return;
     }
@@ -2549,6 +2591,26 @@ async fn handle_link_message(
     }
 }
 
+/// Hands a link slot back when the connection ends, however it ends.
+struct LinkSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for LinkSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// How many connections may be on the link port at once.
+///
+/// A link port needs one connection per configured link, and a few more while
+/// one is being replaced. Anything past that is somebody who is not a server:
+/// each one costs a file descriptor and a task for as long as the handshake
+/// timeout, and the client ports count their connections for exactly this
+/// reason. Nothing has to be authenticated to get this far.
+fn link_slots(configured: usize) -> usize {
+    (configured * 4).max(8)
+}
+
 /// Accept links on this server's link ports.
 pub async fn listen(addr: String, ctx: LinkContext) -> std::io::Result<()> {
     let bind = if let Some(port) = addr.strip_prefix(':') {
@@ -2557,13 +2619,29 @@ pub async fn listen(addr: String, ctx: LinkContext) -> std::io::Result<()> {
         addr.clone()
     };
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    info!("Listening on {} (server links)", bind);
+    let slots = link_slots(ctx.cfg.read().await.links.len());
+    info!(limit = slots, "Listening on {} (server links)", bind);
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    let taken =
+                        in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let slot = LinkSlot(in_flight.clone());
+                    if taken > slots {
+                        warn!(
+                            peer = %peer.ip(),
+                            in_flight = taken,
+                            "Refusing a link connection: the link port is full"
+                        );
+                        drop(slot);
+                        drop(stream);
+                        continue;
+                    }
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
+                        let _slot = slot;
                         serve_link(stream, peer.ip().to_string(), ctx, None).await;
                     });
                 }
@@ -2826,6 +2904,46 @@ mod tests {
         let msg = uid_message("1AA", &client);
         assert_eq!(msg.params.len(), 8);
         assert_eq!(msg.params[6], "*", "an absent account is a star, not a gap");
+    }
+
+    /// A peer chooses the bytes in a `UID`, and nine of them do not have to be
+    /// nine characters. Cutting the first three off a string without checking
+    /// where the characters are panics — and a panic here would unwind past the
+    /// end of the link's read loop, leaving the registry holding a peer that
+    /// had gone and refusing to let it back.
+    /// The link port has to hold a connection open for the whole handshake, and
+    /// nothing has been authenticated by then. A network with two links does
+    /// not need thousands of them, and counting is what keeps somebody who is
+    /// not a server from taking a file descriptor and a task apiece.
+    #[test]
+    fn the_link_port_has_room_for_its_links_and_not_the_world() {
+        // Enough for a link being replaced while the old one is still closing.
+        assert!(link_slots(1) >= 4, "no room to reconnect a single link");
+        assert!(link_slots(10) >= 40);
+        // And a floor, so a server configured to be dialled rather than to dial
+        // still answers.
+        assert!(link_slots(0) >= 8, "a server that only accepts links cannot");
+        // It is a limit, not a suggestion.
+        assert!(link_slots(1000) < usize::MAX / 2);
+    }
+
+    #[test]
+    fn a_user_id_is_bytes_a_peer_chose() {
+        for hostile in [
+            "1A\u{20ac}DEFG",     // nine bytes, a character across the third
+            "\u{20ac}\u{20ac}\u{20ac}",       // nine bytes, three characters
+            "1AA\u{fffd}EFG",
+            "\u{e9}\u{e9}\u{e9}AAA",
+        ] {
+            assert_eq!(hostile.len(), 9, "{hostile:?} is not the length under test");
+            assert!(!valid_uid(hostile), "accepted {hostile:?} as a user id");
+            assert_eq!(owning_sid(hostile), None);
+        }
+        assert!(valid_uid("1AAAAAAAB"));
+        assert_eq!(owning_sid("1AAAAAAAB"), Some("1AA"));
+        // Lowercase is not a user id, so two ids cannot differ only by case.
+        assert!(!valid_uid("1AAaAAAAB"));
+        assert!(!valid_uid("1aAAAAAAB"));
     }
 
     #[test]

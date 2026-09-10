@@ -264,6 +264,7 @@ export SMOKE_OPER_NAME="smokeoper"
 export SMOKE_OPER_PASSWORD="$OPER_PASSWORD"
 export SMOKE_CONFIG="$ETC_DIR/config.toml"
 export SMOKE_RIRCD_BIN="$REPO/target/debug/rircd"
+export SMOKE_RIRCD_PID="$RUN_DIR/rircd.pid"
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 
 status=0
