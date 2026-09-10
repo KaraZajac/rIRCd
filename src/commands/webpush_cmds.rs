@@ -94,91 +94,24 @@ pub async fn handle_webpush(
                 .await;
                 return Ok(());
             }
-
-            if let Err(e) =
-                webpush::check_endpoint(&endpoint, runtime.allow_private_endpoints).await
-            {
-                let text = match e {
-                    EndpointError::NotHttps => "Push endpoints must use https",
-                    EndpointError::Unparseable => "Push endpoint is not a valid URL",
-                    EndpointError::PrivateAddress => {
-                        "Push endpoint resolves to a non-public address"
-                    }
-                    EndpointError::Unresolvable => "Push endpoint host does not resolve",
-                };
-                tracing::info!(client_id, account = %account, endpoint = %endpoint, "WEBPUSH REGISTER rejected: {}", text);
-                reply_to_client(&senders, client_id, fail("INVALID_PARAMS", text), label).await;
-                return Ok(());
-            }
-
-            let parsed = parse_keys(keys);
-            let (Some(p256dh), Some(auth)) = (parsed.get("p256dh"), parsed.get("auth")) else {
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    fail("INVALID_PARAMS", "Keys must include p256dh and auth"),
-                    label,
-                )
-                .await;
-                return Ok(());
-            };
-
-            if let Err(e) = webpush::validate_keys(p256dh, auth) {
-                reply_to_client(&senders, client_id, fail("INVALID_PARAMS", &e), label).await;
-                return Ok(());
-            }
-
-            let subscription = WebpushSubscription {
-                endpoint: endpoint.clone(),
-                p256dh: p256dh.clone(),
-                auth: auth.clone(),
-            };
-
-            match persist::save_webpush_subscription(
-                pool,
-                &account,
-                &subscription,
-                runtime.max_subscriptions,
-            )
-            .await
-            {
-                Ok(true) => {
-                    tracing::info!(client_id, account = %account, endpoint = %endpoint, "Web Push subscription registered");
-                    reply_to_client(
-                        &senders,
-                        client_id,
-                        Message::new("WEBPUSH", vec!["REGISTER".into(), endpoint])
-                            .with_prefix(&cfg.server.name),
-                        label,
-                    )
-                    .await;
-                }
-                Ok(false) => {
-                    reply_to_client(
-                        &senders,
-                        client_id,
-                        fail(
-                            "MAX_REGISTRATIONS",
-                            &format!(
-                                "At most {} push endpoints per account",
-                                runtime.max_subscriptions
-                            ),
-                        ),
-                        label,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    tracing::error!(client_id, account = %account, error = %e, "WEBPUSH REGISTER: database error");
-                    reply_to_client(
-                        &senders,
-                        client_id,
-                        fail("INTERNAL_ERROR", "Could not store the subscription"),
-                        label,
-                    )
-                    .await;
-                }
-            }
+            // Checking the endpoint means asking the network where a name the
+            // client chose lives, and every client's commands are handled by
+            // one loop: waiting here for a name server that is in no hurry is
+            // waiting on behalf of everybody. The rest of this registration
+            // goes with it, so the database write is off the loop too. Nothing
+            // is waiting on the order of the reply -- a client registers an
+            // endpoint once and reads the answer when it comes.
+            tokio::spawn(register_endpoint(
+                client_id.to_string(),
+                account,
+                endpoint,
+                keys.to_string(),
+                senders.clone(),
+                cfg.server.name.clone(),
+                pool.clone(),
+                runtime.clone(),
+                label.map(str::to_string),
+            ));
         }
         "UNREGISTER" => {
             if endpoint == "*" {
@@ -214,6 +147,120 @@ pub async fn handle_webpush(
         }
     }
     Ok(())
+}
+
+/// Do the slow half of `WEBPUSH REGISTER` away from the dispatch loop.
+///
+/// Resolving the endpoint's host and writing the subscription are both waits
+/// on something outside this process, and neither belongs on the loop that
+/// serves every other client.
+#[allow(clippy::too_many_arguments)]
+async fn register_endpoint(
+    client_id: String,
+    account: String,
+    endpoint: String,
+    keys: String,
+    senders: Senders,
+    server_name: String,
+    pool: sqlx::MySqlPool,
+    runtime: std::sync::Arc<webpush::WebpushRuntime>,
+    label: Option<String>,
+) {
+    let label = label.as_deref();
+    let fail = |code: &str, text: &str| {
+        Message::new(
+            "FAIL",
+            vec![
+                "WEBPUSH".into(),
+                code.into(),
+                "REGISTER".into(),
+                endpoint.clone(),
+                text.into(),
+            ],
+        )
+        .with_prefix(&server_name)
+    };
+
+    if let Err(e) = webpush::check_endpoint(&endpoint, runtime.allow_private_endpoints).await {
+        let text = match e {
+            EndpointError::NotHttps => "Push endpoints must use https",
+            EndpointError::Unparseable => "Push endpoint is not a valid URL",
+            EndpointError::PrivateAddress => "Push endpoint resolves to a non-public address",
+            EndpointError::Unresolvable => "Push endpoint host does not resolve",
+        };
+        tracing::info!(client_id, account = %account, endpoint = %endpoint, "WEBPUSH REGISTER rejected: {}", text);
+        reply_to_client(&senders, &client_id, fail("INVALID_PARAMS", text), label).await;
+        return;
+    }
+
+    let parsed = parse_keys(&keys);
+    let (Some(p256dh), Some(auth)) = (parsed.get("p256dh"), parsed.get("auth")) else {
+        reply_to_client(
+            &senders,
+            &client_id,
+            fail("INVALID_PARAMS", "Keys must include p256dh and auth"),
+            label,
+        )
+        .await;
+        return;
+    };
+
+    if let Err(e) = webpush::validate_keys(p256dh, auth) {
+        reply_to_client(&senders, &client_id, fail("INVALID_PARAMS", &e), label).await;
+        return;
+    }
+
+    let subscription = WebpushSubscription {
+        endpoint: endpoint.clone(),
+        p256dh: p256dh.clone(),
+        auth: auth.clone(),
+    };
+
+    match persist::save_webpush_subscription(
+        &pool,
+        &account,
+        &subscription,
+        runtime.max_subscriptions,
+    )
+    .await
+    {
+        Ok(true) => {
+            tracing::info!(client_id, account = %account, endpoint = %endpoint, "Web Push subscription registered");
+            reply_to_client(
+                &senders,
+                &client_id,
+                Message::new("WEBPUSH", vec!["REGISTER".into(), endpoint.clone()])
+                    .with_prefix(&server_name),
+                label,
+            )
+            .await;
+        }
+        Ok(false) => {
+            reply_to_client(
+                &senders,
+                &client_id,
+                fail(
+                    "MAX_REGISTRATIONS",
+                    &format!(
+                        "At most {} push endpoints per account",
+                        runtime.max_subscriptions
+                    ),
+                ),
+                label,
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::error!(client_id, account = %account, error = %e, "WEBPUSH REGISTER: database error");
+            reply_to_client(
+                &senders,
+                &client_id,
+                fail("INTERNAL_ERROR", "Could not store the subscription"),
+                label,
+            )
+            .await;
+        }
+    }
 }
 
 /// Parse the `<keys>` parameter, which uses the message-tag format

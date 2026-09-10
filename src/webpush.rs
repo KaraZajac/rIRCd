@@ -375,9 +375,16 @@ pub async fn check_endpoint(endpoint: &str, allow_private: bool) -> Result<(), E
     }
 
     let port = url.port_or_known_default().unwrap_or(443);
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| EndpointError::Unresolvable)?;
+    // The client chose the name, so it chose whose name server answers. One
+    // that never does would otherwise keep this waiting for as long as the
+    // resolver is willing to retry.
+    let addrs = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| EndpointError::Unresolvable)?
+    .map_err(|_| EndpointError::Unresolvable)?;
 
     let mut saw_any = false;
     for addr in addrs {
