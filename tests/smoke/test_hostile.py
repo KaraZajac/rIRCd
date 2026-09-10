@@ -608,6 +608,109 @@ else:
     )
 check("and it is still serving afterwards", still_alive("a rename flood", f"h24{RUN}"))
 
+section("commands that mean nothing")
+# The parser is fuzzed by the unit tests; this fuzzes what happens after it.
+# Every command the server dispatches, with parameters drawn from the shapes a
+# client can actually put on the wire — empty, enormous, the wrong type, the
+# ends of the number range, names that are not names. The server has to still
+# be there at the end, and nothing may have panicked on the way.
+import random  # noqa: E402
+
+COMMANDS = """ADMIN AUTHENTICATE AWAY CAP CHATHISTORY GHOST HELP HELPOP INFO
+INVITE ISON ISUPPORT JOIN KICK KLINE KNOCK LINKS LIST LUSERS MARKREAD METADATA
+MODE MONITOR MOTD NAMES NICK NOTICE OPER PART PASS PING PONG PRIVMSG REDACT
+REGISTER RENAME SETHOST SETNAME SETUSER STATS TAGMSG TIME TOPIC UNKLINE USER
+USERHOST VERIFY VERSION WALLOPS WEBIRC WEBPUSH WHO WHOIS WHOWAS""".split()
+
+PARAMS = [
+    "", "*", "0", "-1", "9223372036854775807", "-9223372036854775808",
+    "18446744073709551615", "3.5", ":", "::", "#", "#chan", "&chan", "#" + "c" * 200,
+    "nick", "nick!user@host", "a" * 300, "\u00e9\u00e9\u00e9", "\U0001f49c",
+    "+o", "-b", "+", "b", "o,v,h", "timestamp=2024-01-01T00:00:00.000Z",
+    "timestamp=not-a-time", "msgid=x", "LS", "REQ", "END", "302", "SET", "GET",
+    "SUB", "CLEAR", "LIST", "REGISTER", "UNREGISTER", "PLAIN", "SCRAM-SHA-256",
+    "EXTERNAL", "https://example.invalid/p", "p256dh=x;auth=y", "\u202e",
+]
+
+rng = random.Random(20250910)
+
+
+def fuzz_line():
+    cmd = rng.choice(COMMANDS)
+    parts = [cmd]
+    for _ in range(rng.randrange(0, 4)):
+        p = rng.choice(PARAMS)
+        if p == "" and rng.random() < 0.5:
+            continue
+        parts.append(p)
+    if rng.random() < 0.3:
+        parts.append(":" + rng.choice(PARAMS))
+    if rng.random() < 0.15:
+        return "@" + rng.choice(["a=b", "+x", "time=" + "z" * 100, "a" * 200]) + " " + " ".join(parts)
+    return " ".join(parts)
+
+
+SERVER_LOG = os.environ.get("SMOKE_SERVER_LOG", "")
+
+
+def panics_in_log():
+    if not SERVER_LOG or not os.path.exists(SERVER_LOG):
+        return None
+    bad = []
+    with open(SERVER_LOG, errors="replace") as f:
+        for line in f:
+            if "panicked" in line or "Handler panicked" in line:
+                bad.append(line.strip()[:200])
+    return bad
+
+
+panics_before = panics_in_log()
+# Flood control gives each connection a burst of ten commands and then a
+# trickle, so the way to put real work through the handlers is many short
+# connections rather than one loud one. That doubles as the churn test: connect,
+# say something meaningless, hang up, again.
+dispatched = 0
+rounds = 0
+deadline = time.time() + 10
+while time.time() < deadline:
+    rounds += 1
+    try:
+        f = raw(timeout=5)
+    except OSError:
+        break
+    try:
+        # Every third connection stays unregistered, so the paths that answer
+        # "you have not registered" are fuzzed too.
+        if rounds % 3:
+            f.sendall(f"NICK fz{rounds}{RUN}\r\nUSER f 0 * :f\r\n".encode())
+            dispatched += 2
+        batch = "".join(fuzz_line() + "\r\n" for _ in range(8))
+        f.sendall(batch.encode())
+        dispatched += 8
+        time.sleep(0.01)
+        f.setblocking(False)
+        try:
+            f.recv(1 << 20)
+        except (BlockingIOError, OSError):
+            pass
+    except OSError:
+        pass
+    finally:
+        try:
+            f.close()
+        except OSError:
+            pass
+
+time.sleep(1.0)
+panics_after = panics_in_log()
+if panics_before is None or panics_after is None:
+    check("the server log could be read", False, SERVER_LOG)
+else:
+    new_panics = panics_after[len(panics_before):]
+    check(f"{dispatched} commands that mean nothing, over {rounds} connections, panicked nothing",
+          not new_panics, new_panics[:3])
+check("and it is still serving afterwards", still_alive("nonsense", f"h25{RUN}"))
+
 section("still standing")
 check("the server is still accepting and serving clients", still_alive("everything", f"h12{RUN}"))
 
