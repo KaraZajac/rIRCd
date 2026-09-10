@@ -723,7 +723,7 @@ pub async fn load_all_metadata(
         let folded = if target.starts_with('#') || target.starts_with('&') {
             crate::channel::canonical_channel_key(&target)
         } else {
-            target.to_uppercase()
+            crate::casefold::upper(&target)
         };
         out.entry(folded).or_default().insert(key, value);
     }

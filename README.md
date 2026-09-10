@@ -111,6 +111,7 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 | Key | Default | Description |
 |-----|---------|-------------|
 | `name` | `rIRCd.local` | Server hostname shown to clients |
+| `casemapping` | `ascii` | Which names count as the same name. `ascii` folds A–Z and nothing else, and is what a network started today should use. `rfc1459` also folds `[]\~` onto `{}|^`, which a network that has been running since the nineties cannot stop doing without renaming its channels. Advertised as `CASEMAPPING`; every server on one network must agree |
 | `listen` | `[":6667"]` | Plain-text listener addresses |
 | `listen_tls` | `[]` | TLS listener addresses (requires `[tls]`) |
 | `listen_ws` | `[]` | WebSocket listener addresses (e.g. `[":7667"]`) |

@@ -33,6 +33,11 @@ UID, and a nick in flight cannot misdirect it.
 Servers are named by SID and users by UID in every message between servers.
 Names and nicks appear only where a human will read them.
 
+Every server on the network must also agree on `[server] casemapping`, which is
+what decides that two names are the same name. Two servers that disagree would
+each put the same channel in a different place, and there is no message that can
+put it back.
+
 ## The link
 
 Server traffic has its own listener. A client that reaches it is refused, and a

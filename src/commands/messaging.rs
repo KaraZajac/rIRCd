@@ -114,7 +114,7 @@ async fn send_to_client_with_caps(
 /// The identity a conversation is keyed by: the account when the user has one,
 /// otherwise the bare nick, each marked so the two can never collide.
 async fn conversation_key_id(state: &ServerState, nick: &str) -> String {
-    if let Some(id) = state.nick_to_id.get(&nick.to_uppercase()) {
+    if let Some(id) = state.nick_to_id.get(&crate::casefold::upper(nick)) {
         if let Some(client) = state.clients.get(id) {
             let g = client.read().await;
             return match g.account {
@@ -127,7 +127,7 @@ async fn conversation_key_id(state: &ServerState, nick: &str) -> String {
 }
 
 async fn conversation_identity(state: &ServerState, nick: &str) -> String {
-    if let Some(id) = state.nick_to_id.get(&nick.to_uppercase()) {
+    if let Some(id) = state.nick_to_id.get(&crate::casefold::upper(nick)) {
         if let Some(client) = state.clients.get(id) {
             let g = client.read().await;
             return g
@@ -227,7 +227,7 @@ async fn push_absent_members(
             continue;
         }
         // Connected users are served by the per-recipient path.
-        let connected = match state.nick_to_id.get(&account.to_uppercase()) {
+        let connected = match state.nick_to_id.get(&crate::casefold::upper(account)) {
             Some(id) => match state.clients.get(id) {
                 Some(c) => c
                     .try_read()
@@ -749,7 +749,7 @@ pub async fn handle_privmsg(
             .await;
         }
     } else {
-        let target_id = state_guard.nick_to_id.get(&target.to_uppercase()).cloned();
+        let target_id = state_guard.nick_to_id.get(&crate::casefold::upper(target)).cloned();
         if let Some(tid) = target_id {
             let mut privmsg =
                 Message::new("PRIVMSG", vec![target.into(), text.clone()]).with_prefix(&source);
@@ -1236,7 +1236,7 @@ pub async fn deliver_multiline_batch(
                 }
             }
         } else {
-            match state_guard.nick_to_id.get(&batch.target.to_uppercase()) {
+            match state_guard.nick_to_id.get(&crate::casefold::upper(&batch.target)) {
                 Some(tid) => vec![tid.clone()],
                 None => {
                     reply_to_client(
@@ -2719,7 +2719,7 @@ pub async fn deliver_client_batch(
                 None => return Ok(()),
             }
         } else {
-            match state_r.nick_to_id.get(&batch.target.to_uppercase()) {
+            match state_r.nick_to_id.get(&crate::casefold::upper(&batch.target)) {
                 Some(tid) => vec![tid.clone()],
                 None => return Ok(()),
             }

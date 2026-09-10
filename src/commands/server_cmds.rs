@@ -1087,7 +1087,7 @@ pub async fn handle_kill(
 
     let target_id = {
         let state_r = state.read().await;
-        state_r.nick_to_id.get(&target_nick.to_uppercase()).cloned()
+        state_r.nick_to_id.get(&crate::casefold::upper(target_nick)).cloned()
     };
 
     let tid = match target_id {

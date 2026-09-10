@@ -1,4 +1,5 @@
 pub mod capability;
+pub mod casefold;
 pub mod channel;
 pub mod client;
 pub mod commands;

@@ -791,7 +791,7 @@ async fn send_burst(
 async fn monitor_notify(ctx: &LinkContext, nick: &str, online: bool, source: &str) {
     let watchers: Vec<String> = {
         let state = ctx.state.read().await;
-        match state.monitor_watchers.watchers(&nick.to_lowercase()) {
+        match state.monitor_watchers.watchers(&crate::casefold::lower(nick)) {
             Some(set) => set.iter().cloned().collect(),
             None => Vec::new(),
         }
@@ -876,7 +876,7 @@ async fn accept_remote_user(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
         .read()
         .await
         .nick_to_id
-        .get(&nick.to_uppercase())
+        .get(&crate::casefold::upper(nick))
         .cloned();
     if let Some(holder) = holder {
         if holder != *uid {
@@ -886,7 +886,7 @@ async fn accept_remote_user(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
 
     let kept_nick = {
         let mut state = ctx.state.write().await;
-        let kept = !state.nick_to_id.contains_key(&nick.to_uppercase());
+        let kept = !state.nick_to_id.contains_key(&crate::casefold::upper(nick));
         if !kept {
             // The collision was settled against the arriving user: it answers to
             // its own id until it picks another name.
@@ -944,13 +944,13 @@ async fn resolve_nick_collision(
     };
     {
         let mut state = ctx.state.write().await;
-        state.nick_to_id.remove(&nick.to_uppercase());
+        state.nick_to_id.remove(&crate::casefold::upper(nick));
         if let Some(c) = state.clients.get(holder_id) {
             c.write().await.nick = Some(holder_id.to_string());
         }
         state
             .nick_to_id
-            .insert(holder_id.to_uppercase(), holder_id.to_string());
+            .insert(crate::casefold::upper(holder_id), holder_id.to_string());
     }
     if is_local {
         ctx.senders.read().await.deliver(
@@ -990,7 +990,7 @@ async fn accept_remote_nick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     {
         let mut state = ctx.state.write().await;
         if let Some(ref o) = old {
-            state.nick_to_id.remove(&o.to_uppercase());
+            state.nick_to_id.remove(&crate::casefold::upper(o));
         }
         if let Some(c) = state.clients.get(uid) {
             let mut g = c.write().await;
@@ -999,7 +999,7 @@ async fn accept_remote_nick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
         }
         state
             .nick_to_id
-            .insert(new_nick.to_uppercase(), uid.clone());
+            .insert(crate::casefold::upper(new_nick), uid.clone());
     }
     if let Some(o) = old {
         monitor_notify(ctx, &o, false, &o).await;

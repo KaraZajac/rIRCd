@@ -299,8 +299,8 @@ impl MsgIdStore {
 /// `bar!*@*` has to catch `Bar!user@host` — otherwise changing the case of a
 /// nick walks straight through a ban.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.to_lowercase().chars().collect();
-    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let p: Vec<char> = crate::casefold::lower(pattern).chars().collect();
+    let t: Vec<char> = crate::casefold::lower(text).chars().collect();
 
     // Greedy match with one backtrack point, rather than a full dynamic
     // programming table: every ban, except and invite mask on a channel is
@@ -748,7 +748,7 @@ impl ServerState {
 
     /// Push an already-built WhowasEntry (useful when the client borrow conflicts with &mut self).
     pub fn push_whowas(&mut self, entry: WhowasEntry) {
-        let key = entry.nick.to_lowercase();
+        let key = crate::casefold::lower(&entry.nick);
         if !self.whowas.contains_key(&key) {
             self.whowas_order.push_back(key.clone());
         }
@@ -800,7 +800,7 @@ impl ServerState {
         }
         self.max_clients = self.max_clients.max(self.user_count());
         if let Some(ref nick) = client.read().await.nick {
-            self.nick_to_id.insert(nick.to_uppercase(), id);
+            self.nick_to_id.insert(crate::casefold::upper(nick), id);
         }
         client
     }
@@ -816,7 +816,7 @@ impl ServerState {
         self.clients.insert(id.clone(), client.clone());
         self.session_to_user.insert(id.clone(), id.clone());
         if let Some(nick) = nick {
-            self.nick_to_id.insert(nick.to_uppercase(), id);
+            self.nick_to_id.insert(crate::casefold::upper(&nick), id);
         }
         self.max_clients = self.max_clients.max(self.user_count());
         client
@@ -857,14 +857,14 @@ impl ServerState {
             (g.nick.clone(), g.account.clone())
         };
         if let Some(ref n) = nick {
-            self.nick_to_id.remove(&n.to_uppercase());
+            self.nick_to_id.remove(&crate::casefold::upper(n));
             // Metadata is filed under the nick, and a nick with no account
             // behind it belongs to whoever holds it next. Leaving the keys
             // there would hand somebody else's display name and avatar to the
             // next person to take the name, and would grow without bound as
             // names came and went.
             if account.is_none() {
-                self.metadata.remove(&n.to_uppercase());
+                self.metadata.remove(&crate::casefold::upper(n));
             }
         }
         Some(client)
@@ -913,7 +913,7 @@ impl ServerState {
     }
 
     pub async fn get_client_by_nick(&self, nick: &str) -> Option<Arc<RwLock<Client>>> {
-        let id = self.nick_to_id.get(&nick.to_uppercase())?;
+        let id = self.nick_to_id.get(&crate::casefold::upper(nick))?;
         self.clients.get(id).cloned()
     }
 
@@ -926,13 +926,13 @@ impl ServerState {
     /// The ban matching this user, if any. Expired entries are ignored.
     pub fn matching_ban(&self, source: &str, ip: &str) -> Option<&crate::persist::ServerBan> {
         let now = Utc::now().timestamp();
-        let source_lower = source.to_lowercase();
+        let source_lower = crate::casefold::lower(source);
         let ip_forms = [format!("*!*@{}", ip.to_lowercase()), ip.to_lowercase()];
         self.server_bans.iter().find(|ban| {
             if ban.is_expired(now) {
                 return false;
             }
-            let mask = ban.mask.to_lowercase();
+            let mask = crate::casefold::lower(&ban.mask);
             glob_match(&mask, &source_lower) || ip_forms.iter().any(|f| glob_match(&mask, f))
         })
     }
@@ -960,8 +960,8 @@ mod tests {
     /// against. It is obviously correct and obviously too expensive to run on
     /// every join.
     fn glob_match_reference(pattern: &str, text: &str) -> bool {
-        let p: Vec<char> = pattern.to_lowercase().chars().collect();
-        let t: Vec<char> = text.to_lowercase().chars().collect();
+        let p: Vec<char> = crate::casefold::lower(pattern).chars().collect();
+        let t: Vec<char> = crate::casefold::lower(text).chars().collect();
         let (pl, tl) = (p.len(), t.len());
         let mut dp = vec![vec![false; tl + 1]; pl + 1];
         dp[0][0] = true;

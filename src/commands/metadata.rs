@@ -52,7 +52,7 @@ pub(crate) fn metadata_key(target: &str) -> String {
     if is_channel(target) {
         canonical_channel_key(target)
     } else {
-        target.to_uppercase()
+        crate::casefold::upper(target)
     }
 }
 
@@ -274,7 +274,7 @@ async fn broadcast_metadata_event(
     } else {
         // User target: clients sharing a channel with them, plus the user themselves
         let state_r = state.read().await;
-        let target_id = match state_r.nick_to_id.get(&target.to_uppercase()).cloned() {
+        let target_id = match state_r.nick_to_id.get(&crate::casefold::upper(target)).cloned() {
             Some(id) => id,
             None => return,
         };

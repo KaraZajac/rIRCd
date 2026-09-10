@@ -331,7 +331,7 @@ pub async fn handle_whois(
         return Ok(());
     }
 
-    let target_id = state.nick_to_id.get(&target_nick.to_uppercase()).cloned();
+    let target_id = state.nick_to_id.get(&crate::casefold::upper(target_nick)).cloned();
     if target_id.is_none() {
         reply_to_client(
             &senders,
@@ -672,7 +672,7 @@ pub async fn handle_monitor(
             let mut added_patterns: Vec<String> = Vec::new();
             let mut failed = Vec::new();
             for t in &targets {
-                let n = t.to_lowercase();
+                let n = crate::casefold::lower(t);
                 if current_list.contains(&n) {
                     continue;
                 }
@@ -723,7 +723,7 @@ pub async fn handle_monitor(
 
             // Nick-based online/offline check
             for n in &added_nicks {
-                if let Some(id) = state_r.nick_to_id.get(&n.to_uppercase()) {
+                if let Some(id) = state_r.nick_to_id.get(&crate::casefold::upper(n)) {
                     if let Some(c) = state_r.clients.get(id) {
                         let src = c.read().await.source().unwrap_or_else(|| n.clone());
                         online_list.push(src);
@@ -768,7 +768,7 @@ pub async fn handle_monitor(
             if let Some(c) = client_arc {
                 let mut guard = c.write().await;
                 for t in &targets {
-                    let n = t.to_lowercase();
+                    let n = crate::casefold::lower(t);
                     if guard.monitor_list.remove(&n) {
                         if n.contains('!') || n.contains('@') {
                             state_w.monitor_watchers.remove_pattern(&n, &watcher_id);
@@ -846,7 +846,7 @@ pub async fn handle_monitor(
                 } else {
                     // Nick-based check
                     let state_r = state.read().await;
-                    let id_opt = state_r.nick_to_id.get(&n.to_uppercase()).cloned();
+                    let id_opt = state_r.nick_to_id.get(&crate::casefold::upper(n)).cloned();
                     let client_arc = id_opt.and_then(|id| state_r.clients.get(&id).cloned());
                     drop(state_r);
                     match client_arc {
@@ -899,7 +899,7 @@ pub async fn handle_ison(
 
     let mut online: Vec<String> = Vec::new();
     for n in &all {
-        if state_r.nick_to_id.contains_key(&n.to_uppercase()) {
+        if state_r.nick_to_id.contains_key(&crate::casefold::upper(n)) {
             online.push(n.clone());
         }
     }
@@ -926,7 +926,7 @@ pub async fn handle_userhost(
 
     let mut results: Vec<String> = Vec::new();
     for target_nick in msg.params.iter().take(5) {
-        if let Some(tid) = state_r.nick_to_id.get(&target_nick.to_uppercase()) {
+        if let Some(tid) = state_r.nick_to_id.get(&crate::casefold::upper(target_nick)) {
             if let Some(c) = state_r.clients.get(tid) {
                 let g = c.read().await;
                 let oper_star = if g.oper { "*" } else { "" };

@@ -96,6 +96,10 @@ pub struct DatabaseConfig {
     pub database: String,
 }
 
+fn default_casemapping() -> String {
+    "ascii".to_string()
+}
+
 fn default_db_host() -> String {
     "localhost".into()
 }
@@ -323,6 +327,14 @@ pub struct ServerConfig {
     /// and a coin toss for a network — set it before linking.
     #[serde(default)]
     pub sid: Option<String>,
+    /// Which names count as the same name: `ascii` or `rfc1459`.
+    ///
+    /// `ascii` folds A–Z and nothing else, and is what a network started today
+    /// should use. `rfc1459` also folds `[]\~` onto `{}|^`, which a network
+    /// that has been running since the nineties cannot stop doing without
+    /// renaming its channels. Every server on one network must agree.
+    #[serde(default = "default_casemapping")]
+    pub casemapping: String,
     /// Addresses to accept server links on. Never share a port with clients:
     /// the two speak different protocols and answer to different secrets.
     #[serde(default)]
@@ -368,6 +380,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             name: default_server_name(),
+            casemapping: default_casemapping(),
             listen: default_listen(),
             listen_tls: Vec::new(),
             listen_ws: Vec::new(),

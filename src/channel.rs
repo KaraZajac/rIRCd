@@ -151,16 +151,16 @@ impl Channel {
 
     /// Returns (op, voice) for a joining user based on nick/account and persisted lists.
     pub fn persisted_modes_for(&self, nick: &str, account: Option<&str>) -> (bool, bool) {
-        let nick_lower = nick.to_lowercase();
-        let account_str = account.unwrap_or("").to_lowercase();
+        let nick_lower = crate::casefold::lower(nick);
+        let account_str = crate::casefold::lower(account.unwrap_or(""));
         let is_op = self
             .persisted_operators
             .iter()
-            .any(|s| s.to_lowercase() == nick_lower || s.to_lowercase() == account_str);
+            .any(|s| crate::casefold::lower(s) == nick_lower || crate::casefold::lower(s) == account_str);
         let is_voice = self
             .persisted_voice
             .iter()
-            .any(|s| s.to_lowercase() == nick_lower || s.to_lowercase() == account_str);
+            .any(|s| crate::casefold::lower(s) == nick_lower || crate::casefold::lower(s) == account_str);
         (is_op, is_voice)
     }
 
@@ -215,7 +215,7 @@ pub fn canonical_channel_key(name: &str) -> String {
         return name.to_string();
     }
     if name.starts_with('#') || name.starts_with('&') {
-        format!("{}{}", &name[..1], name[1..].to_lowercase())
+        format!("{}{}", &name[..1], crate::casefold::lower(&name[1..]))
     } else {
         name.to_string()
     }

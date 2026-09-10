@@ -1496,7 +1496,7 @@ pub async fn handle_mode(
                             continue;
                         };
                         param_idx += 1;
-                        let target_id = state.nick_to_id.get(&target_nick.to_uppercase()).cloned();
+                        let target_id = state.nick_to_id.get(&crate::casefold::upper(&target_nick)).cloned();
                         // A mode change naming someone who is not here does not
                         // half-apply: it is refused, and no MODE is echoed.
                         let Some(target_id) = target_id else {
@@ -1714,7 +1714,7 @@ pub async fn handle_mode(
                     'v' => {
                         if let Some(target_nick) = msg.params.get(param_idx) {
                             if let Some(target_id) =
-                                state.nick_to_id.get(&target_nick.to_uppercase())
+                                state.nick_to_id.get(&crate::casefold::upper(target_nick))
                             {
                                 if let Some(memb) = ch.members.get_mut(target_id) {
                                     memb.modes.voice = plus;
@@ -1758,7 +1758,7 @@ pub async fn handle_mode(
                     'h' => {
                         if let Some(target_nick) = msg.params.get(param_idx) {
                             if let Some(target_id) =
-                                state.nick_to_id.get(&target_nick.to_uppercase())
+                                state.nick_to_id.get(&crate::casefold::upper(target_nick))
                             {
                                 if let Some(memb) = ch.members.get_mut(target_id) {
                                     memb.modes.halfop = plus;
@@ -2385,7 +2385,7 @@ pub async fn handle_kick(
         .source()
         .unwrap_or_else(|| client_id.to_string());
 
-    let target_id = state.nick_to_id.get(&target_nick.to_uppercase()).cloned();
+    let target_id = state.nick_to_id.get(&crate::casefold::upper(target_nick)).cloned();
 
     let ch_key = canonical_channel_key(ch_name);
     let mut ch_store = channels.write().await;
@@ -2622,7 +2622,7 @@ pub async fn handle_invite(
             return Ok(());
         }
 
-        if let Some(target_id) = state.nick_to_id.get(&target_nick.to_uppercase()) {
+        if let Some(target_id) = state.nick_to_id.get(&crate::casefold::upper(target_nick)) {
             // 443 ERR_USERONCHANNEL: target is already on the channel
             if ch.is_member(target_id) {
                 let nick = client.read().await.nick_or_id().to_string();

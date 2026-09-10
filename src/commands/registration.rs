@@ -83,7 +83,7 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// only to clients that enabled the capability.
 fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING=ascii CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets);
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES=beIq,k,l,imnstpRcC USERMODES=,,,BiorRw MAXLIST=beIq:100 PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current());
     let deny = cfg
         .server
         .client_tag_deny
@@ -171,7 +171,7 @@ pub async fn complete_registration(
     // becoming one of its own.
     let mut attach_to: Option<String> = None;
 
-    if let Some(holder_id) = state_guard.nick_to_id.get(&nick.to_uppercase()).cloned() {
+    if let Some(holder_id) = state_guard.nick_to_id.get(&crate::casefold::upper(&nick)).cloned() {
         // The nick is in use. If it is in use by this same account, this is the
         // same person arriving on another connection, and what happens next is
         // the operator's choice: join the existing user as another session, or
@@ -213,7 +213,7 @@ pub async fn complete_registration(
                 replaced = %holder_id,
                 "Resuming a persistent session; disconnecting the earlier one"
             );
-            state_guard.nick_to_id.remove(&nick.to_uppercase());
+            state_guard.nick_to_id.remove(&crate::casefold::upper(&nick));
             drop(state_guard);
             senders.write().await.close_user(
                 &holder_id,
@@ -515,7 +515,7 @@ pub async fn complete_registration(
         .await
         .monitor_watchers
         .by_nick
-        .get(&nick_str.to_lowercase())
+        .get(&crate::casefold::lower(nick_str))
         .map(|s: &std::collections::HashSet<String>| s.iter().cloned().collect())
         .unwrap_or_default();
     // extended-monitor: mask watchers (nick!user@host globs) also want to know.
@@ -523,7 +523,7 @@ pub async fn complete_registration(
         let state_r = state.read().await;
         for w in state_r
             .monitor_watchers
-            .pattern_watchers_for(&source.to_lowercase())
+            .pattern_watchers_for(&crate::casefold::lower(&source))
         {
             if !watchers.contains(&w) {
                 watchers.push(w);
@@ -1253,7 +1253,7 @@ pub async fn handle_nick(
             }
             if let Some(ref o) = old_nick {
                 tracing::info!(client_id, old_nick = %o, new_nick = %nick, "Nick change");
-                state_guard.nick_to_id.remove(&o.to_uppercase());
+                state_guard.nick_to_id.remove(&crate::casefold::upper(o));
             }
             // One nick change happened at one time, and every server has to
             // agree on when: it is what settles a collision.
@@ -1269,7 +1269,7 @@ pub async fn handle_nick(
             let user_id = state_guard.user_id(client_id);
             state_guard
                 .nick_to_id
-                .insert(nick.to_uppercase(), user_id.clone());
+                .insert(crate::casefold::upper(&nick), user_id.clone());
             // monitor: 731 to watchers of old nick, 730 to watchers of new nick.
             // A change of case is the same nick, so nobody went offline or came
             // online and there is nothing to report.
@@ -1290,7 +1290,7 @@ pub async fn handle_nick(
             let watchers_new: Vec<String> = state_guard
                 .monitor_watchers
                 .by_nick
-                .get(&nick.to_lowercase())
+                .get(&crate::casefold::lower(&nick))
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default();
             drop(state_guard);
@@ -1385,7 +1385,7 @@ pub async fn handle_nick(
             .and_then(|c| c.account.clone());
         match (
             pending_account,
-            state_guard.nick_to_id.get(&nick.to_uppercase()).cloned(),
+            state_guard.nick_to_id.get(&crate::casefold::upper(&nick)).cloned(),
         ) {
             (Some(account), Some(holder)) => match state_guard.clients.get(&holder) {
                 Some(c) => c.read().await.account.as_deref() == Some(account.as_str()),
@@ -1395,7 +1395,7 @@ pub async fn handle_nick(
         }
     };
     let nick_taken =
-        state_guard.nick_to_id.contains_key(&nick.to_uppercase()) && !resuming_own_session;
+        state_guard.nick_to_id.contains_key(&crate::casefold::upper(&nick)) && !resuming_own_session;
     if nick_taken {
         // Remember what was asked for: REGISTER needs to tell someone trying to
         // claim a nick in use that the account is taken, not that they gave no
@@ -1822,7 +1822,7 @@ pub async fn handle_quit(
         .await
         .monitor_watchers
         .by_nick
-        .get(&quit_nick.to_lowercase())
+        .get(&crate::casefold::lower(&quit_nick))
         .map(|s| s.iter().cloned().collect())
         .unwrap_or_default();
     // extended-monitor: mask watchers get the offline notification too.
@@ -1830,7 +1830,7 @@ pub async fn handle_quit(
         let state_r = state.read().await;
         for w in state_r
             .monitor_watchers
-            .pattern_watchers_for(&source.to_lowercase())
+            .pattern_watchers_for(&crate::casefold::lower(&source))
         {
             if !watchers_731.contains(&w) && w != user_id {
                 watchers_731.push(w);
@@ -4681,8 +4681,8 @@ async fn notify_extended_monitor_watchers(
     already_notified: &std::collections::HashSet<String>,
     client_id: &str,
 ) {
-    let nick_lower = nick.to_lowercase();
-    let source_lower = source.to_lowercase();
+    let nick_lower = crate::casefold::lower(nick);
+    let source_lower = crate::casefold::lower(source);
 
     // Collect watchers from both exact nick and pattern matches
     let mut watcher_ids: std::collections::HashSet<String> = std::collections::HashSet::new();

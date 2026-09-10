@@ -116,9 +116,17 @@ def reset_database(name: str) -> None:
     )
 
 
+# Which names count as the same name. The suite parameterises its channel
+# casemapping tests over `ascii` and `rfc1459` and skips whichever the server
+# does not advertise, so proving both means running it twice:
+#
+#     IRCTEST_RIRCD_CASEMAPPING=rfc1459 tests/irctest/run.sh
+CASEMAPPING = os.environ.get("IRCTEST_RIRCD_CASEMAPPING", "ascii")
+
 CONFIG = """\
 [server]
 name = "My.Little.Server"
+casemapping = "{casemapping}"
 listen = [{listen}]
 listen_tls = [{listen_tls}]
 listen_ws = [{listen_ws}]
@@ -215,7 +223,9 @@ class RircdController(BaseServerController, DirectoryBasedController):
 
     isupport = {
         "BOT": "B",
-        "CASEMAPPING": "ascii",
+        # Whichever one this run configured; the suite asserts the server
+        # says what its controller expects.
+        "CASEMAPPING": CASEMAPPING,
         "CHATHISTORY": patma.ANYSTR,
         "ELIST": patma.StrRe(".*U.*"),
         "EXCEPTS": patma.ANYOPTSTR,
@@ -277,6 +287,7 @@ class RircdController(BaseServerController, DirectoryBasedController):
         self._config_path = config_path
         config_path.write_text(
             CONFIG.format(
+                casemapping=CASEMAPPING,
                 listen=listen,
                 listen_tls=listen_tls,
                 listen_ws=listen_ws,

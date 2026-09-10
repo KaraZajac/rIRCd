@@ -690,6 +690,19 @@ pub async fn run(
 
     // Wrap config in Arc<RwLock<>> so REHASH can reload it at runtime
     // ── Server links ───────────────────────────────────────────────────────────
+    // Which names count as the same name, decided once, before anything is
+    // named. Every server on one network has to agree: a link between two that
+    // disagree would put one channel in two places.
+    let mapping = crate::casefold::configure(&cfg.server.casemapping);
+    if mapping != cfg.server.casemapping {
+        warn!(
+            configured = %cfg.server.casemapping,
+            using = %mapping,
+            "Unknown casemapping; using the default"
+        );
+    }
+    info!(casemapping = %mapping, "Names fold under");
+
     let links = Arc::new(RwLock::new(crate::link::LinkRegistry::default()));
     cfg.links_runtime = Some(links.clone());
     let sid = crate::link::our_sid(&cfg);
