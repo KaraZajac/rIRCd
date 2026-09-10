@@ -726,6 +726,17 @@ pub async fn handle_privmsg(
             if pending_edit_msgid.is_none() {
                 cfg.record_history_at(&ch_key, &source, &text, Some(&msgid), "PRIVMSG", &sent_at);
             }
+            // The other servers holding members of this channel deliver to
+            // their own. It goes out once per link, not once per person.
+            let mut across = base_msg.clone();
+            across.tags.insert("msgid".to_string(), Some(msgid.clone()));
+            crate::link::announce_channel_message(
+                cfg,
+                &state_guard.user_id(client_id),
+                &ch_key,
+                &across,
+            )
+            .await;
             push_absent_members(
                 &state_guard,
                 cfg,
@@ -1024,9 +1035,18 @@ pub async fn handle_notice(
             if statusmsg_prefix.is_none() {
                 cfg.record_history_at(&ch_key, &source, &text, Some(&msgid), "NOTICE", &sent_at);
             }
+            let mut across = base_msg.clone();
+            across.tags.insert("msgid".to_string(), Some(msgid.clone()));
+            crate::link::announce_channel_message(
+                cfg,
+                &state_guard.user_id(client_id),
+                &ch_key,
+                &across,
+            )
+            .await;
         }
     } else {
-        let target_id = state_guard.nick_to_id.get(&target.to_uppercase()).cloned();
+        let target_id = state_guard.nick_to_id.get(&crate::casefold::upper(target)).cloned();
         if let Some(tid) = target_id {
             let target_caps = match state_guard.clients.get(&tid) {
                 Some(c) => c.read().await.capabilities.clone(),
@@ -1707,10 +1727,19 @@ pub async fn handle_tagmsg(
                         "TAGMSG",
                     );
                 }
+                let mut across = base_msg.clone();
+                across.tags.insert("msgid".to_string(), Some(msgid.clone()));
+                crate::link::announce_channel_message(
+                    cfg,
+                    &state_guard.user_id(client_id),
+                    &ch_key,
+                    &across,
+                )
+                .await;
             }
         }
     } else {
-        let target_id = state_guard.nick_to_id.get(&target.to_uppercase()).cloned();
+        let target_id = state_guard.nick_to_id.get(&crate::casefold::upper(target)).cloned();
         if let Some(tid) = target_id {
             let target_caps = match state_guard.clients.get(&tid) {
                 Some(c) => c.read().await.capabilities.clone(),

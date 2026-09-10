@@ -247,7 +247,7 @@ async fn send_metadata_batch(
 /// `value = None` means the key was deleted.
 /// The setter (setter_id) does not receive their own notification.
 #[allow(clippy::too_many_arguments)]
-async fn broadcast_metadata_event(
+pub(crate) async fn broadcast_metadata_event(
     state: &Arc<RwLock<ServerState>>,
     channels: &Arc<RwLock<ChannelStore>>,
     senders: &Senders,
@@ -942,6 +942,14 @@ pub async fn handle_metadata(
                 new_value.as_deref(),
             )
             .await;
+            crate::link::announce_metadata(
+                cfg,
+                &state.read().await.user_id(client_id),
+                &target,
+                key,
+                new_value.as_deref(),
+            )
+            .await;
         }
 
         // ── CLEAR ─────────────────────────────────────────────────────────────
@@ -999,6 +1007,7 @@ pub async fn handle_metadata(
             }
 
             // Broadcast deletion events for each cleared key
+            let setter_uid = state.read().await.user_id(client_id);
             for (key, _) in &cleared {
                 broadcast_metadata_event(
                     &state,
@@ -1012,6 +1021,7 @@ pub async fn handle_metadata(
                     None,
                 )
                 .await;
+                crate::link::announce_metadata(cfg, &setter_uid, &target, key, None).await;
             }
 
             // One RPL_KEYNOTSET per key that was cleared, so the client knows

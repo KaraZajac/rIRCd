@@ -689,12 +689,14 @@ async fn split_users(ctx: &LinkContext, gone: &[RemoteServer]) {
         return;
     }
     info!(users = lost.len(), "Netsplit: forgetting users behind the split");
-    for uid in lost {
-        let client = ctx.state.write().await.remove_client(&uid).await;
-        if let Some(client) = client {
-            if let Some(nick) = client.read().await.nick.clone() {
-                monitor_notify(ctx, &nick, false, &nick).await;
-            }
+    // What everybody left behind sees is a room emptying: the reason names the
+    // two servers that stopped being able to reach each other, which is the
+    // convention every client already knows how to read.
+    let ours = ctx.cfg.read().await.server.name.clone();
+    for server in gone {
+        let reason = format!("{} {}", ours, server.name);
+        for uid in lost.iter().filter(|id| owning_sid(id) == Some(&server.sid)) {
+            forget_remote_user(ctx, uid, &reason).await;
         }
     }
 }
@@ -780,6 +782,75 @@ async fn send_burst(
             continue;
         }
         let _ = tx.send(uid_message(origin, &guard)).await;
+    }
+
+    // Every channel: who is in it and what they hold, then its topic and its
+    // lists. A channel with nobody in it does not exist to burst.
+    let channels: Vec<String> = ctx.channels.read().await.channels.keys().cloned().collect();
+    for name in channels {
+        let store = ctx.channels.read().await;
+        let Some(channel) = store.channels.get(&name) else {
+            continue;
+        };
+        let ch = channel.read().await;
+        if ch.members.is_empty() {
+            continue;
+        }
+        let (letters, mode_args) = ch.mode_string();
+        let members = ch
+            .members
+            .iter()
+            .map(|(id, m)| format!("{}{}", m.modes.prefixes_ordered(), id))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut params = vec![ch.created_at.to_string(), ch.name.clone(), letters];
+        params.extend(mode_args);
+        params.push(members);
+        let sjoin = Message::new("SJOIN", params).with_prefix(our_sid);
+
+        let topic = ch.topic.as_ref().map(|t| {
+            Message::new(
+                "TB",
+                vec![
+                    ch.name.clone(),
+                    ch.topic_time.unwrap_or(ch.created_at).to_string(),
+                    ch.topic_setter.clone().unwrap_or_else(|| "*".to_string()),
+                    t.clone(),
+                ],
+            )
+            .with_prefix(our_sid)
+        });
+        let lists: Vec<Message> = ['b', 'e', 'I', 'q']
+            .into_iter()
+            .filter_map(|letter| {
+                let masks = ch.list_of(letter)?;
+                if masks.is_empty() {
+                    return None;
+                }
+                Some(
+                    Message::new(
+                        "BMASK",
+                        vec![
+                            ch.created_at.to_string(),
+                            ch.name.clone(),
+                            letter.to_string(),
+                            masks.join(" "),
+                        ],
+                    )
+                    .with_prefix(our_sid),
+                )
+            })
+            .collect();
+        drop(ch);
+        drop(store);
+
+        let _ = tx.send(sjoin).await;
+        if let Some(topic) = topic {
+            let _ = tx.send(topic).await;
+        }
+        for list in lists {
+            let _ = tx.send(list).await;
+        }
     }
 
     let _ = tx
@@ -1008,17 +1079,47 @@ async fn accept_remote_nick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
+/// Take a user off this server altogether: out of every channel it was in, out
+/// of the client tables, and out of the watch lists — telling the people who
+/// shared a channel with it, because from here it has quit.
+///
+/// One place for it, because a user leaves in three ways — it quits, it is
+/// killed, or the link it was behind drops — and a user left in a channel it
+/// cannot be reached in is a member nobody can kick.
+async fn forget_remote_user(ctx: &LinkContext, uid: &str, reason: &str) {
+    let (source, channels, nick) = {
+        let state = ctx.state.read().await;
+        match state.clients.get(uid) {
+            Some(c) => {
+                let g = c.read().await;
+                (
+                    g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
+                    g.channels.keys().cloned().collect::<Vec<_>>(),
+                    g.nick.clone(),
+                )
+            }
+            None => return,
+        }
+    };
+    let quit = Message::new("QUIT", vec![reason.to_string()]).with_prefix(&source);
+    for key in &channels {
+        let members = members_of(ctx, key).await;
+        to_members(ctx, &members, &quit, Some(uid)).await;
+        unseat_member(ctx, key, uid).await;
+    }
+    ctx.state.write().await.remove_client(uid).await;
+    if let Some(nick) = nick {
+        monitor_notify(ctx, &nick, false, &nick).await;
+    }
+}
+
 /// A user on another server left the network.
 async fn accept_remote_quit(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     let Some(uid) = msg.prefix.clone() else {
         return;
     };
-    let gone = ctx.state.write().await.remove_client(&uid).await;
-    if let Some(client) = gone {
-        if let Some(nick) = client.read().await.nick.clone() {
-            monitor_notify(ctx, &nick, false, &nick).await;
-        }
-    }
+    let reason = msg.params.first().cloned().unwrap_or_else(|| "Quit".to_string());
+    forget_remote_user(ctx, &uid, &reason).await;
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
@@ -1028,6 +1129,10 @@ async fn accept_remote_message(ctx: &LinkContext, msg: &Message, peer_sid: &str)
     let (Some(from), Some(target)) = (msg.prefix.clone(), msg.params.first().cloned()) else {
         return;
     };
+    if target.starts_with('#') || target.starts_with('&') {
+        accept_remote_channel_message(ctx, msg, &from, &target, peer_sid).await;
+        return;
+    }
     let Some(target_sid) = owning_sid(&target) else {
         return;
     };
@@ -1069,6 +1174,7 @@ async fn accept_remote_message(ctx: &LinkContext, msg: &Message, peer_sid: &str)
 
     // The recipient sees a message from a person, not from a user id, addressed
     // to the name they answer to here.
+    let source_line = source.clone();
     let mut out = msg.clone();
     out.prefix = Some(source);
     out.params[0] = target_nick;
@@ -1093,6 +1199,126 @@ async fn accept_remote_message(ctx: &LinkContext, msg: &Message, peer_sid: &str)
         &sender_tags,
     );
     ctx.senders.read().await.deliver(&target, &out);
+
+    // Both ends of a conversation keep it, so the person who was written to can
+    // ask their own server what was said without it having to ask the other.
+    if msg.command == "PRIVMSG" {
+        let (from_id, to_id) = {
+            let state = ctx.state.read().await;
+            (
+                conversation_identity(&state, &from).await,
+                conversation_identity(&state, &target).await,
+            )
+        };
+        if let (Some(a), Some(b)) = (from_id, to_id) {
+            let key = crate::persist::direct_message_key(&a, &b);
+            let text = msg.params.get(1).cloned().unwrap_or_default();
+            let at = out
+                .tags
+                .get("time")
+                .cloned()
+                .flatten()
+                .unwrap_or_else(crate::protocol::server_time_now);
+            let cfg = ctx.cfg.read().await;
+            cfg.record_history_at(&key, &source_line, &text, msgid.as_deref(), "PRIVMSG", &at);
+        }
+    }
+}
+
+/// What a conversation with somebody is filed under: their account when they
+/// have one, and their nick when they do not. It has to be worked out the same
+/// way on both servers, or each would keep half a conversation.
+async fn conversation_identity(state: &ServerState, uid: &str) -> Option<String> {
+    let c = state.clients.get(uid)?;
+    let g = c.read().await;
+    Some(match g.account {
+        Some(ref a) => crate::persist::account_id(a),
+        None => crate::persist::nick_id(g.nick_or_id()),
+    })
+}
+
+/// A message to a channel, from somebody on another server. Every server that
+/// holds a member of the channel delivers to its own, so the message is written
+/// once here for each person reading here.
+async fn accept_remote_channel_message(
+    ctx: &LinkContext,
+    msg: &Message,
+    from: &str,
+    target: &str,
+    peer_sid: &str,
+) {
+    let key = crate::channel::canonical_channel_key(target);
+    let members = members_of(ctx, &key).await;
+    // Passed along either way: a server between two others carries a channel it
+    // may have nobody in.
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+    if members.is_empty() {
+        return;
+    }
+    let (source, sender_account, sender_tags) = {
+        let state = ctx.state.read().await;
+        match state.clients.get(from) {
+            Some(c) => {
+                let g = c.read().await;
+                (
+                    g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
+                    g.account.clone(),
+                    crate::protocol::SenderTags::new(g.bot, g.oper_name.clone()),
+                )
+            }
+            None => {
+                warn!(peer = %peer_sid, from = %from, "Channel message from a user we do not know");
+                return;
+            }
+        }
+    };
+    let mut base = msg.clone();
+    base.prefix = Some(source.clone());
+    let msgid = base.tags.get("msgid").cloned().flatten();
+    let sent_at = base.tags.get("time").cloned().flatten();
+    let client_only: std::collections::HashMap<String, Option<String>> = base
+        .tags
+        .iter()
+        .filter(|(k, _)| k.starts_with('+'))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let client_tag_deny = ctx.cfg.read().await.server.client_tag_deny.clone();
+
+    for member in &members {
+        // A member on another server reads it from theirs.
+        let caps = {
+            let state = ctx.state.read().await;
+            match state.clients.get(member) {
+                Some(c) => {
+                    let g = c.read().await;
+                    if g.server.is_some() {
+                        continue;
+                    }
+                    g.capabilities.clone()
+                }
+                None => continue,
+            }
+        };
+        let out = crate::protocol::add_tags_for_recipient(
+            base.clone(),
+            &caps,
+            sender_account.as_deref(),
+            msgid.as_deref(),
+            Some(&client_only),
+            client_tag_deny.as_deref(),
+            &sender_tags,
+        );
+        ctx.senders.read().await.deliver(member, &out);
+    }
+
+    // Kept here too, so chathistory on this server can answer for a
+    // conversation that happened on another.
+    if msg.command == "PRIVMSG" || msg.command == "NOTICE" {
+        let text = msg.params.get(1).cloned().unwrap_or_default();
+        let cfg = ctx.cfg.read().await;
+        let at = sent_at.unwrap_or_else(crate::protocol::server_time_now);
+        cfg.record_history_at(&key, &source, &text, msgid.as_deref(), &msg.command, &at);
+    }
 }
 
 /// An operator on another server killed one of our users.
@@ -1119,19 +1345,9 @@ async fn accept_remote_kill(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
             None => from.clone(),
         }
     };
-    let (source, channel_names) = {
-        let state = ctx.state.read().await;
-        match state.clients.get(&target) {
-            Some(c) => {
-                let g = c.read().await;
-                (
-                    g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
-                    g.channels.keys().cloned().collect::<Vec<_>>(),
-                )
-            }
-            None => return,
-        }
-    };
+    if !ctx.state.read().await.clients.contains_key(&target) {
+        return;
+    }
     warn!(peer = %peer_sid, killer = %killer, target = %target, "Killed from another server");
 
     ctx.senders.write().await.close_user(
@@ -1143,31 +1359,7 @@ async fn accept_remote_kill(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     );
 
     let text = format!("Killed by {} ({})", killer, reason);
-    let quit = Message::new("QUIT", vec![text.clone()]).with_prefix(&source);
-    for ch_name in &channel_names {
-        let mut store = ctx.channels.write().await;
-        let mut empty = false;
-        if let Some(ch) = store.channels.get_mut(ch_name) {
-            let mut ch = ch.write().await;
-            let members: Vec<String> = ch
-                .members
-                .keys()
-                .filter(|m| **m != target)
-                .cloned()
-                .collect();
-            ch.members.remove(&target);
-            empty = ch.members.is_empty();
-            drop(ch);
-            let registry = ctx.senders.read().await;
-            for member in members {
-                registry.deliver(&member, &quit);
-            }
-        }
-        if empty {
-            store.channels.remove(ch_name);
-        }
-    }
-    ctx.state.write().await.remove_client(&target).await;
+    forget_remote_user(ctx, &target, &text).await;
     // Every server hears about it as a QUIT, which is what it is to them — the
     // one that asked for the kill included, since that is how it learns the
     // user is gone.
@@ -1190,6 +1382,751 @@ async fn accept_remote_away(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
             None => return,
         }
     }
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A member as it appears in a burst: its prefixes, then its id.
+fn split_member(token: &str) -> (&str, &str) {
+    let at = token
+        .find(|c: char| c != '@' && c != '%' && c != '+')
+        .unwrap_or(token.len());
+    token.split_at(at)
+}
+
+fn member_modes_from(prefixes: &str) -> crate::channel::ChannelMemberModeSet {
+    let mut modes = crate::channel::ChannelMemberModeSet::default();
+    for c in prefixes.chars() {
+        match c {
+            '@' => modes.op = true,
+            '%' => modes.halfop = true,
+            '+' => modes.voice = true,
+            _ => {}
+        }
+    }
+    modes
+}
+
+/// How a user appears to the people who see what it did.
+async fn source_of(ctx: &LinkContext, uid: &str) -> Option<String> {
+    let state = ctx.state.read().await;
+    let c = state.clients.get(uid)?;
+    let g = c.read().await;
+    Some(g.source().unwrap_or_else(|| g.nick_or_id().to_string()))
+}
+
+/// Send to every member of a channel. A member on another server has no
+/// connection here, so it costs nothing to pass them over.
+async fn to_members(ctx: &LinkContext, members: &[String], msg: &Message, except: Option<&str>) {
+    let registry = ctx.senders.read().await;
+    for member in members {
+        if Some(member.as_str()) == except {
+            continue;
+        }
+        registry.deliver(member, msg);
+    }
+}
+
+/// The members of a channel, as ids.
+async fn members_of(ctx: &LinkContext, key: &str) -> Vec<String> {
+    let store = ctx.channels.read().await;
+    match store.channels.get(key) {
+        Some(ch) => ch.read().await.members.keys().cloned().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Put a user into a channel here, on both sides of the record: the channel's
+/// member list and the user's own.
+async fn seat_member(
+    ctx: &LinkContext,
+    key: &str,
+    name: &str,
+    uid: &str,
+    modes: crate::channel::ChannelMemberModeSet,
+) {
+    {
+        let mut store = ctx.channels.write().await;
+        let entry = store
+            .channels
+            .entry(key.to_string())
+            .or_insert_with(|| RwLock::new(crate::channel::Channel::new(name.to_string())));
+        entry.write().await.members.insert(
+            uid.to_string(),
+            crate::channel::ChannelMembership {
+                client_id: uid.to_string(),
+                modes: modes.clone(),
+            },
+        );
+    }
+    let state = ctx.state.read().await;
+    if let Some(c) = state.clients.get(uid) {
+        c.write().await.channels.insert(
+            key.to_string(),
+            crate::channel::ChannelMembership {
+                client_id: uid.to_string(),
+                modes,
+            },
+        );
+    }
+}
+
+/// Take a user out of a channel here, and remove the channel if that was the
+/// last of them.
+async fn unseat_member(ctx: &LinkContext, key: &str, uid: &str) {
+    {
+        let mut store = ctx.channels.write().await;
+        let mut empty = false;
+        if let Some(entry) = store.channels.get_mut(key) {
+            let mut ch = entry.write().await;
+            ch.members.remove(uid);
+            ch.invite_list.remove(uid);
+            empty = ch.members.is_empty();
+        }
+        if empty {
+            store.channels.remove(key);
+        }
+    }
+    let state = ctx.state.read().await;
+    if let Some(c) = state.clients.get(uid) {
+        c.write().await.channels.remove(key);
+    }
+}
+
+/// A channel as another server has it. Two servers that both have a channel of
+/// this name have to end up with one channel, and the older timestamp decides
+/// whose it is — the rule every TS network uses, and the only one that
+/// converges without a tie-break.
+async fn accept_remote_sjoin(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    if msg.params.len() < 4 {
+        warn!(peer = %peer_sid, "Malformed SJOIN from a linked server");
+        return;
+    }
+    let Some(ts) = msg.params[0].parse::<i64>().ok() else {
+        return;
+    };
+    let name = msg.params[1].clone();
+    let letters = msg.params[2].clone();
+    let members_field = msg.params[msg.params.len() - 1].clone();
+    let mode_args: Vec<String> = msg.params[3..msg.params.len() - 1].to_vec();
+    let key = crate::channel::canonical_channel_key(&name);
+
+    // What happens to what is already here, decided before anybody is let in.
+    let (existed, deopped, keep_prefixes) = {
+        let mut store = ctx.channels.write().await;
+        let existed = store.channels.contains_key(&key);
+        let entry = store
+            .channels
+            .entry(key.clone())
+            .or_insert_with(|| RwLock::new(crate::channel::Channel::new(name.clone())));
+        let mut ch = entry.write().await;
+        if !existed {
+            ch.created_at = ts;
+            ch.set_mode_string(&letters, &mode_args);
+            (false, Vec::new(), true)
+        } else if ts < ch.created_at {
+            // Theirs is older. Ours gives way: its modes go, and so does every
+            // prefix anybody here was holding.
+            ch.created_at = ts;
+            ch.set_mode_string(&letters, &mode_args);
+            let deopped: Vec<String> = ch
+                .members
+                .iter()
+                .filter(|(_, m)| m.modes.op || m.modes.halfop || m.modes.voice)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &deopped {
+                if let Some(m) = ch.members.get_mut(id) {
+                    m.modes = Default::default();
+                }
+            }
+            (true, deopped, true)
+        } else if ts == ch.created_at {
+            ch.merge_mode_string(&letters, &mode_args);
+            (true, Vec::new(), true)
+        } else {
+            // Ours is older and keeps its modes; theirs arrive with none.
+            (true, Vec::new(), false)
+        }
+    };
+
+    let before = members_of(ctx, &key).await;
+    let mut arrived: Vec<(String, crate::channel::ChannelMemberModeSet)> = Vec::new();
+    for token in members_field.split(' ').filter(|t| !t.is_empty()) {
+        let (prefixes, uid) = split_member(token);
+        if !valid_uid(uid) {
+            continue;
+        }
+        let modes = if keep_prefixes {
+            member_modes_from(prefixes)
+        } else {
+            Default::default()
+        };
+        if before.iter().any(|m| m == uid) {
+            continue;
+        }
+        seat_member(ctx, &key, &name, uid, modes.clone()).await;
+        arrived.push((uid.to_string(), modes));
+    }
+
+    // Everybody here watches the new arrivals come in, and watches their own
+    // channel lose its operators when it was the younger one.
+    let members = members_of(ctx, &key).await;
+    let server = ctx.cfg.read().await.server.name.clone();
+    if existed && !deopped.is_empty() {
+        let mut nicks = Vec::new();
+        {
+            let state = ctx.state.read().await;
+            for id in &deopped {
+                if let Some(c) = state.clients.get(id) {
+                    nicks.push(c.read().await.nick_or_id().to_string());
+                }
+            }
+        }
+        let mut params = vec![name.clone(), format!("-{}", "o".repeat(nicks.len()))];
+        params.extend(nicks);
+        to_members(
+            ctx,
+            &members,
+            &Message::new("MODE", params).with_prefix(&server),
+            None,
+        )
+        .await;
+    }
+    for (uid, modes) in &arrived {
+        let Some(source) = source_of(ctx, uid).await else {
+            continue;
+        };
+        let join = Message::new("JOIN", vec![name.clone()]).with_prefix(&source);
+        to_members(ctx, &members, &join, Some(uid)).await;
+        let prefixes = modes.prefixes_ordered();
+        if !prefixes.is_empty() {
+            let nick = {
+                let state = ctx.state.read().await;
+                match state.clients.get(uid) {
+                    Some(c) => c.read().await.nick_or_id().to_string(),
+                    None => continue,
+                }
+            };
+            let letters: String = prefixes
+                .chars()
+                .map(|c| match c {
+                    '@' => 'o',
+                    '%' => 'h',
+                    _ => 'v',
+                })
+                .collect();
+            let mut params = vec![name.clone(), format!("+{}", letters)];
+            for _ in letters.chars() {
+                params.push(nick.clone());
+            }
+            to_members(
+                ctx,
+                &members,
+                &Message::new("MODE", params).with_prefix(&server),
+                None,
+            )
+            .await;
+        }
+    }
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A user on another server joined a channel.
+async fn accept_remote_join(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(uid), Some(ts), Some(name)) = (
+        msg.prefix.clone(),
+        msg.params.first().and_then(|t| t.parse::<i64>().ok()),
+        msg.params.get(1).cloned(),
+    ) else {
+        return;
+    };
+    let key = crate::channel::canonical_channel_key(&name);
+    {
+        let mut store = ctx.channels.write().await;
+        let existed = store.channels.contains_key(&key);
+        let entry = store
+            .channels
+            .entry(key.clone())
+            .or_insert_with(|| RwLock::new(crate::channel::Channel::new(name.clone())));
+        let mut ch = entry.write().await;
+        if !existed || ts < ch.created_at {
+            ch.created_at = ts;
+        }
+        if ch.members.contains_key(&uid) {
+            return;
+        }
+    }
+    seat_member(ctx, &key, &name, &uid, Default::default()).await;
+    let Some(source) = source_of(ctx, &uid).await else {
+        return;
+    };
+    let members = members_of(ctx, &key).await;
+    let join = Message::new("JOIN", vec![name.clone()]).with_prefix(&source);
+    to_members(ctx, &members, &join, Some(&uid)).await;
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A user on another server left a channel.
+async fn accept_remote_part(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(uid), Some(name)) = (msg.prefix.clone(), msg.params.first().cloned()) else {
+        return;
+    };
+    let key = crate::channel::canonical_channel_key(&name);
+    let members = members_of(ctx, &key).await;
+    if !members.contains(&uid) {
+        return;
+    }
+    let Some(source) = source_of(ctx, &uid).await else {
+        return;
+    };
+    let mut params = vec![name.clone()];
+    if let Some(reason) = msg.params.get(1) {
+        params.push(reason.clone());
+    }
+    to_members(
+        ctx,
+        &members,
+        &Message::new("PART", params).with_prefix(&source),
+        Some(&uid),
+    )
+    .await;
+    unseat_member(ctx, &key, &uid).await;
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// Somebody on another server kicked somebody out of a channel.
+async fn accept_remote_kick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(by), Some(name), Some(target)) = (
+        msg.prefix.clone(),
+        msg.params.first().cloned(),
+        msg.params.get(1).cloned(),
+    ) else {
+        return;
+    };
+    let key = crate::channel::canonical_channel_key(&name);
+    let members = members_of(ctx, &key).await;
+    if !members.contains(&target) {
+        return;
+    }
+    let source = source_of(ctx, &by).await.unwrap_or_else(|| by.clone());
+    let target_nick = {
+        let state = ctx.state.read().await;
+        match state.clients.get(&target) {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => target.clone(),
+        }
+    };
+    let reason = msg.params.get(2).cloned().unwrap_or_else(|| target_nick.clone());
+    to_members(
+        ctx,
+        &members,
+        &Message::new("KICK", vec![name.clone(), target_nick, reason]).with_prefix(&source),
+        None,
+    )
+    .await;
+    unseat_member(ctx, &key, &target).await;
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A channel's topic, set on another server.
+async fn accept_remote_topic(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(uid), Some(name)) = (msg.prefix.clone(), msg.params.first().cloned()) else {
+        return;
+    };
+    let topic = msg.params.get(1).cloned().unwrap_or_default();
+    let key = crate::channel::canonical_channel_key(&name);
+    let Some(source) = source_of(ctx, &uid).await else {
+        return;
+    };
+    let setter = source.split('!').next().unwrap_or(&source).to_string();
+    let now = chrono::Utc::now().timestamp();
+    {
+        let store = ctx.channels.read().await;
+        let Some(entry) = store.channels.get(&key) else {
+            return;
+        };
+        let mut ch = entry.write().await;
+        ch.topic = if topic.is_empty() { None } else { Some(topic.clone()) };
+        ch.topic_setter = Some(setter);
+        ch.topic_time = Some(now);
+    }
+    let members = members_of(ctx, &key).await;
+    to_members(
+        ctx,
+        &members,
+        &Message::new("TOPIC", vec![name.clone(), topic]).with_prefix(&source),
+        None,
+    )
+    .await;
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A topic in a burst: it is already set, so nobody is told it changed.
+async fn accept_remote_topic_burst(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(name), Some(at), Some(setter), Some(topic)) = (
+        msg.params.first().cloned(),
+        msg.params.get(1).and_then(|t| t.parse::<i64>().ok()),
+        msg.params.get(2).cloned(),
+        msg.params.get(3).cloned(),
+    ) else {
+        return;
+    };
+    let key = crate::channel::canonical_channel_key(&name);
+    let store = ctx.channels.read().await;
+    let Some(entry) = store.channels.get(&key) else {
+        return;
+    };
+    let mut ch = entry.write().await;
+    // A topic already here was set on a channel this server has had for longer,
+    // or at the same moment; either way it is not this one's to replace.
+    if ch.topic.is_some() && ch.topic_time.unwrap_or(0) >= at {
+        return;
+    }
+    ch.topic = Some(topic);
+    ch.topic_setter = Some(setter);
+    ch.topic_time = Some(at);
+    drop(ch);
+    drop(store);
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A channel's ban, exception, invite-exception or quiet list, in a burst.
+async fn accept_remote_bmask(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(name), Some(letter), Some(masks)) = (
+        msg.params.get(1).cloned(),
+        msg.params.get(2).and_then(|l| l.chars().next()),
+        msg.params.get(3).cloned(),
+    ) else {
+        return;
+    };
+    let key = crate::channel::canonical_channel_key(&name);
+    {
+        let store = ctx.channels.read().await;
+        let Some(entry) = store.channels.get(&key) else {
+            return;
+        };
+        let mut ch = entry.write().await;
+        let Some(list) = ch.list_mut(letter) else {
+            return;
+        };
+        for mask in masks.split(' ').filter(|m| !m.is_empty()) {
+            if !list.iter().any(|m| m == mask) {
+                list.push(mask.to_string());
+            }
+        }
+    }
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A channel mode set on another server. Prefix modes name their target by id,
+/// so a nick change in flight cannot move an operator status onto somebody
+/// else; the people watching are shown nicks.
+async fn accept_remote_mode(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(by), Some(name), Some(letters)) = (
+        msg.prefix.clone(),
+        msg.params.first().cloned(),
+        msg.params.get(1).cloned(),
+    ) else {
+        return;
+    };
+    let key = crate::channel::canonical_channel_key(&name);
+    let args: Vec<String> = msg.params[2..].to_vec();
+    let source = source_of(ctx, &by)
+        .await
+        .unwrap_or_else(|| ctx.cfg.try_read().map(|c| c.server.name.clone()).unwrap_or(by));
+
+    let mut shown = Vec::new();
+    {
+        let store = ctx.channels.read().await;
+        let Some(entry) = store.channels.get(&key) else {
+            return;
+        };
+        let mut ch = entry.write().await;
+        let mut adding = true;
+        let mut arg = args.iter();
+        let state = ctx.state.read().await;
+        for c in letters.chars() {
+            match c {
+                '+' => adding = true,
+                '-' => adding = false,
+                'o' | 'h' | 'v' => {
+                    let Some(target) = arg.next() else { continue };
+                    let nick = match state.clients.get(target) {
+                        Some(cl) => cl.read().await.nick_or_id().to_string(),
+                        None => target.clone(),
+                    };
+                    if let Some(m) = ch.members.get_mut(target) {
+                        match c {
+                            'o' => m.modes.op = adding,
+                            'h' => m.modes.halfop = adding,
+                            _ => m.modes.voice = adding,
+                        }
+                    }
+                    shown.push(nick);
+                }
+                'b' | 'e' | 'I' | 'q' => {
+                    let Some(mask) = arg.next() else { continue };
+                    if let Some(list) = ch.list_mut(c) {
+                        if adding {
+                            if !list.iter().any(|m| m == mask) {
+                                list.push(mask.clone());
+                            }
+                        } else {
+                            list.retain(|m| m != mask);
+                        }
+                    }
+                    shown.push(mask.clone());
+                }
+                'k' => {
+                    let value = arg.next().cloned();
+                    ch.key = if adding { value.clone() } else { None };
+                    shown.push(value.unwrap_or_else(|| "*".to_string()));
+                }
+                'l' => {
+                    if adding {
+                        let value = arg.next().cloned();
+                        ch.modes.user_limit = value.as_ref().and_then(|v| v.parse().ok());
+                        shown.push(value.unwrap_or_default());
+                    } else {
+                        ch.modes.user_limit = None;
+                    }
+                }
+                'i' => ch.modes.invite_only = adding,
+                'm' => ch.modes.moderated = adding,
+                'n' => ch.modes.no_external = adding,
+                's' => ch.modes.secret = adding,
+                't' => ch.modes.topic_protect = adding,
+                'p' => ch.modes.private = adding,
+                'R' => ch.modes.registered_only = adding,
+                'c' => ch.modes.no_colors = adding,
+                'C' => ch.modes.no_ctcp = adding,
+                _ => {}
+            }
+        }
+    }
+    let members = members_of(ctx, &key).await;
+    let mut params = vec![name.clone(), letters];
+    params.extend(shown);
+    to_members(
+        ctx,
+        &members,
+        &Message::new("MODE", params).with_prefix(&source),
+        None,
+    )
+    .await;
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// Tell the people who share a channel with a user that something about that
+/// user changed — but only the ones that asked to hear about it.
+async fn to_shared_channels(ctx: &LinkContext, uid: &str, cap: &str, msg: &Message) {
+    let channels: Vec<String> = {
+        let state = ctx.state.read().await;
+        match state.clients.get(uid) {
+            Some(c) => c.read().await.channels.keys().cloned().collect(),
+            None => return,
+        }
+    };
+    let mut told: std::collections::HashSet<String> = std::collections::HashSet::new();
+    told.insert(uid.to_string());
+    for key in &channels {
+        for member in members_of(ctx, key).await {
+            if !told.insert(member.clone()) {
+                continue;
+            }
+            let wants = {
+                let state = ctx.state.read().await;
+                match state.clients.get(&member) {
+                    Some(c) => c.read().await.capabilities.contains(cap),
+                    None => false,
+                }
+            };
+            if wants {
+                ctx.senders.read().await.deliver(&member, msg);
+            }
+        }
+    }
+}
+
+/// A user on another server logged in to an account, or out of one.
+async fn accept_remote_account(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(uid), Some(account)) = (msg.prefix.clone(), msg.params.first().cloned()) else {
+        return;
+    };
+    let account = if account == "*" { None } else { Some(account) };
+    let source = {
+        let state = ctx.state.read().await;
+        let Some(c) = state.clients.get(&uid) else {
+            return;
+        };
+        let mut g = c.write().await;
+        g.account = account.clone();
+        g.source().unwrap_or_else(|| g.nick_or_id().to_string())
+    };
+    let shown = account.unwrap_or_else(|| "*".to_string());
+    to_shared_channels(
+        ctx,
+        &uid,
+        "account-notify",
+        &Message::new("ACCOUNT", vec![shown]).with_prefix(&source),
+    )
+    .await;
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A user on another server is shown under a different user@host now.
+async fn accept_remote_chghost(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(uid), Some(user), Some(host)) = (
+        msg.prefix.clone(),
+        msg.params.first().cloned(),
+        msg.params.get(1).cloned(),
+    ) else {
+        return;
+    };
+    let source = {
+        let state = ctx.state.read().await;
+        let Some(c) = state.clients.get(&uid) else {
+            return;
+        };
+        let g = c.read().await;
+        g.source().unwrap_or_else(|| g.nick_or_id().to_string())
+    };
+    {
+        let state = ctx.state.read().await;
+        if let Some(c) = state.clients.get(&uid) {
+            let mut g = c.write().await;
+            g.vuser = Some(user.clone());
+            g.vhost = Some(host.clone());
+        }
+    }
+    to_shared_channels(
+        ctx,
+        &uid,
+        "chghost",
+        &Message::new("CHGHOST", vec![user, host]).with_prefix(&source),
+    )
+    .await;
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A user on another server changed the name it goes by.
+async fn accept_remote_setname(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(uid), Some(realname)) = (msg.prefix.clone(), msg.params.first().cloned()) else {
+        return;
+    };
+    let source = {
+        let state = ctx.state.read().await;
+        let Some(c) = state.clients.get(&uid) else {
+            return;
+        };
+        let mut g = c.write().await;
+        g.realname = Some(realname.clone());
+        g.source().unwrap_or_else(|| g.nick_or_id().to_string())
+    };
+    to_shared_channels(
+        ctx,
+        &uid,
+        "setname",
+        &Message::new("SETNAME", vec![realname]).with_prefix(&source),
+    )
+    .await;
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// Somebody on another server invited one of our users into a channel.
+async fn accept_remote_invite(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(by), Some(target), Some(name)) = (
+        msg.prefix.clone(),
+        msg.params.first().cloned(),
+        msg.params.get(1).cloned(),
+    ) else {
+        return;
+    };
+    let Some(target_sid) = owning_sid(&target) else {
+        return;
+    };
+    let our_sid = ctx.state.read().await.sid.clone();
+    if target_sid != our_sid {
+        if let Some(tx) = ctx.links.read().await.route(target_sid) {
+            let _ = tx.try_send(msg.clone());
+        }
+        return;
+    }
+    let key = crate::channel::canonical_channel_key(&name);
+    let (source, target_nick) = {
+        let state = ctx.state.read().await;
+        let source = match state.clients.get(&by) {
+            Some(c) => {
+                let g = c.read().await;
+                g.source().unwrap_or_else(|| g.nick_or_id().to_string())
+            }
+            None => return,
+        };
+        let nick = match state.clients.get(&target) {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => return,
+        };
+        (source, nick)
+    };
+    // The invitation has to be on the channel here too, or the person it was
+    // sent to would be turned away at a door they were asked through.
+    {
+        let store = ctx.channels.read().await;
+        if let Some(entry) = store.channels.get(&key) {
+            entry.write().await.invite_list.insert(target.clone());
+        }
+    }
+    ctx.senders.read().await.deliver(
+        &target,
+        &Message::new("INVITE", vec![target_nick, name]).with_prefix(&source),
+    );
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A key set on a user or a channel, somewhere else on the network.
+async fn accept_remote_metadata(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(uid), Some(target), Some(key)) = (
+        msg.prefix.clone(),
+        msg.params.first().cloned(),
+        msg.params.get(1).cloned(),
+    ) else {
+        return;
+    };
+    let value = msg.params.get(2).filter(|v| !v.is_empty()).cloned();
+    let Some(source) = source_of(ctx, &uid).await else {
+        return;
+    };
+    let store_key = crate::commands::metadata::metadata_key(&target);
+    {
+        let mut state = ctx.state.write().await;
+        match value {
+            Some(ref v) => {
+                state
+                    .metadata
+                    .entry(store_key)
+                    .or_default()
+                    .insert(key.clone(), v.clone());
+            }
+            None => {
+                if let Some(keys) = state.metadata.get_mut(&store_key) {
+                    keys.remove(&key);
+                }
+            }
+        }
+    }
+    let server = ctx.cfg.read().await.server.name.clone();
+    crate::commands::metadata::broadcast_metadata_event(
+        &ctx.state,
+        &ctx.channels,
+        &ctx.senders,
+        &source,
+        &uid,
+        &server,
+        &target,
+        &key,
+        value.as_deref(),
+    )
+    .await;
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
@@ -1261,6 +2198,141 @@ pub async fn announce_away(cfg: &Config, uid: &str, away: Option<&str>) {
     broadcast(cfg, Message::new("AWAY", params).with_prefix(uid)).await;
 }
 
+/// Tell the network about a channel one of our users just made.
+///
+/// A channel is announced whole — its timestamp, its modes and the person in
+/// it — because the timestamp is what settles which channel it is when the
+/// other side already has one of that name.
+pub async fn announce_channel(cfg: &Config, ts: i64, name: &str, modes: (String, Vec<String>), member: &str) {
+    let (letters, args) = modes;
+    let mut params = vec![ts.to_string(), name.to_string(), letters];
+    params.extend(args);
+    params.push(member.to_string());
+    broadcast(cfg, Message::new("SJOIN", params).with_prefix(our_sid(cfg))).await;
+}
+
+/// Tell the network that one of our users joined a channel that already exists.
+pub async fn announce_join(cfg: &Config, uid: &str, ts: i64, name: &str) {
+    broadcast(
+        cfg,
+        Message::new("JOIN", vec![ts.to_string(), name.to_string()]).with_prefix(uid),
+    )
+    .await;
+}
+
+/// Tell the network that one of our users left a channel.
+pub async fn announce_part(cfg: &Config, uid: &str, name: &str, reason: Option<&str>) {
+    let mut params = vec![name.to_string()];
+    if let Some(reason) = reason {
+        params.push(reason.to_string());
+    }
+    broadcast(cfg, Message::new("PART", params).with_prefix(uid)).await;
+}
+
+/// Tell the network that somebody was kicked out of a channel.
+pub async fn announce_kick(cfg: &Config, uid: &str, name: &str, target: &str, reason: &str) {
+    broadcast(
+        cfg,
+        Message::new(
+            "KICK",
+            vec![name.to_string(), target.to_string(), reason.to_string()],
+        )
+        .with_prefix(uid),
+    )
+    .await;
+}
+
+/// Tell the network about a change to a channel's modes.
+///
+/// The arguments to `+o`, `+h` and `+v` are user ids, not nicks: a nick change
+/// crossing a link would otherwise be able to hand somebody else the op.
+pub async fn announce_channel_mode(cfg: &Config, uid: &str, name: &str, letters: &str, args: &[String]) {
+    if letters.is_empty() || letters == "+" || letters == "-" {
+        return;
+    }
+    let mut params = vec![name.to_string(), letters.to_string()];
+    params.extend(args.iter().cloned());
+    broadcast(cfg, Message::new("MODE", params).with_prefix(uid)).await;
+}
+
+/// Tell the network a channel has a new topic.
+pub async fn announce_topic(cfg: &Config, uid: &str, name: &str, topic: &str) {
+    broadcast(
+        cfg,
+        Message::new("TOPIC", vec![name.to_string(), topic.to_string()]).with_prefix(uid),
+    )
+    .await;
+}
+
+/// Send a message to a channel's members on the other servers.
+///
+/// Every server that holds a member delivers to its own, so this goes out once
+/// per link rather than once per person.
+pub async fn announce_channel_message(cfg: &Config, uid: &str, name: &str, msg: &Message) {
+    if cfg.links_runtime.is_none() {
+        return;
+    }
+    let mut out = msg.clone();
+    out.prefix = Some(uid.to_string());
+    if out.params.is_empty() {
+        out.params.push(name.to_string());
+    } else {
+        out.params[0] = name.to_string();
+    }
+    broadcast(cfg, out).await;
+}
+
+/// Tell the network that one of our users logged in to an account, or out.
+pub async fn announce_account(cfg: &Config, uid: &str, account: Option<&str>) {
+    broadcast(
+        cfg,
+        Message::new("ACCOUNT", vec![account.unwrap_or("*").to_string()]).with_prefix(uid),
+    )
+    .await;
+}
+
+/// Tell the network that one of our users is shown under a new user@host.
+pub async fn announce_chghost(cfg: &Config, uid: &str, user: &str, host: &str) {
+    broadcast(
+        cfg,
+        Message::new("CHGHOST", vec![user.to_string(), host.to_string()]).with_prefix(uid),
+    )
+    .await;
+}
+
+/// Tell the network that one of our users changed the name it goes by.
+pub async fn announce_setname(cfg: &Config, uid: &str, realname: &str) {
+    broadcast(
+        cfg,
+        Message::new("SETNAME", vec![realname.to_string()]).with_prefix(uid),
+    )
+    .await;
+}
+
+/// Tell the network that somebody was invited into a channel.
+pub async fn announce_invite(cfg: &Config, uid: &str, target: &str, name: &str) {
+    broadcast(
+        cfg,
+        Message::new("INVITE", vec![target.to_string(), name.to_string()]).with_prefix(uid),
+    )
+    .await;
+}
+
+/// Tell the network that a key on a user or a channel was set or cleared.
+pub async fn announce_metadata(
+    cfg: &Config,
+    uid: &str,
+    target: &str,
+    key: &str,
+    value: Option<&str>,
+) {
+    let mut params = vec![target.to_string(), key.to_string()];
+    params.push(value.unwrap_or("").to_string());
+    // An empty value is a key that went; a key cannot be set to nothing, so the
+    // two do not need telling apart by anything but this.
+    broadcast(cfg, Message::new("METADATA", params).with_prefix(uid)).await;
+}
+
 /// Send a message to a user on another server. Returns whether there was a way
 /// to reach it — false means the target is not somewhere this server can get to,
 /// and the caller answers as it would for a nick that is not here.
@@ -1321,6 +2393,58 @@ async fn handle_link_message(
         }
         "KILL" => {
             accept_remote_kill(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "SJOIN" => {
+            accept_remote_sjoin(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "JOIN" => {
+            accept_remote_join(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "PART" => {
+            accept_remote_part(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "KICK" => {
+            accept_remote_kick(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "MODE" => {
+            accept_remote_mode(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "TOPIC" => {
+            accept_remote_topic(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "TB" => {
+            accept_remote_topic_burst(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "BMASK" => {
+            accept_remote_bmask(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "ACCOUNT" => {
+            accept_remote_account(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "CHGHOST" => {
+            accept_remote_chghost(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "SETNAME" => {
+            accept_remote_setname(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "INVITE" => {
+            accept_remote_invite(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "METADATA" => {
+            accept_remote_metadata(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }
         "AWAY" => {

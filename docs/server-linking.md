@@ -84,7 +84,9 @@ Each side then sends what it knows, in this order, and finishes with `EOB`:
 2. `UID <nick> <hops> <nick_ts> <user> <host> <uid> <account> :<realname>` for
    every user, prefixed by the SID of the server it is on.
 3. `SJOIN <channel_ts> <channel> <modes> :<@+uid> ...` for every channel, then
-   its topic and its ban, exception and invite-exception lists.
+   `TB <channel> <topic_ts> <setter> :<topic>` for its topic and
+   `BMASK <channel_ts> <channel> <letter> :<mask> ...` for each of its ban,
+   exception, invite-exception and quiet lists.
 4. `EOB`.
 
 Until both sides have sent `EOB` the link is bursting, and conflicts are
@@ -133,14 +135,18 @@ got, so that nobody has to read the source to find out:
 | `NICK`, `QUIT`, `AWAY`, `KILL` | yes |
 | Nick collisions, settled by timestamp | yes |
 | `PRIVMSG`, `NOTICE`, `TAGMSG` between users on different servers | yes |
-| Splits: the users behind a dropped link quit | yes |
-| Channels: `SJOIN`, `MODE`, `TOPIC`, `KICK`, and messages to a channel | not yet |
-| `ACCOUNT`, `CHGHOST`, `SETNAME`, `INVITE`, `METADATA` | not yet |
-| Chathistory answered across the network | not yet |
+| The channel burst — `SJOIN`, `TB`, `BMASK` — and channel collisions | yes |
+| `JOIN`, `PART`, `KICK`, `MODE`, `TOPIC`, and messages to a channel | yes |
+| `ACCOUNT`, `CHGHOST`, `SETNAME`, `INVITE`, `METADATA` | yes |
+| Chathistory: both ends of a conversation keep it | yes |
+| Services commands (`GHOST`, `SANICK`) acting on a remote user | not yet |
+| `WHOIS` forwarded, for the idle time only that server knows | not yet |
 
-Until channels are carried, a channel on one server is a different channel from
-one with the same name on another. Two servers linked today share their people,
-not their rooms.
+A `WHOIS` for somebody on another server is answered from what this one was
+told: their nick, their name, their account, their server. The one thing it
+does not answer is how long they have been quiet, because that is known to the
+server they are typing at and a number invented here would look exactly like a
+real one.
 
 ## Testing
 

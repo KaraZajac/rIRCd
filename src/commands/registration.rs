@@ -1794,6 +1794,7 @@ pub async fn handle_quit(
     // account-notify: on logout send ACCOUNT * to channel peers that have the cap
     if had_account {
         let account_star = Message::new("ACCOUNT", vec!["*".into()]).with_prefix(&source);
+        crate::link::announce_account(cfg, &state.read().await.user_id(client_id), None).await;
         for ch_name in &channel_names {
             let ch_store = channels.read().await;
             let ch_guard = match ch_store.channels.get(ch_name) {
@@ -2684,6 +2685,7 @@ pub async fn handle_authenticate(
 
     // account-notify: tell channel peers that have the cap (prefix = user whose account changed)
     let account_msg = Message::new("ACCOUNT", vec![account.to_string()]).with_prefix(&source);
+    crate::link::announce_account(cfg, &state.read().await.user_id(client_id), Some(account)).await;
     let mut already_notified = std::collections::HashSet::new();
     for ch_name in &channel_list {
         let ch_store = channels.read().await;
@@ -3133,6 +3135,8 @@ async fn handle_authenticate_scram_step(
 
         // account-notify
         let account_msg = Message::new("ACCOUNT", vec![account.clone()]).with_prefix(&source);
+        crate::link::announce_account(cfg, &state.read().await.user_id(client_id), Some(&account))
+            .await;
         for ch_name in &channel_list {
             let ch_store = channels.read().await;
             if let Some(ch) = ch_store.channels.get(ch_name) {
@@ -3321,6 +3325,7 @@ pub async fn login_client(
 
     // account-notify: tell channel peers that have the cap (prefix = user whose account changed)
     let account_msg = Message::new("ACCOUNT", vec![account.to_string()]).with_prefix(&source);
+    crate::link::announce_account(cfg, &state.read().await.user_id(client_id), Some(account)).await;
     let mut already_notified = std::collections::HashSet::new();
     for ch_name in &channel_list {
         let member_ids: Vec<String> = {
@@ -4318,7 +4323,8 @@ pub async fn handle_setname(
         (source, channel_list)
     };
 
-    let setname_msg = Message::new("SETNAME", vec![realname]).with_prefix(&source);
+    let setname_msg = Message::new("SETNAME", vec![realname.clone()]).with_prefix(&source);
+    crate::link::announce_setname(cfg, &state.read().await.user_id(client_id), &realname).await;
 
     // Send to self if they have setname
     let state = state.read().await;
@@ -4464,6 +4470,7 @@ pub async fn handle_sethost(
         state,
         channels,
         senders.clone(),
+        cfg,
         client_id,
         &old_source,
         &new_user,
@@ -4560,6 +4567,7 @@ pub async fn handle_setuser(
         state,
         channels,
         senders,
+        cfg,
         client_id,
         &old_source,
         &new_user,
@@ -4575,6 +4583,7 @@ pub async fn send_chghost_if_changed(
     state: Arc<RwLock<ServerState>>,
     channels: Arc<RwLock<ChannelStore>>,
     senders: Senders,
+    cfg: &Config,
     client_id: &str,
     old_source: &str,
     new_user: &str,
@@ -4595,6 +4604,13 @@ pub async fn send_chghost_if_changed(
     };
     let chghost_msg =
         Message::new("CHGHOST", vec![new_user.into(), new_host.into()]).with_prefix(old_source);
+    crate::link::announce_chghost(
+        cfg,
+        &state.read().await.user_id(client_id),
+        new_user,
+        new_host,
+    )
+    .await;
     let quit_msg = Message::new("QUIT", vec!["Changing host".into()]).with_prefix(old_source);
     let mut already_notified = std::collections::HashSet::new();
     let user_id = state.read().await.user_id(client_id);

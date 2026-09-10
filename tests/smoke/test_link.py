@@ -183,6 +183,122 @@ late.close()
 gone = eventually(lambda: [l for l in whois(b, late_nick) if " 401 " in l])
 check(f"B saw {late_nick} leave", bool(gone), gone)
 
+section("a channel is one channel on both servers")
+CHAN = f"#link{RUN}"
+alice.send(f"JOIN {CHAN}")
+alice.wait_for(" 366 ", seconds=5)
+
+mark_a = alice.mark()
+mark = b.mark()
+b.send(f"JOIN {CHAN}")
+b.wait_for(" 366 ", seconds=5)
+names = " ".join(b.find(" 353 ", lines=b.since(mark)))
+check(f"B sees the user from A in {CHAN}", renamed in names, names)
+
+got = arrives(alice, f"JOIN {CHAN}", mark_a)
+check("A was told when the user on B joined",
+      bool(got) and got[0].startswith(f":lb{RUN}!"), got)
+
+mark = alice.mark()
+b.send(f"PRIVMSG {CHAN} :hello the channel")
+got = arrives(alice, "hello the channel", mark)
+check("a channel message from B reaches the channel on A", bool(got), got)
+check("it comes from the person who sent it",
+      bool(got) and got[0].startswith(f":lb{RUN}!"), got)
+
+mark = b.mark()
+alice.send(f"PRIVMSG {CHAN} :and the other way")
+got = arrives(b, "and the other way", mark)
+check("a channel message from A reaches the channel on B", bool(got), got)
+
+section("channel state crosses too")
+# The channel was made on A, so its user holds the op there and the topic is
+# theirs to set.
+mark = b.mark()
+alice.send(f"TOPIC {CHAN} :shared topic")
+got = arrives(b, "shared topic", mark)
+check("a topic set on A is seen on B", bool(got), got)
+
+mark = b.mark()
+alice.send(f"MODE {CHAN} +m")
+got = arrives(b, f"MODE {CHAN} +m", mark)
+check("a channel mode set on A is seen on B", bool(got), got)
+
+mark = b.mark()
+alice.send(f"MODE {CHAN} +v lb{RUN}")
+got = arrives(b, f"+v", mark)
+check("voice given on A reaches the user on B",
+      bool(got) and f"lb{RUN}" in got[0], got)
+
+# +m is set and the user on B now has voice, so they may still speak.
+mark = alice.mark()
+b.send(f"PRIVMSG {CHAN} :voiced and moderated")
+got = arrives(alice, "voiced and moderated", mark)
+check("a voiced user on B can speak in a moderated channel on A", bool(got), got)
+
+mark = b.mark()
+alice.send(f"MODE {CHAN} -m")
+arrives(b, f"MODE {CHAN} -m", mark)
+
+section("what a user is, not just what they say")
+# A client on B that asked to hear about the people it shares a channel with.
+watcher = Client(f"w{RUN}", caps=["setname", "chghost", "account-notify",
+                                  "invite-notify", "message-tags"], port=B_PORT)
+watcher.join(CHAN)
+mark = watcher.mark()
+alice.send("SETNAME :a whole new name")
+got = arrives(watcher, "SETNAME", mark)
+check("a name change on A reaches the channel on B",
+      bool(got) and "a whole new name" in got[0], got)
+
+alone = Client(f"solo{RUN}", port=B_PORT)
+mark = alone.mark()
+alice.send(f"INVITE solo{RUN} {CHAN}")
+got = arrives(alone, "INVITE", mark)
+check("an invitation from A reaches a user on B",
+      bool(got) and CHAN.lower() in got[0].lower(), got)
+
+# The invitation has to be on the channel there too, or an invite-only door
+# would still be shut to the person who was asked through it.
+mark = b.mark()
+alice.send(f"MODE {CHAN} +i")
+arrives(b, "+i", mark)
+mark = alone.mark()
+alone.send(f"JOIN {CHAN}")
+got = arrives(alone, f"JOIN {CHAN}", mark)
+check("and lets them in through an invite-only door", bool(got), alone.since(mark)[-3:])
+alone.send(f"PART {CHAN}")
+mark = b.mark()
+alice.send(f"MODE {CHAN} -i")
+arrives(b, "-i", mark)
+# METADATA on a user is visible to the people who share a channel with them.
+meta = Client(f"m{RUN}", caps=["draft/metadata-2", "message-tags"], port=B_PORT)
+meta.join(CHAN)
+meta.send("METADATA * SUB display-name")
+meta.read(1.0)
+mark = meta.mark()
+alice.send("METADATA * SET display-name :Alice Across")
+got = arrives(meta, "METADATA", mark)
+check("a key set on A reaches a subscriber on B",
+      bool(got) and "Alice Across" in got[0], got)
+meta.close()
+
+watcher.close()
+alone.close()
+
+section("a channel a user leaves")
+mark = alice.mark()
+b.send(f"PART {CHAN} :going")
+got = arrives(alice, f"PART {CHAN}", mark)
+check("a part on B is seen on A", bool(got), got)
+
+mark = alice.mark()
+b.send(f"JOIN {CHAN}")
+arrives(alice, f"JOIN {CHAN}", mark)
+alice.send(f"KICK {CHAN} lb{RUN} :out you go")
+got = arrives(b, f"KICK {CHAN}", mark, seconds=6)
+check("a kick from A removes the user on B", bool(got), got)
+
 section("a rehash does not take the link down")
 # REHASH replaces the whole configuration. The servers already attached are not
 # re-linked by it, so what the running server knows about them has to survive —
@@ -232,6 +348,12 @@ if os.path.exists(pid_path):
 
     gone = eventually(lambda: [l for l in whois(a, f"lb{RUN}") if " 401 " in l])
     check("the users behind the split are gone from A", bool(gone), gone)
+
+    mark = a.mark()
+    a.send(f"NAMES {CHAN}")
+    a.wait_for(" 366 ", seconds=5)
+    left = " ".join(a.find(" 353 ", lines=a.since(mark)))
+    check("and out of the channels they were in", f"lb{RUN}" not in left, left)
 else:
     check("server B's pid file was written", False, pid_path)
 

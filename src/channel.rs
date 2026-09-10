@@ -206,6 +206,160 @@ impl Channel {
     pub fn member_count(&self) -> usize {
         self.members.len()
     }
+
+    /// The channel's modes as they go over a link: the letters, then the
+    /// arguments the letters that take one need, in the same order.
+    ///
+    /// Written once here so the burst and the reply to `MODE #channel` cannot
+    /// drift apart into two different ideas of what this channel is set to.
+    pub fn mode_string(&self) -> (String, Vec<String>) {
+        let mut letters = String::from("+");
+        let mut args = Vec::new();
+        for (set, letter) in [
+            (self.modes.invite_only, 'i'),
+            (self.modes.moderated, 'm'),
+            (self.modes.no_external, 'n'),
+            (self.modes.secret, 's'),
+            (self.modes.topic_protect, 't'),
+            (self.modes.private, 'p'),
+            (self.modes.registered_only, 'R'),
+            (self.modes.no_colors, 'c'),
+            (self.modes.no_ctcp, 'C'),
+        ] {
+            if set {
+                letters.push(letter);
+            }
+        }
+        if let Some(ref key) = self.key {
+            letters.push('k');
+            args.push(key.clone());
+        }
+        if let Some(limit) = self.modes.user_limit {
+            letters.push('l');
+            args.push(limit.to_string());
+        }
+        (letters, args)
+    }
+
+    /// Take the modes from a link, replacing whatever was set here.
+    ///
+    /// Used where the other side's channel is the older one and this side has
+    /// to give way: half-applying its modes would leave a channel that is
+    /// neither its own nor the one it agreed to.
+    pub fn set_mode_string(&mut self, letters: &str, args: &[String]) {
+        self.modes = ChannelModeSet::default();
+        self.key = None;
+        let mut arg = args.iter();
+        for c in letters.chars() {
+            match c {
+                '+' | '-' => {}
+                'i' => self.modes.invite_only = true,
+                'm' => self.modes.moderated = true,
+                'n' => self.modes.no_external = true,
+                's' => self.modes.secret = true,
+                't' => self.modes.topic_protect = true,
+                'p' => self.modes.private = true,
+                'R' => self.modes.registered_only = true,
+                'c' => self.modes.no_colors = true,
+                'C' => self.modes.no_ctcp = true,
+                'k' => self.key = arg.next().cloned(),
+                'l' => self.modes.user_limit = arg.next().and_then(|v| v.parse().ok()),
+                // A letter from a newer peer. Dropping it is better than
+                // guessing whether it takes an argument and losing the rest.
+                _ => {}
+            }
+        }
+    }
+
+    /// Add the modes from a link to the ones already set.
+    ///
+    /// Two channels of the same age are the same channel, met from two sides,
+    /// and neither side's modes are more right than the other's.
+    pub fn merge_mode_string(&mut self, letters: &str, args: &[String]) {
+        let mut arg = args.iter();
+        for c in letters.chars() {
+            match c {
+                '+' | '-' => {}
+                'i' => self.modes.invite_only = true,
+                'm' => self.modes.moderated = true,
+                'n' => self.modes.no_external = true,
+                's' => self.modes.secret = true,
+                't' => self.modes.topic_protect = true,
+                'p' => self.modes.private = true,
+                'R' => self.modes.registered_only = true,
+                'c' => self.modes.no_colors = true,
+                'C' => self.modes.no_ctcp = true,
+                'k' => {
+                    let v = arg.next().cloned();
+                    if self.key.is_none() {
+                        self.key = v;
+                    }
+                }
+                'l' => {
+                    let v = arg.next().and_then(|v| v.parse::<u32>().ok());
+                    // The looser limit wins: nobody is thrown out of a channel
+                    // by two servers meeting.
+                    self.modes.user_limit = match (self.modes.user_limit, v) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether one of the channel's lists already holds a mask.
+    ///
+    /// Masks are matched without regard to case, so `BAR!*@*` and `bar!*@*` are
+    /// one ban and setting the second over the first would leave two entries
+    /// that ban the same person and take two commands to lift.
+    pub fn list_contains(&self, letter: char, mask: &str) -> bool {
+        let wanted = crate::casefold::lower(mask);
+        self.list_of(letter)
+            .is_some_and(|l| l.iter().any(|m| crate::casefold::lower(m) == wanted))
+    }
+
+    /// Take a mask off one of the channel's lists, however it was capitalised
+    /// when it was put there. Returns whether anything went.
+    pub fn remove_from_list(&mut self, letter: char, mask: &str) -> bool {
+        let wanted = crate::casefold::lower(mask);
+        let Some(list) = self.list_mut(letter) else {
+            return false;
+        };
+        let gone: Vec<String> = list
+            .iter()
+            .filter(|m| crate::casefold::lower(m) == wanted)
+            .cloned()
+            .collect();
+        list.retain(|m| crate::casefold::lower(m) != wanted);
+        for m in &gone {
+            self.list_meta.remove(&format!("{}{}", letter, m));
+        }
+        !gone.is_empty()
+    }
+
+    /// The list a mode letter names, for the burst and for a link that changes
+    /// one.
+    pub fn list_mut(&mut self, letter: char) -> Option<&mut Vec<String>> {
+        match letter {
+            'b' => Some(&mut self.bans),
+            'e' => Some(&mut self.ban_exceptions),
+            'I' => Some(&mut self.invite_exceptions),
+            'q' => Some(&mut self.quiet_list),
+            _ => None,
+        }
+    }
+
+    pub fn list_of(&self, letter: char) -> Option<&Vec<String>> {
+        match letter {
+            'b' => Some(&self.bans),
+            'e' => Some(&self.ban_exceptions),
+            'I' => Some(&self.invite_exceptions),
+            'q' => Some(&self.quiet_list),
+            _ => None,
+        }
+    }
 }
 
 /// Canonical key for channel lookups. # and & channels are case-insensitive per IRC; use lowercase.

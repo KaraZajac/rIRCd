@@ -438,6 +438,22 @@ async fn handle_join_inner(
         let topic = ch.topic.clone();
         let topic_setter = ch.topic_setter.clone();
         let topic_time = ch.topic_time;
+        // What the rest of the network is told. A channel that has just come
+        // into being is announced whole — its age, its modes and the person who
+        // made it — because its age is what settles whose channel it is when
+        // another server already has one of that name. A join to a channel that
+        // was already here says only who joined.
+        let channel_ts = ch.created_at;
+        let channel_modes = ch.mode_string();
+        let announce_whole = ch.members.len() == 1;
+        let member_token = format!(
+            "{}{}",
+            ch.members
+                .get(&user_id)
+                .map(|m| m.modes.prefixes_ordered())
+                .unwrap_or_default(),
+            user_id
+        );
         drop(ch);
         // One event happened at one time. Stamping each copy as it is built
         // gives two people in the same channel two different times for the
@@ -499,6 +515,13 @@ async fn handle_join_inner(
                     send_to_client(&senders, mid, away_notify.clone()).await;
                 }
             }
+        }
+
+        if announce_whole {
+            crate::link::announce_channel(cfg, channel_ts, &ch_key, channel_modes, &member_token)
+                .await;
+        } else {
+            crate::link::announce_join(cfg, &user_id, channel_ts, &ch_key).await;
         }
 
         // Record JOIN event for draft/event-playback
@@ -752,6 +775,7 @@ pub async fn handle_part(
             ch_store.channels.remove(&ch_key);
         }
         drop(ch_store);
+        crate::link::announce_part(cfg, &user_id, &ch_key, Some(&reason)).await;
         tracing::debug!(client_id, channel = %ch_name, reason = %reason, "PART");
 
         // Record PART event for draft/event-playback
@@ -2020,6 +2044,10 @@ pub async fn handle_mode(
             let mode_msg = echo_params
                 .clone()
                 .map(|p| Message::new("MODE", p).with_prefix(nick.as_str()));
+            let link_mode = echo_params
+                .as_ref()
+                .and_then(|p| mode_params_for_link(p, &state));
+            let mode_setter = state.user_id(client_id);
             tracing::debug!(client_id, channel = %target, modes = %msg.params[1..].join(" "), "MODE change");
             drop(ch);
             drop(ch_store);
@@ -2027,6 +2055,10 @@ pub async fn handle_mode(
                 for mid in &member_ids_mode {
                     senders.read().await.deliver(mid, mode_msg);
                 }
+            }
+            if let Some((letters, args)) = link_mode {
+                crate::link::announce_channel_mode(cfg, &mode_setter, &ch_key, &letters, &args)
+                    .await;
             }
             // Persist channel modes to database
             if let Some(ref pool) = cfg.db {
@@ -2132,6 +2164,40 @@ pub async fn handle_mode(
 /// A rejected change must not be announced: a client told `+o nobody` succeeded
 /// would show ops nobody has. Walks the requested mode string in order,
 /// consuming each mode's parameter, and drops the ones in `rejected`.
+/// The same mode change, addressed the way the rest of the network needs it.
+///
+/// `+o` and its like name their target by user id over a link, not by nick: a
+/// nick change crossing in the other direction would otherwise be able to hand
+/// somebody else the op. Everything else goes as written.
+fn mode_params_for_link(params: &[String], state: &ServerState) -> Option<(String, Vec<String>)> {
+    const ALWAYS_PARAM: &str = "ovhbeIqk";
+    let mode_str = params.get(1)?.clone();
+    let mut rest = params[2..].iter();
+    let mut plus = true;
+    let mut out: Vec<String> = Vec::new();
+    for c in mode_str.chars() {
+        match c {
+            '+' => plus = true,
+            '-' => plus = false,
+            _ => {
+                if !(ALWAYS_PARAM.contains(c) || (c == 'l' && plus)) {
+                    continue;
+                }
+                let Some(p) = rest.next() else { continue };
+                if matches!(c, 'o' | 'v' | 'h') {
+                    match state.nick_to_id.get(&crate::casefold::upper(p)) {
+                        Some(id) => out.push(id.clone()),
+                        None => out.push(p.clone()),
+                    }
+                } else {
+                    out.push(p.clone());
+                }
+            }
+        }
+    }
+    Some((mode_str, out))
+}
+
 fn filter_mode_echo(params: &[String], rejected: &[(char, bool)]) -> Option<Vec<String>> {
     // Modes taking a parameter whichever way they are set, and `l` which takes
     // one only when set.
@@ -2320,6 +2386,8 @@ pub async fn handle_topic(
             "TOPIC",
             &happened_at,
         );
+        let setter = state.user_id(client_id);
+        crate::link::announce_topic(cfg, &setter, &ch_key, &topic_text).await;
 
         // Setting a topic is announced with the TOPIC message above, which the
         // setter receives along with everyone else. 331/332/333 answer a query
@@ -2375,6 +2443,8 @@ pub async fn handle_kick(
     let state_arc = state.clone();
     let state = state.read().await;
     let mut kicked_account: Option<String> = None;
+    // Who left the channel and why, told to the network once the locks are down.
+    let mut kicked_across: Option<(String, String)> = None;
     let client = match state.clients.get(client_id) {
         Some(c) => c.clone(),
         None => return Ok(()),
@@ -2455,14 +2525,17 @@ pub async fn handle_kick(
                     // producing notifications while they are away.
                     kicked_account = g.account.clone();
                 }
-                let kick_msg =
-                    Message::new("KICK", vec![ch_name.into(), target_nick.into(), reason])
-                        .with_prefix(&source);
+                let kick_msg = Message::new(
+                    "KICK",
+                    vec![ch_name.into(), target_nick.into(), reason.clone()],
+                )
+                .with_prefix(&source);
                 for mid in ch.members.clone().keys() {
                     senders.read().await.deliver(mid, &kick_msg);
                 }
                 senders.read().await.deliver(&tid, &kick_msg);
                 should_remove_channel = ch.members.is_empty();
+                kicked_across = Some((tid.clone(), reason.clone()));
             }
         }
         drop(ch);
@@ -2472,6 +2545,11 @@ pub async fn handle_kick(
     }
 
     drop(state);
+    if let Some((tid, reason)) = kicked_across {
+        let kicker = state_arc.read().await.user_id(client_id);
+        crate::link::announce_kick(cfg, &kicker, &canonical_channel_key(ch_name), &tid, &reason)
+            .await;
+    }
     if let Some(account) = kicked_account {
         if let Some(set) = state_arc
             .write()
@@ -2701,6 +2779,13 @@ pub async fn handle_invite(
                     send_to_client(&senders, mid, invite_msg.clone()).await;
                 }
             }
+            crate::link::announce_invite(
+                cfg,
+                &state.user_id(client_id),
+                target_id,
+                &canonical_channel_key(ch_name),
+            )
+            .await;
             return Ok(());
         } else {
             // 401 ERR_NOSUCHNICK: target nick not found

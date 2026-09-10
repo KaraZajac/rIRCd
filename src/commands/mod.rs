@@ -1,6 +1,6 @@
 mod channel_cmds;
 mod messaging;
-mod metadata;
+pub(crate) mod metadata;
 mod query_cmds;
 mod registration;
 mod reply;
