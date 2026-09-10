@@ -1,0 +1,6 @@
+# Several handlers take a connection or a message and everything that goes with
+# it: the id, the host, the sender, the capabilities, the label. Eight or nine
+# named parameters read better at the call site than a struct assembled once and
+# unpacked immediately, so the threshold is set where those functions sit rather
+# than bundling arguments to satisfy the default.
+too-many-arguments-threshold = 10
