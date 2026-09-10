@@ -48,13 +48,21 @@ def server_pid():
 
 
 def cpu_seconds(pid):
+    """(user, kernel) seconds of CPU this process has used.
+
+    Split, because they say different things. User time is the server's own
+    work — copying a message, adding tags to it, formatting it. Kernel time is
+    what it asks the machine for: writes, wakeups, polling. A change that
+    removes allocations moves the first number and not the second.
+    """
     if not pid:
-        return 0.0
+        return (0.0, 0.0)
     try:
         fields = open(f"/proc/{pid}/stat").read().split()
     except OSError:
-        return 0.0
-    return (int(fields[13]) + int(fields[14])) / os.sysconf("SC_CLK_TCK")
+        return (0.0, 0.0)
+    hz = os.sysconf("SC_CLK_TCK")
+    return (int(fields[13]) / hz, int(fields[14]) / hz)
 
 
 class Client:
@@ -129,7 +137,7 @@ async def main(receivers, senders):
         c.latencies.clear()
     expected = total_messages * (len(clients) - 1)
 
-    cpu_before = cpu_seconds(pid)
+    user_before, sys_before = cpu_seconds(pid)
     start = time.time()
     for i in range(per_sender):
         for s in sending:
@@ -146,14 +154,20 @@ async def main(receivers, senders):
             break
         await asyncio.sleep(0.05)
     elapsed = time.time() - start
-    cpu = cpu_seconds(pid) - cpu_before
+    user_after, sys_after = cpu_seconds(pid)
+    user, kernel = user_after - user_before, sys_after - sys_before
+    cpu = user + kernel
 
     print(f"messages sent:      {total_messages}")
     print(f"deliveries:         {delivered} of {expected}")
     print(f"time to deliver:    {elapsed:.2f}s")
     print(f"message rate:       {total_messages / elapsed:,.0f}/s")
     print(f"delivery rate:      {delivered / elapsed:,.0f}/s")
-    print(f"server CPU:         {cpu:.2f}s ({cpu / max(delivered, 1) * 1e6:.1f} µs per delivery)")
+    per = 1e6 / max(delivered, 1)
+    print(
+        f"server CPU:         {cpu:.2f}s ({cpu * per:.1f} µs per delivery: "
+        f"{user * per:.1f} its own work, {kernel * per:.1f} asking the machine)"
+    )
 
     def percentiles(samples, label):
         if not samples:
@@ -175,6 +189,15 @@ async def main(receivers, senders):
     # And once more without saturating it: one message, waited for, before the
     # next is sent. That is the number that says whether the server is healthy —
     # how long one thing somebody said takes to reach everybody listening.
+    # SMOKE_LATENCY=0 leaves it out, for measuring the burst on its own: sending
+    # one message at a time is the worst case for anything that batches, so it
+    # colours a reading of where the server's time goes.
+    if os.environ.get("SMOKE_LATENCY") == "0":
+        for t in tasks:
+            t.cancel()
+        for c in clients:
+            c.writer.close()
+        return
     for c in clients:
         c.latencies.clear()
         c.received = 0

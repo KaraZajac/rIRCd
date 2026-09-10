@@ -82,8 +82,8 @@ rather than merely unmeasured. Release build, 16-core desktop, 10 September
 
 | | |
 |---|---|
-| Deliveries per second, saturated | ~100,000 |
-| Server CPU per delivery | ~21 µs |
+| Deliveries per second, saturated | ~138,000 |
+| Server CPU per delivery | ~21 µs, half of it its own work and half asking the kernel |
 | Latency of one message to 219 recipients | 4.6 ms median, 12.0 ms p99 |
 | 2,000 clients connected, registered and joined | 5.9 s (340/s) |
 | Memory per client | ~22 KB (76 MB at 2,000) |
@@ -108,22 +108,29 @@ channel, 10 September 2026:
 
 | | rIRCd 1.4.0 | Ergo 2.19.1 |
 |---|---|---|
-| Deliveries per second | 110,632 | **451,479** |
-| Server CPU per delivery | 21.0 µs | **3.0 µs** |
-| Latency of one message, p50 | **4.5 ms** | 7.4 ms |
-| Latency of one message, p99 | 12.1 ms | **11.2 ms** |
+| Deliveries per second | 138,219 | **451,479** |
+| Server CPU per delivery | 20.7 µs | **3.0 µs** |
+| Latency of one message, p50 | **6.4 ms** | 7.4 ms |
+| Latency of one message, p99 | 13.7 ms | **11.2 ms** |
 
-rIRCd answers one message a shade faster and delivers four times fewer of them.
-The two numbers are not in tension: a message reaches everybody quickly when the
-server is not busy, and the server becomes busy four times sooner.
+rIRCd answers one message a shade faster and delivers three times fewer of them,
+and those two facts are the same fact: it writes each message out as it is
+produced rather than waiting to see whether more are coming. That is why one
+message arrives quickly and why the machine is asked to do so much.
 
-Where the difference is: rIRCd copies the message once per recipient and formats
-it once per recipient, because each connection may have negotiated different
-tags. With clients that negotiated nothing it costs 14.2 µs a delivery instead
-of 21.0, so the tag machinery is about a third of it and the copying is the
-rest. Rendering one line per distinct capability set and sharing it — most
-people in a channel have negotiated the same things — is the change that would
-close the gap, and it has not been made yet.
+The split says where to look. Of the 20.7 µs, about half is the server's own
+work — copying the message, tagging it, formatting it — and about half is
+asking the kernel: writes, wakeups, polling. Preparing one copy per audience
+rather than one per person took the first half down (deliveries went from
+110,632 a second to 138,219). Going further on that side has a floor: even
+free, the other half remains.
+
+The other half is the number of writes. A client's writing loop already batches
+whatever is queued when it wakes, but under a burst the one dispatch loop is the
+bottleneck, so there is usually one message waiting rather than ten. Letting it
+accumulate briefly would trade some of the single-message latency above for
+several messages per write. That is a choice about which of the two numbers
+matters, not a free improvement, and it has not been made.
 
 ## Writing a new suite
 

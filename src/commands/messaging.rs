@@ -80,6 +80,89 @@ fn is_blockable_ctcp(text: &str) -> bool {
     !verb.eq_ignore_ascii_case("ACTION")
 }
 
+/// What one recipient's copy of a message is decided by.
+///
+/// Everything that differs between two people's copies of the same message is a
+/// function of this and of nothing else — which tags are kept, which are added,
+/// whether the client-only ones come through at all. So two recipients whose
+/// views are equal get the same copy, and it only has to be built once.
+///
+/// It is a struct rather than the capability set itself on purpose. A tag that
+/// one day depends on something else about the recipient — what they are
+/// allowed to see, which server they are behind, what they have muted — becomes
+/// another field here and another thing the copies are grouped by. Grouping on
+/// the set directly would have to be taken apart to add one; grouping on a view
+/// does not.
+#[derive(Clone, PartialEq, Eq)]
+struct RecipientView {
+    /// What this connection's user negotiated. Compared whole: two people who
+    /// asked for the same things are the same audience.
+    caps: std::collections::HashSet<String>,
+}
+
+/// The distinct copies one message needs, each built once.
+///
+/// A channel of two hundred people usually holds two or three distinct views —
+/// most clients negotiate the same capabilities — so this turns two hundred
+/// taggings into three. The lookup is a scan because the list is that short,
+/// and comparing two sets stops at the first difference in length.
+struct PreparedCopies<'a> {
+    base: &'a Message,
+    sender_account: Option<&'a str>,
+    msgid: Option<&'a str>,
+    client_only_tags: Option<&'a std::collections::HashMap<String, Option<String>>>,
+    client_tag_deny: Option<&'a [String]>,
+    sender: &'a SenderTags,
+    built: Vec<(RecipientView, Message)>,
+}
+
+impl<'a> PreparedCopies<'a> {
+    fn new(
+        base: &'a Message,
+        sender_account: Option<&'a str>,
+        msgid: Option<&'a str>,
+        client_only_tags: Option<&'a std::collections::HashMap<String, Option<String>>>,
+        client_tag_deny: Option<&'a [String]>,
+        sender: &'a SenderTags,
+    ) -> Self {
+        Self {
+            base,
+            sender_account,
+            msgid,
+            client_only_tags,
+            client_tag_deny,
+            sender,
+            built: Vec::new(),
+        }
+    }
+
+    /// The copy for a recipient that negotiated `caps`, building it if this is
+    /// the first person to be owed that one.
+    fn for_caps(&mut self, caps: &std::collections::HashSet<String>) -> &Message {
+        if let Some(i) = self.built.iter().position(|(view, _)| &view.caps == caps) {
+            return &self.built[i].1;
+        }
+        let copy = add_tags_for_recipient(
+            self.base.clone(),
+            caps,
+            self.sender_account,
+            self.msgid,
+            self.client_only_tags,
+            self.client_tag_deny,
+            self.sender,
+        );
+        self.built
+            .push((RecipientView { caps: caps.clone() }, copy));
+        &self.built[self.built.len() - 1].1
+    }
+
+    /// How many distinct copies this message actually needed. For tests.
+    #[cfg(test)]
+    fn distinct(&self) -> usize {
+        self.built.len()
+    }
+}
+
 /// Send message to a recipient, adding server-time/msgid/account tags and client-only (+prefix) tags.
 #[allow(clippy::too_many_arguments)]
 async fn send_to_client_with_caps(
@@ -680,6 +763,14 @@ pub async fn handle_privmsg(
             base_msg
                 .tags
                 .insert("time".to_string(), Some(sent_at.clone()));
+            let mut copies = PreparedCopies::new(
+                &base_msg,
+                sender_account.as_deref(),
+                Some(&msgid),
+                Some(&msg.tags),
+                cfg.server.client_tag_deny.as_deref(),
+                &sender_tags,
+            );
             for (mid, memb) in &ch.members {
                 // STATUSMSG filter: @ → ops/halfops only; + → voiced/halfop/op only
                 if let Some(pfx) = statusmsg_prefix {
@@ -715,22 +806,14 @@ pub async fn handle_privmsg(
                     senders.read().await.deliver_except(mid, client_id, &tagged);
                     continue;
                 }
-                let recipient_caps = match state_guard.clients.get(mid) {
-                    Some(c) => c.read().await.capabilities.clone(),
-                    None => Default::default(),
+                // The copy this person is owed depends only on what they
+                // negotiated, so it is built once for everybody who negotiated
+                // the same things rather than once for each of them.
+                let tagged = match state_guard.clients.get(mid) {
+                    Some(c) => copies.for_caps(&c.read().await.capabilities).clone(),
+                    None => copies.for_caps(&Default::default()).clone(),
                 };
-                send_to_client_with_caps(
-                    &senders,
-                    mid,
-                    base_msg.clone(),
-                    &recipient_caps,
-                    sender_account.as_deref(),
-                    Some(&msgid),
-                    Some(&msg.tags),
-                    cfg.server.client_tag_deny.as_deref(),
-                    &sender_tags,
-                )
-                .await;
+                send_to_client(&senders, mid, tagged).await;
                 push_notify(
                     &state_guard,
                     cfg,
@@ -1021,6 +1104,14 @@ pub async fn handle_notice(
             {
                 return Ok(());
             }
+            let mut copies = PreparedCopies::new(
+                &base_msg,
+                sender_account.as_deref(),
+                Some(&msgid),
+                Some(&msg.tags),
+                cfg.server.client_tag_deny.as_deref(),
+                &sender_tags,
+            );
             for (mid, memb) in &ch.members {
                 // STATUSMSG filter
                 if let Some(pfx) = statusmsg_prefix {
@@ -1056,22 +1147,14 @@ pub async fn handle_notice(
                     senders.read().await.deliver_except(mid, client_id, &tagged);
                     continue;
                 }
-                let recipient_caps = match state_guard.clients.get(mid) {
-                    Some(c) => c.read().await.capabilities.clone(),
-                    None => Default::default(),
+                // The copy this person is owed depends only on what they
+                // negotiated, so it is built once for everybody who negotiated
+                // the same things rather than once for each of them.
+                let tagged = match state_guard.clients.get(mid) {
+                    Some(c) => copies.for_caps(&c.read().await.capabilities).clone(),
+                    None => copies.for_caps(&Default::default()).clone(),
                 };
-                send_to_client_with_caps(
-                    &senders,
-                    mid,
-                    base_msg.clone(),
-                    &recipient_caps,
-                    sender_account.as_deref(),
-                    Some(&msgid),
-                    Some(&msg.tags),
-                    cfg.server.client_tag_deny.as_deref(),
-                    &sender_tags,
-                )
-                .await;
+                send_to_client(&senders, mid, tagged).await;
                 push_notify(
                     &state_guard,
                     cfg,
@@ -2922,7 +3005,7 @@ pub async fn deliver_client_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::mentions_nick;
+    use super::{mentions_nick, Message, PreparedCopies, SenderTags};
 
     #[test]
     fn highlights_match_whole_nicks_only() {
@@ -2946,5 +3029,51 @@ mod tests {
         assert!(mentions_nick("hey |away|_ how are you", "|away|_"));
         assert!(!mentions_nick("hey kara_ how are you", "kara"));
         assert!(!mentions_nick("hey kara-work", "kara"));
+    }
+
+    fn caps(from: &[&str]) -> std::collections::HashSet<String> {
+        from.iter().map(|c| c.to_string()).collect()
+    }
+
+    /// A channel of many people needs as many copies of a message as there are
+    /// distinct answers to "what did you negotiate?", not as many as there are
+    /// people. That is the whole of the saving, so it is worth a test that
+    /// fails if the grouping is ever quietly lost.
+    #[test]
+    fn one_copy_per_audience_not_per_person() {
+        let base = Message::new("PRIVMSG", vec!["#chan".into(), "hello".into()]);
+        let sender = SenderTags::default();
+        let mut copies = PreparedCopies::new(&base, None, Some("abc"), None, None, &sender);
+
+        let modern = caps(&["message-tags", "server-time", "account-tag"]);
+        let plain = caps(&[]);
+        // Two hundred people, two kinds of client between them.
+        for i in 0..200 {
+            let _ = copies.for_caps(if i % 2 == 0 { &modern } else { &plain });
+        }
+        assert_eq!(copies.distinct(), 2, "one copy per audience");
+    }
+
+    /// And the copies really are different: the grouping must not be hiding a
+    /// tag going to somebody who did not ask for it.
+    #[test]
+    fn each_audience_gets_what_it_asked_for() {
+        let base = Message::new("PRIVMSG", vec!["#chan".into(), "hello".into()]);
+        let sender = SenderTags::default();
+        let mut copies = PreparedCopies::new(&base, Some("kara"), Some("abc"), None, None, &sender);
+
+        let tagged = copies
+            .for_caps(&caps(&["message-tags", "server-time", "account-tag"]))
+            .clone();
+        let bare = copies.for_caps(&caps(&[])).clone();
+
+        assert_eq!(tagged.tags.get("msgid"), Some(&Some("abc".to_string())));
+        assert_eq!(tagged.tags.get("account"), Some(&Some("kara".to_string())));
+        assert!(tagged.tags.contains_key("time"));
+        assert!(
+            bare.tags.is_empty(),
+            "a client that asked for nothing gets nothing: {:?}",
+            bare.tags
+        );
     }
 }
