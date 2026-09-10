@@ -2,7 +2,7 @@ mod channel_cmds;
 mod messaging;
 pub(crate) mod metadata;
 mod query_cmds;
-mod registration;
+pub mod registration;
 mod reply;
 mod server_cmds;
 mod webpush_cmds;

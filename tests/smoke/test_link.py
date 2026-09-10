@@ -347,6 +347,75 @@ alice.send(f"KICK {CHAN} lb{RUN} :out you go")
 got = arrives(b, f"KICK {CHAN}", mark, seconds=6)
 check("a kick from A removes the user on B", bool(got), got)
 
+section("reclaiming a nick held on the other server")
+# GHOST closes the session using a nick so its account can take it back. The
+# connections are on the server that session is on, so a session on the other
+# server has to be closed by that server -- and every rule the asking server
+# checked is checked again there, from what it knows rather than from what it
+# was told.
+from harness import connect_negotiating  # noqa: E402
+
+GHOST_NICK = f"gh{RUN}"
+GHOST_PASSWORD = "hunter2hunter2"
+
+# The account is made on B, where the reclaiming client will be.
+owner = Client(GHOST_NICK, port=B_PORT)
+mark = owner.mark()
+owner.send(f"REGISTER * {GHOST_NICK}@example.invalid {GHOST_PASSWORD}")
+owner.read(2.5)
+registered = bool(owner.find(" 900 ", lines=owner.since(mark))) or bool(
+    owner.find("REGISTER SUCCESS", lines=owner.since(mark)))
+check("an account can be registered on B", registered, owner.since(mark)[-3:])
+owner.close()
+time.sleep(0.8)
+
+# Now the nick is taken on A, by somebody who is not logged in: the stale
+# session this is all about.
+stale = Client(GHOST_NICK, port=A_PORT)
+found = eventually(lambda: [l for l in whois(b, GHOST_NICK) if " 311 " in l])
+check("the stale session on A is seen from B", bool(found), found)
+
+if registered and found:
+    # And the account holder comes back on B under another name.
+    back = connect_negotiating(f"gb{RUN}", caps=["sasl"], port=B_PORT)
+    back.sasl_plain(GHOST_NICK, GHOST_PASSWORD)
+    back.send("CAP END")
+    back.wait_for(" 376 ", " 422 ", seconds=5)
+    logged_in = bool(back.find(" 900 "))
+    check("the account holder logs in on B", logged_in, back.lines[-3:])
+
+    mark = back.mark()
+    back.send(f"GHOST {GHOST_NICK}")
+    back.read(2.0)
+    check("B says it asked A to close the session",
+          bool(back.find("NOTICE", "Asked", lines=back.since(mark))), back.since(mark)[-3:])
+
+    gone = eventually(lambda: [l for l in whois(b, GHOST_NICK) if " 401 " in l], seconds=12)
+    check("and the session on A is closed", bool(gone), gone or whois(b, GHOST_NICK)[-3:])
+    back.close()
+
+    # Somebody with no claim to the nick cannot have it closed. The asking
+    # server refuses this one itself, which is why a second stale session is
+    # needed to prove the far side refuses it too.
+    stale2 = Client(GHOST_NICK, port=A_PORT)
+    eventually(lambda: [l for l in whois(b, GHOST_NICK) if " 311 " in l])
+    stranger = Client(f"gs{RUN}", port=B_PORT)
+    mark = stranger.mark()
+    stranger.send(f"GHOST {GHOST_NICK}")
+    stranger.read(1.5)
+    check("a user with no account cannot close somebody else's session",
+          bool(stranger.find("FAIL GHOST", lines=stranger.since(mark))), stranger.since(mark)[-3:])
+    still_there = [l for l in whois(b, GHOST_NICK) if " 311 " in l]
+    check("and that session is still there", bool(still_there), still_there)
+    stranger.close()
+    stale2.close()
+
+try:
+    stale.close()
+except OSError:
+    pass
+time.sleep(0.5)
+
 section("a rehash does not take the link down")
 # REHASH replaces the whole configuration. The servers already attached are not
 # re-linked by it, so what the running server knows about them has to survive —

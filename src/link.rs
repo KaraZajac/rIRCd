@@ -1266,6 +1266,29 @@ async fn accept_remote_nick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
+/// `:<asker> GHOST <target>` — the account that owns a nick wants the session
+/// using it closed, and that session is on this server.
+///
+/// Passed along when the session is somewhere else again, because a network
+/// wider than two servers puts one in between.
+async fn accept_remote_ghost(ctx: &LinkContext, msg: &Message) {
+    let (Some(asker), Some(target)) = (msg.prefix.clone(), msg.params.first().cloned()) else {
+        return;
+    };
+    if pass_along(ctx, msg, &target).await {
+        return;
+    }
+    let server_name = ctx.cfg.read().await.server.name.clone();
+    crate::commands::registration::ghost_for_remote(
+        &ctx.state,
+        &ctx.senders,
+        &server_name,
+        &asker,
+        &target,
+    )
+    .await;
+}
+
 /// `:<asker> WHOISREQ <target> <token>` — somebody on another server wants to
 /// know how long one of ours has been quiet.
 ///
@@ -2747,6 +2770,10 @@ async fn handle_link_message(
         }
         "NICK" => {
             accept_remote_nick(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "GHOST" => {
+            accept_remote_ghost(ctx, msg).await;
             std::ops::ControlFlow::Continue(())
         }
         "WHOISREQ" => {

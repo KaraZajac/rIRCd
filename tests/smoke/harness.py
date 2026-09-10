@@ -140,9 +140,9 @@ class Client:
         return self
 
 
-def connect_negotiating(nick, caps=None):
+def connect_negotiating(nick, caps=None, port=None):
     """A client that has sent CAP LS but not yet completed registration."""
-    c = Client()
+    c = Client(port=port)
     c.send("CAP LS 302")
     c.read(0.7)
     if caps:

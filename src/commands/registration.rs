@@ -4124,6 +4124,43 @@ pub async fn handle_ghost(
         return Ok(());
     };
 
+    // The connections are on the server the session is on, so a session
+    // somewhere else has to be closed by the server it is on. Everything that
+    // decides whether it may be closed has been checked here and is checked
+    // again there, from what that server knows rather than from what this one
+    // says.
+    let elsewhere = {
+        let state_r = state.read().await;
+        match state_r.clients.get(&ghost_id) {
+            Some(c) => c.read().await.server.is_some(),
+            None => false,
+        }
+    };
+    if elsewhere {
+        let asked = crate::link::route_to_user(
+            cfg,
+            &self_id,
+            &ghost_id,
+            &Message::new("GHOST", vec![String::new()]),
+        )
+        .await;
+        tracing::info!(client_id, %account, ghost = %ghost_id, asked,
+                       "GHOST: asking the server holding the session to close it");
+        let text = if asked {
+            format!("Asked the server holding {} to close that session", target)
+        } else {
+            format!("There is no way to reach the server holding {}", target)
+        };
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("NOTICE", vec![nick, text]).with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
     tracing::info!(client_id, %account, ghost = %ghost_id, "GHOST: closing stale session");
     senders.write().await.close_user(
         &ghost_id,
@@ -4142,6 +4179,72 @@ pub async fn handle_ghost(
     )
     .await;
     Ok(())
+}
+
+/// Close a session on this server because the account that owns its nick asked,
+/// from another server.
+///
+/// Every condition the asking server checked is checked again here, from what
+/// this server knows: that the asker has an account, that the account owns the
+/// nick being reclaimed, and that they are not asking to close themselves. A
+/// link is trusted to speak for its own users, not to have got the rules right.
+pub async fn ghost_for_remote(
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    server_name: &str,
+    asker_uid: &str,
+    target_uid: &str,
+) {
+    let asker_account = {
+        let state_r = state.read().await;
+        match state_r.clients.get(asker_uid) {
+            Some(c) => c.read().await.account.clone(),
+            None => None,
+        }
+    };
+    let Some(account) = asker_account else {
+        tracing::warn!(asker = %asker_uid, "GHOST from a user with no account, refused");
+        return;
+    };
+    if asker_uid == target_uid {
+        return;
+    }
+    let (target_nick, target_is_ours) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(target_uid) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.nick.clone(), g.server.is_none())
+            }
+            None => (None, false),
+        }
+    };
+    let Some(target_nick) = target_nick else {
+        return;
+    };
+    if !target_is_ours {
+        // Not ours to close. The server that holds it was the one asked.
+        return;
+    }
+    if !target_nick.eq_ignore_ascii_case(&account) {
+        tracing::warn!(
+            asker = %asker_uid,
+            %account,
+            target = %target_nick,
+            "GHOST for a nick the asking account does not own, refused"
+        );
+        return;
+    }
+    tracing::info!(asker = %asker_uid, %account, target = %target_uid,
+                   "GHOST: closing a session for another server");
+    senders.write().await.close_user(
+        target_uid,
+        Message::new(
+            "ERROR",
+            vec![format!("Closing link: replaced by {}", account)],
+        )
+        .with_prefix(server_name),
+    );
 }
 
 /// VERIFY {<account>|*} <code> — draft/account-registration. Confirms an account

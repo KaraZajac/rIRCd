@@ -170,7 +170,13 @@ got, so that nobody has to read the source to find out:
 | Chathistory: both ends of a conversation keep it | yes |
 | TLS, with each side pinned to the other's certificate | yes |
 | `WHOIS` forwarded, for the idle time only that server knows | yes |
-| Services commands (`GHOST`, `SANICK`) acting on a remote user | not yet |
+| `GHOST`, for a session held on another server | yes |
+
+`SANICK` is not here and never was: it is an operator forcibly renaming
+somebody, which no part of this server does, so there is nothing to carry
+across a link. It is a feature to decide on rather than a gap to close.
+
+A `WHOIS` for somebody on another server is answered from what this one was
 
 ### What a link is allowed to say
 
@@ -186,6 +192,25 @@ users are keyed by this server's own ids, so a peer allowed to name any id could
 send `:1AAAAAAAB QUIT` and disconnect somebody on the server it had just linked
 to. `tests/smoke/test_link_hostile.py` does exactly that, three hundred ids at a
 time, and checks that everybody is still there afterwards.
+
+### Asking somebody else to act
+
+`GHOST` closes the session using a nick so the account that owns it can take it
+back, and the connections are on the server that session is on. So the request
+goes there:
+
+    :<asker> GHOST <target>
+
+It is addressed to one server, passed along by any in between, and there is
+nothing to wait for — the session closing is announced as an ordinary `QUIT`,
+which is how everybody including the asker finds out.
+
+Everything the asking server checked is checked again on arrival, from what the
+receiving server knows rather than from what it was told: that the asker has an
+account, that the account owns the nick being reclaimed, and that they are not
+asking to close themselves. A link is trusted to speak for its own users, not to
+have got the rules right — and accounts cross a link, so the far side can check
+this for itself.
 
 ### Asking, rather than announcing
 
