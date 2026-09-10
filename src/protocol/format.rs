@@ -80,11 +80,11 @@ pub fn format_message(msg: &Message) -> String {
 
     if let Some(ref prefix) = msg.prefix {
         out.push(':');
-        out.push_str(prefix);
+        push_on_one_line(&mut out, prefix);
         out.push(' ');
     }
 
-    out.push_str(&msg.command);
+    push_on_one_line(&mut out, &msg.command);
 
     for (i, param) in msg.params.iter().enumerate() {
         out.push(' ');
@@ -105,11 +105,34 @@ pub fn format_message(msg: &Message) -> String {
         {
             out.push(':');
         }
-        out.push_str(param);
+        push_on_one_line(&mut out, param);
     }
 
     out.push_str("\r\n");
     out
+}
+
+/// Append text that cannot end the line early.
+///
+/// One message is one line, and the only thing that may say where it ends is
+/// the CRLF this function is not writing. A carriage return or a line feed
+/// reaching here would split the message in two, and the second half would look
+/// to the reader exactly like something the server had said — so they never
+/// reach here, whatever put them in the string. A NUL ends the line for a C
+/// client, and goes for the same reason.
+///
+/// Nothing a client sends can carry one: the parser refuses a message with
+/// either inside it. This is for everything else — a topic out of the database,
+/// a line of MOTD from a configuration file, a name a linked server chose.
+fn push_on_one_line(out: &mut String, text: &str) {
+    if text
+        .bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == 0)
+    {
+        out.extend(text.chars().filter(|c| *c != '\r' && *c != '\n' && *c != '\0'));
+        return;
+    }
+    out.push_str(text);
 }
 
 fn format_tags(tags: &HashMap<String, Option<String>>) -> String {

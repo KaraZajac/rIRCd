@@ -24,6 +24,17 @@ pub fn parse_message_with_limit(line: &str, max_body: usize) -> Result<Message, 
         return Err(ParseError::InputTooLong);
     }
 
+    // A carriage return or a line feed left inside the line is not content: it
+    // is a second message somebody is trying to smuggle through the first. A
+    // bare CR survives reading up to the newline, and a WebSocket frame is
+    // delimited by the frame and not by either character at all — so the only
+    // place that can refuse it for every transport at once is here. NUL goes
+    // with them: it ends the line for anything reading it as a C string, and no
+    // specification has ever allowed one in a message.
+    if line.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return Err(ParseError::ForbiddenCharacter);
+    }
+
     // Leading spaces are separator, never content: a line may not begin with a
     // parameter, and trimming here means the prefix and command are found
     // wherever they actually start.
@@ -178,6 +189,9 @@ fn is_command_token(s: &str) -> bool {
 pub enum ParseError {
     Malformed,
     InputTooLong,
+    /// A CR, LF or NUL inside the line, where only the end of it may have a
+    /// terminator and none of the three may appear at all.
+    ForbiddenCharacter,
 }
 
 impl std::fmt::Display for ParseError {
@@ -185,6 +199,10 @@ impl std::fmt::Display for ParseError {
         match self {
             ParseError::Malformed => write!(f, "Malformed message"),
             ParseError::InputTooLong => write!(f, "Input line was too long"),
+            ParseError::ForbiddenCharacter => write!(
+                f,
+                "Message contained a carriage return, line feed or NUL"
+            ),
         }
     }
 }

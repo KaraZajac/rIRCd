@@ -220,3 +220,66 @@ fn a_line_never_exceeds_the_limit_it_was_given() {
         );
     }
 }
+
+/// One message is one line. A carriage return or a line feed left inside a
+/// message would end it early, and everything after would reach the reader
+/// looking exactly like something the server had said — a forged PRIVMSG from
+/// anyone, a numeric that never happened.
+///
+/// A bare CR survives reading up to the newline, and a WebSocket frame is
+/// delimited by the frame rather than by either character, so the refusal has
+/// to be in the parser, where every transport passes.
+#[test]
+fn a_message_may_not_smuggle_a_second_one() {
+    use rircd::protocol::parse_message;
+
+    for hostile in [
+        "PRIVMSG #chan :hi\r:evil!e@e PRIVMSG #chan :forged",
+        "PRIVMSG #chan :hi\n:evil!e@e PRIVMSG #chan :forged",
+        "PRIVMSG #chan :hi\r\n:evil!e@e PRIVMSG #chan :forged",
+        "NICK a\rb",
+        "@tag=x\ry PRIVMSG #chan :hi",
+        "\rPING x",
+        "PING to\0ken",
+    ] {
+        assert!(
+            parse_message(hostile).is_err(),
+            "accepted a line with an embedded terminator: {hostile:?}"
+        );
+    }
+
+    // The terminator the line legitimately ends with is still fine.
+    assert!(parse_message("PING token\r\n").is_ok());
+    assert!(parse_message("PING token\n").is_ok());
+    assert!(parse_message("PING token\r").is_ok());
+}
+
+/// The same promise from the other side. Nothing a client sends can carry a
+/// terminator any more, but a topic out of the database, a line of MOTD from a
+/// configuration file, or a name a linked server chose has never been through
+/// the parser — and one message still has to be one line.
+#[test]
+fn nothing_written_out_can_end_the_line_early() {
+    let hostile = "innocent\r\n:evil!e@e PRIVMSG #chan :forged";
+    let cases = [
+        Message::new("PRIVMSG", vec!["#chan".into(), hostile.into()]),
+        Message::new("332", vec!["nick".into(), "#chan".into(), hostile.into()]),
+        Message::new("PRIVMSG", vec!["#chan".into(), "hi".into()])
+            .with_prefix("evil\r\n:server 001 you :welcome"),
+        Message::new("NOTICE", vec!["nick".into(), "a\0b".into()]),
+    ];
+    for msg in cases {
+        let line = format_message(&msg);
+        assert_eq!(
+            line.matches("\r\n").count(),
+            1,
+            "more than one line came out of one message: {line:?}"
+        );
+        assert!(line.ends_with("\r\n"), "{line:?}");
+        let body = line.trim_end_matches("\r\n");
+        assert!(
+            !body.contains('\r') && !body.contains('\n') && !body.contains('\0'),
+            "a terminator survived into the body: {body:?}"
+        );
+    }
+}

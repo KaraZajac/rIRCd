@@ -74,5 +74,39 @@ try:
 except WebSocketError as e:
     check("binary.ircv3.net is also offered", False, str(e))
 
+section("one frame, one message")
+# A WebSocket frame is delimited by the frame, so a CR or LF inside one is not
+# a terminator to the transport and would be written straight into the stream
+# of every other client. It has to be refused.
+import time  # noqa: E402
+
+CHAN = "#wsinj"
+victim = Client("wsvictim")
+victim.join(CHAN)
+inj = WsClient(IRC_HOST, WS_PORT)
+inj.register("wsinj", caps=["message-tags"])
+inj.send(f"JOIN {CHAN}")
+inj.read(1.0)
+victim.read(1.0)
+
+mark = victim.mark()
+inj.send(f"PRIVMSG {CHAN} :innocent\r\n:evil!e@e PRIVMSG {CHAN} :FORGED")
+inj.read(1.0)
+time.sleep(0.3)
+victim.read(1.5)
+seen = victim.since(mark)
+check("a frame carrying two lines cannot forge one of them",
+      not [l for l in seen if "FORGED" in l], seen)
+
+mark = victim.mark()
+inj.send(f"PRIVMSG {CHAN} :still here")
+inj.read(0.5)
+victim.read(1.5)
+check("the WebSocket survives a frame that was refused",
+      bool(victim.find("still here", lines=victim.since(mark))),
+      victim.since(mark)[-3:])
+inj.close()
+victim.close()
+
 tcp.close()
 summary("websocket")

@@ -41,6 +41,11 @@ const ALPHABET: &[&str] = &[
     " ", "  ", ":", "@", "!", ";", "=", ",", "*", "?", "+", "-", "#", "&", "%", "$", "\\", "/",
     "a", "Z", "0", "9", "\t", "\x07", "\u{0}", "\u{7f}", "é", "💜", "\u{202e}", "\u{feff}",
     "PRIVMSG", "NICK", "CAP", "time", "msgid", "draft/x", "batch",
+    // The two characters that end a line, and the one that ends it for anything
+    // reading a C string. Without them here the test below asserted that
+    // nothing could smuggle a second line against an alphabet that could not
+    // produce one, and it passed for a year while the server let them through.
+    "\r", "\n", "\r\n", "\u{0}",
 ];
 
 fn gibberish(rng: &mut Rng, max_pieces: usize) -> String {

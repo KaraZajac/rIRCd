@@ -358,6 +358,41 @@ check(
 one.close()
 two.close()
 
+section("one message, one line")
+# A carriage return or a line feed inside a message would end it early, and
+# everything after it would arrive at the reader looking exactly like something
+# the server had said. A bare CR survives being read up to the newline, so it
+# has to be refused rather than trimmed.
+INJ = f"#inj{RUN}"
+victim = Client(f"vic{RUN}")
+victim.join(INJ)
+attacker = Client(f"att{RUN}")
+attacker.join(INJ)
+victim.read(0.5)
+
+for label, payload in [
+    ("a bare carriage return", f"PRIVMSG {INJ} :hi\r:evil!e@e PRIVMSG {INJ} :FORGED-CR\r\n"),
+    ("a NUL", f"PRIVMSG {INJ} :hi\x00:evil!e@e PRIVMSG {INJ} :FORGED-NUL\r\n"),
+]:
+    mark = victim.mark()
+    attacker.sock.sendall(payload.encode())
+    time.sleep(0.5)
+    victim.read(1.0)
+    seen = victim.since(mark)
+    check(f"{label} does not smuggle a second message", not [l for l in seen if "FORGED" in l], seen)
+
+# Refusing the line must not cost the client its connection.
+mark = victim.mark()
+attacker.send(f"PRIVMSG {INJ} :still here")
+victim.read(1.5)
+check(
+    "the connection survives a message that was refused",
+    bool(victim.find("still here", lines=victim.since(mark))),
+    victim.since(mark)[-3:],
+)
+victim.close()
+attacker.close()
+
 section("still standing")
 check("the server is still accepting and serving clients", still_alive("everything", f"h12{RUN}"))
 
