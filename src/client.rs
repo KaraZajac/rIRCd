@@ -188,6 +188,10 @@ pub async fn handle_client(
     .await;
 }
 
+/// Commands a batch collects. Only these are one logical message when they
+/// carry an open batch's tag; anything else is an ordinary command wearing it.
+const BATCHED_COMMANDS: &[&str] = &["PRIVMSG", "NOTICE", "TAGMSG"];
+
 /// Whether a command is exempt from flood control.
 ///
 /// Registration is exempt because a client has to get through it before it can
@@ -201,8 +205,20 @@ pub async fn handle_client(
 /// other server on the network. Left exempt, one connection renaming itself as
 /// fast as it can decides how much of this server everybody else gets, and the
 /// backlog it builds outlives the connection that sent it.
-fn flood_exempt(command: &str, has_said_who_they_are: bool) -> bool {
-    match command {
+///
+/// The lines a batch collects are one logical message between them: charging a
+/// token each would make the advertised multiline limits unusable, because
+/// max-lines is twice the bucket, and the server bounds the batch itself. That
+/// is true of the three commands a batch actually collects and of nothing else
+/// — a WHO with a batch tag on it is a WHO.
+fn flood_exempt(msg: &Message, has_said_who_they_are: bool, open_batch: Option<&str>) -> bool {
+    if open_batch.is_some()
+        && BATCHED_COMMANDS.contains(&msg.command.as_str())
+        && msg.tags.get("batch").and_then(|v| v.as_deref()) == open_batch
+    {
+        return true;
+    }
+    match msg.command.as_str() {
         "CAP" | "USER" | "PASS" | "AUTHENTICATE" | "PING" | "PONG" | "QUIT" | "BATCH" => true,
         "NICK" => !has_said_who_they_are,
         _ => false,
@@ -416,15 +432,7 @@ async fn handle_client_stream<S>(
                                     (flood_tokens + elapsed * flood_refill_rate).min(flood_capacity);
                                 flood_last_refill = now;
 
-                                // Lines inside an open batch form one logical message.
-                                // Charging a token each makes the advertised multiline
-                                // limits unusable, because max-lines is twice the bucket.
-                                // The server bounds batch size itself, so this is not a
-                                // way to flood.
-                                let in_open_batch = open_batch.is_some()
-                                    && msg.tags.get("batch").and_then(|v| v.as_deref())
-                                        == open_batch.as_deref();
-                                if !flood_exempt(&msg.command, said_who_they_are) && !in_open_batch {
+                                if !flood_exempt(&msg, said_who_they_are, open_batch.as_deref()) {
                                     if flood_tokens < 1.0 {
                                         tracing::warn!(client = %client_id, command = %msg.command, "Flood control triggered");
                                         let reply = Message::new(
@@ -675,15 +683,7 @@ pub async fn handle_client_ws(
                                     (flood_tokens + elapsed * flood_refill_rate).min(flood_capacity);
                                 flood_last_refill = now;
 
-                                // Lines inside an open batch form one logical message.
-                                // Charging a token each makes the advertised multiline
-                                // limits unusable, because max-lines is twice the bucket.
-                                // The server bounds batch size itself, so this is not a
-                                // way to flood.
-                                let in_open_batch = open_batch.is_some()
-                                    && msg.tags.get("batch").and_then(|v| v.as_deref())
-                                        == open_batch.as_deref();
-                                if !flood_exempt(&msg.command, said_who_they_are) && !in_open_batch {
+                                if !flood_exempt(&msg, said_who_they_are, open_batch.as_deref()) {
                                     if flood_tokens < 1.0 {
                                         tracing::warn!(client = %client_id, command = %msg.command, "Flood control triggered (WS)");
                                         let reply = Message::new(
@@ -782,15 +782,7 @@ pub async fn handle_client_ws(
                                     (flood_tokens + elapsed * flood_refill_rate).min(flood_capacity);
                                 flood_last_refill = now;
 
-                                // Lines inside an open batch form one logical message.
-                                // Charging a token each makes the advertised multiline
-                                // limits unusable, because max-lines is twice the bucket.
-                                // The server bounds batch size itself, so this is not a
-                                // way to flood.
-                                let in_open_batch = open_batch.is_some()
-                                    && msg.tags.get("batch").and_then(|v| v.as_deref())
-                                        == open_batch.as_deref();
-                                if !flood_exempt(&msg.command, said_who_they_are) && !in_open_batch {
+                                if !flood_exempt(&msg, said_who_they_are, open_batch.as_deref()) {
                                     if flood_tokens < 1.0 {
                                         let reply = Message::new(
                                             "NOTICE",

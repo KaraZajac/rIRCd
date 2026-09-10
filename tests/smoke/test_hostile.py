@@ -608,6 +608,34 @@ else:
     )
 check("and it is still serving afterwards", still_alive("a rename flood", f"h24{RUN}"))
 
+section("a command wearing a batch tag")
+# The lines a batch collects are one logical message, so they are not charged
+# to flood control -- the advertised multiline limits are larger than the
+# bucket. That is true of the three commands a batch collects. Anything else
+# with the tag on it is an ordinary command, and left exempt it was a way for
+# any client to send as many of them as it liked.
+tagged = raw(timeout=10)
+tagged.sendall(f"NICK bt{RUN}\r\nUSER b 0 * :b\r\n".encode())
+time.sleep(0.5)
+tagged.sendall(b"BATCH +x draft/client-batch #batchflood\r\n")
+time.sleep(0.2)
+tagged.sendall(b"@batch=x WHO 0\r\n" * 60)
+time.sleep(1.5)
+tagged.setblocking(False)
+seen = b""
+try:
+    while True:
+        d = tagged.recv(1 << 20)
+        if not d:
+            break
+        seen += d
+except (BlockingIOError, OSError):
+    pass
+tagged.close()
+check("a WHO with a batch tag on it is still a WHO",
+      b"Flood control" in seen,
+      seen[-200:])
+
 section("commands that mean nothing")
 # The parser is fuzzed by the unit tests; this fuzzes what happens after it.
 # Every command the server dispatches, with parameters drawn from the shapes a
