@@ -1744,7 +1744,10 @@ pub async fn handle_kline(
         set_by: nick.clone(),
         set_at: chrono::Utc::now().timestamp(),
         expires_at: if duration > 0 {
-            Some(chrono::Utc::now().timestamp() + duration)
+            // The duration is whatever number was typed. Added to the clock it
+            // can leave the range a timestamp has, which in a release build
+            // wraps round to the past and quietly makes the ban expired.
+            Some(chrono::Utc::now().timestamp().saturating_add(duration))
         } else {
             None
         },

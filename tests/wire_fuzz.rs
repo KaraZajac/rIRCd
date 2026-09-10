@@ -38,14 +38,59 @@ impl Rng {
 /// the awkward ends of Unicode. Random bytes alone almost never produce a
 /// parseable message, so the interesting cases have to be aimed for.
 const ALPHABET: &[&str] = &[
-    " ", "  ", ":", "@", "!", ";", "=", ",", "*", "?", "+", "-", "#", "&", "%", "$", "\\", "/",
-    "a", "Z", "0", "9", "\t", "\x07", "\u{0}", "\u{7f}", "é", "💜", "\u{202e}", "\u{feff}",
-    "PRIVMSG", "NICK", "CAP", "time", "msgid", "draft/x", "batch",
+    " ",
+    "  ",
+    ":",
+    "@",
+    "!",
+    ";",
+    "=",
+    ",",
+    "*",
+    "?",
+    "+",
+    "-",
+    "#",
+    "&",
+    "%",
+    "$",
+    "\\",
+    "/",
+    "a",
+    "Z",
+    "0",
+    "9",
+    "\t",
+    "\x07",
+    "\u{0}",
+    "\u{7f}",
+    "é",
+    "💜",
+    "\u{202e}",
+    "\u{feff}",
+    "PRIVMSG",
+    "NICK",
+    "CAP",
+    "time",
+    "msgid",
+    "draft/x",
+    "batch",
     // The two characters that end a line, and the one that ends it for anything
     // reading a C string. Without them here the test below asserted that
     // nothing could smuggle a second line against an alphabet that could not
     // produce one, and it passed for a year while the server let them through.
-    "\r", "\n", "\r\n", "\u{0}",
+    "\r",
+    "\n",
+    "\r\n",
+    "\u{0}",
+    // Numbers that are not numbers this server can hold. A timestamp off a
+    // link, a channel limit, a history count: each is parsed from whatever the
+    // sender typed and then used in arithmetic that has a range.
+    "9223372036854775807",
+    "-9223372036854775808",
+    "18446744073709551615",
+    "-1",
+    "00000000000000000000",
 ];
 
 fn gibberish(rng: &mut Rng, max_pieces: usize) -> String {
