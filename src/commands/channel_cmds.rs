@@ -2739,12 +2739,18 @@ pub async fn handle_invite(
             return Ok(());
         }
 
+        // Being an operator is only needed to invite past a closed door. "If the
+        // channel has the invite-only mode set, the client must have channel
+        // operator privileges" — RFC 1459 §4.2.7, RFC 2812 §3.2.7 and the
+        // Modern spec all say it of `+i` and of nothing else. On an ordinary
+        // channel any member may bring somebody, which is what asking a friend
+        // to join is.
         let is_op = ch
             .members
             .get(&state.user_id(client_id))
             .map(|m| m.modes.op)
             .unwrap_or(false);
-        if !is_op {
+        if ch.modes.invite_only && !is_op {
             let nick = client.read().await.nick_or_id().to_string();
             reply_to_client(
                 &senders,

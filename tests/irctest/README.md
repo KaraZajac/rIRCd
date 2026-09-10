@@ -98,9 +98,30 @@ harness being told the server does not do that at all: Ergo skips
 `LINKS`, `WALLOPS` and SASL re-authentication. rIRCd runs every test Ergo runs
 and sixteen more, and passes them.
 
-The ten rIRCd skips are the ones neither server runs: `CASEMAPPING=rfc1459`,
-non-UTF-8 messages, and four `WHO` tests irctest marks "not consistently
-implemented".
+Four of the ten rIRCd skips are not a gap at all. irctest parametrises the
+casemapping tests over `ascii` and `rfc1459` and skips whichever the server does
+not advertise; rIRCd implements both, so the other four pass under the other
+setting:
+
+    IRCTEST_RIRCD_CASEMAPPING=rfc1459 tests/irctest/run.sh -k ChannelCaseSensitivity
+    4 passed, 2 skipped
+
+Which is the mirror of the default run. Across the two configurations rIRCd
+passes 548 of the 557 tests collected, and the six that never run are two for
+non-UTF-8 messages — refused on purpose, this server advertises `UTF8ONLY` — and
+four `WHO` tests irctest marks "not consistently implemented" and skips for
+everybody.
+
+There is also a `strict` marker for tests asserting a stricter reading than the
+specification requires. They are left out of the default run because passing
+them is a choice rather than conformance, but they are worth running:
+
+    IRCTEST_MARKERS=strict tests/irctest/run.sh
+    4 passed
+
+One of those four used to fail, and it was a real defect rather than a strict
+reading: rIRCd asked for channel operator status to `INVITE` on any channel,
+where the specifications ask for it only on an invite-only one.
 
 Read it for what it is. It is one comparison against one server on one
 selection of tests, it says nothing about the several servers irctest supports

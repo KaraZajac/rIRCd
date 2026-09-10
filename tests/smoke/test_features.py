@@ -25,6 +25,8 @@ PASSWORD = "hunter2secret"
 ACCOUNT = f"scram{RUN_ID}"
 HISTORY = f"#history{RUN_ID}"
 BANS = f"#bans{RUN_ID}"
+# Gets +i partway through, so it must be a fresh channel each run.
+OPENINV = f"#openinv{RUN_ID}"
 BATCHING = f"#batching{RUN_ID}"
 TAGS = ["message-tags", "server-time", "batch", "echo-message"]
 
@@ -989,6 +991,37 @@ check("336 names the channel", bool(invitee.find(" 336 ", "#invited", lines=invi
 check("337 ends the list", bool(invitee.find(" 337 ", lines=invitee.since(mark))), invitee.since(mark)[-3:])
 inviter.close()
 invitee.close()
+
+section("who may invite")
+# Operator status is what gets somebody past a closed door, and an ordinary
+# channel has no door: "if the channel has the invite-only mode set, the client
+# must have channel operator privileges" is what the specs say of +i, and of
+# nothing else. A member asking a friend to join is not an operator action.
+host = Client("invhost")
+host.join(OPENINV)
+member = Client("invmember")
+member.join(OPENINV)
+guest = Client("invguest")
+mark = member.mark()
+member.send(f"INVITE invguest {OPENINV}")
+member.read(1.5)
+check("a member of an ordinary channel may invite",
+      bool(member.find(" 341 ", OPENINV, lines=member.since(mark))), member.since(mark)[-3:])
+mark = guest.mark()
+guest.read(1.0)
+check("and the guest hears about it",
+      bool(guest.find("INVITE", OPENINV, lines=guest.since(mark))), guest.since(mark)[-3:])
+
+host.send(f"MODE {OPENINV} +i")
+host.read(1.0)
+mark = member.mark()
+member.send(f"INVITE invguest2 {OPENINV}")
+member.read(1.5)
+check("but not once the channel is invite-only",
+      bool(member.find(" 482 ", lines=member.since(mark))), member.since(mark)[-3:])
+guest.close()
+member.close()
+host.close()
 lister.close()
 
 op.close()
