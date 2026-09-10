@@ -46,8 +46,16 @@ pub fn lower(s: &str) -> String {
 
 /// The fold itself, with the choice passed in rather than read. Everything that
 /// decides whether two names are equal goes through here.
+///
+/// Only ASCII folds, whichever mapping is in use. `CASEMAPPING=ascii` promises
+/// a client that "the characters a to z are the lower-case equivalents of the
+/// characters A to Z" and of nothing else; `rfc1459` adds four more ASCII
+/// characters to that and no others. Folding the rest of Unicode as well would
+/// be this server quietly disagreeing with every client that implements the
+/// mapping it was told about — `CAFÉ` and `café` would be one person here and
+/// two people to them, and a ban on one would appear not to match the other.
 fn fold_lower(s: &str, rfc1459: bool) -> String {
-    let base = s.to_lowercase();
+    let base = s.to_ascii_lowercase();
     if !rfc1459 {
         return base;
     }
@@ -62,7 +70,7 @@ pub fn upper(s: &str) -> String {
 }
 
 fn fold_upper(s: &str, rfc1459: bool) -> String {
-    let base = s.to_uppercase();
+    let base = s.to_ascii_uppercase();
     if !rfc1459 {
         return base;
     }
@@ -132,6 +140,35 @@ mod tests {
                     fold_upper(a, rfc) == fold_upper(b, rfc),
                     "rfc1459={rfc}: {a} vs {b}"
                 );
+            }
+        }
+    }
+
+    /// `CASEMAPPING` is a promise to the client about which characters fold,
+    /// and both mappings promise ASCII only. A server that folded the rest of
+    /// Unicode as well would be telling a client that `CAFÉ` and `café` are two
+    /// names while treating them as one — so a member list would be one short,
+    /// and a ban the server applied would look to the client like a ban that
+    /// did not match.
+    #[test]
+    fn only_ascii_folds_whichever_mapping_is_in_use() {
+        for rfc in [false, true] {
+            assert_eq!(fold_lower("CAFE", rfc), "cafe", "ASCII still folds");
+            assert_ne!(
+                fold_lower("CAFÉ", rfc),
+                fold_lower("café", rfc),
+                "rfc1459={rfc}: É is not a letter either mapping folds"
+            );
+            assert_ne!(
+                fold_upper("Straße", rfc),
+                fold_upper("STRASSE", rfc),
+                "rfc1459={rfc}: nor is ß, which Unicode uppercases to two letters"
+            );
+            // And the fold must not change the length of a name, or an
+            // identifier could outgrow the limit it was checked against.
+            for name in ["café", "ΣΣΣ", "Straße", "ǅ"] {
+                assert_eq!(fold_lower(name, rfc).len(), name.len(), "{name}");
+                assert_eq!(fold_upper(name, rfc).len(), name.len(), "{name}");
             }
         }
     }
