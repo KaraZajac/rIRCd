@@ -138,7 +138,7 @@ TS6, is in [docs/server-linking.md](docs/server-linking.md).
 ```toml
 [server]
 sid = "1AA"                      # this server's identity on the network
-listen_links = ["0.0.0.0:7000"]  # server traffic never shares a client port
+listen_links_tls = ["0.0.0.0:7000"]  # server traffic never shares a client port
 
 [[links]]
 name = "irc2.example.org"
@@ -147,7 +147,8 @@ host = "10.0.0.2"
 port = 7000
 send_password = "what we send"
 receive_password = "what we expect"
-tls = false
+tls = true
+fingerprint = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 autoconnect = true
 ```
 
@@ -155,11 +156,16 @@ autoconnect = true
 |-----|---------|-------------|
 | `sid` | _(derived from the name)_ | Three characters, a digit then two alphanumerics, unique on the network. Derived from the server name when unset, which is a coin toss for a network — set it before linking |
 | `listen_links` | `[]` | Addresses to accept links on. A client that reaches one gets nothing, and a server that reaches a client port is treated as a client |
+| `listen_links_tls` | `[]` | The same, encrypted with the certificate in `[tls]`. A link carries every private message that crosses it, so this is what a link between two machines should be |
+| `tls` | `false` | Dial this peer over TLS. Needs a `fingerprint`, and needs `[tls]` set on this server too, because the peer pins this one in the same way |
+| `fingerprint` | _(unset)_ | SHA-256 of the peer's certificate, as `openssl x509 -in cert.pem -noout -sha256 -fingerprint` prints it. This is what says the far end is the server meant rather than whoever answered; there is no list of certificate authorities here, which is also why a self-signed certificate is as good as any other. A link told which certificate to expect refuses a peer that presents none, so the plaintext port is not a way around it |
 | `send_password` / `receive_password` | — | Separate on purpose: each direction has its own secret, so one leaked configuration does not let the holder link both ways |
 | `autoconnect` | `false` | Keep the link up, retrying with a widening delay |
 
 `tests/smoke/run-link.sh` brings up two servers with their own databases on
 their own ports, links them, and checks what each one knows about the other.
+`--tls` runs the same checks over an encrypted link, with a throwaway
+certificate for each side.
 
 ### `[network]`
 

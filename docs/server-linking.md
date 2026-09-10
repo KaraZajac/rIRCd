@@ -46,7 +46,11 @@ a port, so a mistake in one configuration cannot become an authentication
 bypass in the other.
 
     [server]
-    listen_links = ["0.0.0.0:7000"]
+    listen_links_tls = ["0.0.0.0:7000"]
+
+    [tls]
+    cert = "/etc/rIRCd/cert.pem"
+    key  = "/etc/rIRCd/key.pem"
 
     [[links]]
     name = "irc2.example.org"
@@ -56,11 +60,36 @@ bypass in the other.
     send_password = "what we send"
     receive_password = "what we expect"
     tls = true
+    fingerprint = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
     autoconnect = true
 
 `send_password` and `receive_password` are separate on purpose: each direction
 has its own secret, so one leaked configuration does not let the holder link in
 both directions.
+
+### TLS
+
+A link carries every private message that crosses it and the password that
+opened it, so it should be encrypted between two machines. `listen_links_tls`
+accepts links with the certificate in `[tls]`, and `tls = true` on a `[[links]]`
+block dials one.
+
+Which server is at the other end is decided by `fingerprint`: the SHA-256 of
+the peer's certificate, in the form `openssl x509 -in cert.pem -noout -sha256
+-fingerprint` prints (colons and case are ignored). There is no list of
+certificate authorities here, and none is wanted — the two operators have
+spoken to each other, so the certificate is known in advance, and pinning it
+means a self-signed one is as good as any other.
+
+A `[[links]]` block with `tls = true` and no fingerprint is refused at startup:
+without one this server would be encrypting the link to whoever answered rather
+than to that peer. A block *with* a fingerprint refuses a peer that presents no
+certificate at all, which is what a connection to the plaintext listener would
+be — otherwise the pin could be stepped around by dialling the other port.
+
+Each side pins the other, so both directions are checked: the server that dials
+presents its own certificate too, which is why `[tls]` must be configured even
+on a server that only ever dials out.
 
 ### Handshake
 
@@ -139,6 +168,7 @@ got, so that nobody has to read the source to find out:
 | `JOIN`, `PART`, `KICK`, `MODE`, `TOPIC`, and messages to a channel | yes |
 | `ACCOUNT`, `CHGHOST`, `SETNAME`, `INVITE`, `METADATA` | yes |
 | Chathistory: both ends of a conversation keep it | yes |
+| TLS, with each side pinned to the other's certificate | yes |
 | Services commands (`GHOST`, `SANICK`) acting on a remote user | not yet |
 | `WHOIS` forwarded, for the idle time only that server knows | not yet |
 
@@ -153,4 +183,7 @@ real one.
     tests/smoke/run-link.sh
 
 brings up two servers with their own databases, links them, and runs
-`tests/smoke/test_link.py` against both ends.
+`tests/smoke/test_link.py` against both ends. Add `--tls` and it makes a
+certificate for each side, pins them to one another, and runs the same tests
+over an encrypted link — a link is a link once it is up, so the checks do not
+change.

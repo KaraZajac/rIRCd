@@ -127,6 +127,35 @@ pub struct ClientMessage {
 ///
 /// Separate so it can be called again on REHASH: certificates are renewed on a
 /// schedule, and restarting the server to pick one up drops every connection.
+/// The acceptor for link ports.
+///
+/// Always asks the peer for a certificate, whatever `[tls] client_certs` says
+/// about clients: on a link it is not an optional extra but the thing a
+/// `fingerprint` in the link block is checked against.
+pub fn build_link_tls_acceptor(cfg: &Config) -> anyhow::Result<TlsAcceptor> {
+    let cert_path = cfg
+        .tls
+        .cert
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("listen_links_tls needs a certificate under [tls]"))?;
+    let key_path = cfg
+        .tls
+        .key
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("listen_links_tls needs a key under [tls]"))?;
+    let mut cert_file = std::io::BufReader::new(fs::File::open(cert_path)?);
+    let mut key_file = std::io::BufReader::new(fs::File::open(key_path)?);
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_file)
+        .filter_map(|r| r.ok())
+        .collect();
+    let key = rustls_pemfile::private_key(&mut key_file)?
+        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+    let cfg_tls = tokio_rustls::rustls::ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(OptionalClientCertVerifier::new()))
+        .with_single_cert(certs, key)?;
+    Ok(TlsAcceptor::from(Arc::new(cfg_tls)))
+}
+
 pub fn build_tls_acceptor(cfg: &Config) -> anyhow::Result<TlsAcceptor> {
     let cert_path = cfg
         .tls
@@ -733,6 +762,12 @@ pub async fn run(
         let cfg = cfg_arc.read().await;
         for addr in &cfg.server.listen_links {
             crate::link::listen(addr.clone(), link_ctx.clone()).await?;
+        }
+        if !cfg.server.listen_links_tls.is_empty() {
+            let acceptor = build_link_tls_acceptor(&cfg)?;
+            for addr in &cfg.server.listen_links_tls {
+                crate::link::listen_tls(addr.clone(), link_ctx.clone(), acceptor.clone()).await?;
+            }
         }
         for link in cfg.links.iter().filter(|l| l.autoconnect) {
             crate::link::autoconnect(link.clone(), link_ctx.clone());

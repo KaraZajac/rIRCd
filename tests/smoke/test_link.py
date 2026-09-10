@@ -77,8 +77,15 @@ except (socket.timeout, OSError):
 s.close()
 text = got.decode("utf-8", "replace")
 check("a client on the link port is not registered", " 001 " not in text, text[:200])
-check("it is told why, or simply dropped",
-      text == "" or "ERROR" in text, text[:200])
+if os.environ.get("LINK_TLS") == "1":
+    # A TLS link port answers something that is not IRC at all: a TLS alert,
+    # whose first byte is the record type 0x15. Anything readable would mean
+    # the port had spoken IRC to a stranger before asking who it was.
+    check("it is answered in TLS, not in IRC",
+          got == b"" or got[:1] == b"\x15", repr(got[:32]))
+else:
+    check("it is told why, or simply dropped",
+          text == "" or "ERROR" in text, text[:200])
 
 section("users are shared across the link")
 # A user on A must be a user on B: the burst carries everyone who was already

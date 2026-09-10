@@ -507,6 +507,105 @@ where
     Ok(greeting)
 }
 
+// ─── TLS ──────────────────────────────────────────────────────────────────────
+
+/// The SHA-256 of a certificate, lower-case hex — the same string `WHOIS`
+/// prints for a client that presented one.
+fn fingerprint_of(cert: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(cert)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+/// Whether a certificate is the one the configuration named.
+///
+/// Colons are allowed in the configured form because that is how `openssl
+/// x509 -fingerprint` prints it, and case is ignored because hex has two
+/// spellings of the same number. The comparison itself does not stop early: a
+/// fingerprint is not a secret, but it is what says who the peer is, and
+/// nothing here is fast enough for the difference to be worth having.
+fn fingerprint_matches(configured: &str, presented: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let want = configured.replace(':', "").to_ascii_lowercase();
+    let got = presented.replace(':', "").to_ascii_lowercase();
+    want.len() == got.len() && bool::from(want.as_bytes().ct_eq(got.as_bytes()))
+}
+
+/// Whether the certificate a peer presented is the one its link block allows.
+///
+/// A link block that names a certificate is a link that may only be that
+/// machine. Arriving with no certificate at all — over a plaintext listener,
+/// say — is the way round that check rather than an absence of one, so it is
+/// refused exactly as a wrong certificate is. A block that names none accepts
+/// the peer on its password alone, which is what a plaintext link has always
+/// been.
+fn certificate_is_acceptable(configured: Option<&str>, presented: Option<&str>) -> bool {
+    match (configured, presented) {
+        (None, _) => true,
+        (Some(want), Some(got)) => fingerprint_matches(want, got),
+        (Some(_), None) => false,
+    }
+}
+
+/// Accepts exactly one certificate: the one the link block named.
+///
+/// A link is between two servers whose operators have spoken to each other, so
+/// the certificate is known in advance and there is nothing for a certificate
+/// authority to add. Pinning it also means a self-signed certificate — which is
+/// what an IRC network usually has — is as good as any other.
+#[derive(Debug)]
+struct PinnedPeer {
+    fingerprint: String,
+    supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedPeer {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if fingerprint_matches(&self.fingerprint, &fingerprint_of(end_entity.as_ref())) {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "the peer presented a certificate this link was not told about".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_algs.supported_schemes()
+    }
+}
+
+fn signature_algs() -> rustls::crypto::WebPkiSupportedAlgorithms {
+    rustls::crypto::ring::default_provider().signature_verification_algorithms
+}
+
 /// Run one accepted link connection.
 ///
 /// Stage one: the handshake, the registry entry, and the keepalive that notices
@@ -520,6 +619,10 @@ pub async fn serve_link<S>(
     // Set when this server dialled out: which link it was, so the answer can
     // be checked against the server it meant to reach.
     expect: Option<LinkConfig>,
+    // The certificate the peer presented, if this link is over TLS. Which
+    // certificate it had to be is only knowable once the peer has said which
+    // server it is, so the checking happens below rather than in the handshake.
+    peer_certfp: Option<String>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -571,6 +674,26 @@ pub async fn serve_link<S>(
             }
         }
     };
+
+    if !certificate_is_acceptable(link.fingerprint.as_deref(), peer_certfp.as_deref()) {
+        warn!(
+            peer = %greeting.name,
+            configured = %link.name,
+            presented = %peer_certfp.as_deref().unwrap_or("none"),
+            "Refusing link: not the certificate this link was told about"
+        );
+        let _ = writer
+            .write_all(b"ERROR :Closing link: certificate does not match\r\n")
+            .await;
+        return;
+    }
+    if link.fingerprint.is_none() && peer_certfp.is_some() {
+        info!(
+            peer = %greeting.name,
+            configured = %link.name,
+            "Linked over TLS, but no fingerprint is configured for this peer"
+        );
+    }
 
     if ctx.links.read().await.is_linked(&greeting.sid) {
         warn!(
@@ -2624,8 +2747,30 @@ fn link_slots(configured: usize) -> usize {
     (configured * 4).max(8)
 }
 
+/// How long a peer has to finish a TLS handshake before the slot it is holding
+/// is given back. A peer that opens a connection and says nothing costs a
+/// socket; it must not cost a link slot for as long as it likes.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Accept links on this server's link ports.
 pub async fn listen(addr: String, ctx: LinkContext) -> std::io::Result<()> {
+    listen_on(addr, ctx, None).await
+}
+
+/// The same, with TLS in front of it.
+pub async fn listen_tls(
+    addr: String,
+    ctx: LinkContext,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> std::io::Result<()> {
+    listen_on(addr, ctx, Some(acceptor)).await
+}
+
+async fn listen_on(
+    addr: String,
+    ctx: LinkContext,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+) -> std::io::Result<()> {
     let bind = if let Some(port) = addr.strip_prefix(':') {
         format!("0.0.0.0:{}", port)
     } else {
@@ -2633,7 +2778,12 @@ pub async fn listen(addr: String, ctx: LinkContext) -> std::io::Result<()> {
     };
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     let slots = link_slots(ctx.cfg.read().await.links.len());
-    info!(limit = slots, "Listening on {} (server links)", bind);
+    info!(
+        limit = slots,
+        "Listening on {} (server links{})",
+        bind,
+        if acceptor.is_some() { ", TLS" } else { "" }
+    );
     let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
@@ -2652,9 +2802,38 @@ pub async fn listen(addr: String, ctx: LinkContext) -> std::io::Result<()> {
                         continue;
                     }
                     let ctx = ctx.clone();
+                    let acceptor = acceptor.clone();
                     tokio::spawn(async move {
                         let _slot = slot;
-                        serve_link(stream, peer.ip().to_string(), ctx, None).await;
+                        let peer_addr = peer.ip().to_string();
+                        let Some(acceptor) = acceptor else {
+                            serve_link(stream, peer_addr, ctx, None, None).await;
+                            return;
+                        };
+                        let tls = match tokio::time::timeout(
+                            TLS_HANDSHAKE_TIMEOUT,
+                            acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls)) => tls,
+                            Ok(Err(e)) => {
+                                warn!(peer = %peer_addr, "Link TLS handshake failed: {}", e);
+                                return;
+                            }
+                            Err(_) => {
+                                warn!(peer = %peer_addr, "Link TLS handshake did not finish");
+                                return;
+                            }
+                        };
+                        let certfp = {
+                            let (_, session) = tls.get_ref();
+                            session
+                                .peer_certificates()
+                                .and_then(|certs| certs.first())
+                                .map(|cert| fingerprint_of(cert.as_ref()))
+                        };
+                        serve_link(tls, peer_addr, ctx, None, certfp).await;
                     });
                 }
                 Err(e) => {
@@ -2665,6 +2844,113 @@ pub async fn listen(addr: String, ctx: LinkContext) -> std::io::Result<()> {
         }
     });
     Ok(())
+}
+
+/// This server's own certificate and key, for the links it dials out on.
+///
+/// Read afresh each time rather than kept, so a REHASH that replaces the
+/// certificate is picked up by the next link rather than the next restart.
+fn own_certificate(
+    cfg: &Config,
+) -> Option<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    let (cert_path, key_path) = (cfg.tls.cert.as_ref()?, cfg.tls.key.as_ref()?);
+    let mut cert_file = std::io::BufReader::new(std::fs::File::open(cert_path).ok()?);
+    let mut key_file = std::io::BufReader::new(std::fs::File::open(key_path).ok()?);
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_file)
+        .filter_map(|r| r.ok())
+        .collect();
+    let key = rustls_pemfile::private_key(&mut key_file).ok()??;
+    if certs.is_empty() {
+        return None;
+    }
+    Some((certs, key))
+}
+
+/// Put TLS in front of a link this server dialled, and hand it on.
+///
+/// The certificate is checked against the fingerprint in the link block and
+/// nothing else — see `PinnedPeer`. What the peer presented is then passed on
+/// as well, so the same check the inbound side makes is made here too rather
+/// than being assumed from the fact that the handshake succeeded.
+async fn dial_tls(
+    stream: tokio::net::TcpStream,
+    host: &str,
+    target: &str,
+    link: &LinkConfig,
+    ctx: LinkContext,
+) {
+    let Some(ref fingerprint) = link.fingerprint else {
+        // Refused at load; belt and braces, because a link with no fingerprint
+        // has nothing to check the far end against.
+        warn!(link = %link.name, "Not dialling: tls is set with no fingerprint");
+        return;
+    };
+    let builder = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedPeer {
+            fingerprint: fingerprint.clone(),
+            supported_algs: signature_algs(),
+        }));
+    // The peer checks this server the same way round, which it can only do if
+    // this server offers a certificate of its own. Dialling without one links
+    // to a peer that pinned us to nothing, so it is worth saying out loud.
+    let own_certificate = {
+        let cfg = ctx.cfg.read().await;
+        own_certificate(&cfg)
+    };
+    let tls_config = match own_certificate {
+        Some((certs, key)) => match builder.with_client_auth_cert(certs, key) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(link = %link.name, "Not dialling: this server's own certificate is unusable: {}", e);
+                return;
+            }
+        },
+        None => {
+            warn!(
+                link = %link.name,
+                "Dialling without a certificate of this server's own: set cert \
+                 and key under [tls], or the peer has nothing to recognise this \
+                 server by"
+            );
+            builder.with_no_client_auth()
+        }
+    };
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name = match rustls::pki_types::ServerName::try_from(host.to_string()) {
+        Ok(name) => name,
+        Err(_) => {
+            warn!(link = %link.name, host = %host, "Not dialling: host is not a name TLS can use");
+            return;
+        }
+    };
+    let tls = match tokio::time::timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        connector.connect(server_name, stream),
+    )
+    .await
+    {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(e)) => {
+            warn!(link = %link.name, target = %target, "Link TLS handshake failed: {}", e);
+            return;
+        }
+        Err(_) => {
+            warn!(link = %link.name, target = %target, "Link TLS handshake did not finish");
+            return;
+        }
+    };
+    let certfp = {
+        let (_, session) = tls.get_ref();
+        session
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| fingerprint_of(cert.as_ref()))
+    };
+    serve_link(tls, target.to_string(), ctx, Some(link.clone()), certfp).await;
 }
 
 /// Keep an outbound link up, retrying with a widening delay.
@@ -2690,7 +2976,18 @@ pub fn autoconnect(link: LinkConfig, ctx: LinkContext) {
                 Ok(stream) => {
                     info!(link = %link.name, target = %target, "Connecting");
                     delay = std::time::Duration::from_secs(2);
-                    serve_link(stream, target.clone(), ctx.clone(), Some(link.clone())).await;
+                    if link.tls {
+                        dial_tls(stream, &host, &target, &link, ctx.clone()).await;
+                    } else {
+                        serve_link(
+                            stream,
+                            target.clone(),
+                            ctx.clone(),
+                            Some(link.clone()),
+                            None,
+                        )
+                        .await;
+                    }
                     warn!(link = %link.name, "Link closed");
                 }
                 Err(e) => {
@@ -2940,6 +3237,65 @@ mod tests {
         );
         // It is a limit, not a suggestion.
         assert!(link_slots(1000) < usize::MAX / 2);
+    }
+
+    /// A fingerprint is written more than one way. `openssl x509 -fingerprint`
+    /// puts colons in it and shouts; the server prints it in lower case with
+    /// none. Both name the same certificate.
+    /// The rule a link block's `fingerprint` states, in all four cases. The
+    /// last one is the whole point: a peer that presents no certificate has
+    /// not satisfied a pin, it has stepped around it.
+    #[test]
+    fn a_pinned_link_is_only_that_machine() {
+        let want = "ab".repeat(32);
+        let other = "cd".repeat(32);
+        assert!(super::certificate_is_acceptable(None, None));
+        assert!(super::certificate_is_acceptable(None, Some(&want)));
+        assert!(super::certificate_is_acceptable(Some(&want), Some(&want)));
+        assert!(!super::certificate_is_acceptable(Some(&want), Some(&other)));
+        assert!(
+            !super::certificate_is_acceptable(Some(&want), None),
+            "a link told which certificate to expect must not accept none"
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_is_the_same_however_it_is_spelt() {
+        let plain = "ab".repeat(32);
+        let shouted = plain.to_uppercase();
+        let colons = plain
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(":");
+        assert!(super::fingerprint_matches(&plain, &plain));
+        assert!(super::fingerprint_matches(&shouted, &plain));
+        assert!(super::fingerprint_matches(&colons, &plain));
+        assert!(super::fingerprint_matches(&colons.to_uppercase(), &plain));
+    }
+
+    /// And a different certificate is a different link, however close.
+    #[test]
+    fn a_fingerprint_that_is_nearly_right_is_wrong() {
+        let want = "ab".repeat(32);
+        let mut nearly = want.clone();
+        nearly.pop();
+        nearly.push('c');
+        assert!(!super::fingerprint_matches(&want, &nearly));
+        assert!(!super::fingerprint_matches(&want, ""));
+        assert!(!super::fingerprint_matches(&want, &want[..62]));
+    }
+
+    /// The fingerprint of a certificate is its SHA-256, the same string the
+    /// rest of the server prints for a client that presented one.
+    #[test]
+    fn a_fingerprint_is_the_sha256_of_the_certificate() {
+        // SHA-256 of the empty input, which is a fixed and checkable number.
+        assert_eq!(
+            super::fingerprint_of(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]

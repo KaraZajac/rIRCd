@@ -339,6 +339,13 @@ pub struct ServerConfig {
     /// the two speak different protocols and answer to different secrets.
     #[serde(default)]
     pub listen_links: Vec<String>,
+    /// Addresses to accept server links on with TLS, using the certificate in
+    /// `[tls]`. A link carries every private message that crosses it and the
+    /// password that opened it, so this is what a link between two machines
+    /// should be. The peer is asked for a certificate of its own, and which
+    /// certificate it must be is the `fingerprint` in its `[[links]]` block.
+    #[serde(default)]
+    pub listen_links_tls: Vec<String>,
     /// A password every connection must send with PASS before registering.
     /// Stored in the clear on purpose: it is shared with everyone allowed on
     /// the server, so it is a door key, not a secret about any one person.
@@ -403,6 +410,7 @@ impl Default for ServerConfig {
             password: None,
             sid: None,
             listen_links: Vec::new(),
+            listen_links_tls: Vec::new(),
         }
     }
 }
@@ -427,9 +435,19 @@ pub struct LinkConfig {
     pub send_password: String,
     /// What this server expects from the peer.
     pub receive_password: String,
-    /// Connect with TLS.
+    /// Dial this peer over TLS.
     #[serde(default)]
     pub tls: bool,
+    /// SHA-256 of the peer's certificate, lower-case hex, as `VERSION` and
+    /// `WHOIS` print a client's.
+    ///
+    /// This is what says the server at the other end is the one meant, so a
+    /// TLS link is refused without it: there is no list of certificate
+    /// authorities here to fall back on, and an unchecked certificate proves
+    /// only that somebody has a certificate. It is checked in both
+    /// directions — dialling out, and answering a peer that dialled in.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
     /// Keep the link up, retrying with a widening delay when it drops.
     #[serde(default)]
     pub autoconnect: bool,
@@ -677,21 +695,47 @@ impl Config {
 
 // ─── Load / init ──────────────────────────────────────────────────────────────
 
+impl Config {
+    /// Refuse a configuration that cannot mean what it says.
+    ///
+    /// Checked at load rather than at use, because the answer does not depend
+    /// on anything that happens later and an operator who has got this wrong
+    /// wants to know at once — not the first time a link is dialled.
+    pub fn check(&self) -> anyhow::Result<()> {
+        for link in &self.links {
+            if link.tls && link.fingerprint.is_none() {
+                anyhow::bail!(
+                    "[[links]] {}: tls = true needs a fingerprint. There is no \
+                     list of certificate authorities here, so without one this \
+                     server would encrypt the link to whoever answered rather \
+                     than to that peer. Take it from the peer with: openssl \
+                     x509 -in <cert> -noout -sha256 -fingerprint",
+                    link.name
+                );
+            }
+            if let Some(ref fp) = link.fingerprint {
+                let cleaned = fp.replace(':', "");
+                if cleaned.len() != 64 || !cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    anyhow::bail!(
+                        "[[links]] {}: fingerprint is not a SHA-256 — expected \
+                         64 hex characters, got {}",
+                        link.name,
+                        fp
+                    );
+                }
+            }
+        }
+        if !self.server.listen_links_tls.is_empty() && !self.tls_enabled() {
+            anyhow::bail!("listen_links_tls needs a certificate: set cert and key under [tls]");
+        }
+        Ok(())
+    }
+}
+
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     let content = fs::read_to_string(path)?;
     let config: Config = toml::from_str(&content)?;
-    // A link carries every private message that crosses it, and its password.
-    // `tls` is in the shape of a link block but nothing reads it yet, so a
-    // server that started anyway would be telling its operator the traffic was
-    // encrypted when it was not.
-    if let Some(link) = config.links.iter().find(|l| l.tls) {
-        anyhow::bail!(
-            "[[links]] {}: tls = true is not implemented yet, and a link that \
-             asked for it would run in the clear. Set tls = false to link \
-             without it.",
-            link.name
-        );
-    }
+    config.check()?;
     Ok(config)
 }
 
