@@ -202,10 +202,9 @@ impl std::fmt::Display for ParseError {
         match self {
             ParseError::Malformed => write!(f, "Malformed message"),
             ParseError::InputTooLong => write!(f, "Input line was too long"),
-            ParseError::ForbiddenCharacter => write!(
-                f,
-                "Message contained a carriage return, line feed or NUL"
-            ),
+            ParseError::ForbiddenCharacter => {
+                write!(f, "Message contained a carriage return, line feed or NUL")
+            }
         }
     }
 }

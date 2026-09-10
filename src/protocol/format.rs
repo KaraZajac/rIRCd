@@ -125,11 +125,11 @@ pub fn format_message(msg: &Message) -> String {
 /// either inside it. This is for everything else — a topic out of the database,
 /// a line of MOTD from a configuration file, a name a linked server chose.
 fn push_on_one_line(out: &mut String, text: &str) {
-    if text
-        .bytes()
-        .any(|b| b == b'\r' || b == b'\n' || b == 0)
-    {
-        out.extend(text.chars().filter(|c| *c != '\r' && *c != '\n' && *c != '\0'));
+    if text.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        out.extend(
+            text.chars()
+                .filter(|c| *c != '\r' && *c != '\n' && *c != '\0'),
+        );
         return;
     }
     out.push_str(text);

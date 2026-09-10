@@ -2626,8 +2626,7 @@ pub async fn listen(addr: String, ctx: LinkContext) -> std::io::Result<()> {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
-                    let taken =
-                        in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let taken = in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let slot = LinkSlot(in_flight.clone());
                     if taken > slots {
                         warn!(
@@ -2922,7 +2921,10 @@ mod tests {
         assert!(link_slots(10) >= 40);
         // And a floor, so a server configured to be dialled rather than to dial
         // still answers.
-        assert!(link_slots(0) >= 8, "a server that only accepts links cannot");
+        assert!(
+            link_slots(0) >= 8,
+            "a server that only accepts links cannot"
+        );
         // It is a limit, not a suggestion.
         assert!(link_slots(1000) < usize::MAX / 2);
     }
@@ -2930,8 +2932,8 @@ mod tests {
     #[test]
     fn a_user_id_is_bytes_a_peer_chose() {
         for hostile in [
-            "1A\u{20ac}DEFG",     // nine bytes, a character across the third
-            "\u{20ac}\u{20ac}\u{20ac}",       // nine bytes, three characters
+            "1A\u{20ac}DEFG",           // nine bytes, a character across the third
+            "\u{20ac}\u{20ac}\u{20ac}", // nine bytes, three characters
             "1AA\u{fffd}EFG",
             "\u{e9}\u{e9}\u{e9}AAA",
         ] {
