@@ -11,7 +11,15 @@ import os
 import socket
 import time
 
-from harness import IRC_HOST, IRC_PORT, Client, check, section, summary
+from harness import (
+    IRC_HOST,
+    IRC_PORT,
+    OPER_PASSWORD,
+    Client,
+    check,
+    section,
+    summary,
+)
 
 RUN = format(int(time.time()) % 100000, "05d")
 
@@ -393,6 +401,46 @@ check(
 )
 victim.close()
 attacker.close()
+
+section("a table a client can put things in")
+# `STATS m` counts commands by name, and the name is whatever word the client
+# sent. Nothing removes one, so an unknown command left alone is a string this
+# server holds until it stops — and the client can disconnect and come back to
+# send more names.
+OPER_NAME = os.environ.get("SMOKE_OPER_NAME", "smokeoper")
+
+
+def counted_commands(nick):
+    c = Client(nick)
+    c.send(f"OPER {OPER_NAME} {OPER_PASSWORD}")
+    c.wait_for(" 381 ", " 464 ", seconds=5)
+    mark = c.mark()
+    c.send("STATS m")
+    c.wait_for(" 219 ", seconds=8)
+    n = len([l for l in c.since(mark) if " 212 " in l])
+    c.close()
+    return n
+
+
+before_counted = counted_commands(f"h15{RUN}")
+offered = 0
+for round_ in range(30):
+    try:
+        junk = socket.create_connection((IRC_HOST, IRC_PORT), timeout=5)
+        junk.sendall(f"NICK j{round_}{RUN}\r\nUSER j 0 * :j\r\n".encode())
+        junk.sendall("".join(f"ZQ{offered + i:08d}\r\n" for i in range(8)).encode())
+        offered += 8
+        time.sleep(0.03)
+        junk.close()
+    except OSError:
+        break
+time.sleep(0.5)
+after_counted = counted_commands(f"h16{RUN}")
+check(
+    f"{offered} invented command names do not each become an entry",
+    after_counted - before_counted <= 2,
+    f"{before_counted} -> {after_counted} entries in STATS m",
+)
 
 section("a peer that never finishes its line")
 # Reading up to the newline means a peer that never sends one decides how much

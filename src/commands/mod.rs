@@ -94,6 +94,45 @@ fn split_targets(msg: &Message, max: usize) -> Vec<Message> {
 /// Messages one client-initiated batch may carry before the server gives up on it.
 const CLIENT_BATCH_MAX_MESSAGES: usize = 100;
 
+/// How many distinct commands `STATS m` will ever name.
+///
+/// Real commands number a few dozen. The cap is what makes this a counter
+/// rather than somewhere a client can put things: the key is whatever word it
+/// sent, and nothing here ever removes one.
+const MAX_COUNTED_COMMANDS: usize = 256;
+
+/// The one bucket everything that is not a command goes into, so a client
+/// cannot name a new one.
+const UNKNOWN_COMMAND_KEY: &str = "<other>";
+
+/// Count a command for `STATS m`.
+///
+/// A client chooses the word, and the word becomes a key that is never removed:
+/// left alone, `CMD000001`, `CMD000002` and so on cost this server a string
+/// apiece for as long as it runs, and the client can go away and come back to
+/// send more. So a word that is not shaped like a command is not one, and once
+/// the table is full nothing new goes in it.
+async fn count_command(state: &Arc<RwLock<ServerState>>, command: &str) {
+    let shaped = command.len() <= 32
+        && !command.is_empty()
+        && (command.bytes().all(|b| b.is_ascii_uppercase())
+            || (command.len() == 3 && command.bytes().all(|b| b.is_ascii_digit())));
+    let mut state_w = state.write().await;
+    let key = if shaped { command } else { UNKNOWN_COMMAND_KEY };
+    if let Some(n) = state_w.command_counts.get_mut(key) {
+        *n += 1;
+        return;
+    }
+    if state_w.command_counts.len() >= MAX_COUNTED_COMMANDS {
+        *state_w
+            .command_counts
+            .entry(UNKNOWN_COMMAND_KEY.to_string())
+            .or_insert(0) += 1;
+        return;
+    }
+    state_w.command_counts.insert(key.to_string(), 1);
+}
+
 pub async fn handle_message(
     client_id: String,
     host: String,
@@ -385,13 +424,7 @@ pub async fn handle_message(
         }
     }
 
-    state
-        .write()
-        .await
-        .command_counts
-        .entry(msg.command.clone())
-        .and_modify(|n| *n += 1)
-        .or_insert(1);
+    count_command(&state, &msg.command).await;
 
     tracing::trace!(
         client = %client_id,
