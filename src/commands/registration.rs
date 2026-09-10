@@ -1735,10 +1735,7 @@ pub async fn handle_quit(
                     .with_prefix(&cfg.server.name),
             );
         }
-        let mut state_w = state.write().await;
-        state_w.pending_multiline.remove(client_id);
-        state_w.pending_client_batches.remove(client_id);
-        state_w.certfps.remove(client_id);
+        state.write().await.forget_session(client_id);
         return Ok(());
     }
     let (source, channel_names, had_account, quit_nick, monitor_list) = {
@@ -1768,7 +1765,7 @@ pub async fn handle_quit(
             state_guard.record_whowas(&c, &cfg.server.name);
             (source, chans, had_account, nick, list)
         } else {
-            state_guard.pending.remove(client_id);
+            state_guard.forget_session(client_id);
             drop(state_guard);
             // A connection that quits before registering ends the same way:
             // forgetting it is not enough, the socket has to be closed.
@@ -1899,7 +1896,7 @@ pub async fn handle_quit(
         state_w
             .monitor_watchers
             .remove_client_patterns(&user_id, &monitor_list);
-        state_w.certfps.remove(client_id);
+        state_w.forget_session(client_id);
         state_w.remove_client(&user_id).await;
     }
     // The last connection is gone, so the person is gone from the network, not

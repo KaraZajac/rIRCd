@@ -939,6 +939,21 @@ impl ServerState {
         self.users().count()
     }
 
+    /// Forget everything one connection left behind.
+    ///
+    /// Several tables here are keyed by a connection id, and a connection id
+    /// never comes back: a half-sent batch, a certificate fingerprint, a
+    /// registration that was still being negotiated. Whatever is still filed
+    /// under one when the socket closes is memory nothing will ever look at
+    /// again, and a client that connects, leaves something and hangs up can
+    /// come straight back to leave another.
+    pub fn forget_session(&mut self, session_id: &str) {
+        self.pending.remove(session_id);
+        self.pending_multiline.remove(session_id);
+        self.pending_client_batches.remove(session_id);
+        self.certfps.remove(session_id);
+    }
+
     /// Remove a user and every connection it had.
     pub async fn remove_client(&mut self, id: &str) -> Option<Arc<RwLock<Client>>> {
         let user_id = self.user_id(id);
@@ -947,13 +962,21 @@ impl ServerState {
         for session in &sessions {
             self.clients.remove(session);
             self.session_to_user.remove(session);
+            self.forget_session(session);
         }
         self.clients.remove(&user_id);
         self.session_to_user.remove(&user_id);
+        self.forget_session(&user_id);
         let (nick, account) = {
             let g = client.read().await;
             (g.nick.clone(), g.account.clone())
         };
+        // Where a user with no account had read up to is filed under its
+        // connection, and that connection is not coming back. An account's
+        // markers are its own and are kept.
+        if account.is_none() {
+            self.read_markers.remove(&user_id);
+        }
         if let Some(ref n) = nick {
             self.nick_to_id.remove(&crate::casefold::upper(n));
             // Metadata is filed under the nick, and a nick with no account
@@ -1321,4 +1344,64 @@ mod session_tests {
         assert_eq!(registry.sessions_of("nobody"), vec!["nobody".to_string()]);
     }
 
+    /// A connection that leaves takes everything filed under it with it.
+    ///
+    /// Half a dozen tables here are keyed by a connection id, and that id never
+    /// comes back. Anything left in one of them is memory nothing will ever
+    /// read, and a client can connect, leave something and hang up as often as
+    /// it likes.
+    #[tokio::test]
+    async fn a_connection_that_goes_leaves_nothing_behind() {
+        use super::{Client, PendingConnection, ServerState};
+
+        let state = ServerState::new();
+        let mut state_w = state.write().await;
+        let mut client = Client::new("desktop".into(), "198.51.100.7".into());
+        client.nick = Some("someone".into());
+        state_w.add_client(client, "desktop").await;
+        state_w.attach_session("desktop", "phone").await;
+
+        // The kinds of thing a connection can leave lying about: a
+        // registration it was still negotiating, a batch it never closed, the
+        // fingerprint of its certificate, where it had read up to.
+        for session in ["desktop", "phone"] {
+            state_w.pending.insert(
+                session.into(),
+                PendingConnection::new("198.51.100.7".into()),
+            );
+            state_w.certfps.insert(session.into(), "deadbeef".repeat(8));
+            state_w.pending_client_batches.insert(
+                session.into(),
+                super::PendingClientBatch {
+                    ref_tag: "1".into(),
+                    batch_type: "draft/multiline".into(),
+                    target: "#somewhere".into(),
+                    messages: Vec::new(),
+                },
+            );
+        }
+        state_w
+            .read_markers
+            .entry("desktop".into())
+            .or_default()
+            .insert("#somewhere".into(), "2024-01-01T00:00:00.000Z".into());
+
+        state_w.remove_client("phone").await;
+
+        assert!(
+            state_w.pending.is_empty(),
+            "a pending registration was kept"
+        );
+        assert!(state_w.certfps.is_empty(), "a fingerprint was kept");
+        assert!(
+            state_w.pending_client_batches.is_empty(),
+            "an unfinished batch was kept"
+        );
+        assert!(
+            state_w.read_markers.is_empty(),
+            "a marker filed under a connection was kept"
+        );
+        assert!(state_w.clients.is_empty());
+        assert!(state_w.session_to_user.is_empty());
+    }
 }
