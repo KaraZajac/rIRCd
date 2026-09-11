@@ -401,4 +401,94 @@ if CONFIG:
               anyone.since(mark)[-3:])
         anyone.close()
 
+# ── whose profile is it ──────────────────────────────────────────────────────
+
+section("a profile belongs to the person, not to the name they are using")
+
+# What happened on a live server: a restart left a ghost holding the usual nick,
+# the client reconnected as <nick>_ and republished its whole profile, and those
+# rows stayed under <nick>_ for ever. Anyone taking that name afterwards wore
+# the avatar, display name and pronouns of somebody they had never met.
+
+PROFILE = f"prof{RUN}"
+make_account(PROFILE)
+
+# Logged in, but using a fallback name, exactly as a client does after a restart.
+p1 = logged_in(f"{PROFILE}_", PROFILE)
+p1.send("METADATA * SET display-name :The Real Person")
+p1.send("METADATA * SET avatar :https://example.invalid/me.png")
+p1.read(1.5)
+mark = p1.mark()
+p1.send("METADATA * LIST")
+p1.read(1.5)
+check("the profile is set", bool(p1.find("The Real Person", lines=p1.since(mark))),
+      p1.since(mark)[-4:])
+time.sleep(0.8)
+check("and written down under the account, not the nick",
+      db(f"SELECT COUNT(*) FROM metadata WHERE target='a:{PROFILE}'") != "0",
+      db("SELECT GROUP_CONCAT(DISTINCT target) FROM metadata"))
+check("nothing is filed under the fallback name",
+      db(f"SELECT COUNT(*) FROM metadata WHERE target LIKE '%{PROFILE}\\_%'") == "0",
+      db("SELECT GROUP_CONCAT(DISTINCT target) FROM metadata"))
+p1.close()
+time.sleep(0.6)
+
+stranger_nick = Client(f"{PROFILE}_")
+mark = stranger_nick.mark()
+stranger_nick.send("METADATA * LIST")
+stranger_nick.read(1.5)
+check("whoever takes the name next inherits nothing",
+      not stranger_nick.find("The Real Person", lines=stranger_nick.since(mark)),
+      stranger_nick.since(mark)[-4:])
+mark = stranger_nick.mark()
+stranger_nick.send(f"METADATA {PROFILE}_ GET display-name")
+stranger_nick.read(1.5)
+check("and cannot be handed it by asking for the name",
+      not stranger_nick.find("The Real Person", lines=stranger_nick.since(mark)),
+      stranger_nick.since(mark)[-4:])
+stranger_nick.close()
+
+section("but the person keeps it, under whatever name")
+
+p2 = logged_in(f"{PROFILE}_again", PROFILE)
+mark = p2.mark()
+p2.send("METADATA * LIST")
+p2.read(1.5)
+check("the same account comes back to its own profile",
+      bool(p2.find("The Real Person", lines=p2.since(mark))), p2.since(mark)[-4:])
+
+mark = p2.mark()
+p2.send(f"NICK {PROFILE}_moved")
+p2.read(1.0)
+p2.send("METADATA * LIST")
+p2.read(1.5)
+check("and a nick change does not move it anywhere",
+      bool(p2.find("The Real Person", lines=p2.since(mark))), p2.since(mark)[-4:])
+time.sleep(0.8)
+check("still written down under the account alone",
+      db("SELECT COUNT(*) FROM metadata WHERE target LIKE 'n:%'") == "0",
+      db("SELECT GROUP_CONCAT(DISTINCT target) FROM metadata"))
+p2.close()
+
+section("somebody with no account keeps nothing")
+
+anon2 = Client(f"anonmeta{RUN}")
+anon2.send("METADATA * SET display-name :Just Passing Through")
+anon2.read(1.2)
+time.sleep(0.8)
+check("a borrowed name is never written down",
+      db("SELECT COUNT(*) FROM metadata WHERE value='Just Passing Through'") == "0",
+      db("SELECT GROUP_CONCAT(target) FROM metadata WHERE value='Just Passing Through'"))
+anon2.close()
+time.sleep(0.6)
+
+after_anon = Client(f"anonmeta{RUN}")
+mark = after_anon.mark()
+after_anon.send("METADATA * LIST")
+after_anon.read(1.5)
+check("and the next holder of it inherits nothing either",
+      not after_anon.find("Just Passing Through", lines=after_anon.since(mark)),
+      after_anon.since(mark)[-4:])
+after_anon.close()
+
 summary("ownership")

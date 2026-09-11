@@ -801,10 +801,14 @@ pub async fn load_all_metadata(
         let target: String = row.get("target");
         let key: String = row.get("meta_key");
         let value: String = row.get("value");
+        // Keys are stored in the shape they are looked up in — a channel by
+        // its canonical name, a person by `a:<account>`. Anything else is a
+        // row `migrate_metadata_to_accounts` did not reach, and folding it
+        // would only make an unreachable key look reachable.
         let folded = if target.starts_with('#') || target.starts_with('&') {
             crate::channel::canonical_channel_key(&target)
         } else {
-            crate::casefold::upper(&target)
+            target.clone()
         };
         out.entry(folded).or_default().insert(key, value);
     }
@@ -832,6 +836,92 @@ fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
 }
 
 /// Compute SCRAM-SHA-256 (StoredKey, ServerKey) from a cleartext password.
+/// Move metadata that was filed under a nick to the account behind it.
+///
+/// Profiles used to be keyed by whatever nick the person held when they set
+/// them. That made a profile a property of a name rather than of a person: the
+/// next holder of the name inherited the avatar, the display name and the
+/// pronouns, and one restart that left a ghost on somebody's usual nick was
+/// enough to strand a full copy under the nick they fell back to.
+///
+/// A row whose name is a verified account moves to that account. A row whose
+/// name is not — the stranded copies, and every nick that was never registered
+/// — is deleted: there is nobody it can be said to belong to, and leaving it is
+/// the whole of the problem. Channels are not touched.
+///
+/// Returns how many rows moved and how many went.
+pub async fn migrate_metadata_to_accounts(pool: &sqlx::MySqlPool) -> (u64, u64) {
+    use sqlx::Row;
+    let rows = match sqlx::query("SELECT DISTINCT target FROM metadata")
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return (0, 0),
+    };
+    let (mut moved, mut dropped) = (0, 0);
+    for row in rows {
+        let target: String = row.get("target");
+        // Already in the shape it should be, or a channel, which never was a
+        // nick and cannot be inherited by taking a name.
+        if target.starts_with('#')
+            || target.starts_with('&')
+            || target.starts_with("a:")
+            || target.starts_with("n:")
+        {
+            continue;
+        }
+        let name = target.to_lowercase();
+        let registered: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM users WHERE nick_lower = ? AND verified = 1")
+                .bind(&name)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        if registered.is_some() {
+            // An account may already have rows under the new key; the ones it
+            // carried under a nick do not get to overwrite them.
+            let to = format!("a:{name}");
+            let done = sqlx::query(
+                "UPDATE IGNORE metadata SET target = ? WHERE target = ?",
+            )
+            .bind(&to)
+            .bind(&target)
+            .execute(pool)
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0);
+            moved += done;
+            // Whatever `UPDATE IGNORE` would not move is a duplicate of a row
+            // the account already has, so it is redundant rather than lost.
+            let left = sqlx::query("DELETE FROM metadata WHERE target = ?")
+                .bind(&target)
+                .execute(pool)
+                .await
+                .map(|r| r.rows_affected())
+                .unwrap_or(0);
+            dropped += left;
+        } else {
+            let gone = sqlx::query("DELETE FROM metadata WHERE target = ?")
+                .bind(&target)
+                .execute(pool)
+                .await
+                .map(|r| r.rows_affected())
+                .unwrap_or(0);
+            if gone > 0 {
+                tracing::info!(
+                    target = %target,
+                    rows = gone,
+                    "Metadata filed under a name with no account behind it: dropped"
+                );
+            }
+            dropped += gone;
+        }
+    }
+    (moved, dropped)
+}
+
 pub fn scram_compute(password: &str, salt: &[u8], iterations: u32) -> ([u8; 32], [u8; 32]) {
     let salted = pbkdf2_sha256(password.as_bytes(), salt, iterations);
     let client_key = hmac_sha256(&salted, b"Client Key");

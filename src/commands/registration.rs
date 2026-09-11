@@ -444,7 +444,14 @@ pub async fn complete_registration(
     // a user with a nick, so they move into its store and come back as part of
     // the burst.
     if !pending_metadata.is_empty() {
-        let key = crate::commands::metadata::metadata_key(nick_str);
+        // Filed under the account if the client logged in during registration,
+        // and under the nick if it did not. By this point SASL has finished
+        // either way, so this is the first moment the answer is known.
+        let account = client.read().await.account.clone();
+        let key = match account {
+            Some(ref account) => crate::commands::metadata::account_key(account),
+            None => crate::commands::metadata::nick_key(nick_str),
+        };
         {
             let mut state_w = state.write().await;
             let entry = state_w.metadata.entry(key.clone()).or_default();
@@ -454,8 +461,10 @@ pub async fn complete_registration(
         }
         // Only an account is a lasting identity to file keys under; a bare
         // nick belongs to whoever holds it next.
-        let account = client.read().await.account.clone();
-        if let (Some(pool), true) = (cfg.db.as_ref(), account.is_some()) {
+        if let (Some(pool), true) = (
+            cfg.db.as_ref(),
+            crate::commands::metadata::is_lasting(&key),
+        ) {
             for (k, v) in &pending_metadata {
                 crate::persist::save_metadata(pool, &key, k, v).await;
             }
@@ -1286,25 +1295,28 @@ pub async fn handle_nick(
                 }
                 state_guard.push_whowas(entry);
             }
-            let mut moved_metadata: Vec<(String, String)> = Vec::new();
-            let mut metadata_left_behind: Option<String> = None;
             if let Some(ref o) = old_nick {
                 tracing::info!(client_id, old_nick = %o, new_nick = %nick, "Nick change");
                 state_guard.nick_to_id.remove(&crate::casefold::upper(o));
-                // Metadata is filed under the nick, and the nick is about to
-                // belong to whoever asks for it next. It describes the person,
-                // though — their display name, their avatar — so it goes with
-                // them. Left where it was, the next holder of the old name
-                // wears it, and every name anybody ever used keeps a row.
-                let (from, to) = (
-                    crate::commands::metadata::metadata_key(o),
-                    crate::commands::metadata::metadata_key(&nick),
-                );
-                if from != to {
-                    if let Some(keys) = state_guard.metadata.remove(&from) {
-                        moved_metadata = keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                        metadata_left_behind = Some(from);
-                        state_guard.metadata.insert(to, keys);
+                // Somebody logged in has their profile filed under their
+                // account, so changing what they are called moves nothing:
+                // it was never filed under the name. Somebody with no account
+                // has keys filed under the nick they are leaving, and those
+                // describe the person rather than the seat, so they come along
+                // — left behind, the next holder of the old name wears them.
+                let account = match state_guard.clients.get(client_id) {
+                    Some(c) => c.read().await.account.clone(),
+                    None => None,
+                };
+                if account.is_none() {
+                    let (from, to) = (
+                        crate::commands::metadata::nick_key(o),
+                        crate::commands::metadata::nick_key(&nick),
+                    );
+                    if from != to {
+                        if let Some(keys) = state_guard.metadata.remove(&from) {
+                            state_guard.metadata.insert(to, keys);
+                        }
                     }
                 }
             }
@@ -1347,15 +1359,8 @@ pub async fn handle_nick(
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default();
             drop(state_guard);
-            // What was moved in memory has to move on disk too, or the old name
-            // gets it back at the next start.
-            if let (Some(pool), Some(from)) = (cfg.db.as_ref(), metadata_left_behind.as_ref()) {
-                let to = crate::commands::metadata::metadata_key(&nick);
-                persist::clear_metadata(pool, from).await;
-                for (k, v) in &moved_metadata {
-                    persist::save_metadata(pool, &to, k, v).await;
-                }
-            }
+            // Nothing to move on disk: what is written down is filed under an
+            // account, and an account does not change when a nick does.
             // The rest of the network is told once the local tables are
             // settled, and never while a lock over them is held.
             crate::link::announce_nick(cfg, &user_id, &nick, nick_ts).await;

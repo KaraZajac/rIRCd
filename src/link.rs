@@ -1288,17 +1288,24 @@ async fn accept_remote_nick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
         let mut state = ctx.state.write().await;
         if let Some(ref o) = old {
             state.nick_to_id.remove(&crate::casefold::upper(o));
-            // Metadata is filed under the nick here as well, and it describes
-            // the person rather than the name. It moves with them, or the next
-            // holder of the name they let go wears it — a copy of the same
-            // thing the server they are on does with theirs.
-            let (from, to) = (
-                crate::commands::metadata::metadata_key(o),
-                crate::commands::metadata::metadata_key(new_nick),
-            );
-            if from != to {
-                if let Some(keys) = state.metadata.remove(&from) {
-                    state.metadata.insert(to, keys);
+            // A copy of what the server they are on does with theirs: somebody
+            // logged in has their profile filed under their account, so a nick
+            // change moves nothing. Somebody with no account has keys filed
+            // under the name they are letting go, and those describe the person
+            // rather than the seat, so they travel.
+            let account = match state.clients.get(uid) {
+                Some(c) => c.read().await.account.clone(),
+                None => None,
+            };
+            if account.is_none() {
+                let (from, to) = (
+                    crate::commands::metadata::nick_key(o),
+                    crate::commands::metadata::nick_key(new_nick),
+                );
+                if from != to {
+                    if let Some(keys) = state.metadata.remove(&from) {
+                        state.metadata.insert(to, keys);
+                    }
                 }
             }
         }
@@ -2603,7 +2610,7 @@ async fn accept_remote_metadata(ctx: &LinkContext, msg: &Message, peer_sid: &str
     let Some(source) = source_of(ctx, &uid).await else {
         return;
     };
-    let store_key = crate::commands::metadata::metadata_key(&target);
+    let store_key = crate::commands::metadata::metadata_key(&target, &ctx.state).await;
     {
         let mut state = ctx.state.write().await;
         match value {

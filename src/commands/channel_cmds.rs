@@ -685,9 +685,11 @@ async fn handle_join_inner(
                     Some(c) => c.read().await.nick_or_id().to_string(),
                     None => continue,
                 };
+                let member_key =
+                    crate::commands::metadata::metadata_key_in(&member_nick, &state).await;
                 let entries: Vec<(String, String)> = state
                     .metadata
-                    .get(&crate::commands::metadata::metadata_key(&member_nick))
+                    .get(&member_key)
                     .map(|m| {
                         m.iter()
                             .filter(|(k, _)| subs.contains(*k))

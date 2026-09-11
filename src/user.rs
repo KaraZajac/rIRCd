@@ -1097,13 +1097,14 @@ impl ServerState {
         }
         if let Some(ref n) = nick {
             self.nick_to_id.remove(&crate::casefold::upper(n));
-            // Metadata is filed under the nick, and a nick with no account
-            // behind it belongs to whoever holds it next. Leaving the keys
-            // there would hand somebody else's display name and avatar to the
-            // next person to take the name, and would grow without bound as
-            // names came and went.
+            // A nick with no account behind it belongs to whoever holds it
+            // next. Leaving the keys there would hand somebody else's display
+            // name and avatar to the next person to take the name, and would
+            // grow without bound as names came and went. An account's keys are
+            // filed under the account and stay where they are.
             if account.is_none() {
-                self.metadata.remove(&crate::casefold::upper(n));
+                self.metadata
+                    .remove(&crate::commands::metadata::nick_key(n));
             }
         }
         Some(client)

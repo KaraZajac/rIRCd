@@ -45,15 +45,68 @@ fn normalize_target(target: &str, self_nick: &str) -> String {
     }
 }
 
+/// Where an account's metadata is filed.
+///
+/// A profile describes a person, and on this server a person is an account.
+/// Filing it under a nick instead files it under what they are called at the
+/// moment, which means the next holder of that name wears their avatar, their
+/// display name and their pronouns. A nick is a seat; an account is who is
+/// sitting in it.
+pub(crate) fn account_key(account: &str) -> String {
+    format!("a:{}", account.to_lowercase())
+}
+
+/// Where a nick's metadata is filed when there is no account behind it.
+///
+/// Nothing under this prefix is ever written down. It lasts as long as the
+/// connection that set it and is dropped when that goes, because a name with
+/// nobody registered to it is borrowed rather than owned.
+pub(crate) fn nick_key(nick: &str) -> String {
+    format!("n:{}", crate::casefold::upper(nick))
+}
+
+/// Whether this key is one worth keeping between restarts.
+///
+/// Derived from the key rather than decided beside it, so the question "is
+/// this lasting?" and the question "where does it go?" cannot drift apart and
+/// write an ephemeral profile into the database under a borrowed name.
+pub(crate) fn is_lasting(key: &str) -> bool {
+    !key.starts_with("n:")
+}
+
 /// Storage key for a target. IRC compares nicks and channel names
 /// case-insensitively, so metadata set on "Alice" must be found by a client
 /// asking about "alice". Replies still echo the spelling the client used.
-pub(crate) fn metadata_key(target: &str) -> String {
+///
+/// A channel is filed under its own name. A person is filed under the account
+/// behind whichever nick was asked about — and when nobody is holding that
+/// nick, under the account of that name if it has a profile, so somebody's
+/// profile is still theirs while they are offline.
+pub(crate) async fn metadata_key_in(target: &str, state: &ServerState) -> String {
     if is_channel(target) {
-        canonical_channel_key(target)
-    } else {
-        crate::casefold::upper(target)
+        return canonical_channel_key(target);
     }
+    if let Some(user_id) = state.nick_to_id.get(&crate::casefold::upper(target)) {
+        if let Some(client) = state.clients.get(user_id) {
+            let account = client.read().await.account.clone();
+            return match account {
+                Some(account) => account_key(&account),
+                None => nick_key(target),
+            };
+        }
+    }
+    let as_account = account_key(target);
+    if state.metadata.contains_key(&as_account) {
+        as_account
+    } else {
+        nick_key(target)
+    }
+}
+
+/// The same, taking the lock itself. For callers that hold nothing.
+pub(crate) async fn metadata_key(target: &str, state: &Arc<RwLock<ServerState>>) -> String {
+    let state_r = state.read().await;
+    metadata_key_in(target, &state_r).await
 }
 
 fn is_channel(t: &str) -> bool {
@@ -448,7 +501,7 @@ pub async fn handle_metadata(
         .await;
     }
 
-    let (self_nick, is_oper, setter_source, has_batch, self_account) = {
+    let (self_nick, is_oper, setter_source, has_batch) = {
         let state_r = state.read().await;
         let client = match state_r.clients.get(client_id) {
             Some(c) => c.clone(),
@@ -467,13 +520,7 @@ pub async fn handle_metadata(
         let g = client.read().await;
         let src = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
         let has_batch = senders.read().await.caps_of(client_id).contains("batch");
-        (
-            g.nick_or_id().to_string(),
-            g.oper,
-            src,
-            has_batch,
-            g.account.clone(),
-        )
+        (g.nick_or_id().to_string(), g.oper, src, has_batch)
     };
 
     let target = normalize_target(target_param, &self_nick);
@@ -544,7 +591,9 @@ pub async fn handle_metadata(
             }
 
             let state_r = state.read().await;
-            let meta = state_r.metadata.get(&metadata_key(&target));
+            let meta = state_r
+                .metadata
+                .get(&metadata_key_in(&target, &state_r).await);
             let mut entries = Vec::new();
             let mut missing = Vec::new();
 
@@ -695,9 +744,10 @@ pub async fn handle_metadata(
 
             let entries: Vec<(String, String)> = {
                 let state_r = state.read().await;
+                let key = metadata_key_in(&target, &state_r).await;
                 state_r
                     .metadata
-                    .get(&metadata_key(&target))
+                    .get(&key)
                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default()
             };
@@ -845,14 +895,15 @@ pub async fn handle_metadata(
             // Key count limit (only when setting, not deleting)
             if value.is_some() {
                 let state_r = state.read().await;
+                let counting_key = metadata_key_in(&target, &state_r).await;
                 let current_count = state_r
                     .metadata
-                    .get(&metadata_key(&target))
+                    .get(&counting_key)
                     .map(|m| m.len())
                     .unwrap_or(0);
                 let already_set = state_r
                     .metadata
-                    .get(&metadata_key(&target))
+                    .get(&counting_key)
                     .and_then(|m| m.get(key))
                     .is_some();
                 drop(state_r);
@@ -877,10 +928,13 @@ pub async fn handle_metadata(
                 }
             }
 
-            // Apply change
+            // Apply change. The key is worked out once and used for both the
+            // table in memory and the one on disk, so they cannot disagree
+            // about whose profile this is.
+            let store_key = metadata_key(&target, &state).await;
             let new_value = {
                 let mut state_w = state.write().await;
-                let entry = state_w.metadata.entry(metadata_key(&target)).or_default();
+                let entry = state_w.metadata.entry(store_key.clone()).or_default();
                 if let Some(ref val) = value {
                     entry.insert(key.to_string(), val.clone());
                 } else {
@@ -893,13 +947,12 @@ pub async fn handle_metadata(
             // identity: keeping its keys would hand them to whoever takes the
             // name next, and would grow the table for as long as names came
             // and went. Channels and accounts do persist.
-            let lasting = is_channel(&target) || self_account.is_some();
             if let Some(ref pool) = cfg.db {
-                if lasting {
+                if is_lasting(&store_key) {
                     if let Some(ref v) = new_value {
-                        crate::persist::save_metadata(pool, &metadata_key(&target), key, v).await;
+                        crate::persist::save_metadata(pool, &store_key, key, v).await;
                     } else {
-                        crate::persist::delete_metadata(pool, &metadata_key(&target), key).await;
+                        crate::persist::delete_metadata(pool, &store_key, key).await;
                     }
                 }
             }
@@ -1009,14 +1062,17 @@ pub async fn handle_metadata(
                 return Ok(());
             }
 
+            let clear_key = metadata_key(&target, &state).await;
             let cleared: Vec<(String, String)> = {
                 let mut state_w = state.write().await;
-                let entry = state_w.metadata.entry(metadata_key(&target)).or_default();
+                let entry = state_w.metadata.entry(clear_key.clone()).or_default();
                 entry.drain().collect()
             };
 
             if let Some(ref pool) = cfg.db {
-                crate::persist::clear_metadata(pool, &metadata_key(&target)).await;
+                if is_lasting(&clear_key) {
+                    crate::persist::clear_metadata(pool, &clear_key).await;
+                }
             }
 
             // Broadcast deletion events for each cleared key
@@ -1312,9 +1368,10 @@ pub async fn handle_metadata(
             // Return all metadata for target (client can filter by their subscriptions locally)
             let entries: Vec<(String, String)> = {
                 let state_r = state.read().await;
+                let key = metadata_key_in(&target, &state_r).await;
                 state_r
                     .metadata
-                    .get(&metadata_key(&target))
+                    .get(&key)
                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default()
             };

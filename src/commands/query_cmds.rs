@@ -601,9 +601,11 @@ pub async fn handle_whois(
     // for metadata at all. A client that did not negotiate it has no idea what
     // these numerics are.
     if crate::commands::metadata::wants_metadata(&session_caps(&senders, client_id).await) {
+        let whois_key =
+            crate::commands::metadata::metadata_key_in(target_nick, &state).await;
         let entries: Vec<(String, String)> = state
             .metadata
-            .get(&crate::commands::metadata::metadata_key(target_nick))
+            .get(&whois_key)
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
         for (key, value) in entries {

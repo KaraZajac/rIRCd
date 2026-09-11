@@ -266,6 +266,13 @@ pub async fn run(
         }
         // Load read markers and metadata into server state
         let markers = crate::persist::load_read_markers(pool).await;
+        // Profiles used to be filed under a nick. Move them onto the account
+        // they belong to before anything reads them, and drop the ones that
+        // belong to nobody — a name somebody borrowed once is not an identity.
+        let (moved, dropped) = crate::persist::migrate_metadata_to_accounts(pool).await;
+        if moved > 0 || dropped > 0 {
+            info!("Metadata: {moved} row(s) moved onto their account, {dropped} dropped");
+        }
         let meta = crate::persist::load_all_metadata(pool).await;
         let memberships = crate::persist::load_account_channels(pool).await;
         let bans = crate::persist::load_server_bans(pool).await;
