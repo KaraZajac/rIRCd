@@ -1609,6 +1609,38 @@ pub async fn handle_mode(
                             rejected_modes.push(('o', plus));
                             continue;
                         }
+                        // Taking the founder's operator status away would be
+                        // the same coup as kicking them, done quietly: in a
+                        // moderated channel it silences the owner in their own
+                        // room. They keep it for as long as the channel is
+                        // theirs, and `CHANOWN` is how it stops being theirs.
+                        let target_is_founder = match state.clients.get(&target_id) {
+                            Some(c) => {
+                                let account = c.read().await.account.clone();
+                                ch.is_founder(account.as_deref())
+                            }
+                            None => false,
+                        };
+                        if !plus && target_is_founder {
+                            reply_to_client(
+                                &senders,
+                                client_id,
+                                Message::new(
+                                    "482",
+                                    vec![
+                                        nick.clone(),
+                                        target.into(),
+                                        "The founder keeps operator status in their own channel"
+                                            .into(),
+                                    ],
+                                )
+                                .with_prefix(&cfg.server.name),
+                                label,
+                            )
+                            .await;
+                            rejected_modes.push(('o', plus));
+                            continue;
+                        }
                         if let Some(memb) = ch.members.get_mut(&target_id) {
                             memb.modes.op = plus;
                         }
@@ -2627,6 +2659,35 @@ pub async fn handle_kick(
                 .await;
                 return Ok(());
             }
+            // The founder cannot be thrown out of their own channel. An
+            // operator they appointed removing them is the one thing a channel
+            // must not allow — it is how a room gets taken from the person
+            // whose room it is. Somebody who has to be got rid of is got rid of
+            // by taking the channel off them first, which is a decision that
+            // leaves a trace, rather than by a KICK that leaves none.
+            let target_account = match state.clients.get(&tid) {
+                Some(c) => c.read().await.account.clone(),
+                None => None,
+            };
+            if ch.is_founder(target_account.as_deref()) {
+                let nick = client.read().await.nick_or_id().to_string();
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "482",
+                        vec![
+                            nick,
+                            ch_name.into(),
+                            "You cannot remove the founder from their own channel".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
             if ch.members.remove(&tid).is_some() {
                 tracing::info!(client_id, channel = %ch_name, target = %target_nick, "KICK");
                 if let Some(target_client) = state.clients.get(&tid) {
@@ -3229,5 +3290,302 @@ pub async fn handle_rename(
         }
     }
 
+    Ok(())
+}
+
+/// `CHANOWN <#channel> [<account>]` — who a channel belongs to, and handing it on.
+///
+/// Being the founder is the one standing a channel cannot take back: the
+/// founder is opped whenever they return, cannot be kicked out of their own
+/// room, and cannot be deopped in it. That is deliberate — an operator they
+/// appointed turning on them is how a channel gets stolen — but it also means
+/// ownership has to have a door, or a channel outlives every reason anyone had
+/// for making it. This is the door.
+///
+/// Two people may open it. The founder, because it is theirs to give: somebody
+/// leaves a project and the channel should go where the project went. And a
+/// network operator, because a channel whose founder has vanished, or whose
+/// founder is the problem, has no other way out. The operator's use of it is
+/// said in the channel and logged by name. It is meant to be usable, and it is
+/// meant to be seen — an operator who wants a channel can already kick, mode
+/// and ban their way through it, so what keeps them honest is not being unable
+/// to act but being unable to act quietly.
+pub async fn handle_chanown(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let fail = |code: &str, target: &str, text: &str| {
+        Message::new(
+            "FAIL",
+            vec![
+                "CHANOWN".into(),
+                code.into(),
+                target.into(),
+                text.into(),
+            ],
+        )
+        .with_prefix(&cfg.server.name)
+    };
+
+    let Some(ch_name) = msg.params.first().cloned() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail("NEED_PARAMS", "*", "Which channel?"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let new_owner = msg.params.get(1).cloned();
+    let ch_key = canonical_channel_key(&ch_name);
+
+    let (nick, account, is_oper, oper_name) = {
+        let state_r = state.read().await;
+        let Some(client) = state_r.clients.get(client_id) else {
+            return Ok(());
+        };
+        let guard = client.read().await;
+        (
+            guard.nick_or_id().to_string(),
+            guard.account.clone(),
+            guard.oper,
+            guard.oper_name.clone(),
+        )
+    };
+
+    // The channel has to exist to be owned. An owned one is resident even with
+    // nobody in it, which is the whole point of keeping it, so this answers for
+    // a channel nobody is standing in.
+    let Some(founder) = ({
+        let store = channels.read().await;
+        match store.channels.get(&ch_key) {
+            Some(ch) => Some(ch.read().await.founder.clone()),
+            None => None,
+        }
+    }) else {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail("NO_SUCH_CHANNEL", &ch_name, "No such channel"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+
+    // No second parameter is a question rather than an instruction.
+    let Some(new_owner) = new_owner else {
+        let reply = if founder.is_empty() {
+            Message::new(
+                "NOTE",
+                vec![
+                    "CHANOWN".into(),
+                    "NO_FOUNDER".into(),
+                    ch_name.clone(),
+                    "This channel has no founder".into(),
+                ],
+            )
+        } else {
+            Message::new(
+                "NOTE",
+                vec![
+                    "CHANOWN".into(),
+                    "FOUNDER".into(),
+                    ch_name.clone(),
+                    founder.clone(),
+                    format!("{ch_name} belongs to {founder}"),
+                ],
+            )
+        };
+        reply_to_client(
+            &senders,
+            client_id,
+            reply.with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+
+    let owns_it = account
+        .as_deref()
+        .is_some_and(|a| !founder.is_empty() && a.eq_ignore_ascii_case(&founder));
+    if !owns_it && !is_oper {
+        // A channel with no founder is not up for grabs by whoever asks first.
+        // Somebody has to decide who it belongs to, and that is an operator.
+        let text = if founder.is_empty() {
+            "This channel has no founder; an operator has to give it one"
+        } else {
+            "Only the founder of a channel can hand it on"
+        };
+        reply_to_client(
+            &senders,
+            client_id,
+            fail("NOT_FOUNDER", &ch_name, text),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    if new_owner.eq_ignore_ascii_case(&founder) {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(
+                "ALREADY_FOUNDER",
+                &ch_name,
+                &format!("{new_owner} already owns {ch_name}"),
+            ),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    // The new owner has to be an account that exists. Handing a channel to a
+    // name nobody can log in as is handing it to nobody, and it would look like
+    // it had worked.
+    if let Some(ref pool) = cfg.db {
+        if !crate::persist::nick_is_registered(pool, &cfg.db_health, &new_owner).await {
+            reply_to_client(
+                &senders,
+                client_id,
+                fail(
+                    "NO_SUCH_ACCOUNT",
+                    &new_owner,
+                    "There is no account by that name",
+                ),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
+    // Apply it. The outgoing founder keeps operator status: handing a channel
+    // on is not the same as being thrown out of it, and somebody who gives a
+    // channel away should not have to ask for their own room back.
+    let (created_at, reopped) = {
+        let store = channels.read().await;
+        let Some(entry) = store.channels.get(&ch_key) else {
+            return Ok(());
+        };
+        let mut ch = entry.write().await;
+        ch.founder = new_owner.clone();
+        for who in [&new_owner, &founder] {
+            if !who.is_empty() && !ch.persisted_operators.iter().any(|o| o == who) {
+                ch.persisted_operators.push(who.clone());
+            }
+        }
+        // If the new owner is standing in the channel, they hold it now.
+        let mut reopped = Vec::new();
+        let state_r = state.read().await;
+        for member_id in ch.members.keys().cloned().collect::<Vec<_>>() {
+            let Some(c) = state_r.clients.get(&member_id) else {
+                continue;
+            };
+            let theirs = c.read().await.account.clone();
+            if theirs
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(&new_owner))
+            {
+                if let Some(memb) = ch.members.get_mut(&member_id) {
+                    memb.modes.op = true;
+                }
+                reopped.push(c.read().await.nick_or_id().to_string());
+            }
+        }
+        (ch.created_at, reopped)
+    };
+
+    if let Some(ref pool) = cfg.db {
+        crate::persist::record_channel_founder(pool, &ch_key, &new_owner).await;
+        crate::persist::set_channel_access(pool, &ch_key, &new_owner, true, true).await;
+        if !founder.is_empty() {
+            crate::persist::set_channel_access(pool, &ch_key, &founder, true, true).await;
+        }
+    }
+
+    let mut carried = vec![new_owner.clone()];
+    if !founder.is_empty() {
+        carried.push(founder.clone());
+    }
+    crate::link::announce_channel_access(cfg, &ch_key, created_at, 'f', std::slice::from_ref(&new_owner))
+        .await;
+    crate::link::announce_channel_access(cfg, &ch_key, created_at, 'o', &carried).await;
+
+    // Said out loud, in the channel, whoever did it. A transfer that only the
+    // two people involved could see would be a quiet way to take a room.
+    let by = match (is_oper, oper_name.as_deref()) {
+        (true, Some(name)) if !owns_it => format!("network operator {name}"),
+        (true, None) if !owns_it => "a network operator".to_string(),
+        _ => nick.clone(),
+    };
+    let announcement = Message::new(
+        "NOTICE",
+        vec![
+            ch_name.clone(),
+            format!("{ch_name} now belongs to {new_owner}, handed over by {by}"),
+        ],
+    )
+    .with_prefix(&cfg.server.name);
+    let members: Vec<String> = {
+        let store = channels.read().await;
+        match store.channels.get(&ch_key) {
+            Some(ch) => ch.read().await.members.keys().cloned().collect(),
+            None => Vec::new(),
+        }
+    };
+    for member_id in &members {
+        senders.read().await.deliver(member_id, &announcement);
+    }
+    for member_nick in &reopped {
+        let mode = Message::new(
+            "MODE",
+            vec![ch_name.clone(), "+o".into(), member_nick.clone()],
+        )
+        .with_prefix(&cfg.server.name);
+        for other in &members {
+            senders.read().await.deliver(other, &mode);
+        }
+    }
+
+    if is_oper && !owns_it {
+        tracing::warn!(
+            client_id,
+            channel = %ch_key,
+            from = %founder,
+            to = %new_owner,
+            oper = %oper_name.unwrap_or_else(|| nick.clone()),
+            "CHANOWN: an operator moved a channel they do not own"
+        );
+    } else {
+        tracing::info!(client_id, channel = %ch_key, from = %founder, to = %new_owner, "CHANOWN");
+    }
+
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTE",
+            vec![
+                "CHANOWN".into(),
+                "TRANSFERRED".into(),
+                ch_name.clone(),
+                new_owner.clone(),
+                format!("{ch_name} now belongs to {new_owner}"),
+            ],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
     Ok(())
 }

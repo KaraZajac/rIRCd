@@ -867,6 +867,18 @@ pub async fn handle_message(
         "MONITOR" => {
             query_cmds::handle_monitor(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
+        "CHANOWN" => {
+            channel_cmds::handle_chanown(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
         "RENAME" => {
             channel_cmds::handle_rename(
                 &client_id,

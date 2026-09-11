@@ -519,7 +519,8 @@ traditional network is done by the server itself, against MariaDB.
 | Identify | SASL PLAIN, SCRAM-SHA-256 or EXTERNAL — no `/msg NickServ` |
 | Nick protection | Registered nicks are reserved for their account (`nick_protection`) |
 | Nick recovery | `GHOST <nick>` closes a stale session of your own that is holding it, wherever on the network it is |
-| Channel founder | The account that creates a channel; always opped on join, and never shut out of it by its own `+b`/`+i`/`+k`/`+l` |
+| Channel founder | The account that creates a channel; always opped on join, never shut out of it by its own `+b`/`+i`/`+k`/`+l`, and not kickable or deoppable in it |
+| Channel transfer | `CHANOWN #channel <account>` — by the founder, or by an operator, said out loud in the channel |
 | Channel access lists | `MODE +o` / `+v` by an operator is remembered and restored on the next join |
 | Channel modes, topic, key | Persisted; kept when an owned channel empties, and restored on startup |
 | Ban lists (`AKICK`-ish) | `+b`, `+e`, `+I` and `+q` masks are persisted and restored |
@@ -528,6 +529,37 @@ traditional network is done by the server itself, against MariaDB.
 
 Still absent: per-channel access *levels* beyond operator and voice, `AKICK`,
 and memos.
+
+### Owning a channel
+
+Whoever creates a channel while logged in is its founder, which is an account
+rather than a nick — whoever is logged in as it owns the channel, on any
+connection and under any name.
+
+A founder is opped whenever they come back, cannot be kicked out of their own
+channel, cannot be deopped in it, and is not shut out by its own `+b`, `+i`,
+`+k` or `+l`. An operator turning on the person who appointed them is how a
+channel gets stolen, and none of those doors opens that way.
+
+That leaves ownership needing a door of its own, which is `CHANOWN`:
+
+```
+CHANOWN #channel              what it says: who this channel belongs to
+CHANOWN #channel <account>    hand it on
+```
+
+The founder may hand their own channel on — somebody leaves a project and the
+channel should go where the project went. A network operator may hand on any
+channel, because one whose founder has vanished, or whose founder is the
+problem, has no other way out. An operator doing it is announced in the channel
+as an operator and logged by name: an operator who wants a channel can already
+kick, mode and ban their way through it, so what keeps them honest is not being
+unable to act but being unable to act quietly.
+
+The outgoing founder keeps operator status. Handing a channel on is not the
+same as being thrown out of it. The new owner must be an account that exists,
+and the change crosses the network as a `CACCESS` line, so every server agrees
+about whose channel it is.
 
 ## Channel Persistence
 

@@ -134,6 +134,21 @@ impl Channel {
         !self.founder.is_empty() || !self.persisted_operators.is_empty()
     }
 
+    /// Whether this account owns the channel.
+    ///
+    /// The founder is an account rather than a nick, so whoever is logged in
+    /// as it is the owner — on any connection, under any name. Somebody who is
+    /// not logged in owns nothing, which is why a bare `None` is never a match
+    /// even when the channel has no founder at all.
+    pub fn is_founder(&self, account: Option<&str>) -> bool {
+        match account {
+            Some(account) if !self.founder.is_empty() => {
+                account.eq_ignore_ascii_case(&self.founder)
+            }
+            _ => false,
+        }
+    }
+
     /// Whether one mask covers this source. `~a:` matches the account rather
     /// than the hostmask; everything else is a glob, exactly like the ban list —
     /// an exact-match check would silence nobody, since these are almost always
