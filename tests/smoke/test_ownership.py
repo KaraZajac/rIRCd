@@ -297,4 +297,108 @@ check("and the channel really moved", channel_row(CH, "founder") == owner, chann
 oper.close()
 watcher.close()
 
+section("a rename takes the channel's record with it")
+
+# RENAME moved the channel in memory and left its row under the old name, so
+# after a restart the old name came back owned and the new one was a stranger.
+BEFORE = f"#before{RUN}"
+AFTER = f"#after{RUN}"
+r = logged_in(f"{owner}_n", owner)
+r.join(BEFORE)
+r.send(f"MODE {BEFORE} +m")
+r.send(f"TOPIC {BEFORE} :moving house")
+r.read(1.2)
+time.sleep(0.8)
+check("the channel starts out recorded under its own name",
+      channel_row(BEFORE, "founder") == owner, channel_row(BEFORE, "founder"))
+
+mark = r.mark()
+r.send(f"RENAME {BEFORE} {AFTER} :moving")
+r.read(1.5)
+time.sleep(0.8)
+check("the rename is accepted",
+      not r.find("FAIL RENAME", lines=r.since(mark)), r.since(mark)[-3:])
+check("the record moved to the new name",
+      channel_row(AFTER, "founder") == owner, channel_row(AFTER, "founder"))
+check("and nothing is left behind under the old one",
+      channel_row(BEFORE, "founder") == "", repr(channel_row(BEFORE, "founder")))
+check("the modes came too", "m" in (channel_row(AFTER, "mode_flags") or ""),
+      channel_row(AFTER, "mode_flags"))
+r.close()
+
+section("who may bring a channel into being")
+
+# channel_creation gates making a channel, never walking into one that exists.
+# The setting is changed under the running server with REHASH and put back
+# afterwards, so the suites that follow see the server they expect.
+CONFIG = os.environ.get("SMOKE_CONFIG", "")
+original = open(CONFIG).read() if CONFIG else ""
+
+
+def rehash_with(setting):
+    """Rewrite the server's configuration and make it read it again."""
+    text = original
+    if setting:
+        text = text.replace("[server]", f"[server]\n{setting}", 1)
+    open(CONFIG, "w").write(text)
+    op = Client(f"cfg{RUN}{abs(hash(setting)) % 100}")
+    op.send(f"OPER {os.environ.get('SMOKE_OPER_NAME', 'smokeoper')} "
+            f"{os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+    op.wait_for(" 381 ", " 464 ", seconds=5)
+    op.send("REHASH")
+    op.wait_for(" 382 ", seconds=5)
+    op.close()
+    time.sleep(0.5)
+
+
+if CONFIG:
+    try:
+        rehash_with('channel_creation = "accounts"')
+
+        anon = Client(f"anon{RUN}")
+        mark = anon.mark()
+        anon.send(f"JOIN #fresh{RUN}")
+        anon.read(1.5)
+        check("somebody not logged in cannot make a channel",
+              bool(anon.find(" 477 ", lines=anon.since(mark))), anon.since(mark)[-3:])
+
+        holder = logged_in(f"{owner}_cc", owner)
+        mark = holder.mark()
+        holder.join(f"#fresh{RUN}")
+        holder.read(1.5)
+        check("somebody logged in can",
+              bool(holder.find(f"JOIN", f"#fresh{RUN}", lines=holder.since(mark))),
+              holder.since(mark)[-3:])
+        check("and the channel it makes has a founder from the start",
+              channel_row(f"#fresh{RUN}", "founder") == owner,
+              channel_row(f"#fresh{RUN}", "founder"))
+
+        mark = anon.mark()
+        anon.send(f"JOIN #fresh{RUN}")
+        anon.read(1.5)
+        check("joining one that already exists is not gated",
+              bool(anon.find("JOIN", f"#fresh{RUN}", lines=anon.since(mark))),
+              anon.since(mark)[-3:])
+        anon.close()
+        holder.close()
+
+        rehash_with('channel_creation = "opers"')
+        member = logged_in(f"{owner}_op", owner)
+        mark = member.mark()
+        member.join(f"#opersonly{RUN}")
+        member.read(1.5)
+        check("with opers-only even an account is refused",
+              bool(member.find(" 481 ", lines=member.since(mark))), member.since(mark)[-3:])
+        member.close()
+    finally:
+        rehash_with(None)
+        anyone = Client(f"any{RUN}")
+        mark = anyone.mark()
+        anyone.join(f"#default{RUN}")
+        anyone.read(1.5)
+        check("and by default anybody may still make one",
+              bool(anyone.find("JOIN", f"#default{RUN}", lines=anyone.since(mark))),
+              anyone.since(mark)[-3:])
+        anyone.close()
+
 summary("ownership")

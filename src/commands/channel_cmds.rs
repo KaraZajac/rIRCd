@@ -120,6 +120,7 @@ async fn handle_join_inner(
     let user_id = client_data.id.clone();
 
     let account = client_data.account.clone();
+    let is_oper = client_data.oper;
     drop(client_data);
     // What this connection negotiated, not what the person behind it did on
     // some other client: a reply belongs to the one that asked.
@@ -219,6 +220,33 @@ async fn handle_join_inner(
         let ch_key = canonical_channel_key(ch_name);
 
         let mut ch_store = channels.write().await;
+        // Bringing a channel into being is a different act from walking into
+        // one, and a network may want to say who can do it. Joining a channel
+        // that already exists is never gated here — that is what the channel's
+        // own modes are for.
+        if !ch_store.channels.contains_key(&ch_key) {
+            let refusal = match cfg.server.channel_creation {
+                crate::config::ChannelCreation::Anyone => None,
+                crate::config::ChannelCreation::Accounts if account.is_none() => Some((
+                    "477",
+                    "You must be logged in to an account to create a channel",
+                )),
+                crate::config::ChannelCreation::Opers if !is_oper => Some((
+                    "481",
+                    "Only a network operator can create a channel here",
+                )),
+                _ => None,
+            };
+            if let Some((numeric, text)) = refusal {
+                drop(ch_store);
+                reply_self!(Message::new(
+                    numeric,
+                    vec![nick.clone(), ch_name.to_string(), text.into()],
+                )
+                .with_prefix(&cfg.server.name));
+                continue;
+            }
+        }
         let ch = ch_store
             .channels
             .entry(ch_key.clone())
@@ -3175,6 +3203,12 @@ pub async fn handle_rename(
 
     let case_only = old_key == new_key;
     tracing::info!(client_id, old = %old_name, new = %new_name, case_only, "RENAME channel");
+    // The channel keeps everything it had, so its record has to come with it.
+    if !case_only {
+        if let Some(ref pool) = cfg.db {
+            crate::persist::rename_channel(pool, &old_key, &new_key).await;
+        }
+    }
     let channel = ch_store.channels.remove(&old_key).expect("channel existed");
     let mut ch = channel.write().await;
     // Store the new name as given; new_key is only the lookup key.

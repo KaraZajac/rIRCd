@@ -121,6 +121,7 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 | `ping_timeout_secs` | `90` | How long to wait for PONG before sending next PING |
 | `disconnect_timeout_secs` | `150` | Time after missed PONG before disconnecting client |
 | `nick_protection` | `true` | Reserve a registered nick for its account; others get 433 |
+| `channel_creation` | `anyone` | Who may bring a new channel into being: `anyone`, `accounts` or `opers`. Only creating is gated, never joining one that already exists. `accounts` is the useful one — a channel made by somebody not logged in has no founder and never gets one, so requiring an account makes every channel owned from its first moment |
 | `admin_name` / `admin_location` / `admin_email` | _(unset)_ | Shown by `ADMIN` (256–259) |
 | `client_tag_deny` | _(unset)_ | List of client-only tags to drop (e.g. `["+typing"]` or `["*"]` to drop all) |
 | `cloak_key` | _(unset)_ | If set, connecting clients receive an HMAC-SHA256-based virtual host cloak (e.g. `"mysecret"`) |
@@ -560,6 +561,13 @@ The outgoing founder keeps operator status. Handing a channel on is not the
 same as being thrown out of it. The new owner must be an account that exists,
 and the change crosses the network as a `CACCESS` line, so every server agrees
 about whose channel it is.
+
+A channel made by somebody who is not logged in has no founder, and never gets
+one — there was no account to write down. `channel_creation = "accounts"` is
+the setting that closes that: it gates *making* a channel, never joining one,
+so every channel on the network is owned from its first moment. `opers` makes
+the channel list something decided rather than grown, which suits a private
+network and would be hostile on a general one.
 
 ## Channel Persistence
 

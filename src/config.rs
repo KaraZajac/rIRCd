@@ -293,6 +293,15 @@ pub struct ServerConfig {
     /// registering an account is what claims the nick.
     #[serde(default = "default_nick_protection")]
     pub nick_protection: bool,
+    /// Who may bring a new channel into being: `anyone`, `accounts` or
+    /// `opers`. This gates creating one, never joining one that exists.
+    ///
+    /// `accounts` is the interesting setting. A channel made by somebody who
+    /// is not logged in has no founder and never gets one, so it belongs to
+    /// nobody for as long as it exists; requiring an account makes "every
+    /// channel has an owner" true by construction rather than by luck.
+    #[serde(default = "default_channel_creation")]
+    pub channel_creation: ChannelCreation,
     /// Comma-separated list of channels to suggest to clients that enable draft/auto-join.
     /// Example: "#general, #help, #dev"
     #[serde(default)]
@@ -361,6 +370,24 @@ fn default_server_description() -> String {
     format!("rIRCd v{}", env!("CARGO_PKG_VERSION"))
 }
 
+/// Who may make a channel that does not exist yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelCreation {
+    /// Anybody who can join can make one. What IRC has always done.
+    Anyone,
+    /// Only somebody logged in, so the channel has a founder from its first
+    /// moment.
+    Accounts,
+    /// Only a network operator: a network whose channel list is decided rather
+    /// than grown.
+    Opers,
+}
+
+fn default_channel_creation() -> ChannelCreation {
+    ChannelCreation::Anyone
+}
+
 fn default_nick_protection() -> bool {
     true
 }
@@ -402,6 +429,7 @@ impl Default for ServerConfig {
             admin_location: None,
             admin_email: None,
             nick_protection: default_nick_protection(),
+            channel_creation: default_channel_creation(),
             auto_join: None,
             description: default_server_description(),
             register_before_connect: default_register_before_connect(),

@@ -663,6 +663,41 @@ pub async fn save_channel_topic(pool: &sqlx::MySqlPool, channel_name: &str, topi
     .await;
 }
 
+/// Move a channel's stored record to its new name.
+///
+/// A `RENAME` moved the channel in memory and left its row where it was, so
+/// after a restart the old name came back owned, with the modes and bans and
+/// access list, and the new name was a stranger. The access, voice and list
+/// tables hang off the channel row rather than the name, so moving the row
+/// takes them with it.
+///
+/// Returns whether anything moved. A new name that already has a record of its
+/// own is not overwritten — two channels cannot become one by being renamed
+/// into each other, and the caller says so rather than silently merging them.
+pub async fn rename_channel(pool: &sqlx::MySqlPool, old_name: &str, new_name: &str) -> bool {
+    let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM channels WHERE name = ?")
+        .bind(new_name)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    if taken.is_some() {
+        tracing::warn!(
+            old = %old_name,
+            new = %new_name,
+            "RENAME: the new name already has a stored channel, leaving both alone"
+        );
+        return false;
+    }
+    sqlx::query("UPDATE channels SET name = ? WHERE name = ?")
+        .bind(new_name)
+        .bind(old_name)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected() > 0)
+        .unwrap_or(false)
+}
+
 // ─── Read markers ─────────────────────────────────────────────────────────────
 
 /// Upsert a read marker timestamp for an account+target.
