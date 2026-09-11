@@ -405,6 +405,31 @@ key_file = "/etc/rIRCd/vapid.key"
 
 ---
 
+### Reloading
+
+`REHASH` from an operator and `SIGHUP` from outside do the same thing: read the
+configuration again and put it in place without dropping anybody. The
+certificate is re-read too, which is the point of it — renewals happen on
+somebody else's schedule, and restarting to pick one up would disconnect
+everyone.
+
+```bash
+systemctl reload rircd        # the unit file sends SIGHUP
+kill -HUP "$(cat /etc/rIRCd/rircd.pid)"
+```
+
+For Let's Encrypt, that is the deploy hook:
+
+```bash
+certbot renew --deploy-hook 'systemctl reload rircd'
+```
+
+What survives the reload is everything a connection is holding: the database
+pool, the history writer, the servers already linked, and the Web Push key —
+rotating that last one would invalidate every push subscription registered
+under it. A configuration that will not load leaves the running one alone and
+says why in the log.
+
 ## CLI Commands
 
 | Command | Description |

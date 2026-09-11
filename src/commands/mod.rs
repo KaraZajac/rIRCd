@@ -4,7 +4,7 @@ pub(crate) mod metadata;
 mod query_cmds;
 pub mod registration;
 mod reply;
-mod server_cmds;
+pub mod server_cmds;
 mod webpush_cmds;
 pub mod whois_remote;
 

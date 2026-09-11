@@ -1324,92 +1324,27 @@ pub async fn handle_wallops(
 
 // ─── REHASH ───────────────────────────────────────────────────────────────────
 
-/// REHASH — reload the config file without restarting (oper only).
-/// Replies: 382 RPL_REHASHING
-pub async fn handle_rehash(
-    client_id: &str,
-    state: Arc<RwLock<ServerState>>,
-    senders: Senders,
-    cfg: Arc<RwLock<Config>>,
-    label: Option<&str>,
-) -> anyhow::Result<()> {
+/// Read the configuration again and put it in place, without dropping anybody.
+///
+/// Shared by `REHASH` and by `SIGHUP`, because they are the same operation
+/// asked for in two ways: an operator on the network, and whoever renewed the
+/// certificate. The unit file in `distrib/` sends the signal on
+/// `systemctl reload`.
+///
+/// What survives the swap is everything a connection is holding: the database
+/// pool, the history writer, the servers already linked, the Web Push key, and
+/// the TLS acceptor itself — which is behind a lock precisely so a renewed
+/// certificate can be dropped into it while clients keep talking.
+///
+/// Returns the path that was read, so the caller can say which file it was.
+pub async fn reload_config(
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    cfg: &Arc<RwLock<Config>>,
+    config_path: &std::path::Path,
+) -> anyhow::Result<String> {
     let server_name = cfg.read().await.server.name.clone();
-
-    let (is_oper, nick) = {
-        let state_r = state.read().await;
-        match state_r.clients.get(client_id) {
-            Some(c) => {
-                let g = c.read().await;
-                (
-                    g.may(crate::config::OperPrivilege::Rehash),
-                    g.nick_or_id().to_string(),
-                )
-            }
-            None => return Ok(()),
-        }
-    };
-
-    if !is_oper {
-        reply_to_client(
-            &senders,
-            client_id,
-            Message::new(
-                "481",
-                vec![nick, "Permission Denied- You're not an IRC operator".into()],
-            )
-            .with_prefix(&server_name),
-            label,
-        )
-        .await;
-        return Ok(());
-    }
-
-    let config_path = state.read().await.config_path.clone();
-    let config_path = match config_path {
-        Some(p) => p,
-        None => {
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new(
-                    "FAIL",
-                    vec![
-                        "REHASH".into(),
-                        "INTERNAL_ERROR".into(),
-                        "*".into(),
-                        "No config path available".into(),
-                    ],
-                )
-                .with_prefix(&server_name),
-                label,
-            )
-            .await;
-            return Ok(());
-        }
-    };
-
-    let new_cfg = match crate::config::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            reply_to_client(
-                &senders,
-                client_id,
-                Message::new(
-                    "FAIL",
-                    vec![
-                        "REHASH".into(),
-                        "INTERNAL_ERROR".into(),
-                        "*".into(),
-                        format!("Failed to load config: {}", e),
-                    ],
-                )
-                .with_prefix(&server_name),
-                label,
-            )
-            .await;
-            return Ok(());
-        }
-    };
+    let new_cfg = crate::config::load(config_path)?;
 
     // Snapshot old cap list before replacing config
     let old_caps_raw = crate::capability::build_cap_list(&*cfg.read().await, false, false);
@@ -1442,10 +1377,10 @@ pub async fn handle_rehash(
             match crate::server::build_tls_acceptor(&new_cfg) {
                 Ok(acceptor) => {
                     *shared.write().await = acceptor;
-                    tracing::info!("REHASH: TLS certificate reloaded");
+                    tracing::info!("Certificate reloaded");
                 }
                 Err(e) => {
-                    tracing::error!("REHASH: keeping the current certificate: {}", e);
+                    tracing::error!("Keeping the certificate that is running: {}", e);
                 }
             }
         }
@@ -1460,14 +1395,13 @@ pub async fn handle_rehash(
             None => match crate::webpush::WebpushRuntime::new(webpush_cfg) {
                 Ok(runtime) => Some(std::sync::Arc::new(runtime)),
                 Err(e) => {
-                    tracing::error!("REHASH: could not set up Web Push: {}", e);
+                    tracing::error!("Could not set up Web Push: {}", e);
                     None
                 }
             },
         };
     }
 
-    let config_file = config_path.to_string_lossy().to_string();
     *cfg.write().await = new_cfg;
 
     // Compute new cap list and diff
@@ -1546,6 +1480,96 @@ pub async fn handle_rehash(
             }
         }
     }
+
+    Ok(config_path.to_string_lossy().to_string())
+}
+
+/// REHASH — reload the config file without restarting (oper only).
+/// Replies: 382 RPL_REHASHING
+pub async fn handle_rehash(
+    client_id: &str,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: Arc<RwLock<Config>>,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let server_name = cfg.read().await.server.name.clone();
+
+    let (is_oper, nick) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (
+                    g.may(crate::config::OperPrivilege::Rehash),
+                    g.nick_or_id().to_string(),
+                )
+            }
+            None => return Ok(()),
+        }
+    };
+
+    if !is_oper {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "481",
+                vec![nick, "Permission Denied- You're not an IRC operator".into()],
+            )
+            .with_prefix(&server_name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let config_path = state.read().await.config_path.clone();
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "REHASH".into(),
+                        "INTERNAL_ERROR".into(),
+                        "*".into(),
+                        "No config path available".into(),
+                    ],
+                )
+                .with_prefix(&server_name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    let config_file = match reload_config(&state, &senders, &cfg, &config_path).await {
+        Ok(file) => file,
+        Err(e) => {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "FAIL",
+                    vec![
+                        "REHASH".into(),
+                        "INTERNAL_ERROR".into(),
+                        "*".into(),
+                        format!("Failed to load config: {}", e),
+                    ],
+                )
+                .with_prefix(&server_name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    };
 
     info!("Config reloaded by {}", nick);
     reply_to_client(

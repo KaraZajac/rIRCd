@@ -776,6 +776,14 @@ pub async fn run(
 
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // A certificate is renewed on somebody else's schedule, and the acceptor is
+    // behind a lock so a new one can be dropped in without anybody noticing.
+    // SIGHUP is how that gets asked for from outside the network — it is what
+    // `systemctl reload` sends, and what the unit file in distrib/ has always
+    // told operators to send. Until this existed the default disposition
+    // applied, which is to die: a documented way to take the server down.
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
     loop {
         tokio::select! {
@@ -909,6 +917,34 @@ pub async fn run(
             } => {
                 info!("Shutting down (SIGTERM)");
                 break;
+            }
+            _ = async {
+                #[cfg(unix)]
+                {
+                    sighup.recv().await;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                let path = state.read().await.config_path.clone();
+                match path {
+                    Some(path) => {
+                        match crate::commands::server_cmds::reload_config(
+                            &state, &senders, &cfg_arc, &path,
+                        )
+                        .await
+                        {
+                            Ok(file) => info!(config = %file, "Reloaded on SIGHUP"),
+                            Err(e) => error!(
+                                "SIGHUP: keeping the configuration that is running: {}",
+                                e
+                            ),
+                        }
+                    }
+                    None => warn!("SIGHUP: no configuration file to reload"),
+                }
             }
         }
     }
