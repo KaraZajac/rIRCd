@@ -1825,7 +1825,7 @@ pub async fn handle_quit(
                 }
             }
             ch.members.remove(&user_id);
-            should_remove = ch.members.is_empty();
+            should_remove = ch.members.is_empty() && !ch.is_registered();
         }
         if should_remove {
             ch_store.channels.remove(ch_name);

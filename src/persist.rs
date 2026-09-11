@@ -630,6 +630,21 @@ pub async fn save_channel_modes(
     .await;
 }
 
+/// Store a channel's topic, so it outlives the last person in the room.
+///
+/// The topic was being loaded at startup and never written, which meant it was
+/// only ever as durable as the channel object holding it.
+pub async fn save_channel_topic(pool: &sqlx::MySqlPool, channel_name: &str, topic: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO channels (name, topic) VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE topic = VALUES(topic)",
+    )
+    .bind(channel_name)
+    .bind(topic)
+    .execute(pool)
+    .await;
+}
+
 // ─── Read markers ─────────────────────────────────────────────────────────────
 
 /// Upsert a read marker timestamp for an account+target.

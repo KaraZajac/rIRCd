@@ -1756,14 +1756,14 @@ async fn seat_member(
 async fn unseat_member(ctx: &LinkContext, key: &str, uid: &str) {
     {
         let mut store = ctx.channels.write().await;
-        let mut empty = false;
+        let mut forget = false;
         if let Some(entry) = store.channels.get_mut(key) {
             let mut ch = entry.write().await;
             ch.members.remove(uid);
             ch.invite_list.remove(uid);
-            empty = ch.members.is_empty();
+            forget = ch.members.is_empty() && !ch.is_registered();
         }
-        if empty {
+        if forget {
             store.channels.remove(key);
         }
     }

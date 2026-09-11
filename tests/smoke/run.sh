@@ -270,7 +270,7 @@ export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 status=0
 if [ "$SERVE_ONLY" = 0 ]; then
   if [ ${#SUITES[@]} -eq 0 ]; then
-    SUITES=(test_core.py test_ircv3.py test_features.py test_websocket.py test_account.py test_webpush.py test_multiclient.py test_hostile.py)
+    SUITES=(test_core.py test_ircv3.py test_features.py test_websocket.py test_account.py test_ownership.py test_webpush.py test_multiclient.py test_hostile.py)
   fi
   for suite in "${SUITES[@]}"; do
     say "Running $suite"

@@ -296,6 +296,20 @@ async fn handle_join_inner(
             continue;
         }
 
+        // Somebody who holds the channel cannot be shut out of it. A registered
+        // channel keeps its modes now when the last person leaves, so +b, +i,
+        // +k and +l on an empty room would otherwise be a door that locks from
+        // the inside — the founder sets one, goes to bed, and never gets back
+        // in. Only an account counts here: a nick on the operator list is not
+        // proof of who is typing it.
+        let holds_the_channel = account.as_deref().is_some_and(|a| {
+            a.eq_ignore_ascii_case(&ch.founder)
+                || ch
+                    .persisted_operators
+                    .iter()
+                    .any(|o| o.eq_ignore_ascii_case(a))
+        });
+
         // An invitation is permission to come in. Refusing the person you just
         // invited is not a safer channel, it is a broken invitation.
         //
@@ -305,6 +319,7 @@ async fn handle_join_inner(
         if ch.is_banned(account.as_deref(), &source)
             && !ch.is_ban_exempt(account.as_deref(), &source)
             && !ch.invite_list.contains(&user_id)
+            && !holds_the_channel
         {
             reply_self!(Message::new(
                 "474",
@@ -334,6 +349,7 @@ async fn handle_join_inner(
         if ch.modes.invite_only
             && !ch.invite_list.contains(&user_id)
             && !ch.is_invite_exempt(account.as_deref(), &source)
+            && !holds_the_channel
         {
             reply_self!(Message::new(
                 "473",
@@ -349,7 +365,9 @@ async fn handle_join_inner(
 
         if let Some(ref key) = ch.key {
             // Constant-time comparison to prevent timing attacks on channel keys
-            if !ct_eq(provided_key.as_bytes(), key.as_bytes()) && !ch.invite_list.contains(&user_id)
+            if !ct_eq(provided_key.as_bytes(), key.as_bytes())
+                && !ch.invite_list.contains(&user_id)
+                && !holds_the_channel
             {
                 reply_self!(Message::new(
                     "475",
@@ -367,7 +385,10 @@ async fn handle_join_inner(
         // An invitation is permission to come in, so it outlasts a full
         // channel: refusing someone you just invited defeats the invite.
         if let Some(limit) = ch.modes.user_limit {
-            if ch.member_count() >= limit as usize && !ch.invite_list.contains(&user_id) {
+            if ch.member_count() >= limit as usize
+                && !ch.invite_list.contains(&user_id)
+                && !holds_the_channel
+            {
                 reply_self!(Message::new(
                     "471",
                     vec![
@@ -781,10 +802,10 @@ pub async fn handle_part(
                 senders.read().await.deliver(mid, &part_msg);
             }
             ch.members.remove(&user_id);
-            should_remove = ch.members.is_empty();
+            should_remove = ch.members.is_empty() && !ch.is_registered();
         }
         if should_remove {
-            tracing::debug!(channel = %ch_key, "Channel empty, removing");
+            tracing::debug!(channel = %ch_key, "Channel empty and unclaimed, forgetting it");
             ch_store.channels.remove(&ch_key);
         }
         drop(ch_store);
@@ -2439,6 +2460,9 @@ pub async fn handle_topic(
         );
         let setter = state.user_id(client_id);
         crate::link::announce_topic(cfg, &setter, &ch_key, &topic_text).await;
+        if let Some(ref pool) = cfg.db {
+            crate::persist::save_channel_topic(pool, &ch_key, &topic_text).await;
+        }
 
         // Setting a topic is announced with the TOPIC message above, which the
         // setter receives along with everyone else. 331/332/333 answer a query
@@ -2588,7 +2612,7 @@ pub async fn handle_kick(
                     senders.read().await.deliver(mid, &kick_msg);
                 }
                 senders.read().await.deliver(&tid, &kick_msg);
-                should_remove_channel = ch.members.is_empty();
+                should_remove_channel = ch.members.is_empty() && !ch.is_registered();
                 kicked_across = Some((tid.clone(), reason.clone()));
             }
         }

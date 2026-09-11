@@ -112,6 +112,28 @@ impl Channel {
         }
     }
 
+    /// Whether an empty channel is still somebody's.
+    ///
+    /// A channel nobody is in is normally forgotten: it was a name two people
+    /// used for an afternoon, and remembering it costs memory for nothing. A
+    /// channel that belongs to somebody is different. Its founder, its
+    /// operators, its bans and its modes live in the database, and the
+    /// database is only read at startup — so dropping it here would not park
+    /// it somewhere safe, it would hand it blank to whoever walked in next.
+    ///
+    /// What counts is somebody who can run the place: a founder, or an
+    /// operator whose status was granted to last. Modes and bans on their own
+    /// do not, however permanent they look. Nobody owns such a channel, so
+    /// nobody could ever lift what is set on it — keeping a `+k` that no
+    /// living person knows the key to would not be preserving a channel, it
+    /// would be sealing one.
+    ///
+    /// Whoever is kept for is also exempt from the channel's own doors, which
+    /// is what makes this safe to keep: see the join path in `channel_cmds`.
+    pub fn is_registered(&self) -> bool {
+        !self.founder.is_empty() || !self.persisted_operators.is_empty()
+    }
+
     /// Whether one mask covers this source. `~a:` matches the account rather
     /// than the hostmask; everything else is a glob, exactly like the ban list —
     /// an exact-match check would silence nobody, since these are almost always
