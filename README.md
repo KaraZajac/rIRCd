@@ -162,6 +162,14 @@ autoconnect = true
 | `send_password` / `receive_password` | — | Separate on purpose: each direction has its own secret, so one leaked configuration does not let the holder link both ways |
 | `autoconnect` | `false` | Keep the link up, retrying with a widening delay |
 
+A link carries everything two servers need to agree on: who is connected, what
+they are called, which channels they are in and what is said in them. It also
+carries the two things that need an answer rather than an announcement — a
+`WHOIS` asks the server somebody is on how long they have been quiet, and a
+`GHOST` asks the server a stale session is on to close it. What a link is
+allowed to say, and what it is not, is in
+[docs/server-linking.md](docs/server-linking.md).
+
 `tests/smoke/run-link.sh` brings up two servers with their own databases on
 their own ports, links them, and checks what each one knows about the other.
 `--tls` runs the same checks over an encrypted link, with a throwaway
@@ -211,7 +219,7 @@ key  = "/etc/rIRCd/key.pem"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `max_channels_per_client` | `50` | Max channels a single client may join |
-| `max_connections_per_ip` | `16` | Connections allowed from one address; 0 for no limit |
+| `max_connections_per_ip` | `16` | Connections allowed from one address; 0 for no limit. Everything arriving through a proxy, a Tor onion service or a web gateway shares one address, so a server fronted that way wants this raised or off — or `[webirc]`, where the gateway can say who the client really is |
 | `max_clients` | `0` | Connections allowed in total; 0 for no limit |
 | `max_line_length` | `512` | Longest message body accepted, before tags; advertised as `LINELEN` |
 | `flood_burst` | `10` | Commands a client may send back to back before being throttled |
@@ -477,7 +485,7 @@ traditional network is done by the server itself, against MariaDB.
 | Nick registration | `REGISTER` / `VERIFY` (draft/account-registration), with optional email verification |
 | Identify | SASL PLAIN, SCRAM-SHA-256 or EXTERNAL — no `/msg NickServ` |
 | Nick protection | Registered nicks are reserved for their account (`nick_protection`) |
-| Nick recovery | `GHOST <nick>` closes a stale session of your own that is holding it |
+| Nick recovery | `GHOST <nick>` closes a stale session of your own that is holding it, wherever on the network it is |
 | Channel founder | The account that creates a channel; always opped on join |
 | Channel access lists | `MODE +o` / `+v` by an operator is remembered and restored on the next join |
 | Channel modes, topic, key | Persisted and restored on startup |
@@ -555,7 +563,7 @@ still accepted in `CAP REQ` so older clients keep working.
 | **draft/event-playback** | Full | JOIN/PART/QUIT/TOPIC/NICK events stored in DB and replayed in CHATHISTORY |
 | **draft/network-icon** | Full | Optional `ICON=` ISUPPORT token; config `network.icon` |
 | **draft/read-marker** | Full | MARKREAD target [timestamp]; per-account, persisted in MariaDB. A client with no account keeps its marker for the life of the connection only — a connection id does not come back tomorrow to read it |
-| **draft/metadata-2** / **draft/metadata-3** | Full | METADATA GET/LIST/SET/CLEAR/SUB/UNSUB/SUBS/SYNC; key-value per user and channel, persisted in MariaDB for accounts (a bare nick's keys last as long as its connection, so the next holder of the name does not inherit them). Both names of the same specification are advertised; replies to a `-3` client come back in a `metadata` batch and subscription notices as RPL_KEYVALUE. `before-connect` lets a client set its own keys during registration; RPL_WHOISKEYVALUE (760) carries them in WHOIS. An invite-only or secret channel does not hand its metadata to non-members |
+| **draft/metadata-2** / **draft/metadata-3** | Full | METADATA GET/LIST/SET/CLEAR/SUB/UNSUB/SUBS/SYNC; key-value per user and channel, persisted in MariaDB for accounts (a bare nick's keys last as long as its connection, and move with the person when they change nick, so the next holder of a name never inherits them). Both names of the same specification are advertised; replies to a `-3` client come back in a `metadata` batch and subscription notices as RPL_KEYVALUE. `before-connect` lets a client set its own keys during registration; RPL_WHOISKEYVALUE (760) carries them in WHOIS. An invite-only or secret channel does not hand its metadata to non-members |
 | **STATUSMSG** | Full | PRIVMSG/NOTICE to `@#channel` (ops+) or `+#channel` (voiced+); advertised in 005 `STATUSMSG=@+` |
 | **draft/account-registration** | Full | REGISTER \* [email] password; logs the client in on success; optional email verification via VERIFY (`[email]` config) |
 | **draft/multiline** | Full | BATCH draft/multiline; max-bytes=4096, max-lines=20; fallback for non-multiline clients |
@@ -606,7 +614,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `UNKLINE` | — | Oper-only: remove a ban |
 | `DIE` | — | Oper-only: shut the server down |
 | `ADMIN` | 256/257/258/259 | Who runs this server (`[server] admin_*`) |
-| `GHOST` | — | Close a stale session holding a nick your account owns |
+| `GHOST` | — | Close a stale session holding a nick your account owns, on this server or another one |
 | `WALLOPS` | — | Oper-only: broadcast a message to all users with `+w` |
 | `MOTD` | 375/372/376 | Send the message of the day |
 | `ISON` | 303 | Check which nicks in a list are currently online |
@@ -652,18 +660,44 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 
 ## Testing
 
-`cargo test` runs the unit and integration tests (message formatting, RFC 8291
-encryption vectors, capability gating, verification-code rules).
+`cargo test` runs the unit and integration tests: message formatting, RFC 8291
+encryption vectors, capability gating, verification-code rules, and fuzzers that
+throw arbitrary bytes at the parser and at the link protocol.
 
-For end-to-end checks against a real server there is a smoke harness that brings
-up a throwaway MariaDB, an SMTP sink and `rircd` itself:
+End-to-end, against a real server with a throwaway MariaDB and an SMTP sink
+behind it:
 
 ```bash
-tests/smoke/run.sh          # run every suite, then tear down
-tests/smoke/run.sh --keep   # leave the server up for manual poking
+tests/smoke/run.sh                  # every suite, then tear down
+tests/smoke/run.sh --keep           # leave it up for manual poking
+tests/smoke/run-link.sh             # two servers, linked
+tests/smoke/run-link.sh --tls       # the same, over an encrypted link
 ```
 
-See [tests/smoke/README.md](tests/smoke/README.md).
+And against [progval/irctest](https://github.com/progval/irctest), which is the
+suite the other IRC servers are measured with:
+
+```bash
+tests/smoke/run.sh --serve-only     # it needs the database
+tests/irctest/run.sh
+```
+
+Where that leaves things, on the same checkout with the same markers: rIRCd
+passes **544 of 557** with nothing failing, and four more under
+`IRCTEST_RIRCD_CASEMAPPING=rfc1459` — which this server implements and the
+default run therefore skips. The six that never run are two for non-UTF-8
+messages, refused on purpose, and four `WHO` tests irctest marks "not
+consistently implemented" and skips for everybody. For something to measure
+against, Ergo 2.19.1 on the same machine passes 527 and skips 26.
+
+Two of the suites are about being attacked rather than being correct:
+`test_hostile.py` is a client that is not trying to be a client, and
+`test_link_hostile.py` is a peer that lies about which servers it speaks for.
+And `soak.py` runs for hours against a linked pair, watching for memory or open
+files that grow when they should not.
+
+See [tests/smoke/README.md](tests/smoke/README.md) and
+[tests/irctest/README.md](tests/irctest/README.md).
 
 ---
 
