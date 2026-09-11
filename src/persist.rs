@@ -1475,6 +1475,12 @@ const HISTORY_BATCH: usize = 200;
 const HISTORY_QUEUE: usize = 10_000;
 /// Appends to one target before its history is pruned again.
 const PRUNE_INTERVAL: u32 = 100;
+/// Targets whose progress towards that is remembered at once.
+///
+/// Generous: a busy server has thousands of channels on the go, and this is a
+/// counter apiece. What it stops is the count being kept for every channel
+/// anybody has ever said anything in.
+const MAX_PRUNE_COUNTERS: usize = 50_000;
 
 impl HistoryWriter {
     /// `health` is shared with the command handlers: the writer is usually the
@@ -1549,9 +1555,27 @@ impl HistoryWriter {
                         let counter = since_prune.entry(entry.target.clone()).or_insert(0);
                         *counter += 1;
                         if *counter >= PRUNE_INTERVAL {
-                            *counter = 0;
+                            // Forgotten rather than zeroed: a target counting
+                            // from nothing is a target with no entry, and the
+                            // key is a channel name somebody chose. Zeroing
+                            // kept one for every channel anybody ever spoke in,
+                            // for as long as the server ran.
+                            since_prune.remove(&entry.target);
                             prune_channel_history(&pool, &entry.target).await;
                         }
+                    }
+                    // The ones part-way to their next prune still accumulate,
+                    // so they have a ceiling too. Losing the counts means
+                    // pruning those targets a little later than otherwise,
+                    // which no one can tell from the outside — where an
+                    // unbounded table is a client deciding what this server
+                    // remembers for ever.
+                    if since_prune.len() > MAX_PRUNE_COUNTERS {
+                        tracing::debug!(
+                            targets = since_prune.len(),
+                            "Forgetting how close each target was to a prune"
+                        );
+                        since_prune.clear();
                     }
                 }
 

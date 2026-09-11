@@ -34,6 +34,11 @@ LINK_DIR = os.environ.get("LINK_DIR", "target/smoke/link")
 
 SECONDS = int(sys.argv[1]) if len(sys.argv) > 1 else 3600
 RESIDENTS = int(os.environ.get("SOAK_RESIDENTS", "24"))
+# One workload at a time, for telling apart what drifts with connections and
+# what drifts with messages. SOAK_CHURN=0 leaves people alone once they have
+# arrived; SOAK_TALK=0 has them arrive and say nothing.
+WITH_CHURN = os.environ.get("SOAK_CHURN", "1") != "0"
+WITH_TALK = os.environ.get("SOAK_TALK", "1") != "0"
 CHANNELS = ["#soak1", "#soak2", "#soak3"]
 SAMPLE_EVERY = 30
 
@@ -249,9 +254,12 @@ async def main():
     stats = {"churned": 0}
     samples = []
     tasks = [asyncio.create_task(who.drain()) for who in residents if who.writer]
-    tasks += [asyncio.create_task(who.talk(until)) for who in residents if who.writer]
-    tasks.append(asyncio.create_task(churn(until, stats)))
+    if WITH_TALK:
+        tasks += [asyncio.create_task(who.talk(until)) for who in residents if who.writer]
+    if WITH_CHURN:
+        tasks.append(asyncio.create_task(churn(until, stats)))
     tasks.append(asyncio.create_task(latency(until, samples)))
+    print(f"  talking: {WITH_TALK}, coming and going: {WITH_CHURN}")
 
     history = []
     started = time.time()
