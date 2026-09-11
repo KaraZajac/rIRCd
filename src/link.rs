@@ -167,7 +167,7 @@ pub fn greeting_lines(cfg: &Config) -> Vec<String> {
     let sid = our_sid(cfg);
     vec![
         format!("PASS {} TS {} {}", PASSWORD_SLOT, LINK_PROTOCOL, sid),
-        "CAPAB :TAGS MSGID ACCOUNT CHATHISTORY METADATA".to_string(),
+        "CAPAB :TAGS MSGID ACCOUNT CHATHISTORY METADATA CACCESS".to_string(),
         format!("SERVER {} 1 :{}", cfg.server.name, cfg.server.description),
     ]
 }
@@ -952,8 +952,11 @@ async fn send_burst(
         let _ = tx.send(uid_message(origin, &guard)).await;
     }
 
-    // Every channel: who is in it and what they hold, then its topic and its
-    // lists. A channel with nobody in it does not exist to burst.
+    // Every channel: who is in it and what they hold, then who it belongs to,
+    // its topic and its lists. A channel with nobody in it is bursted only if
+    // somebody owns it — an empty room nobody claimed is not a fact worth
+    // carrying across a link, but an owned one is, or the peer would learn
+    // about it for the first time from whoever walked in next.
     let channels: Vec<String> = ctx.channels.read().await.channels.keys().cloned().collect();
     for name in channels {
         let store = ctx.channels.read().await;
@@ -961,7 +964,7 @@ async fn send_burst(
             continue;
         };
         let ch = channel.read().await;
-        if ch.members.is_empty() {
+        if ch.members.is_empty() && !ch.is_registered() {
             continue;
         }
         let (letters, mode_args) = ch.mode_string();
@@ -974,7 +977,11 @@ async fn send_burst(
         let mut params = vec![ch.created_at.to_string(), ch.name.clone(), letters];
         params.extend(mode_args);
         params.push(members);
-        let sjoin = Message::new("SJOIN", params).with_prefix(our_sid);
+        // An empty channel has nobody to join, so there is no SJOIN to send;
+        // the ownership lines below are what tell the peer it exists.
+        let sjoin = (!ch.members.is_empty())
+            .then(|| Message::new("SJOIN", params).with_prefix(our_sid));
+        let access = access_messages(&ch, our_sid);
 
         let topic = ch.topic.as_ref().map(|t| {
             Message::new(
@@ -1012,7 +1019,15 @@ async fn send_burst(
         drop(ch);
         drop(store);
 
-        let _ = tx.send(sjoin).await;
+        if let Some(sjoin) = sjoin {
+            let _ = tx.send(sjoin).await;
+        }
+        // Ownership goes before the topic and the lists: for a channel nobody
+        // is standing in it is what creates the channel on the other side, and
+        // `TB` and `BMASK` have nothing to attach themselves to until it does.
+        for line in access {
+            let _ = tx.send(line).await;
+        }
         if let Some(topic) = topic {
             let _ = tx.send(topic).await;
         }
@@ -1024,6 +1039,43 @@ async fn send_burst(
     let _ = tx
         .send(Message::new("EOB", vec![]).with_prefix(our_sid))
         .await;
+}
+
+/// What a channel's ownership looks like on the wire.
+///
+/// Three lists, a letter each, in the shape `BMASK` already uses: `f` for the
+/// founder, `o` for the operators whose status was granted to last, `v` for
+/// the voices. The channel's timestamp rides along, because that is what
+/// settles a disagreement about who the founder is.
+///
+/// Every name here is an account rather than a nick. It has to mean the same
+/// person on the server that receives it as on the one that sent it, and a
+/// nick does not — it is only who somebody is called at the moment.
+fn access_messages(ch: &crate::channel::Channel, our_sid: &str) -> Vec<Message> {
+    let mut out = Vec::new();
+    let mut add = |letter: char, names: &[String]| {
+        if names.is_empty() {
+            return;
+        }
+        out.push(
+            Message::new(
+                "CACCESS",
+                vec![
+                    ch.created_at.to_string(),
+                    ch.name.clone(),
+                    letter.to_string(),
+                    names.join(" "),
+                ],
+            )
+            .with_prefix(our_sid),
+        );
+    };
+    if !ch.founder.is_empty() {
+        add('f', std::slice::from_ref(&ch.founder));
+    }
+    add('o', &ch.persisted_operators);
+    add('v', &ch.persisted_voice);
+    out
 }
 
 /// Tell the local watchers of a nick that it came online or went offline.
@@ -2150,6 +2202,130 @@ async fn accept_remote_bmask(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
+/// Who a channel on another server belongs to.
+///
+/// Ownership was the one piece of channel state that did not cross a link, and
+/// each server keeps its own database, so `#chan` could have a different
+/// founder on every server on the network — and a transfer, however carefully
+/// made, would only have moved it on one of them.
+///
+/// It is merged rather than replaced: two servers that each learned part of
+/// the truth end up holding all of it. The only thing that has to be decided
+/// is the founder, because a channel has exactly one, and the rule is the one
+/// the rest of the protocol already uses — the older channel keeps what it has.
+/// When both were made in the same second the name that sorts first wins,
+/// which is arbitrary but is the same answer on both sides, and converging on
+/// an arbitrary answer beats disagreeing about a considered one.
+async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(ts), Some(name), Some(letter), Some(names)) = (
+        msg.params.first().and_then(|t| t.parse::<i64>().ok()),
+        msg.params.get(1).cloned(),
+        msg.params.get(2).and_then(|l| l.chars().next()),
+        msg.params.get(3).cloned(),
+    ) else {
+        return;
+    };
+    let names: Vec<String> = names
+        .split(' ')
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() || !matches!(letter, 'f' | 'o' | 'v') {
+        return;
+    }
+
+    let key = crate::channel::canonical_channel_key(&name);
+    // What this server ends up believing, so it can be written down once the
+    // locks are back. Nothing is persisted for a change that did not happen.
+    let mut new_founder: Option<String> = None;
+    let mut newly_granted: Vec<String> = Vec::new();
+    let mut newly_revoked: Vec<String> = Vec::new();
+    {
+        let mut store = ctx.channels.write().await;
+        let existed = store.channels.contains_key(&key);
+        let entry = store
+            .channels
+            .entry(key.clone())
+            .or_insert_with(|| RwLock::new(crate::channel::Channel::new(name.clone())));
+        let mut ch = entry.write().await;
+        // The age to judge by is the one this server held before the message
+        // arrived; a channel it is hearing about for the first time is as old
+        // as the message says it is.
+        let ours = if existed { ch.created_at } else { ts };
+        if ts < ch.created_at {
+            ch.created_at = ts;
+        }
+        match letter {
+            'f' => {
+                let theirs = &names[0];
+                let take = ch.founder.is_empty()
+                    || ts < ours
+                    || (ts == ours && theirs.as_str() < ch.founder.as_str());
+                if take && !theirs.eq_ignore_ascii_case(&ch.founder) {
+                    if !ch.founder.is_empty() {
+                        warn!(
+                            channel = %name,
+                            ours = %ch.founder,
+                            theirs = %theirs,
+                            "Two servers claimed a different founder; taking the older channel's"
+                        );
+                    }
+                    ch.founder = theirs.clone();
+                    new_founder = Some(theirs.clone());
+                }
+            }
+            letter => {
+                let list = if letter == 'o' {
+                    &mut ch.persisted_operators
+                } else {
+                    &mut ch.persisted_voice
+                };
+                for who in &names {
+                    // A name on its own is somebody who has this status now; a
+                    // name with a `-` is somebody who no longer does. Merging
+                    // is what lets two servers that each knew half the list end
+                    // up with all of it, but a list that can only grow would
+                    // mean status was impossible to take away across a link.
+                    match who.strip_prefix('-') {
+                        Some(gone) => {
+                            let before = list.len();
+                            list.retain(|held| !held.eq_ignore_ascii_case(gone));
+                            if list.len() != before {
+                                newly_revoked.push(gone.to_string());
+                            }
+                        }
+                        None => {
+                            if !list.iter().any(|held| held.eq_ignore_ascii_case(who)) {
+                                list.push(who.clone());
+                                newly_granted.push(who.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Write down what was learned, or it is forgotten at the next restart and
+    // this server starts disagreeing with the network all over again.
+    if new_founder.is_some() || !newly_granted.is_empty() || !newly_revoked.is_empty() {
+        let pool = ctx.cfg.read().await.db.clone();
+        if let Some(pool) = pool {
+            if let Some(ref founder) = new_founder {
+                crate::persist::record_channel_founder(&pool, &key, founder).await;
+            }
+            for who in &newly_granted {
+                crate::persist::set_channel_access(&pool, &key, who, letter == 'o', true).await;
+            }
+            for who in &newly_revoked {
+                crate::persist::set_channel_access(&pool, &key, who, letter == 'o', false).await;
+            }
+        }
+    }
+
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
 /// A channel mode set on another server. Prefix modes name their target by id,
 /// so a nick change in flight cannot move an operator status onto somebody
 /// else; the people watching are shown nicks.
@@ -2607,6 +2783,37 @@ pub async fn announce_topic(cfg: &Config, uid: &str, name: &str, topic: &str) {
     .await;
 }
 
+/// Tell the network that a channel's ownership changed here.
+///
+/// `names` are accounts, and a name may be prefixed with `-` to say the status
+/// was taken away rather than given. `letter` is `f` for the founder, `o` for
+/// the operator list, `v` for the voice list.
+pub async fn announce_channel_access(
+    cfg: &Config,
+    name: &str,
+    created_at: i64,
+    letter: char,
+    names: &[String],
+) {
+    if cfg.links_runtime.is_none() || names.is_empty() {
+        return;
+    }
+    broadcast(
+        cfg,
+        Message::new(
+            "CACCESS",
+            vec![
+                created_at.to_string(),
+                name.to_string(),
+                letter.to_string(),
+                names.join(" "),
+            ],
+        )
+        .with_prefix(our_sid(cfg)),
+    )
+    .await;
+}
+
 /// Send a message to a channel's members on the other servers.
 ///
 /// Every server that holds a member delivers to its own, so this goes out once
@@ -2822,6 +3029,10 @@ async fn handle_link_message(
         }
         "BMASK" => {
             accept_remote_bmask(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "CACCESS" => {
+            accept_remote_access(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }
         "ACCOUNT" => {

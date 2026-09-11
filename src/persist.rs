@@ -509,6 +509,24 @@ pub async fn set_channel_founder(pool: &sqlx::MySqlPool, channel_name: &str, acc
     .await;
 }
 
+/// Write down a founder that has already been decided.
+///
+/// `set_channel_founder` claims a channel that has none, which is what
+/// creating one does. This replaces whatever is there, and is for the answer
+/// the network settled on: when two servers disagreed about whose channel it
+/// is, the one that loses has to stop believing its own version or it will
+/// argue again after the next restart.
+pub async fn record_channel_founder(pool: &sqlx::MySqlPool, channel_name: &str, account: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO channels (name, founder) VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE founder = VALUES(founder)",
+    )
+    .bind(channel_name)
+    .bind(account)
+    .execute(pool)
+    .await;
+}
+
 // ─── Channels ─────────────────────────────────────────────────────────────────
 
 /// Load all channel configs from the database.

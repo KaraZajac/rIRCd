@@ -127,7 +127,10 @@ async fn handle_join_inner(
 
     // Collected while the state read guard is held, applied once it is released.
     let mut remembered_memberships: Vec<(String, String)> = Vec::new();
-    let mut new_founder: Option<String> = None;
+    // The channels this JOIN founded, each with the account that founded it and
+    // the moment the channel was made. One JOIN can name several channels, and
+    // founding one of them says nothing about the others.
+    let mut new_founders: Vec<(String, String, i64)> = Vec::new();
 
     // JOIN 0: part all channels the client is currently in
     if ch_names.trim() == "0" {
@@ -409,7 +412,7 @@ async fn handle_join_inner(
         if is_first && ch.founder.is_empty() {
             if let Some(ref acct) = account {
                 ch.founder = acct.clone();
-                new_founder = Some(acct.clone());
+                new_founders.push((ch_key.clone(), acct.clone(), ch.created_at));
                 if !ch.persisted_operators.iter().any(|o| o == acct) {
                     ch.persisted_operators.push(acct.clone());
                 }
@@ -693,13 +696,18 @@ async fn handle_join_inner(
             }
         }
     }
-    if let Some(founder) = new_founder {
+    for (ch_key, founder, created_at) in &new_founders {
         if let Some(ref pool) = cfg.db {
-            for (ch_key, _) in &remembered_memberships {
-                crate::persist::set_channel_founder(pool, ch_key, &founder).await;
-                crate::persist::set_channel_access(pool, ch_key, &founder, true, true).await;
-            }
+            crate::persist::set_channel_founder(pool, ch_key, founder).await;
+            crate::persist::set_channel_access(pool, ch_key, founder, true, true).await;
         }
+        // A founder the rest of the network does not know about is a founder
+        // only here, and the next server somebody joins from would hand the
+        // channel to whoever arrived first there.
+        crate::link::announce_channel_access(cfg, ch_key, *created_at, 'f', std::slice::from_ref(founder))
+            .await;
+        crate::link::announce_channel_access(cfg, ch_key, *created_at, 'o', std::slice::from_ref(founder))
+            .await;
     }
 
     Ok(())
@@ -2074,6 +2082,7 @@ pub async fn handle_mode(
             };
             let mode_key_val = ch.key.clone();
             let mode_limit_val = ch.modes.user_limit;
+            let channel_created_at = ch.created_at;
             let member_ids_mode: Vec<String> = ch.members.keys().cloned().collect();
             let echo_params = filter_mode_echo(&msg.params, &rejected_modes);
             let mode_msg = echo_params
@@ -2116,6 +2125,30 @@ pub async fn handle_mode(
                     )
                     .await;
                 }
+            }
+            // Status that was granted to last is part of who a channel belongs
+            // to, so the rest of the network has to hear about it — otherwise
+            // an operator here is an ordinary member one server over.
+            for letter in ['o', 'v'] {
+                let changed: Vec<String> = access_changes
+                    .iter()
+                    .filter(|(_, is_op, _)| *is_op == (letter == 'o'))
+                    .map(|(who, _, granted)| {
+                        if *granted {
+                            who.clone()
+                        } else {
+                            format!("-{who}")
+                        }
+                    })
+                    .collect();
+                crate::link::announce_channel_access(
+                    cfg,
+                    &ch_key,
+                    channel_created_at,
+                    letter,
+                    &changed,
+                )
+                .await;
             }
         }
     } else if target.eq_ignore_ascii_case(&nick) {

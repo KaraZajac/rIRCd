@@ -113,9 +113,14 @@ Each side then sends what it knows, in this order, and finishes with `EOB`:
 2. `UID <nick> <hops> <nick_ts> <user> <host> <uid> <account> :<realname>` for
    every user, prefixed by the SID of the server it is on.
 3. `SJOIN <channel_ts> <channel> <modes> :<@+uid> ...` for every channel, then
-   `TB <channel> <topic_ts> <setter> :<topic>` for its topic and
+   `CACCESS <channel_ts> <channel> <letter> :<account> ...` for who it belongs
+   to, `TB <channel> <topic_ts> <setter> :<topic>` for its topic and
    `BMASK <channel_ts> <channel> <letter> :<mask> ...` for each of its ban,
    exception, invite-exception and quiet lists.
+
+   A channel with nobody in it is bursted when somebody owns it, and then it
+   has no `SJOIN` — there is no one to join — so `CACCESS` is what creates it
+   on the other side and has to come before `TB` and `BMASK`.
 4. `EOB`.
 
 Until both sides have sent `EOB` the link is bursting, and conflicts are
@@ -127,7 +132,26 @@ A message that changes shared state goes to every link except the one it came
 from, with the originator's UID or SID as its prefix and its tags intact. That
 is the whole rule: `PRIVMSG`, `NOTICE`, `TAGMSG`, `JOIN`, `PART`, `KICK`,
 `MODE`, `TOPIC`, `NICK`, `QUIT`, `AWAY`, `ACCOUNT`, `CHGHOST`, `SETNAME`,
-`INVITE`, `METADATA`.
+`INVITE`, `METADATA`, `CACCESS`.
+
+### `CACCESS`
+
+`CACCESS <channel_ts> <channel> <letter> :<account> ...` says who a channel
+belongs to: `f` for its founder, `o` for the operators whose status was granted
+to last, `v` for the voices. The names are accounts rather than nicks, because
+a nick is only what somebody is called at the moment and this has to mean the
+same person at both ends. A name prefixed with `-` says the status was taken
+away; without it, given.
+
+It merges rather than replaces, so two servers that each learned part of a
+channel's access list end up holding all of it. The founder is the exception,
+because a channel has exactly one: the older channel keeps the founder it has,
+and when both were made in the same second the account that sorts first wins —
+arbitrary, but the same answer on both sides, and converging on an arbitrary
+answer beats disagreeing about a considered one.
+
+Each server writes down what it learns, so it does not forget at the next
+restart and start disagreeing with the network all over again.
 
 `msgid` and `time` are carried, not regenerated, so a message has one identity
 and one timestamp across the network — which is what lets chathistory on one
@@ -164,7 +188,8 @@ got, so that nobody has to read the source to find out:
 | `NICK`, `QUIT`, `AWAY`, `KILL` | yes |
 | Nick collisions, settled by timestamp | yes |
 | `PRIVMSG`, `NOTICE`, `TAGMSG` between users on different servers | yes |
-| The channel burst — `SJOIN`, `TB`, `BMASK` — and channel collisions | yes |
+| The channel burst — `SJOIN`, `CACCESS`, `TB`, `BMASK` — and channel collisions | yes |
+| Channel ownership: founder, operator and voice lists, by account | yes |
 | `JOIN`, `PART`, `KICK`, `MODE`, `TOPIC`, and messages to a channel | yes |
 | `ACCOUNT`, `CHGHOST`, `SETNAME`, `INVITE`, `METADATA` | yes |
 | Chathistory: both ends of a conversation keep it | yes |

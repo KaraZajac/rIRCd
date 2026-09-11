@@ -440,6 +440,100 @@ got = arrives(alice, "still talking after the rehash", mark)
 check("messages still cross the link after a rehash", bool(got), got)
 oper.close()
 
+section("who a channel belongs to crosses the link")
+# Ownership was the one piece of channel state that stayed on the server it was
+# made on. Each server keeps its own database, so #chan could have a different
+# founder on every server of the network, and a transfer would only ever have
+# moved it on one of them.
+import subprocess
+
+
+def side_db(side, query):
+    """One query against one server's own database."""
+    sock = os.environ.get("LINK_DB_SOCK", "")
+    if not sock:
+        return ""
+    out = subprocess.run(
+        ["mariadb", f"--socket={sock}", "-N", "-B", f"rircdb_{side}", "-e", query],
+        capture_output=True, text=True,
+    )
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+OWNER = f"own{RUN}"
+OWNED = f"#owned{RUN}"
+PASSWORD = "link-ownership-password"
+
+# The account name has to be the nick registering it, so the account is made
+# under the name it will have and logged into from a connection using another.
+maker = Client(OWNER, port=A_PORT)
+mark = maker.mark()
+maker.send(f"REGISTER * {OWNER}@example.invalid {PASSWORD}")
+maker.read(2.5)
+made = bool(maker.find("REGISTER SUCCESS", lines=maker.since(mark)))
+check("an account can be registered on A", made, maker.since(mark)[-3:])
+maker.close()
+
+if made:
+    founder = connect_negotiating(f"fa{RUN}", caps=["sasl"], port=A_PORT)
+    founder.sasl_plain(OWNER, PASSWORD)
+    founder.send("CAP END")
+    founder.wait_for(" 001 ", seconds=6)
+    check("and it can log in on A", bool(founder.find(" 900 ")), founder.lines[-5:])
+    mark = founder.mark()
+    founder.join(OWNED)
+    founder.read(1.5)
+    check("the account founds the channel on A",
+          bool(founder.find(f"@fa{RUN}", lines=founder.since(mark))
+               or founder.find(f"+o fa{RUN}", lines=founder.since(mark))),
+          founder.since(mark)[-5:])
+    check("A wrote the founder down",
+          side_db("a", f"SELECT founder FROM channels WHERE name='{OWNED}'") == OWNER,
+          side_db("a", f"SELECT founder FROM channels WHERE name='{OWNED}'"))
+
+    learned = eventually(
+        lambda: side_db("b", f"SELECT founder FROM channels WHERE name='{OWNED}'") == OWNER,
+        seconds=6)
+    check("B learned who the channel belongs to", bool(learned),
+          side_db("b", f"SELECT founder FROM channels WHERE name='{OWNED}'"))
+    check("B holds the founder in its operator list too",
+          OWNER in side_db("b",
+              "SELECT GROUP_CONCAT(nick_or_account) FROM channel_operators o "
+              f"JOIN channels c ON o.channel_id = c.id WHERE c.name='{OWNED}'"),
+          side_db("b",
+              "SELECT GROUP_CONCAT(nick_or_account) FROM channel_operators o "
+              f"JOIN channels c ON o.channel_id = c.id WHERE c.name='{OWNED}'"))
+
+    # Status granted on one server is status on the network, not just there.
+    guest = Client(f"gb{RUN}", port=B_PORT)
+    guest.join(OWNED)
+    guest.read(1.0)
+    founder.send(f"MODE {OWNED} +o gb{RUN}")
+    founder.read(1.2)
+    opped = eventually(
+        lambda: f"gb{RUN}" in side_db("b",
+            "SELECT GROUP_CONCAT(nick_or_account) FROM channel_operators o "
+            f"JOIN channels c ON o.channel_id = c.id WHERE c.name='{OWNED}'"),
+        seconds=6)
+    check("an operator made on A is remembered on B", bool(opped),
+          side_db("b",
+              "SELECT GROUP_CONCAT(nick_or_account) FROM channel_operators o "
+              f"JOIN channels c ON o.channel_id = c.id WHERE c.name='{OWNED}'"))
+
+    founder.send(f"MODE {OWNED} -o gb{RUN}")
+    founder.read(1.2)
+    unopped = eventually(
+        lambda: f"gb{RUN}" not in side_db("b",
+            "SELECT GROUP_CONCAT(nick_or_account) FROM channel_operators o "
+            f"JOIN channels c ON o.channel_id = c.id WHERE c.name='{OWNED}'"),
+        seconds=6)
+    check("and taking it away is remembered too", bool(unopped),
+          side_db("b",
+              "SELECT GROUP_CONCAT(nick_or_account) FROM channel_operators o "
+              f"JOIN channels c ON o.channel_id = c.id WHERE c.name='{OWNED}'"))
+    guest.close()
+    founder.close()
+
 section("a split is noticed")
 # Stop B and watch A report the split rather than carrying on as if nothing
 # happened.

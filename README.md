@@ -163,11 +163,19 @@ autoconnect = true
 | `autoconnect` | `false` | Keep the link up, retrying with a widening delay |
 
 A link carries everything two servers need to agree on: who is connected, what
-they are called, which channels they are in and what is said in them. It also
-carries the two things that need an answer rather than an announcement — a
-`WHOIS` asks the server somebody is on how long they have been quiet, and a
-`GHOST` asks the server a stale session is on to close it. What a link is
-allowed to say, and what it is not, is in
+they are called, which channels they are in and what is said in them — and who
+those channels belong to. Ownership is carried as accounts rather than nicks,
+because it has to mean the same person at both ends, and it is merged rather
+than replaced: two servers that each learned part of the truth end up holding
+all of it, and where they disagree about a founder the older channel keeps its
+own. A channel nobody is standing in is bursted too when somebody owns it, so a
+server joining the network learns whose it is rather than finding out from
+whoever walks in next.
+
+A link also carries the two things that need an answer rather than an
+announcement — a `WHOIS` asks the server somebody is on how long they have been
+quiet, and a `GHOST` asks the server a stale session is on to close it. What a
+link is allowed to say, and what it is not, is in
 [docs/server-linking.md](docs/server-linking.md).
 
 `tests/smoke/run-link.sh` brings up two servers with their own databases on
