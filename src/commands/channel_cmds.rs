@@ -450,8 +450,14 @@ async fn handle_join_inner(
             || account
                 .as_deref()
                 .is_some_and(|a| a.eq_ignore_ascii_case(&ch.founder));
+        // Being first through the door makes somebody an operator only when
+        // there is nobody the channel already belongs to. A channel that keeps
+        // its founder, its access list and its modes when the last person
+        // leaves would otherwise hand `@` to whoever came back first — which is
+        // every restart, and every quiet hour, and is exactly the takeover that
+        // keeping the channel was meant to stop.
         let modes = ChannelMemberModeSet {
-            op: is_first || persisted_op,
+            op: persisted_op || (is_first && !ch.is_registered()),
             voice: persisted_voice,
             ..Default::default()
         };

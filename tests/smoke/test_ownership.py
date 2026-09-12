@@ -619,4 +619,51 @@ check("but it is not written down for the next holder of the name",
 passing.close()
 back.close()
 
+section("an owned channel that is standing open")
+
+# The case the earlier checks missed, because they set +i and the stranger was
+# turned away at the door before there was any question of ops. A real channel
+# is usually just open — and then being first through the door is something
+# that happens to everybody eventually, at every restart and every quiet hour.
+OPEN_OWNED = f"#openowned{RUN}"
+holder2 = logged_in(f"{owner}_o", owner)
+holder2.join(OPEN_OWNED)
+holder2.send(f"TOPIC {OPEN_OWNED} :an ordinary channel with an owner")
+holder2.read(1.2)
+time.sleep(0.8)
+check("it has an owner and no door on it",
+      channel_row(OPEN_OWNED, "founder") == owner
+      and "i" not in (channel_row(OPEN_OWNED, "mode_flags") or ""),
+      (channel_row(OPEN_OWNED, "founder"), channel_row(OPEN_OWNED, "mode_flags")))
+holder2.send(f"PART {OPEN_OWNED}")
+holder2.read(1.0)
+holder2.close()
+time.sleep(0.6)
+
+# Everybody has gone. The next person in is first, and first is not the same
+# as the owner.
+passerby = Client(f"first{RUN}")
+mark = passerby.mark()
+passerby.join(OPEN_OWNED)
+passerby.read(1.5)
+arrived = passerby.since(mark)
+check("the next person in does get in", bool(passerby.find("JOIN", OPEN_OWNED, lines=arrived)),
+      arrived[-3:])
+check("but being first does not make them an operator of somebody else's channel",
+      not passerby.find(f"@first{RUN}", lines=arrived), arrived[-4:])
+check("and the topic is still the owner's",
+      bool(passerby.find("an ordinary channel with an owner", lines=arrived)), arrived[-4:])
+
+# The owner comes back and is an operator again, with somebody already there.
+back2 = logged_in(f"{owner}_o2", owner)
+mark = back2.mark()
+back2.join(OPEN_OWNED)
+back2.read(1.5)
+check("while the owner is an operator whenever they return",
+      bool(back2.find(f"@{owner}_o2", lines=back2.since(mark))
+           or back2.find(f"+o {owner}_o2", lines=back2.since(mark))),
+      back2.since(mark)[-5:])
+passerby.close()
+back2.close()
+
 summary("ownership")
