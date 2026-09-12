@@ -184,6 +184,37 @@ their own ports, links them, and checks what each one knows about the other.
 `--tls` runs the same checks over an encrypted link, with a throwaway
 certificate for each side.
 
+### Serving a hidden service
+
+Behind a Tor onion service every client reaches the server from `127.0.0.1`.
+`max_connections_per_ip` then reads as "this many people may use the server
+through Tor at once", which is not a rule anybody meant to write — and it
+cannot be fixed by counting more carefully, because the addresses genuinely are
+all the same. There is nothing to tell apart.
+
+Give the hidden service a listener of its own and name it:
+
+```toml
+[server]
+listen = ["0.0.0.0:6667", "127.0.0.1:6668"]   # 6668 is the one Tor forwards to
+
+[limits]
+max_connections_per_ip = 16                   # still true of the public port
+shared_address_listeners = ["127.0.0.1:6668"]
+max_clients_behind_one_address = 256
+```
+
+The public port keeps the per-address limit, which is the stronger rule. The
+onion's port is capped as a whole: a weaker promise, and the strongest one
+available, because it bounds what the door can let through without pretending
+to know who is coming through it.
+
+Worth knowing: a host ban lands on every onion client at once, since they are
+one address, and the cost of a failed login is counted per address too, so one
+person guessing passwords makes the others wait. `WEBIRC` does not help here —
+the connection's slot is claimed before the first line is read, so a gateway
+that could say who the client really is says it too late to matter.
+
 ### `[network]`
 
 | Key | Default | Description |
@@ -228,7 +259,9 @@ key  = "/etc/rIRCd/key.pem"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `max_channels_per_client` | `50` | Max channels a single client may join |
-| `max_connections_per_ip` | `16` | Connections allowed from one address; 0 for no limit. Everything arriving through a proxy, a Tor onion service or a web gateway shares one address, so a server fronted that way wants this raised or off — or `[webirc]`, where the gateway can say who the client really is |
+| `max_connections_per_ip` | `16` | Connections allowed from one address; 0 for no limit. Read at startup, not on rehash |
+| `shared_address_listeners` | `[]` | Listeners where every client arrives from the same address — a Tor hidden service, or anything behind a local proxy. The per-address limit cannot mean anything there, so connections on these are counted against the listener instead. Must name a `listen`, `listen_tls`, `listen_ws` or `listen_wss` address exactly; the server refuses to start if it does not, because a typo would silently leave the listener capped at `max_connections_per_ip`. Read at startup, not on rehash |
+| `max_clients_behind_one_address` | `256` | The cap that stands in for the per-address one on those listeners; 0 leaves only `max_clients` |
 | `max_clients` | `0` | Connections allowed in total; 0 for no limit |
 | `max_line_length` | `512` | Longest message body accepted, before tags; advertised as `LINELEN` |
 | `flood_burst` | `10` | Commands a client may send back to back before being throttled |

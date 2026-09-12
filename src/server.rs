@@ -453,7 +453,13 @@ pub async fn run(
 
         let tx = tx.clone();
         let server_name = server_name.clone();
-        let limits = limits.clone();
+        // Counted against this door rather than against an address, when the
+        // configuration says everything reaches it from the same one.
+        let limits = limits.on_listener(
+            &bind_addr,
+            &cfg.limits.shared_address_listeners,
+            cfg.limits.max_clients_behind_one_address,
+        );
         let connections = connections.clone();
         tokio::spawn(async move {
             loop {
@@ -501,7 +507,11 @@ pub async fn run(
             let tx = tx.clone();
             let tls_acc = acceptor.clone();
             let server_name = server_name_tls.clone();
-            let limits = limits.clone();
+            let limits = limits.on_listener(
+                &bind_addr,
+                &cfg.limits.shared_address_listeners,
+                cfg.limits.max_clients_behind_one_address,
+            );
             let connections = connections.clone();
             tokio::spawn(async move {
                 loop {
@@ -577,7 +587,11 @@ pub async fn run(
             server_name: server_name_ws,
             counter: connections.clone(),
             keepalive,
-            limits: limits.clone(),
+            limits: limits.on_listener(
+                &bind_addr,
+                &cfg.limits.shared_address_listeners,
+                cfg.limits.max_clients_behind_one_address,
+            ),
         };
 
         let app = axum::Router::new()
@@ -641,7 +655,11 @@ pub async fn run(
             let tls_acc = acceptor.clone();
             let tx_wss = tx.clone();
             let server_name_wss = server_name.clone();
-            let limits_wss = limits.clone();
+            let limits_wss = limits.on_listener(
+                &bind_addr,
+                &cfg.limits.shared_address_listeners,
+                cfg.limits.max_clients_behind_one_address,
+            );
             let connections = connections.clone();
             tokio::spawn(async move {
                 loop {

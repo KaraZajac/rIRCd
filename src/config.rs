@@ -537,6 +537,20 @@ pub struct LimitsConfig {
     /// Connections allowed in total; 0 for no limit.
     #[serde(default)]
     pub max_clients: usize,
+    /// Listeners where every client arrives from the same address — a Tor
+    /// hidden service, or anything behind a local proxy.
+    ///
+    /// `max_connections_per_ip` cannot mean anything on such a listener: the
+    /// addresses really are all the same, so the limit reads as "this many
+    /// people may use the server through Tor at once". Naming the listener
+    /// here counts its connections against the listener instead, capped by
+    /// `max_clients_behind_one_address`.
+    #[serde(default)]
+    pub shared_address_listeners: Vec<String>,
+    /// The cap that stands in for the per-address one on those listeners.
+    /// 0 for no limit, which leaves only `max_clients`.
+    #[serde(default = "default_max_behind_one_address")]
+    pub max_clients_behind_one_address: usize,
     /// Longest message body accepted, before tags. 512 is the protocol's own
     /// limit and the default; raising it lets clients send the long SASL
     /// responses and passwords that some do. Advertised as LINELEN.
@@ -564,6 +578,15 @@ fn default_max_channels() -> usize {
 fn default_max_per_ip() -> usize {
     16
 }
+/// How many may be behind one address before a shared listener is full.
+///
+/// Generous, because the whole point is that there is no way to tell one
+/// person with many connections from many people with one each — and a number
+/// that turns a hidden service away at sixteen would be the bug this setting
+/// exists to fix. It is a ceiling on the door rather than a rule about people.
+fn default_max_behind_one_address() -> usize {
+    256
+}
 fn default_max_line_length() -> usize {
     crate::protocol::DEFAULT_MAX_MESSAGE_BODY
 }
@@ -583,6 +606,8 @@ impl Default for LimitsConfig {
             max_channels_per_client: default_max_channels(),
             max_targets: default_max_targets(),
             max_connections_per_ip: default_max_per_ip(),
+            shared_address_listeners: Vec::new(),
+            max_clients_behind_one_address: default_max_behind_one_address(),
             max_clients: 0,
             max_line_length: default_max_line_length(),
             flood_burst: default_flood_burst(),
@@ -751,6 +776,29 @@ impl Config {
                         fp
                     );
                 }
+            }
+        }
+        // A shared-address listener that names no real listener is a typo, and
+        // a silent one: the hidden service it was meant for stays capped at
+        // `max_connections_per_ip`, which is the whole problem it was written
+        // to solve, and nothing says so.
+        for named in &self.limits.shared_address_listeners {
+            let wanted = crate::client::normalise_listen(named);
+            let listens_there = self
+                .server
+                .listen
+                .iter()
+                .chain(&self.server.listen_tls)
+                .chain(&self.server.listen_ws)
+                .chain(&self.server.listen_wss)
+                .any(|addr| crate::client::normalise_listen(addr) == wanted);
+            if !listens_there {
+                anyhow::bail!(
+                    "shared_address_listeners names {named}, which this server does \
+                     not listen on. It has to match a listen, listen_tls, listen_ws \
+                     or listen_wss address exactly, or the listener it was meant for \
+                     keeps the per-address limit."
+                );
             }
         }
         if !self.server.listen_links_tls.is_empty() && !self.tls_enabled() {

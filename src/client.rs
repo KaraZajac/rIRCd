@@ -32,6 +32,27 @@ pub struct ConnectionLimits {
     pub max_total: usize,
     counts: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
     total: Arc<std::sync::atomic::AtomicUsize>,
+    /// Set when this view serves a listener whose clients all arrive from the
+    /// same address. See `on_listener`.
+    shared: Option<SharedListener>,
+}
+
+/// A listener where counting by address cannot mean anything.
+///
+/// Behind a Tor hidden service, or any local proxy, every client arrives from
+/// 127.0.0.1. The per-address limit then says "sixteen people may use this
+/// server through Tor at once", which is not a rule anybody meant to write —
+/// and it cannot be fixed by counting more carefully, because the addresses
+/// genuinely are all the same. There is nothing to tell apart.
+///
+/// So the whole listener is capped instead. It is a weaker promise than the
+/// per-address one, and it is the strongest one available: it bounds what the
+/// door can let through without pretending to know who is coming through it.
+#[derive(Clone, Debug)]
+struct SharedListener {
+    addr: String,
+    max: usize,
+    count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Releases a connection's slot when the connection ends.
@@ -42,11 +63,20 @@ pub struct ConnectionSlot {
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        if let Ok(mut counts) = self.limits.counts.lock() {
-            if let Some(n) = counts.get_mut(&self.host) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
-                    counts.remove(&self.host);
+        match self.limits.shared {
+            Some(ref shared) => {
+                shared
+                    .count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            None => {
+                if let Ok(mut counts) = self.limits.counts.lock() {
+                    if let Some(n) = counts.get_mut(&self.host) {
+                        *n = n.saturating_sub(1);
+                        if *n == 0 {
+                            counts.remove(&self.host);
+                        }
+                    }
                 }
             }
         }
@@ -56,12 +86,52 @@ impl Drop for ConnectionSlot {
     }
 }
 
+/// One spelling for a listen address, so configuration and bind agree.
+///
+/// `:6667` is how the rest of the configuration lets somebody write "every
+/// address, this port", and it is turned into `0.0.0.0:6667` before binding.
+/// A listener named in one spelling and bound in the other is the same
+/// listener, and must not silently fail to match.
+pub fn normalise_listen(addr: &str) -> String {
+    let addr = addr.trim();
+    if let Some(port) = addr.strip_prefix(':') {
+        format!("0.0.0.0:{port}")
+    } else {
+        addr.to_string()
+    }
+}
+
 impl ConnectionLimits {
     pub fn new(max_per_ip: usize, max_total: usize) -> Self {
         Self {
             max_per_ip,
             max_total,
             ..Default::default()
+        }
+    }
+
+    /// A view of these limits for one listener.
+    ///
+    /// Naming a listener here says its clients all reach it from one address,
+    /// so connections arriving on it are counted against the listener rather
+    /// than against the address they appear to come from. Every other listener
+    /// keeps the per-address limit, which is the stronger rule and is only
+    /// given up where it has stopped meaning anything.
+    pub fn on_listener(&self, addr: &str, shared_addresses: &[String], max: usize) -> Self {
+        let mine = normalise_listen(addr);
+        if !shared_addresses
+            .iter()
+            .any(|listed| normalise_listen(listed) == mine)
+        {
+            return self.clone();
+        }
+        Self {
+            shared: Some(SharedListener {
+                addr: mine,
+                max,
+                count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            ..self.clone()
         }
     }
 
@@ -75,6 +145,29 @@ impl ConnectionLimits {
             self.total
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return Err("Server is full");
+        }
+        if let Some(ref shared) = self.shared {
+            let taken = shared
+                .count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if shared.max > 0 && taken > shared.max {
+                shared
+                    .count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                self.total
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    listener = %shared.addr,
+                    max = shared.max,
+                    "A listener behind one address is full"
+                );
+                return Err("This entrance is full");
+            }
+            return Ok(ConnectionSlot {
+                limits: self.clone(),
+                host: host.to_string(),
+            });
         }
         {
             let mut counts = match self.counts.lock() {
@@ -1023,4 +1116,65 @@ mod tests {
             held.push(limits.claim("198.51.100.5").expect("no limit"));
         }
     }
+
+    #[test]
+    fn a_listener_behind_one_address_is_not_counted_by_address() {
+        let limits = ConnectionLimits::new(2, 0);
+        let onion = limits.on_listener("127.0.0.1:6667", &["127.0.0.1:6667".into()], 5);
+        // Everybody arrives from the same place, which is the whole point.
+        let mut held = Vec::new();
+        for i in 0..5 {
+            held.push(
+                onion
+                    .claim("127.0.0.1")
+                    .unwrap_or_else(|e| panic!("connection {i} refused: {e}")),
+            );
+        }
+        assert!(
+            onion.claim("127.0.0.1").is_err(),
+            "the listener's own cap still stops somewhere"
+        );
+        drop(held.pop());
+        assert!(
+            onion.claim("127.0.0.1").is_ok(),
+            "a slot given back is a slot available"
+        );
+    }
+
+    #[test]
+    fn every_other_listener_keeps_the_per_address_limit() {
+        let limits = ConnectionLimits::new(2, 0);
+        let ordinary = limits.on_listener("0.0.0.0:6667", &["127.0.0.1:6667".into()], 5);
+        let _a = ordinary.claim("198.51.100.7").expect("first");
+        let _b = ordinary.claim("198.51.100.7").expect("second");
+        assert!(
+            ordinary.claim("198.51.100.7").is_err(),
+            "the address limit is the stronger rule and is kept where it means something"
+        );
+    }
+
+    #[test]
+    fn a_shared_listener_is_named_in_whichever_spelling() {
+        let limits = ConnectionLimits::new(1, 0);
+        // `:6667` is how the configuration lets somebody say "every address".
+        let onion = limits.on_listener("0.0.0.0:6667", &[":6667".into()], 4);
+        let _a = onion.claim("127.0.0.1").expect("first");
+        assert!(
+            onion.claim("127.0.0.1").is_ok(),
+            "the two spellings name the same listener"
+        );
+    }
+
+    #[test]
+    fn the_total_is_still_the_total() {
+        let limits = ConnectionLimits::new(0, 2);
+        let onion = limits.on_listener("127.0.0.1:6667", &["127.0.0.1:6667".into()], 0);
+        let _a = onion.claim("127.0.0.1").expect("first");
+        let _b = onion.claim("127.0.0.1").expect("second");
+        assert!(
+            onion.claim("127.0.0.1").is_err(),
+            "a listener with no cap of its own is still inside max_clients"
+        );
+    }
+
 }
