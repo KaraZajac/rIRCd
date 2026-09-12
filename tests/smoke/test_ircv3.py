@@ -314,6 +314,30 @@ if red_msgid:
           bool(red_peer.find("FAIL REDACT REDACT_FORBIDDEN", lines=red_peer.since(mark))),
           red_peer.since(mark))
 
+    # Whose message it is was decided by comparing nicks, and a nick is only
+    # what somebody is called for now. Letting the author go by name means the
+    # next holder of the name can delete what the last one said.
+    author_nick = red.nick
+    fresh = f"renamed{int(time.time()) % 100000}"
+    red.send(f"NICK {fresh}")
+    red.read(1.2)
+    taker = Client(author_nick, caps=TAGS)
+    taker.join("#redact")
+    mark = taker.mark()
+    taker.send(f"REDACT #redact {other_msgid} :I am called what they were called")
+    taker.read(1.5)
+    check("taking the author's old name does not come with their messages",
+          bool(taker.find("FAIL REDACT REDACT_FORBIDDEN", lines=taker.since(mark))),
+          taker.since(mark))
+    taker.close()
+
+    # And the author still can, under whatever they are called now.
+    mark = red.mark()
+    red.send(f"REDACT #redact {other_msgid} :on reflection")
+    red.read(1.5)
+    check("while the author still can, under their new name",
+          not red.find("FAIL REDACT", lines=red.since(mark)), red.since(mark)[-3:])
+
 section("draft/chathistory")
 hist = Client("historian", caps=TAGS + ["draft/chathistory", "draft/event-playback"])
 hist.join("#redact")

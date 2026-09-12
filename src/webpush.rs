@@ -140,6 +140,13 @@ impl WebpushRuntime {
         let key = VapidKey::load_or_create(Path::new(&cfg.key_file))?;
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
+            // A push endpoint is a place a client chose, and the whole point of
+            // checking it is that this server does not visit places clients
+            // choose for it. A redirect hands that choice straight back: the
+            // endpoint that passed the check answers "go and ask 127.0.0.1
+            // instead", and without this the server would. RFC 8030 posts to
+            // the endpoint itself, so a push service has no reason to redirect.
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("rIRCd/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
@@ -177,6 +184,22 @@ pub fn notify(cfg: &crate::config::Config, account: &str, msg: &crate::protocol:
     tokio::spawn(async move {
         let subs = crate::persist::load_webpush_subscriptions(&pool, &account).await;
         for sub in subs {
+            // Checked again here, not only when it was subscribed. A name is
+            // checked by asking whoever answers for it, and the client chose
+            // whose name server that is: one that answered with a public
+            // address on the day it was registered can answer with a private
+            // one every day after. Nothing waits for this — delivery is already
+            // off the loop everybody shares.
+            if let Err(reason) = check_endpoint(&sub.endpoint, runtime.allow_private_endpoints).await {
+                tracing::warn!(
+                    account,
+                    endpoint = %sub.endpoint,
+                    ?reason,
+                    "Web Push endpoint is no longer somewhere this server will post"
+                );
+                crate::persist::delete_webpush_subscription(&pool, &sub.endpoint).await;
+                continue;
+            }
             let body = match encrypt(&sub.p256dh, &sub.auth, payload.as_bytes()) {
                 Ok(b) => b,
                 Err(e) => {
@@ -585,6 +608,48 @@ mod tests {
         );
         // The escape hatch exists for testing against a local push service.
         assert_eq!(check_endpoint("https://127.0.0.1/x", true).await, Ok(()));
+    }
+
+    /// A push endpoint is somewhere a client chose, and the point of checking
+    /// it is that this server does not go where clients send it. A redirect
+    /// hands that choice straight back: the endpoint that passed the check
+    /// answers "ask 127.0.0.1 instead". It must not be followed.
+    #[tokio::test]
+    async fn a_push_endpoint_cannot_redirect_the_server_somewhere_else() {
+        use tokio::io::AsyncWriteExt;
+
+        // Somewhere nothing is listening, so following the redirect would be
+        // visible as a connection refused rather than as a success.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/secret\r\n\
+                          Content-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let answer = http
+            .post(format!("http://{addr}/push"))
+            .body(Vec::new())
+            .send()
+            .await
+            .expect("the endpoint itself answers");
+        assert_eq!(
+            answer.status().as_u16(),
+            302,
+            "the redirect is seen and not followed"
+        );
     }
 
     #[test]

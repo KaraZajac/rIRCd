@@ -2028,7 +2028,17 @@ pub async fn handle_redact(
             .map(|(t, s)| (t.to_string(), s.to_string()))
     };
 
-    // (target_channel_or_nick, sender_nick_for_auth)
+    // Who this server will accept as the author.
+    //
+    // A nick is not it. Whoever said something and then changed their name has
+    // left that name for somebody else to pick up, and picking it up must not
+    // come with the power to delete what its last holder said. The in-memory
+    // store keeps the user id, which is the person; the database keeps the
+    // source they said it from, which at least takes a name, a user and a host
+    // to wear rather than just a name.
+    let mut author_id: Option<String> = None;
+    let mut author_source: Option<String> = None;
+    // (target_channel_or_nick, sender_nick_for_display)
     let (target, sender_nick): (String, Option<String>) = if let Some((t, sender_id)) = in_mem {
         debug!(
             "REDACT: msgid={} found in memory store (target={} sender_id={})",
@@ -2042,6 +2052,7 @@ pub async fn handle_redact(
                 None
             }
         };
+        author_id = Some(sender_id);
         (t, nick)
     } else {
         debug!("REDACT: msgid={} not in memory, querying DB", msgid);
@@ -2053,8 +2064,9 @@ pub async fn handle_redact(
         };
         match db_result {
             Some((channel, source)) => {
-                // source is "nick!user@host"; extract just the nick for auth
+                // Kept whole for the check; split only for what is shown.
                 let nick = source.split('!').next().map(|s| s.to_string());
+                author_source = Some(source.clone());
                 debug!(
                     "REDACT: msgid={} found in DB (channel={} source={} nick={:?})",
                     msgid, channel, source, nick
@@ -2124,11 +2136,16 @@ pub async fn handle_redact(
         return Ok(());
     }
 
-    // Authorization: own message (by nick), channel op, or IRC oper
-    let is_own = sender_nick
-        .as_deref()
-        .map(|sn| sn.eq_ignore_ascii_case(&current_nick))
-        .unwrap_or(false);
+    // Authorization: own message, channel op, or IRC oper.
+    let is_own = match (&author_id, &author_source) {
+        // The person, by the id this server knows them by. Names do not come
+        // into it, so changing one does not hand anything over.
+        (Some(id), _) => *id == state.read().await.user_id(client_id),
+        // Older than this run, so all that was kept is where it came from. The
+        // whole of it has to match, not the name at the front of it.
+        (None, Some(stored)) => stored.eq_ignore_ascii_case(&source),
+        (None, None) => false,
+    };
 
     let is_op = if target.starts_with('#') || target.starts_with('&') {
         let ch_key = canonical_channel_key(&target);

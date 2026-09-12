@@ -121,6 +121,7 @@ The only file rIRCd needs is `/etc/rIRCd/config.toml`. All user accounts, channe
 | `ping_timeout_secs` | `90` | How long to wait for PONG before sending next PING |
 | `disconnect_timeout_secs` | `150` | Time after missed PONG before disconnecting client |
 | `nick_protection` | `true` | Reserve a registered nick for its account; others get 433 |
+| `trusted_proxies` | `[]` | Addresses whose `X-Forwarded-For` is believed. A plaintext WebSocket listener usually sits behind a reverse proxy, and the header is how the proxy says who the client is — but it is only a header, and anybody can send one. Believed from nobody by default, so the connecting address is used. **If you serve WebSockets behind nginx or similar, add the proxy's address here or every client will look like the proxy** |
 | `channel_creation` | `anyone` | Who may bring a new channel into being: `anyone`, `accounts` or `opers`. Only creating is gated, never joining one that already exists. `accounts` is the useful one — a channel made by somebody not logged in has no founder and never gets one, so requiring an account makes every channel owned from its first moment |
 | `admin_name` / `admin_location` / `admin_email` | _(unset)_ | Shown by `ADMIN` (256–259) |
 | `client_tag_deny` | _(unset)_ | List of client-only tags to drop (e.g. `["+typing"]` or `["*"]` to drop all) |
@@ -286,8 +287,10 @@ privileges = ["kill", "ban"]   # omit for all privileges
 ```
 
 `privileges` limits what an operator may do: `kill`, `ban` (KLINE/UNKLINE),
-`rehash`, `die`, `sethost`, `wallops`. Omitting the key keeps the previous
-behaviour, where every operator may do everything.
+`rehash`, `die`, `sethost`, `wallops`, `channels` (`CHANOWN` on a channel that
+is not theirs). Omitting the key keeps the previous behaviour, where every
+operator may do everything — so this only narrows operators who were already
+narrowed, and `channels` has to be listed for them to move a channel.
 
 ### `[filehost]`
 

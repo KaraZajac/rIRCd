@@ -301,6 +301,25 @@ check("the room is told it was an operator who did it",
 time.sleep(0.8)
 check("and the channel really moved", channel_row(CH, "founder") == owner, channel_row(CH, "founder"))
 oper.close()
+
+# Deciding who owns a room is its own privilege. An operator trusted to keep
+# the network orderly is not automatically trusted to take channels off people.
+limited = Client(f"lim{RUN}")
+limited.send(f"OPER smokehelper "
+             f"{os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+limited.wait_for(" 381 ", " 464 ", seconds=5)
+check("a limited operator still logs in", bool(limited.find(" 381 ")), limited.lines[-3:])
+mark = limited.mark()
+limited.send(f"CHANOWN {CH} {stranger}")
+limited.read(1.5)
+check("but one without the channels privilege cannot move a channel",
+      bool(limited.find("FAIL CHANOWN", lines=limited.since(mark)))
+      and not limited.find("NOTE CHANOWN TRANSFERRED", lines=limited.since(mark)),
+      limited.since(mark)[-3:])
+time.sleep(0.6)
+check("and the channel did not move", channel_row(CH, "founder") == owner,
+      channel_row(CH, "founder"))
+limited.close()
 watcher.close()
 
 section("a rename takes the channel's record with it")

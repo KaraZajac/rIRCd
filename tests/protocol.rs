@@ -314,3 +314,45 @@ fn a_larger_body_limit_is_not_overruled_by_the_total() {
         "the ordinary limit is not loosened by this"
     );
 }
+
+/// A client cannot choose its own address.
+///
+/// `X-Forwarded-For` is how a reverse proxy says whose connection it is passing
+/// on, and it is also just a header. Believed from anybody, it would let a
+/// WebSocket client pick which bans apply to it, which connection limit it
+/// counts against, whose failed-login budget it spends, and what everybody else
+/// sees as its host.
+#[test]
+fn a_forwarded_address_is_believed_only_from_a_proxy() {
+    use axum::http::HeaderMap;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+    let stranger: std::net::SocketAddr = "198.51.100.7:5000".parse().unwrap();
+    let proxy: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    assert_eq!(
+        rircd::server::forwarded_for_for_test(&headers, stranger, &[]),
+        "198.51.100.7",
+        "nobody is trusted, so the socket is the answer"
+    );
+    assert_eq!(
+        rircd::server::forwarded_for_for_test(&headers, stranger, &["127.0.0.1".into()]),
+        "198.51.100.7",
+        "a header from somebody who is not the proxy says nothing"
+    );
+    assert_eq!(
+        rircd::server::forwarded_for_for_test(&headers, proxy, &["127.0.0.1".into()]),
+        "203.0.113.9",
+        "from the proxy, it is the client it is passing on"
+    );
+
+    // A client that sends its own header pushes the lie to the left; the proxy
+    // appends what it actually saw, so the truth is on the end.
+    let mut forged = HeaderMap::new();
+    forged.insert("x-forwarded-for", "1.2.3.4, 198.51.100.7".parse().unwrap());
+    assert_eq!(
+        rircd::server::forwarded_for_for_test(&forged, proxy, &["127.0.0.1".into()]),
+        "198.51.100.7",
+        "the entry the proxy added wins over the one the client invented"
+    );
+}

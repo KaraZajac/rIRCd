@@ -841,13 +841,19 @@ pub async fn handle_webirc(
     let password = msg.params.first().map(|s| s.as_str());
     let ip = msg.params.get(3).map(|s| s.as_str()).unwrap_or("");
     drop(state_guard);
-    // Constant-time comparison for WEBIRC password to prevent timing attacks
+    // Constant-time comparison for WEBIRC password to prevent timing attacks.
+    //
+    // A server with no `[webirc]` block has no gateway to believe, so there is
+    // nothing WEBIRC can be right about: it is refused rather than matched
+    // against nothing. That was already the outcome — a client that supplies
+    // the address supplies the password slot before it — but only because of
+    // how the parameters are counted, which is a thin thing for "can a stranger
+    // set their own host" to rest on.
     let password_ok = match (expected, password) {
         (Some(e), Some(p)) => {
             use subtle::ConstantTimeEq;
             e.len() == p.len() && e.as_bytes().ct_eq(p.as_bytes()).into()
         }
-        (None, None) => true,
         _ => false,
     };
     if !password_ok || ip.is_empty() {
@@ -3232,7 +3238,20 @@ async fn handle_authenticate_scram_step(
         let recovered_client_key = xor32(&client_proof, &client_signature);
         let recovered_stored_key = sha256_reg(&recovered_client_key);
 
-        if recovered_stored_key != scram.stored_key {
+        // Constant time. The client chooses the proof and so chooses what this
+        // is compared against, which is the shape every attack on a byte-by-byte
+        // comparison needs: vary the proof, watch how long the answer takes,
+        // learn the stored key one byte at a time. Cheap for them — no password
+        // is being guessed here, only a hash — so the comparison has to cost the
+        // same whether it matches at the first byte or the last.
+        let proof_ok: bool = {
+            use subtle::ConstantTimeEq;
+            recovered_stored_key.ct_eq(&scram.stored_key).into()
+        };
+        // And charged for, the way every other credential check is. Without it
+        // this was the one door somebody could knock on as fast as they liked.
+        let over_budget = !state.write().await.auth_cost.spend(host).is_zero();
+        if !proof_ok || over_budget {
             sasl_fail(
                 state,
                 &senders,
@@ -3245,6 +3264,9 @@ async fn handle_authenticate_scram_step(
             .await;
             return Ok(());
         }
+
+        // Right the first time costs nothing: that check was one somebody wanted.
+        state.write().await.auth_cost.refund(host);
 
         // Compute and send server-final: v=base64(ServerSignature)
         let server_sig = hmac_sha256_reg(&scram.server_key, auth_message.as_bytes());

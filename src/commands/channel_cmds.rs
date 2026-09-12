@@ -3399,7 +3399,7 @@ pub async fn handle_chanown(
     let new_owner = msg.params.get(1).cloned();
     let ch_key = canonical_channel_key(&ch_name);
 
-    let (nick, account, is_oper, oper_name) = {
+    let (nick, account, may_move_channels, oper_name) = {
         let state_r = state.read().await;
         let Some(client) = state_r.clients.get(client_id) else {
             return Ok(());
@@ -3408,7 +3408,10 @@ pub async fn handle_chanown(
         (
             guard.nick_or_id().to_string(),
             guard.account.clone(),
-            guard.oper,
+            // Acting on somebody else's channel is its own privilege. An
+            // operator whose list does not name it is an operator for the
+            // things it does name, and this is not one of them.
+            guard.may(crate::config::OperPrivilege::Channels),
             guard.oper_name.clone(),
         )
     };
@@ -3428,7 +3431,7 @@ pub async fn handle_chanown(
                 let user_id = state.read().await.user_id(client_id);
                 let hidden = ch.modes.secret || ch.modes.invite_only;
                 let may_see = !hidden
-                    || is_oper
+                    || may_move_channels
                     || ch.is_member(&user_id)
                     || ch.is_founder(account.as_deref());
                 may_see.then(|| ch.founder.clone())
@@ -3483,7 +3486,7 @@ pub async fn handle_chanown(
     let owns_it = account
         .as_deref()
         .is_some_and(|a| !founder.is_empty() && a.eq_ignore_ascii_case(&founder));
-    if !owns_it && !is_oper {
+    if !owns_it && !may_move_channels {
         // A channel with no founder is not up for grabs by whoever asks first.
         // Somebody has to decide who it belongs to, and that is an operator.
         let text = if founder.is_empty() {
@@ -3593,7 +3596,7 @@ pub async fn handle_chanown(
 
     // Said out loud, in the channel, whoever did it. A transfer that only the
     // two people involved could see would be a quiet way to take a room.
-    let by = match (is_oper, oper_name.as_deref()) {
+    let by = match (may_move_channels, oper_name.as_deref()) {
         (true, Some(name)) if !owns_it => format!("network operator {name}"),
         (true, None) if !owns_it => "a network operator".to_string(),
         _ => nick.clone(),
@@ -3627,7 +3630,7 @@ pub async fn handle_chanown(
         }
     }
 
-    if is_oper && !owns_it {
+    if may_move_channels && !owns_it {
         tracing::warn!(
             client_id,
             channel = %ch_key,

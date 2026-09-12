@@ -293,6 +293,20 @@ pub struct ServerConfig {
     /// registering an account is what claims the nick.
     #[serde(default = "default_nick_protection")]
     pub nick_protection: bool,
+    /// Addresses whose `X-Forwarded-For` this server will believe.
+    ///
+    /// A plaintext WebSocket listener usually sits behind a reverse proxy, and
+    /// the header is how the proxy says who the client really is. It is also
+    /// just a header: anybody can send one. Believing it from whoever asks
+    /// means a client picks its own address — which picks which bans apply to
+    /// it, which connection limit it counts against, whose failed-login budget
+    /// it spends, and what everybody else sees as its host.
+    ///
+    /// So it is believed only from the addresses named here, and the connection
+    /// the proxy made is what is checked against this list. Empty by default,
+    /// which means the socket's own address is used and the header is ignored.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
     /// Who may bring a new channel into being: `anyone`, `accounts` or
     /// `opers`. This gates creating one, never joining one that exists.
     ///
@@ -429,6 +443,7 @@ impl Default for ServerConfig {
             admin_location: None,
             admin_email: None,
             nick_protection: default_nick_protection(),
+            trusted_proxies: Vec::new(),
             channel_creation: default_channel_creation(),
             auto_join: None,
             description: default_server_description(),
@@ -639,6 +654,11 @@ pub enum OperPrivilege {
     Die,
     SetHost,
     Wallops,
+    /// Acting on a channel that is not theirs: taking one off its founder and
+    /// giving it to somebody else. Separate from `ban`, because keeping the
+    /// network orderly and deciding who owns a room are different jobs, and an
+    /// operator trusted with one is not automatically trusted with the other.
+    Channels,
 }
 
 impl OperPrivilege {
@@ -650,6 +670,7 @@ impl OperPrivilege {
             Self::Die => "die",
             Self::SetHost => "sethost",
             Self::Wallops => "wallops",
+            Self::Channels => "channels",
         }
     }
 }

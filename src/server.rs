@@ -215,6 +215,49 @@ fn supported_ws_protocols(headers: &axum::http::HeaderMap) -> Vec<String> {
 /// counted against anything. Any real client finishes in well under a second.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The forwarded-address rule, for tests.
+#[doc(hidden)]
+pub fn forwarded_for_for_test(
+    headers: &axum::http::HeaderMap,
+    peer: std::net::SocketAddr,
+    trusted: &[String],
+) -> String {
+    forwarded_for(headers, peer, trusted)
+}
+
+/// Who a WebSocket client really is.
+///
+/// A plaintext WebSocket listener usually sits behind a reverse proxy, and
+/// `X-Forwarded-For` is how the proxy says whose connection it is passing on.
+/// It is also just a header, and anybody can send one — so it is believed only
+/// when the connection carrying it came from an address the operator named as a
+/// proxy. Otherwise the address that actually connected is the answer, because
+/// letting a client choose its own would let it choose which bans apply to it,
+/// which connection limit it counts against, whose failed-login budget it
+/// spends, and what everybody else sees as its host.
+///
+/// The last entry is taken, not the first. A proxy appends what it saw to
+/// whatever was already there, so a client that sends a header of its own
+/// pushes its lie to the left and the truth is what the proxy put on the end.
+fn forwarded_for(
+    headers: &axum::http::HeaderMap,
+    peer: std::net::SocketAddr,
+    trusted: &[String],
+) -> String {
+    let actual = peer.ip().to_string();
+    if !trusted.iter().any(|t| t == &actual) {
+        return actual;
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or(actual)
+}
+
 pub async fn run(
     mut cfg: Config,
     config_path: &Path,
@@ -587,6 +630,7 @@ pub async fn run(
             counter: Arc<std::sync::atomic::AtomicU64>,
             keepalive: client::KeepaliveConfig,
             limits: client::ConnectionLimits,
+            trusted_proxies: Arc<Vec<String>>,
         }
 
         let ws_state = WsState {
@@ -599,6 +643,7 @@ pub async fn run(
                 &cfg.limits.shared_address_listeners,
                 cfg.limits.max_clients_behind_one_address,
             ),
+            trusted_proxies: Arc::new(cfg.server.trusted_proxies.clone()),
         };
 
         let app = axum::Router::new()
@@ -607,16 +652,15 @@ pub async fn run(
                 axum::routing::get(
                     |ws: axum::extract::ws::WebSocketUpgrade,
                      headers: axum::http::HeaderMap,
+                     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                        std::net::SocketAddr,
+                    >,
                      axum::extract::State(st): axum::extract::State<WsState>| async move {
                         let id = st
                             .counter
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let client_id = format!("ws-{}", id);
-                        let host = headers
-                            .get("x-forwarded-for")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("unknown")
-                            .to_string();
+                        let host = forwarded_for(&headers, peer, &st.trusted_proxies);
                         // The client lists subprotocols in its order of
                         // preference, and that is the order to choose from:
                         // offering ours instead would pick text for a client
@@ -641,7 +685,11 @@ pub async fn run(
             .with_state(ws_state);
 
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
+            // With connect info, so the handler can see who actually connected
+            // rather than only what they claimed in a header.
+            let service =
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+            if let Err(e) = axum::serve(listener, service).await {
                 error!("WebSocket server error: {}", e);
             }
         });
