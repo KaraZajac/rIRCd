@@ -939,6 +939,11 @@ pub async fn handle_metadata(
                     entry.insert(key.to_string(), val.clone());
                 } else {
                     entry.remove(key);
+                    // The last key going is the target going: an empty set of
+                    // keys is not something to keep a place for.
+                    if entry.is_empty() {
+                        state_w.metadata.remove(&store_key);
+                    }
                 }
                 value.clone()
             };
@@ -1065,8 +1070,14 @@ pub async fn handle_metadata(
             let clear_key = metadata_key(&target, &state).await;
             let cleared: Vec<(String, String)> = {
                 let mut state_w = state.write().await;
-                let entry = state_w.metadata.entry(clear_key.clone()).or_default();
-                entry.drain().collect()
+                // Taken out rather than emptied in place. Clearing what was
+                // never set would otherwise leave a row of nothing behind, once
+                // per target anybody thought to clear.
+                state_w
+                    .metadata
+                    .remove(&clear_key)
+                    .map(|keys| keys.into_iter().collect())
+                    .unwrap_or_default()
             };
 
             if let Some(ref pool) = cfg.db {

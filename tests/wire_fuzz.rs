@@ -289,3 +289,43 @@ fn channel_modes_off_a_link_never_panic() {
         }
     }
 }
+
+/// No burst line this server builds is longer than a peer will read.
+///
+/// A channel with a few thousand people in it names them all, and a line too
+/// long is not truncated at the far end — it is dropped whole, so the channel
+/// arrives quietly missing half its members. Splitting is only safe because
+/// every receiver of these adds rather than replaces.
+#[test]
+fn a_crowded_channel_is_bursted_in_pieces_a_peer_can_read() {
+    let members: Vec<String> = (0..4000).map(|n| format!("@1AA{n:06}")).collect();
+    let pieces = rircd::link::in_line_sized_pieces_for_test(&members, 6800, usize::MAX);
+    assert!(pieces.len() > 1, "four thousand members do not fit in one line");
+    for piece in &pieces {
+        assert!(
+            piece.len() <= 6800,
+            "a piece outgrew what it was given: {} bytes",
+            piece.len()
+        );
+        // What is sent has to survive being parsed by the peer that reads it.
+        let line = format!(":1AA SJOIN 1700000000 #crowded +nt :{piece}");
+        assert!(
+            rircd::protocol::parse_message_with_limit(&line, 16384).is_ok(),
+            "a peer could not parse a line this server would send"
+        );
+    }
+    let rebuilt: Vec<&str> = pieces.iter().flat_map(|p| p.split(' ')).collect();
+    assert_eq!(rebuilt.len(), 4000, "nobody was lost in the splitting");
+}
+
+/// Counted as well as measured: the far end refuses a list naming more than a
+/// channel can hold, so an honest full list must not be sent as one line.
+#[test]
+fn an_access_list_is_split_by_count_too() {
+    let names: Vec<String> = (0..250).map(|n| format!("acct{n}")).collect();
+    let pieces = rircd::link::in_line_sized_pieces_for_test(&names, 100_000, 100);
+    assert_eq!(pieces.len(), 3, "250 names in pieces of at most 100");
+    for piece in &pieces {
+        assert!(piece.split(' ').count() <= 100, "a piece named too many");
+    }
+}

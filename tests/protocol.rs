@@ -283,3 +283,34 @@ fn nothing_written_out_can_end_the_line_early() {
         );
     }
 }
+
+/// A caller that allows a larger body can actually use it.
+///
+/// A server link allows 16 KB because a burst line names every member of a
+/// channel. That limit used to be unreachable: the total-length check ran
+/// first, at the client's figure, so a line between the two was refused
+/// without anybody looking at it — and a channel with enough members in it
+/// failed to cross a link, silently.
+#[test]
+fn a_larger_body_limit_is_not_overruled_by_the_total() {
+    let members: Vec<String> = (0..1200).map(|n| format!("@1AA{n:06}")).collect();
+    let line = format!(":1AA SJOIN 1700000000 #big +nt :{}", members.join(" "));
+    assert!(
+        line.len() > rircd::protocol::MAX_TOTAL_TAGGED,
+        "the point of this test is a line past the client's total: {} bytes",
+        line.len()
+    );
+    let parsed = rircd::protocol::parse_message_with_limit(&line, 16384)
+        .expect("a link's own limit should carry a link's own burst");
+    assert_eq!(parsed.command, "SJOIN");
+    assert_eq!(
+        parsed.params.last().map(|p| p.split(' ').count()),
+        Some(1200),
+        "every member arrived"
+    );
+    // And a client is held to the client's figure, unchanged.
+    assert!(
+        rircd::protocol::parse_message(&line).is_err(),
+        "the ordinary limit is not loosened by this"
+    );
+}

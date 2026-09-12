@@ -6,9 +6,15 @@ use std::collections::HashMap;
 /// so it is the default rather than a hard ceiling.
 pub const DEFAULT_MAX_MESSAGE_BODY: usize = 512;
 const MAX_TAG_DATA: usize = 4094;
-/// The longest a whole line may be, tags included. Tags are counted separately
-/// from the body and have far more room, so this is the only bound on what one
-/// line can cost to read.
+/// The longest a whole line may be, tags included, for a caller using the
+/// protocol's own body limit. Tags are counted separately from the body and
+/// have far more room, so this is the bound on what one line can cost to read.
+///
+/// A caller that allows a larger body — a server link, whose burst lines name
+/// every member of a channel — gets a total large enough to hold it. Without
+/// that, the larger body limit was unreachable: the line was turned away here
+/// before anything looked at the body, and a channel with enough members in it
+/// simply failed to cross a link, saying nothing about why.
 pub const MAX_TOTAL_TAGGED: usize = 8191;
 
 /// Parse an IRC message from a line (without CRLF).
@@ -23,7 +29,8 @@ pub fn parse_message_with_limit(line: &str, max_body: usize) -> Result<Message, 
         .trim_end_matches('\n')
         .trim_end_matches('\r');
 
-    if line.len() > MAX_TOTAL_TAGGED {
+    let total_allowed = MAX_TOTAL_TAGGED.max(max_body.saturating_add(MAX_TAG_DATA));
+    if line.len() > total_allowed {
         return Err(ParseError::InputTooLong);
     }
 

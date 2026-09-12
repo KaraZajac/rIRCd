@@ -504,14 +504,28 @@ if made:
               "SELECT GROUP_CONCAT(nick_or_account) FROM channel_operators o "
               f"JOIN channels c ON o.channel_id = c.id WHERE c.name='{OWNED}'"))
 
-    # Status granted on one server is status on the network, not just there.
-    guest = Client(f"gb{RUN}", port=B_PORT)
+    # Status granted on one server is status on the network, not just there —
+    # and it is granted to an account, because that is what it is remembered
+    # against. The account is made on B, where the person holding it will be.
+    GUEST = f"gst{RUN}"
+    maker_b = Client(GUEST, port=B_PORT)
+    mark = maker_b.mark()
+    maker_b.send(f"REGISTER * {GUEST}@example.invalid {PASSWORD}")
+    maker_b.read(2.5)
+    guest_made = bool(maker_b.find("REGISTER SUCCESS", lines=maker_b.since(mark)))
+    check("a second account can be registered on B", guest_made, maker_b.since(mark)[-3:])
+    maker_b.close()
+
+    guest = connect_negotiating(f"gb{RUN}", caps=["sasl"], port=B_PORT)
+    guest.sasl_plain(GUEST, PASSWORD)
+    guest.send("CAP END")
+    guest.wait_for(" 001 ", seconds=6)
     guest.join(OWNED)
     guest.read(1.0)
     founder.send(f"MODE {OWNED} +o gb{RUN}")
     founder.read(1.2)
     opped = eventually(
-        lambda: f"gb{RUN}" in side_db("b",
+        lambda: GUEST in side_db("b",
             "SELECT GROUP_CONCAT(nick_or_account) FROM channel_operators o "
             f"JOIN channels c ON o.channel_id = c.id WHERE c.name='{OWNED}'"),
         seconds=6)
@@ -523,7 +537,7 @@ if made:
     founder.send(f"MODE {OWNED} -o gb{RUN}")
     founder.read(1.2)
     unopped = eventually(
-        lambda: f"gb{RUN}" not in side_db("b",
+        lambda: GUEST not in side_db("b",
             "SELECT GROUP_CONCAT(nick_or_account) FROM channel_operators o "
             f"JOIN channels c ON o.channel_id = c.id WHERE c.name='{OWNED}'"),
         seconds=6)

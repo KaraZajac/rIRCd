@@ -273,6 +273,13 @@ pub async fn run(
         if moved > 0 || dropped > 0 {
             info!("Metadata: {moved} row(s) moved onto their account, {dropped} dropped");
         }
+        // Standing channel status belongs to an account for the same reason.
+        let ungrounded = crate::persist::drop_channel_access_without_accounts(pool).await;
+        if ungrounded > 0 {
+            info!(
+                "Channel access: {ungrounded} row(s) named somebody with no account, dropped"
+            );
+        }
         let meta = crate::persist::load_all_metadata(pool).await;
         let memberships = crate::persist::load_account_channels(pool).await;
         let bans = crate::persist::load_server_bans(pool).await;

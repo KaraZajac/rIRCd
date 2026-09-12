@@ -836,6 +836,35 @@ fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
 }
 
 /// Compute SCRAM-SHA-256 (StoredKey, ServerKey) from a cleartext password.
+/// Drop channel status that was remembered under a nick.
+///
+/// Standing operator and voice used to be stored as whatever the person was
+/// called if they were not logged in, and matched against a nick as well as an
+/// account when they came back. Either half of that is enough to hand somebody
+/// else's status to whoever takes a name — and nick reservation, the thing that
+/// would normally stop a name being taken, deliberately fails open when this
+/// database is unreachable, which is exactly when it would matter.
+///
+/// Rows naming a verified account stay. The rest go: they grant nothing now,
+/// and left in place they would keep channels resident for no one's benefit.
+/// Anybody dropped here is still an operator for as long as they are in the
+/// channel; it is only the remembering that stops.
+pub async fn drop_channel_access_without_accounts(pool: &sqlx::MySqlPool) -> u64 {
+    let mut dropped = 0;
+    for table in ["channel_operators", "channel_voice"] {
+        let gone = sqlx::query(&format!(
+            "DELETE FROM {table} WHERE nick_or_account NOT IN \
+             (SELECT nick FROM (SELECT nick_lower AS nick FROM users WHERE verified = 1) AS a)"
+        ))
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected())
+        .unwrap_or(0);
+        dropped += gone;
+    }
+    dropped
+}
+
 /// Move metadata that was filed under a nick to the account behind it.
 ///
 /// Profiles used to be keyed by whatever nick the person held when they set

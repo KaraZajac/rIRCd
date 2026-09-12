@@ -290,13 +290,31 @@ pub struct LinkRegistry {
     servers: std::collections::HashMap<String, RemoteServer>,
     /// Outbound queues to directly-attached servers, by SID.
     peers: std::collections::HashMap<String, tokio::sync::mpsc::Sender<Message>>,
+    /// Peers that have not said `EOB` yet.
+    ///
+    /// A burst is the one time a peer may tell this server that things it has
+    /// never heard of exist. After it, a message about something unknown is
+    /// either late or untrue, and either way is not a reason to make a place
+    /// for it.
+    bursting: std::collections::HashSet<String>,
 }
 
 impl LinkRegistry {
     /// Record a directly-attached server and the queue to reach it.
     pub fn attach(&mut self, server: RemoteServer, tx: tokio::sync::mpsc::Sender<Message>) {
+        self.bursting.insert(server.sid.clone());
         self.peers.insert(server.sid.clone(), tx);
         self.servers.insert(server.sid.clone(), server);
+    }
+
+    /// Whether this peer is still sending everything it knows.
+    pub fn is_bursting(&self, sid: &str) -> bool {
+        self.bursting.contains(sid)
+    }
+
+    /// The peer said `EOB`: it has told us everything it had.
+    pub fn burst_finished(&mut self, sid: &str) {
+        self.bursting.remove(sid);
     }
 
     /// Record a server the peer told us about.
@@ -308,6 +326,9 @@ impl LinkRegistry {
     /// servers that went, so their users can be quit.
     pub fn detach(&mut self, sid: &str) -> Vec<RemoteServer> {
         self.peers.remove(sid);
+        // A peer that never finished bursting is not still bursting once it is
+        // gone, and a reconnecting peer must not inherit the last one's state.
+        self.bursting.remove(sid);
         let mut gone: Vec<RemoteServer> = Vec::new();
         if let Some(server) = self.servers.remove(sid) {
             gone.push(server);
@@ -968,19 +989,27 @@ async fn send_burst(
             continue;
         }
         let (letters, mode_args) = ch.mode_string();
-        let members = ch
+        let members: Vec<String> = ch
             .members
             .iter()
             .map(|(id, m)| format!("{}{}", m.modes.prefixes_ordered(), id))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let mut params = vec![ch.created_at.to_string(), ch.name.clone(), letters];
-        params.extend(mode_args);
-        params.push(members);
-        // An empty channel has nobody to join, so there is no SJOIN to send;
-        // the ownership lines below are what tell the peer it exists.
-        let sjoin = (!ch.members.is_empty())
-            .then(|| Message::new("SJOIN", params).with_prefix(our_sid));
+            .collect();
+        let mut fixed = vec![ch.created_at.to_string(), ch.name.clone(), letters];
+        fixed.extend(mode_args);
+        // A busy channel names more members than one line can hold. Split it:
+        // the receiving side adds members rather than replacing them, and
+        // merges the modes, so the same channel told in four lines is the same
+        // channel. An empty channel has nobody to join and so has no SJOIN at
+        // all; the ownership lines below are what tell the peer it exists.
+        let room = BURST_LINE_BUDGET.saturating_sub(fixed.join(" ").len() + 32);
+        let sjoins: Vec<Message> = in_line_sized_pieces(&members, room.max(64), usize::MAX)
+            .into_iter()
+            .map(|piece| {
+                let mut params = fixed.clone();
+                params.push(piece);
+                Message::new("SJOIN", params).with_prefix(our_sid)
+            })
+            .collect();
         let access = access_messages(&ch, our_sid);
 
         let topic = ch.topic.as_ref().map(|t| {
@@ -1002,24 +1031,31 @@ async fn send_burst(
                 if masks.is_empty() {
                     return None;
                 }
+                let room = BURST_LINE_BUDGET.saturating_sub(ch.name.len() + 64);
                 Some(
-                    Message::new(
-                        "BMASK",
-                        vec![
-                            ch.created_at.to_string(),
-                            ch.name.clone(),
-                            letter.to_string(),
-                            masks.join(" "),
-                        ],
-                    )
-                    .with_prefix(our_sid),
+                    in_line_sized_pieces(masks, room.max(64), usize::MAX)
+                        .into_iter()
+                        .map(|piece| {
+                            Message::new(
+                                "BMASK",
+                                vec![
+                                    ch.created_at.to_string(),
+                                    ch.name.clone(),
+                                    letter.to_string(),
+                                    piece,
+                                ],
+                            )
+                            .with_prefix(our_sid)
+                        })
+                        .collect::<Vec<_>>(),
                 )
             })
+            .flatten()
             .collect();
         drop(ch);
         drop(store);
 
-        if let Some(sjoin) = sjoin {
+        for sjoin in sjoins {
             let _ = tx.send(sjoin).await;
         }
         // Ownership goes before the topic and the lists: for a channel nobody
@@ -1041,6 +1077,100 @@ async fn send_burst(
         .await;
 }
 
+/// The earliest a channel can honestly claim to have been made.
+///
+/// Before IRCv3, before this server, before anybody reading this had a network
+/// to put a channel on. Nothing truthful is older than the millennium.
+const EARLIEST_PLAUSIBLE_TS: i64 = 946_684_800;
+
+/// How far ahead of this server's clock a peer's timestamp may be.
+///
+/// Clocks drift and not every machine runs NTP; a day is more than enough for
+/// an honest one and far less than useful to a dishonest one.
+const CLOCK_SKEW_ALLOWED: i64 = 86_400;
+
+/// A timestamp from a peer, or `None` if it cannot be true.
+///
+/// Whose channel it is, on every TS network, is settled by whose copy is older.
+/// That makes the timestamp the one number a peer most gains by lying about:
+/// claim a channel was made in 1970 and it is yours everywhere, with your modes
+/// and your operators, on every server that hears it. A link is trusted for
+/// what it says about its own users, which is not the same as being trusted to
+/// rewrite when things happened.
+///
+/// An implausible one is not a reason to drop the message — an honest peer with
+/// a wrong clock still has real users in real channels — so the timestamp is
+/// refused and the rest is believed.
+fn plausible_ts(ts: i64, peer_sid: &str, what: &str) -> Option<i64> {
+    let ceiling = chrono::Utc::now().timestamp().saturating_add(CLOCK_SKEW_ALLOWED);
+    if ts < EARLIEST_PLAUSIBLE_TS || ts > ceiling {
+        warn!(
+            peer = %peer_sid,
+            ts,
+            what,
+            "Refusing a timestamp a channel could not have: keeping ours"
+        );
+        return None;
+    }
+    Some(ts)
+}
+
+/// How long a burst line may get before it is split.
+///
+/// A line has to survive being read and being parsed at the far end, and the
+/// smaller of the two is what counts. Deliberately under the oldest limit a
+/// peer might hold rather than the newest: a server that allows more is not the
+/// one that decides, and a line too long for the peer is not truncated there —
+/// it is dropped whole, so a channel arrives quietly missing half its members.
+const BURST_LINE_BUDGET: usize = 7000;
+
+/// Split tokens so no line built from them outgrows what a peer will read.
+///
+/// A burst line names every member of a channel, every mask on one of its
+/// lists, every account with standing in it. Any of those can be longer than a
+/// line may be. The same fact told in several lines is the same fact: every
+/// receiver of these merges rather than replaces, which is what makes splitting
+/// them safe.
+fn in_line_sized_pieces(tokens: &[String], room: usize, most: usize) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut current = String::new();
+    let mut held = 0usize;
+    for token in tokens {
+        let would_be = if current.is_empty() {
+            token.len()
+        } else {
+            current.len() + 1 + token.len()
+        };
+        if !current.is_empty() && (would_be > room || held >= most) {
+            pieces.push(std::mem::take(&mut current));
+            held = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(token);
+        held += 1;
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    pieces
+}
+
+/// The splitting, for tests that check no line this server builds is one a
+/// peer would drop.
+#[doc(hidden)]
+pub fn in_line_sized_pieces_for_test(tokens: &[String], room: usize, most: usize) -> Vec<String> {
+    in_line_sized_pieces(tokens, room, most)
+}
+
+/// Names one `CACCESS` may carry.
+///
+/// A channel's access list is capped, so a message longer than the cap is
+/// either a mistake or somebody finding out how many database writes one line
+/// can be worth. Either way, nothing useful is past the end of it.
+const MAX_ACCESS_NAMES_PER_MESSAGE: usize = crate::channel::MAX_CHANNEL_ACCESS;
+
 /// What a channel's ownership looks like on the wire.
 ///
 /// Three lists, a letter each, in the shape `BMASK` already uses: `f` for the
@@ -1057,18 +1187,24 @@ fn access_messages(ch: &crate::channel::Channel, our_sid: &str) -> Vec<Message> 
         if names.is_empty() {
             return;
         }
-        out.push(
-            Message::new(
-                "CACCESS",
-                vec![
-                    ch.created_at.to_string(),
-                    ch.name.clone(),
-                    letter.to_string(),
-                    names.join(" "),
-                ],
-            )
-            .with_prefix(our_sid),
-        );
+        // Split by length and by count alike: the far end refuses a line that
+        // names more than a channel could hold, which is the right answer to a
+        // peer inventing work and the wrong answer to an honest full list.
+        let room = BURST_LINE_BUDGET.saturating_sub(ch.name.len() + 64);
+        for piece in in_line_sized_pieces(names, room.max(64), MAX_ACCESS_NAMES_PER_MESSAGE) {
+            out.push(
+                Message::new(
+                    "CACCESS",
+                    vec![
+                        ch.created_at.to_string(),
+                        ch.name.clone(),
+                        letter.to_string(),
+                        piece,
+                    ],
+                )
+                .with_prefix(our_sid),
+            );
+        }
     };
     if !ch.founder.is_empty() {
         add('f', std::slice::from_ref(&ch.founder));
@@ -1888,6 +2024,9 @@ async fn accept_remote_sjoin(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
         return;
     };
     let name = msg.params[1].clone();
+    // A timestamp that cannot be true is not allowed to decide whose channel
+    // this is. Ours stands, and the members they named still arrive.
+    let claimed_ts = plausible_ts(ts, peer_sid, "SJOIN");
     let letters = msg.params[2].clone();
     let members_field = msg.params[msg.params.len() - 1].clone();
     let mode_args: Vec<String> = msg.params[3..msg.params.len() - 1].to_vec();
@@ -1902,6 +2041,15 @@ async fn accept_remote_sjoin(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
             .entry(key.clone())
             .or_insert_with(|| RwLock::new(crate::channel::Channel::new(name.clone())));
         let mut ch = entry.write().await;
+        // Nothing to compare against on a channel this server has not seen, so
+        // an unbelievable claim becomes now rather than becoming forever.
+        let ts = claimed_ts.unwrap_or_else(|| {
+            if existed {
+                ch.created_at
+            } else {
+                chrono::Utc::now().timestamp()
+            }
+        });
         if !existed {
             ch.created_at = ts;
             ch.set_mode_string(&letters, &mode_args);
@@ -2235,13 +2383,40 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
     let names: Vec<String> = names
         .split(' ')
         .filter(|n| !n.is_empty())
+        .take(MAX_ACCESS_NAMES_PER_MESSAGE + 1)
         .map(str::to_string)
         .collect();
     if names.is_empty() || !matches!(letter, 'f' | 'o' | 'v') {
         return;
     }
+    // A line is one line's worth of news. A peer that sends more than a channel
+    // could hold is not describing a channel, and answering it would mean one
+    // message costing this server a database write per name.
+    if names.len() > MAX_ACCESS_NAMES_PER_MESSAGE {
+        warn!(
+            peer = %peer_sid,
+            channel = %name,
+            "Refusing a channel access list longer than a channel can hold"
+        );
+        return;
+    }
 
     let key = crate::channel::canonical_channel_key(&name);
+    // A burst is the one time a peer may say that something this server has
+    // never heard of exists. Afterwards, a channel nobody here knows about is
+    // not a reason to make one — otherwise a peer could name channels until
+    // this server ran out of room, and each would stay resident for having an
+    // access list.
+    if !ctx.channels.read().await.channels.contains_key(&key)
+        && !ctx.links.read().await.is_bursting(peer_sid)
+    {
+        tracing::debug!(
+            peer = %peer_sid,
+            channel = %name,
+            "Ignoring channel access for a channel that does not exist here"
+        );
+        return;
+    }
     // What this server ends up believing, so it can be written down once the
     // locks are back. Nothing is persisted for a change that did not happen.
     let mut new_founder: Option<String> = None;
@@ -2257,7 +2432,9 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
         let mut ch = entry.write().await;
         // The age to judge by is the one this server held before the message
         // arrived; a channel it is hearing about for the first time is as old
-        // as the message says it is.
+        // as the message says it is. A timestamp that cannot be true decides
+        // nothing — otherwise claiming 1970 would be claiming the channel.
+        let ts = plausible_ts(ts, peer_sid, "CACCESS").unwrap_or(ch.created_at);
         let ours = if existed { ch.created_at } else { ts };
         if ts < ch.created_at {
             ch.created_at = ts;
@@ -2302,6 +2479,14 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
                             }
                         }
                         None => {
+                            if list.len() >= crate::channel::MAX_CHANNEL_ACCESS {
+                                warn!(
+                                    peer = %peer_sid,
+                                    channel = %name,
+                                    "Channel access list is full, ignoring the rest"
+                                );
+                                break;
+                            }
                             if !list.iter().any(|held| held.eq_ignore_ascii_case(who)) {
                                 list.push(who.clone());
                                 newly_granted.push(who.clone());
@@ -2805,20 +2990,23 @@ pub async fn announce_channel_access(
     if cfg.links_runtime.is_none() || names.is_empty() {
         return;
     }
-    broadcast(
-        cfg,
-        Message::new(
-            "CACCESS",
-            vec![
-                created_at.to_string(),
-                name.to_string(),
-                letter.to_string(),
-                names.join(" "),
-            ],
+    let room = BURST_LINE_BUDGET.saturating_sub(name.len() + 64);
+    for piece in in_line_sized_pieces(names, room.max(64), MAX_ACCESS_NAMES_PER_MESSAGE) {
+        broadcast(
+            cfg,
+            Message::new(
+                "CACCESS",
+                vec![
+                    created_at.to_string(),
+                    name.to_string(),
+                    letter.to_string(),
+                    piece,
+                ],
+            )
+            .with_prefix(our_sid(cfg)),
         )
-        .with_prefix(our_sid(cfg)),
-    )
-    .await;
+        .await;
+    }
 }
 
 /// Send a message to a channel's members on the other servers.
@@ -3072,6 +3260,7 @@ async fn handle_link_message(
         }
         "EOB" => {
             info!(peer = %peer_sid, "Burst complete");
+            ctx.links.write().await.burst_finished(peer_sid);
             std::ops::ControlFlow::Continue(())
         }
         "SQUIT" | "ERROR" => {

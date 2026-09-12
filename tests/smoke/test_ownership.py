@@ -260,11 +260,17 @@ b.read(1.2)
 check("and the new founder can now remove the old one",
       not b.find(" 482 ", lines=b.since(mark)), b.since(mark)[-3:])
 
+# They gave the channel away and were then removed from it, and it is invite
+# only, so it is not theirs and not visible to them. Both answers refuse; the
+# one they get is the one that says nothing about the channel still being there.
 mark = a.mark()
 a.send(f"CHANOWN {CH} {owner}")
 a.read(1.2)
 check("who can no longer hand the channel back to themselves",
-      bool(a.find("FAIL CHANOWN NOT_FOUNDER", lines=a.since(mark))), a.since(mark)[-3:])
+      bool(a.find("FAIL CHANOWN", lines=a.since(mark)))
+      and not a.find("NOTE CHANOWN TRANSFERRED", lines=a.since(mark)), a.since(mark)[-3:])
+check("and a channel they cannot see does not confirm itself to them",
+      bool(a.find("NO_SUCH_CHANNEL", lines=a.since(mark))), a.since(mark)[-3:])
 a.close()
 b.close()
 
@@ -490,5 +496,108 @@ check("and the next holder of it inherits nothing either",
       not after_anon.find("Just Passing Through", lines=after_anon.since(mark)),
       after_anon.since(mark)[-4:])
 after_anon.close()
+
+section("a channel that hides itself hides itself from CHANOWN too")
+
+# Answering "only the founder may do that" to somebody who cannot see the
+# channel tells them it exists, which is the one thing +s is for.
+SECRET = f"#secret{RUN}"
+keeper = logged_in(f"{owner}_s", owner)
+keeper.join(SECRET)
+keeper.send(f"MODE {SECRET} +s")
+keeper.read(1.2)
+
+outsider = Client(f"out{RUN}")
+mark = outsider.mark()
+outsider.send(f"CHANOWN {SECRET}")
+outsider.read(1.5)
+check("a stranger is told there is no such channel",
+      bool(outsider.find("FAIL CHANOWN NO_SUCH_CHANNEL", lines=outsider.since(mark))),
+      outsider.since(mark)[-3:])
+check("and is not told who owns it",
+      not outsider.find(owner, lines=outsider.since(mark)), outsider.since(mark)[-3:])
+mark = outsider.mark()
+outsider.send(f"CHANOWN {SECRET} {stranger}")
+outsider.read(1.5)
+check("nor can they tell it apart from one that does not exist by trying",
+      bool(outsider.find("FAIL CHANOWN NO_SUCH_CHANNEL", lines=outsider.since(mark))),
+      outsider.since(mark)[-3:])
+outsider.close()
+
+mark = keeper.mark()
+keeper.send(f"CHANOWN {SECRET}")
+keeper.read(1.5)
+check("while whoever owns it still gets an answer",
+      bool(keeper.find("NOTE CHANOWN FOUNDER", owner, lines=keeper.since(mark))),
+      keeper.since(mark)[-3:])
+keeper.close()
+
+section("standing in a channel belongs to an account, not to a name")
+
+# Operator status that outlives a visit used to be stored as whatever the
+# person was called, and matched against a nick as well as an account. Either
+# half hands somebody's status to whoever takes their name — and the thing that
+# would normally stop a name being taken, nick reservation, deliberately fails
+# open when the database is unreachable, which is exactly when it matters.
+
+NAMED = f"#named{RUN}"
+holder = logged_in(f"{owner}_a", owner)
+holder.join(NAMED)
+holder.read(1.0)
+
+# An account is given standing here.
+helper = logged_in(f"{stranger}_a", stranger)
+helper.join(NAMED)
+helper.read(1.0)
+holder.send(f"MODE {NAMED} +o {stranger}_a")
+holder.read(1.2)
+time.sleep(0.8)
+check("an account's standing is remembered", stranger in persisted_operators(NAMED),
+      persisted_operators(NAMED))
+helper.close()
+holder.close()
+time.sleep(0.6)
+
+# Somebody arrives using that account's name, without being it.
+impostor = Client(stranger)
+mark = impostor.mark()
+impostor.send(f"JOIN {NAMED}")
+impostor.read(1.5)
+took_the_name = bool(impostor.find(f"JOIN {NAMED}", lines=impostor.since(mark))) or \
+    bool(impostor.find(" 353 ", lines=impostor.since(mark)))
+if took_the_name:
+    check("wearing the name does not inherit what the account was given",
+          not impostor.find(f"@{stranger}", lines=impostor.since(mark)),
+          impostor.since(mark)[-5:])
+else:
+    # Nick reservation turned them away before they could even register, which
+    # is the other defence and is fine — but it is the one that fails open when
+    # the database is unreachable, so it is not the one being tested here.
+    check("the name is reserved, so the other defence answered first",
+          bool(impostor.find(" 433 ")), impostor.lines[-4:])
+impostor.close()
+
+# And somebody not logged in is an operator while they are here, no longer.
+passing = Client(f"pass{RUN}b")
+passing.join(NAMED)
+passing.read(1.0)
+back = logged_in(f"{owner}_b", owner)
+back.join(NAMED)
+back.read(1.0)
+# They may already hold it from being first into a room that was standing
+# empty, so this asks for the status rather than assuming the change is visible.
+back.send(f"MODE {NAMED} +o pass{RUN}b")
+back.read(1.2)
+mark = back.mark()
+back.send(f"NAMES {NAMED}")
+back.read(1.2)
+check("somebody with no account can still be made an operator",
+      bool(back.find(" 353 ", f"@pass{RUN}b", lines=back.since(mark))),
+      back.since(mark)[-3:])
+time.sleep(0.8)
+check("but it is not written down for the next holder of the name",
+      f"pass{RUN}b" not in persisted_operators(NAMED), persisted_operators(NAMED))
+passing.close()
+back.close()
 
 summary("ownership")

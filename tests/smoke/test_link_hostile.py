@@ -246,6 +246,95 @@ if linked:
           [l for l in a_log()[len(before):].splitlines() if "Refus" in l][:2])
     check("and A is still serving", still_serving("a nonsense prefix"))
 
+    # Channel ownership crosses a link, which means a peer can say who owns
+    # what. What it must not be able to say is that a thousand channels exist,
+    # or that one has more operators than a channel can hold: an owned channel
+    # stays in memory, so either would be a way to fill this server up.
+    ghost = f"#ghost{RUN}"
+    before = a_log()
+    peer.send(f":{B_SID} CACCESS {int(time.time())} {ghost} f :someone")
+    peer.send(f":{B_SID} CACCESS {int(time.time())} {ghost} o :" + " ".join(
+        f"op{n}" for n in range(500)))
+    time.sleep(1.0)
+    lister = Client(f"l{RUN}", port=A_PORT)
+    mark = lister.mark()
+    lister.send("LIST")
+    lister.wait_for(" 323 ", seconds=5)
+    listed = " ".join(lister.since(mark))
+    check("a peer cannot name a channel into existence after its burst",
+          ghost not in listed, listed[-200:])
+
+    # And on a channel that does exist, the list it can grow is bounded.
+    real = f"#real{RUN}"
+    resident = Client(f"r{RUN}", port=A_PORT)
+    resident.join(real)
+    time.sleep(0.5)
+    before = a_log()
+    # Inside the 16 KB a link line may be, so this reaches the handler rather
+    # than being turned away for length: one line, two thousand names, and a
+    # database write for each of them if nothing says otherwise.
+    peer.send(f":{B_SID} CACCESS {int(time.time())} {real} o :" + " ".join(
+        f"f{n}" for n in range(2000)))
+    time.sleep(1.2)
+    new_log = a_log()[len(before):]
+    check("nor send an access list longer than a channel can hold",
+          "longer than a channel can hold" in new_log,
+          [l for l in new_log.splitlines() if "Refusing" in l][:2])
+    check("and A is still serving", still_serving("an oversized access list"))
+
+    # Naming channels as fast as it can, each with an owner.
+    named = 0
+    stop = time.time() + 3
+    while time.time() < stop:
+        try:
+            peer.send(f":{B_SID} CACCESS {int(time.time())} #fill{named} f :owner{named}")
+            named += 1
+        except OSError:
+            break
+    time.sleep(1.0)
+    mark = lister.mark()
+    lister.send("LIST")
+    lister.wait_for(" 323 ", seconds=5)
+    after_flood = " ".join(lister.since(mark))
+    check(f"{named} channels claimed by a peer make none of them",
+          "#fill0" not in after_flood and "#fill1 " not in after_flood,
+          after_flood[-200:])
+    check("and A is still serving", still_serving("a flood of claimed channels"))
+    lister.close()
+    resident.close()
+
+    # Whose channel it is, on every TS network, is settled by whose copy is
+    # older. That makes the timestamp the one number a peer most gains by lying
+    # about: claim 1970 and the channel is yours everywhere, with your modes.
+    stolen = f"#stolen{RUN}"
+    settler = Client(f"s{RUN}", port=A_PORT)
+    settler.join(stolen)
+    settler.send(f"MODE {stolen} +t")
+    settler.read(1.2)
+    mark = settler.mark()
+    settler.send(f"MODE {stolen}")
+    settler.read(1.2)
+    ours = [l for l in settler.since(mark) if " 329 " in l]
+    before = a_log()
+    peer.send(f":{B_SID} SJOIN 0 {stolen} +im :{B_SID}AAAAAA")
+    peer.send(f":{B_SID} SJOIN -9223372036854775808 {stolen} +k stolenkey :{B_SID}AAAAAA")
+    peer.send(f":{B_SID} CACCESS 0 {stolen} f :thief")
+    time.sleep(1.2)
+    new_log = a_log()[len(before):]
+    check("a peer cannot claim a channel was made before the millennium",
+          "could not have" in new_log,
+          [l for l in new_log.splitlines() if "Refusing" in l][:2])
+    mark = settler.mark()
+    settler.send(f"MODE {stolen}")
+    settler.read(1.2)
+    after = " ".join(settler.since(mark))
+    check("so the channel keeps the age it really has",
+          bool(ours) and ours[0].split()[-1] in after, (ours[:1], after[-160:]))
+    check("and does not take the modes that came with the lie",
+          "k" not in after.split(f"{stolen} ")[-1].split()[0] if f"{stolen} " in after else True,
+          after[-160:])
+    settler.close()
+
     # Nonsense at volume, on a connection that has been believed.
     junk = 0
     stop = time.time() + 4

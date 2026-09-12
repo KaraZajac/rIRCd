@@ -434,7 +434,7 @@ async fn handle_join_inner(
         }
 
         let is_first = ch.members.is_empty();
-        let (persisted_op, persisted_voice) = ch.persisted_modes_for(&nick, account.as_deref());
+        let (persisted_op, persisted_voice) = ch.persisted_modes_for(account.as_deref());
         // Whoever creates a channel while logged in becomes its founder, and is
         // opped whenever they return.
         if is_first && ch.founder.is_empty() {
@@ -1679,12 +1679,27 @@ pub async fn handle_mode(
                         // database for the next one.
                         if let Some(c) = state.clients.get(&target_id) {
                             let g = c.read().await;
-                            let who = g
-                                .account
-                                .clone()
-                                .unwrap_or_else(|| g.nick_or_id().to_string());
+                            // Only an account is written down. Somebody not
+                            // logged in is an operator for as long as they are
+                            // here, and that is all: remembering a name would
+                            // hand the status to whoever took the name next.
+                            let who = match g.account.clone() {
+                                Some(account) => account,
+                                None => {
+                                    drop(g);
+                                    continue;
+                                }
+                            };
                             if plus {
-                                if !ch.persisted_operators.contains(&who) {
+                                // Status that outlives a visit is written down,
+                                // and what is written down needs a ceiling.
+                                // The operator status itself still applies for
+                                // as long as they are here; it is only the
+                                // remembering that stops.
+                                if !ch.persisted_operators.contains(&who)
+                                    && ch.persisted_operators.len()
+                                        < crate::channel::MAX_CHANNEL_ACCESS
+                                {
                                     ch.persisted_operators.push(who.clone());
                                 }
                             } else {
@@ -1856,7 +1871,10 @@ pub async fn handle_mode(
                                             .clone()
                                             .unwrap_or_else(|| g.nick_or_id().to_string());
                                         if plus {
-                                            if !ch.persisted_voice.contains(&who) {
+                                            if !ch.persisted_voice.contains(&who)
+                                                && ch.persisted_voice.len()
+                                                    < crate::channel::MAX_CHANNEL_ACCESS
+                                            {
                                                 ch.persisted_voice.push(who.clone());
                                             }
                                         } else {
@@ -3401,7 +3419,20 @@ pub async fn handle_chanown(
     let Some(founder) = ({
         let store = channels.read().await;
         match store.channels.get(&ch_key) {
-            Some(ch) => Some(ch.read().await.founder.clone()),
+            Some(ch) => {
+                let ch = ch.read().await;
+                // A channel that hides itself hides itself here too. Answering
+                // "only the founder may do that" to somebody who cannot see the
+                // channel tells them it exists, which is the one thing +s is
+                // for. Whoever owns it, and an operator, can always see it.
+                let user_id = state.read().await.user_id(client_id);
+                let hidden = ch.modes.secret || ch.modes.invite_only;
+                let may_see = !hidden
+                    || is_oper
+                    || ch.is_member(&user_id)
+                    || ch.is_founder(account.as_deref());
+                may_see.then(|| ch.founder.clone())
+            }
             None => None,
         }
     }) else {
@@ -3516,7 +3547,10 @@ pub async fn handle_chanown(
         let mut ch = entry.write().await;
         ch.founder = new_owner.clone();
         for who in [&new_owner, &founder] {
-            if !who.is_empty() && !ch.persisted_operators.iter().any(|o| o == who) {
+            if !who.is_empty()
+                && !ch.persisted_operators.iter().any(|o| o == who)
+                && ch.persisted_operators.len() < crate::channel::MAX_CHANNEL_ACCESS
+            {
                 ch.persisted_operators.push(who.clone());
             }
         }

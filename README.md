@@ -555,7 +555,7 @@ traditional network is done by the server itself, against MariaDB.
 | Nick recovery | `GHOST <nick>` closes a stale session of your own that is holding it, wherever on the network it is |
 | Channel founder | The account that creates a channel; always opped on join, never shut out of it by its own `+b`/`+i`/`+k`/`+l`, and not kickable or deoppable in it |
 | Channel transfer | `CHANOWN #channel <account>` — by the founder, or by an operator, said out loud in the channel |
-| Channel access lists | `MODE +o` / `+v` by an operator is remembered and restored on the next join |
+| Channel access lists | `MODE +o` / `+v` on an **account** is remembered and restored on the next join. Somebody not logged in holds the status while they are there and no longer: a name proves nothing, so remembering one would hand the status to whoever took it next |
 | Channel modes, topic, key | Persisted; kept when an owned channel empties, and restored on startup |
 | Ban lists (`AKICK`-ish) | `+b`, `+e`, `+I` and `+q` masks are persisted and restored |
 | Network bans | `KLINE` / `UNKLINE`, persisted and enforced on connect |
@@ -617,7 +617,7 @@ forgotten would seal the channel rather than save it.
 - **Topic** — persisted whenever a channel topic is set; 333 RPL_TOPICWHOTIME and 329 RPL_CREATIONTIME sent on JOIN.
 - **Channel modes** — mode flags (`+imnstRcC`), key (`+k`), and user limit (`+l`) are saved to the database on every MODE change, kept when an owned channel empties, and restored on startup.
 - **Ban and exception lists** — `+b`, `+e`, `+I` and `+q` masks are saved per channel and restored, so neither an empty room nor a restart makes an owned channel forget who was banned.
-- **Operators / Voice** — stored per channel; users in these lists receive `@`/`+` automatically when they join.
+- **Operators / Voice** — stored per channel **by account**; whoever logs in to one receives `@`/`+` automatically when they join, under any nick. Status granted to somebody with no account applies while they are present and is not written down. Rows stored under a bare nick by an older version are dropped at startup, with a count in the log — they granted nothing that could be trusted, because nick reservation is what would have protected them and it fails open when the database is unreachable.
 - **Direct messages** — private conversations are stored per nick pair and replayed by `CHATHISTORY <nick>`; `CHATHISTORY TARGETS` lists only the requesting user's own conversations.
 - **Message history** — PRIVMSG, NOTICE, and channel events (JOIN, PART, QUIT, TOPIC, NICK) are appended (up to 1,000 entries per channel, oldest pruned). Clients with `draft/chathistory` can request history via `CHATHISTORY LATEST/BEFORE/AFTER/AROUND/BETWEEN #channel <cursor> <limit>` or list active conversations with `CHATHISTORY TARGETS timestamp=<from> timestamp=<to> <limit>`. Clients with `draft/event-playback` receive the full event timeline; otherwise only messages are returned.
 - **Edit history** — Edited messages retain a pointer to their original msgid. On CHATHISTORY replay, clients with `draft/message-edit` receive the `+draft/edit` tag so they can update their local buffer.

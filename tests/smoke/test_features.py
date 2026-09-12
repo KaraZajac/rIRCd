@@ -615,6 +615,10 @@ if founder.find("VERIFICATION_REQUIRED", lines=founder.since(mark)):
         founder.read(2.0)
 founder.join(owner_chan)
 
+# Status that outlives a visit is remembered against an account, and the
+# founder has one. Somebody not logged in holds what they are given while they
+# are here and no further: remembering a name would hand it to whoever took the
+# name next, and a name is not proof of anything.
 regular = Client(f"regular{RUN_ID}", caps=TAGS)
 regular.join(owner_chan)
 founder.send(f"MODE {owner_chan} +o regular{RUN_ID}")
@@ -629,30 +633,31 @@ ops = db(
     "SELECT nick_or_account FROM channel_operators o JOIN channels c ON c.id = o.channel_id "
     f"WHERE c.name = '{owner_chan}'"
 ).split("\n")
-check("granting +o is remembered", f"regular{RUN_ID}" in ops, ops)
-voice = db(
-    "SELECT nick_or_account FROM channel_voice v JOIN channels c ON c.id = v.channel_id "
-    f"WHERE c.name = '{owner_chan}'"
-).split("\n")
-check("granting +v is remembered", f"regular{RUN_ID}" in voice, voice)
+check("the founder's own standing is remembered", f"founder{RUN_ID}" in ops, ops)
+check("a grant to a name with no account behind it is not",
+      f"regular{RUN_ID}" not in ops, ops)
 
+mark = regular.mark()
+regular.send(f"NAMES {owner_chan}")
+regular.read(1.2)
+here_now = " ".join(regular.find(" 353 ", lines=regular.since(mark)))
+check("though it applies for as long as they are here",
+      f"@regular{RUN_ID}" in here_now, here_now)
 regular.close()
-time.sleep(0.5)
-returning = Client(f"regular{RUN_ID}", caps=TAGS)
-mark = returning.mark()
-returning.join(owner_chan)
-names = " ".join(returning.find(" 353 ", lines=returning.since(mark)))
-check("status is restored on the next join", f"@regular{RUN_ID}" in names, names)
 
-mark = founder.mark()
-founder.send(f"MODE {owner_chan} -o regular{RUN_ID}")
-founder.read(1.5)
-time.sleep(1.0)
-ops = db(
-    "SELECT nick_or_account FROM channel_operators o JOIN channels c ON c.id = o.channel_id "
-    f"WHERE c.name = '{owner_chan}'"
-)
-check("taking it away is remembered too", f"regular{RUN_ID}" not in ops.split("\n"), ops)
+# The founder comes back under another name: the status is the account's.
+founder.close()
+time.sleep(0.5)
+back_nick = f"backagain{RUN_ID}"
+returning = connect_negotiating(back_nick, caps=["sasl"])
+returning.sasl_plain(f"founder{RUN_ID}", PASSWORD)
+returning.send("CAP END")
+returning.wait_for(" 001 ", seconds=6)
+returning.join(owner_chan)
+returning.read(1.5)
+names = " ".join(returning.find(" 353 "))
+check("an account's standing is restored under any name",
+      f"@{back_nick}" in names, returning.lines[-6:])
 returning.close()
 founder.close()
 

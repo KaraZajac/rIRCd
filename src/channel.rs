@@ -1,5 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// Operators or voices a channel may remember at once.
+///
+/// Status that outlives a visit has to be written down, and anything written
+/// down needs a ceiling or it is somewhere to put things. The same number the
+/// ban list uses: a channel that needs a hundred standing operators is not
+/// being run by its operators.
+pub const MAX_CHANNEL_ACCESS: usize = 100;
+
 /// Channel membership with mode prefixes
 #[derive(Debug, Clone)]
 pub struct ChannelMembership {
@@ -62,9 +70,16 @@ pub struct Channel {
     pub ban_exceptions: Vec<String>,
     /// Invite exceptions (+I masks): users matching these can join invite-only channels
     pub invite_exceptions: Vec<String>,
-    /// From channels.toml: nicks/accounts that get @ when they join
+    /// Accounts that get @ when they join.
+    ///
+    /// Accounts, not nicks. Status that outlives a visit belongs to whoever
+    /// can prove they are the same person, and a nick proves nothing: names
+    /// are given up and taken. Matching one here would mean that taking a name
+    /// was enough to inherit what it had been given — and nick reservation,
+    /// which is what would normally stop that, deliberately fails open when the
+    /// database is unreachable.
     pub persisted_operators: Vec<String>,
-    /// From channels.toml: nicks/accounts that get + when they join
+    /// Accounts that get + when they join. Accounts for the same reason.
     pub persisted_voice: Vec<String>,
     /// Channel creation time (Unix timestamp); sent as 329 RPL_CREATIONTIME
     pub created_at: i64,
@@ -187,16 +202,13 @@ impl Channel {
     }
 
     /// Returns (op, voice) for a joining user based on nick/account and persisted lists.
-    pub fn persisted_modes_for(&self, nick: &str, account: Option<&str>) -> (bool, bool) {
-        let nick_lower = crate::casefold::lower(nick);
-        let account_str = crate::casefold::lower(account.unwrap_or(""));
-        let is_op = self.persisted_operators.iter().any(|s| {
-            crate::casefold::lower(s) == nick_lower || crate::casefold::lower(s) == account_str
-        });
-        let is_voice = self.persisted_voice.iter().any(|s| {
-            crate::casefold::lower(s) == nick_lower || crate::casefold::lower(s) == account_str
-        });
-        (is_op, is_voice)
+    pub fn persisted_modes_for(&self, account: Option<&str>) -> (bool, bool) {
+        let Some(account) = account else {
+            return (false, false);
+        };
+        let wanted = crate::casefold::lower(account);
+        let held = |list: &[String]| list.iter().any(|s| crate::casefold::lower(s) == wanted);
+        (held(&self.persisted_operators), held(&self.persisted_voice))
     }
 
     /// Check if the client is banned (account-extban ~a: or hostmask glob match).
