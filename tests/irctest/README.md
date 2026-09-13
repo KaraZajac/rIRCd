@@ -52,8 +52,10 @@ takes server startup from ~6s to ~0.3s. Workers get their own databases, so
 server's own extensions — irctest doubles as the integration suite for Ergo and
 Sable, and those tests assert their behaviour, not the specification's.
 `not deprecated` drops superseded specifications such as the old METADATA
-draft, and `not strict` drops tests asserting a stricter reading than the
-specification requires. Override with `IRCTEST_MARKERS` to see them.
+draft. The `strict` tests — those asserting a stricter reading than the
+specification requires — all pass, so they are run by default; a suite that
+skips what it could pass is measuring less than it might. Override with
+`IRCTEST_MARKERS` to change any of this.
 
 ## What is left
 
@@ -79,7 +81,7 @@ first, with accounts and history built in the way rIRCd has them.
 curl -sL https://github.com/ergochat/ergo/releases/download/v2.19.1/ergo-2.19.1-linux-x86_64.tar.gz | tar xz
 cd target/irctest && PATH=$PWD/../../ergo-2.19.1-linux-x86_64:$PATH \
   ../irctest-venv/bin/pytest --controller irctest.controllers.ergo \
-  -m 'not implementation-specific and not deprecated and not strict' \
+  -m 'not implementation-specific and not deprecated' \
   --deselect 'irctest/server_tests/links.py::ServicesLinksTestCase::testLinksWithServices' \
   --timeout 600 -n 4 -q -rs
 ```

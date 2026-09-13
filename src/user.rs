@@ -810,6 +810,10 @@ pub struct ServerState {
     /// expensive on purpose, so an address that keeps getting it wrong is told
     /// no before anything is checked.
     pub auth_cost: crate::authcost::AuthCost,
+    /// Users held on behalf of other servers, kept as a count so the ceiling
+    /// on them is a comparison rather than a walk through every user on every
+    /// line of a burst.
+    pub remote_users: usize,
     /// Most clients connected at once since start, for the `max` field of
     /// RPL_LOCALUSERS/RPL_GLOBALUSERS. Clients come and go, so the current
     /// count is not a high-water mark.
@@ -1085,10 +1089,13 @@ impl ServerState {
         self.clients.remove(&user_id);
         self.session_to_user.remove(&user_id);
         self.forget_session(&user_id);
-        let (nick, account) = {
+        let (nick, account, remote) = {
             let g = client.read().await;
-            (g.nick.clone(), g.account.clone())
+            (g.nick.clone(), g.account.clone(), g.server.is_some())
         };
+        if remote {
+            self.remote_users = self.remote_users.saturating_sub(1);
+        }
         // Where a user with no account had read up to is filed under its
         // connection, and that connection is not coming back. An account's
         // markers are its own and are kept.

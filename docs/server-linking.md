@@ -155,6 +155,16 @@ answer beats disagreeing about a considered one.
 Each server writes down what it learns, so it does not forget at the next
 restart and start disagreeing with the network all over again.
 
+### What a peer cannot make this server hold
+
+A link is trusted with what it says, not with how much of it this server has
+room for. `max_remote_users` and `max_servers` in `[limits]` bound the users
+and servers a peer may introduce; past either, the introduction is refused and
+logged and the link stays up. A `CACCESS` line is held to the number of names a
+channel can hold, and after a peer's burst it can no longer name channels into
+existence. And nobody is seated in a channel who was never introduced: an
+`SJOIN` naming an id no `UID` announced is an `SJOIN` naming nobody.
+
 `msgid` and `time` are carried, not regenerated, so a message has one identity
 and one timestamp across the network — which is what lets chathistory on one
 server answer for a conversation that happened on another.

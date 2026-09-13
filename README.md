@@ -263,6 +263,8 @@ key  = "/etc/rIRCd/key.pem"
 | `max_connections_per_ip` | `16` | Connections allowed from one address; 0 for no limit. Read at startup, not on rehash |
 | `shared_address_listeners` | `[]` | Listeners where every client arrives from the same address — a Tor hidden service, or anything behind a local proxy. The per-address limit cannot mean anything there, so connections on these are counted against the listener instead. Must name a `listen`, `listen_tls`, `listen_ws` or `listen_wss` address exactly; the server refuses to start if it does not, because a typo would silently leave the listener capped at `max_connections_per_ip`. Read at startup, not on rehash |
 | `max_clients_behind_one_address` | `256` | The cap that stands in for the per-address one on those listeners; 0 leaves only `max_clients` |
+| `max_remote_users` | `250000` | Users this server will hold on behalf of other servers; 0 for no limit. A link is trusted with what it says about its users, not with how many of them there is room for: past this, further introductions are refused and logged, and the link stays up |
+| `max_servers` | `512` | Servers this one will know about, direct peers included; 0 for no limit. No network has more than a few hundred |
 | `max_clients` | `0` | Connections allowed in total; 0 for no limit |
 | `max_line_length` | `512` | Longest message body accepted, before tags; advertised as `LINELEN` |
 | `flood_burst` | `10` | Commands a client may send back to back before being throttled |

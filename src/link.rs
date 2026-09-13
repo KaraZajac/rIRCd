@@ -1325,6 +1325,22 @@ async fn accept_remote_user(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
             // its own id until it picks another name.
             client.nick = Some(uid.clone());
         }
+        // A link is trusted with what it says about its users, not with how
+        // many of them this server has room for. Past the ceiling the user is
+        // refused and the link stays up: a peer that has introduced a quarter
+        // of a million people is not describing a network, and cutting the
+        // link would only make the real ones on it unreachable.
+        let ceiling = ctx.cfg.read().await.limits.max_remote_users;
+        if ceiling > 0 && state.remote_users >= ceiling {
+            warn!(
+                peer = %peer_sid,
+                uid = %uid,
+                ceiling,
+                "Refusing a user past max_remote_users"
+            );
+            return;
+        }
+        state.remote_users += 1;
         state.add_remote_user(client).await;
         kept
     };
@@ -1920,6 +1936,16 @@ async fn seat_member(
     uid: &str,
     modes: crate::channel::ChannelMemberModeSet,
 ) {
+    // Only somebody this server has been told about can be put in a channel.
+    // A burst introduces every user before the channels they are in, so an
+    // id nobody knows is not a person who arrived early; it is a name in an
+    // SJOIN that a peer could send a million of, each of which used to become
+    // a member with no user behind it — counted towards +l, listed by NAMES,
+    // and never removed, because nobody was there to leave.
+    if !ctx.state.read().await.clients.contains_key(uid) {
+        tracing::debug!(uid = %uid, channel = %key, "Not seating a user nobody introduced");
+        return;
+    }
     {
         let mut store = ctx.channels.write().await;
         let entry = store
@@ -2861,6 +2887,18 @@ async fn accept_remote_server(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
     let our_sid = ctx.state.read().await.sid.clone();
     if *sid == our_sid {
         warn!(peer = %peer_sid, sid = %sid, "A linked server is using our own id");
+        return;
+    }
+    let ceiling = ctx.cfg.read().await.limits.max_servers;
+    let known = ctx.links.read().await.count();
+    if ceiling > 0 && known >= ceiling {
+        warn!(
+            peer = %peer_sid,
+            server = %name,
+            known,
+            ceiling,
+            "Refusing a server past max_servers"
+        );
         return;
     }
     ctx.links.write().await.introduce(RemoteServer {

@@ -895,6 +895,17 @@ pub async fn handle_part(
     Ok(())
 }
 
+/// Whether a channel is hidden from this person: secret, and they are not in it.
+///
+/// `+s` withholds one thing, that the channel exists, and every query that
+/// answers differently for a secret channel than for one that is not there
+/// gives it away. So a hidden channel is treated as absent, wherever this is
+/// asked: the answer is whatever the answer for no channel at all would be.
+async fn hidden_from(ch: &RwLock<Channel>, state: &ServerState, client_id: &str) -> bool {
+    let ch = ch.read().await;
+    ch.modes.secret && !ch.is_member(&state.user_id(client_id))
+}
+
 pub async fn handle_names(
     client_id: &str,
     msg: Message,
@@ -921,6 +932,11 @@ pub async fn handle_names(
 
     if ch_names.is_empty() {
         for (ch_name, ch) in &ch_store.channels {
+            // A bare NAMES lists the channels a person may see, and a secret
+            // one they are not in is not among them.
+            if hidden_from(ch, &state, client_id).await {
+                continue;
+            }
             send_names_for_channel(
                 ch,
                 ch_name,
@@ -946,7 +962,16 @@ pub async fn handle_names(
 
     for ch_name in ch_names {
         let ch_key = canonical_channel_key(ch_name);
-        match ch_store.channels.get(&ch_key) {
+        // A secret channel this person is not in is answered as no channel:
+        // the one RPL_ENDOFNAMES the specification asks for, and nothing that
+        // says a channel was there to be secret about.
+        let mut entry = ch_store.channels.get(&ch_key);
+        if let Some(ch) = entry {
+            if hidden_from(ch, &state, client_id).await {
+                entry = None;
+            }
+        }
+        match entry {
             Some(ch) if single => {
                 send_names_for_channel(
                     ch,
@@ -1445,6 +1470,24 @@ pub async fn handle_mode(
             let is_op = member.map(|m| m.modes.op).unwrap_or(false);
 
             if msg.params.len() == 1 {
+                // The modes of a channel that hides itself are not for
+                // outsiders: the reply would carry `+s` in it, and with it the
+                // fact that there is a channel to be secret about. Answered
+                // the way a channel that does not exist is answered.
+                if member.is_none() && ch.modes.secret {
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        Message::new(
+                            "403",
+                            vec![nick.clone(), target.into(), "No such channel".into()],
+                        )
+                        .with_prefix(&cfg.server.name),
+                        label,
+                    )
+                    .await;
+                    return Ok(());
+                }
                 let mut modes = String::new();
                 if ch.modes.invite_only {
                     modes.push('i');
@@ -2465,6 +2508,28 @@ pub async fn handle_topic(
             .unwrap_or(false);
 
         if new_topic.is_none() {
+            // A channel that hides itself hides its topic. Answering with the
+            // topic — or with "no topic is set" — to somebody outside a +s
+            // channel tells them the channel exists, which is the one thing
+            // +s withholds. A +p channel may be known to exist but is not
+            // read from outside.
+            let member = ch.is_member(&state.user_id(client_id));
+            if !member && (ch.modes.secret || ch.modes.private) {
+                let (numeric, text) = if ch.modes.secret {
+                    ("403", "No such channel")
+                } else {
+                    ("442", "You're not on that channel")
+                };
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(numeric, vec![nick.clone(), ch_name.into(), text.into()])
+                        .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
             if let Some(ref topic) = ch.topic {
                 reply_to_client(
                     &senders,

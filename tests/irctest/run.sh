@@ -65,10 +65,11 @@ MSG
 fi
 
 # Deselect what is not about us: tests for another server's own extensions
-# (irctest doubles as Ergo's and Sable's integration suite), for deprecated
-# specifications, and ones asserting a stricter reading than the specification
-# requires.
-MARKERS="${IRCTEST_MARKERS:-not implementation-specific and not deprecated and not strict}"
+# (irctest doubles as Ergo's and Sable's integration suite) and for deprecated
+# specifications. The `strict` tests — the ones asserting a stricter reading
+# than the specification requires — all pass, so they are held to as well:
+# a suite that skips what it could pass is measuring less than it might.
+MARKERS="${IRCTEST_MARKERS:-not implementation-specific and not deprecated}"
 
 # rIRCd's services are part of the server rather than a second one linked to
 # it, so LINKS on a one-server network lists one server. This test asserts a

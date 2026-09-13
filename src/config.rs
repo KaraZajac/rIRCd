@@ -572,6 +572,19 @@ pub struct LimitsConfig {
     /// 0 for no limit, which leaves only `max_clients`.
     #[serde(default = "default_max_behind_one_address")]
     pub max_clients_behind_one_address: usize,
+    /// Users this server will hold on behalf of other servers; 0 for no limit.
+    ///
+    /// A link is trusted with what it says about its users, not with how many
+    /// of them this server has room for. Every user a peer introduces is kept
+    /// here for as long as it stays, and a peer that introduces them without
+    /// end is not describing a network. Past this, further introductions are
+    /// refused and logged; the link stays up.
+    #[serde(default = "default_max_remote_users")]
+    pub max_remote_users: usize,
+    /// Servers this one will know about, its direct peers included; 0 for no
+    /// limit. No network has more than a few hundred.
+    #[serde(default = "default_max_servers")]
+    pub max_servers: usize,
     /// Longest message body accepted, before tags. 512 is the protocol's own
     /// limit and the default; raising it lets clients send the long SASL
     /// responses and passwords that some do. Advertised as LINELEN.
@@ -608,6 +621,14 @@ fn default_max_per_ip() -> usize {
 fn default_max_behind_one_address() -> usize {
     256
 }
+/// Generous, because a real large network is real. It is a ceiling on a lie,
+/// not a rule about people.
+fn default_max_remote_users() -> usize {
+    250_000
+}
+fn default_max_servers() -> usize {
+    512
+}
 fn default_max_line_length() -> usize {
     crate::protocol::DEFAULT_MAX_MESSAGE_BODY
 }
@@ -629,6 +650,8 @@ impl Default for LimitsConfig {
             max_connections_per_ip: default_max_per_ip(),
             shared_address_listeners: Vec::new(),
             max_clients_behind_one_address: default_max_behind_one_address(),
+            max_remote_users: default_max_remote_users(),
+            max_servers: default_max_servers(),
             max_clients: 0,
             max_line_length: default_max_line_length(),
             flood_burst: default_flood_burst(),

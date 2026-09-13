@@ -760,6 +760,43 @@ check("nor the ban list", not nosy.find(" 216 ", lines=told), told[-3:])
 check("but uptime is still anybody's", bool(nosy.find(" 242 ", lines=told)), told[-3:])
 nosy.close()
 
+section("a channel that hides itself")
+
+# +s withholds one thing: that the channel exists. Every query that answers
+# differently for a secret channel than for one that does not exist gives it
+# away, and TOPIC, MODE and NAMES were each answering an outsider in full.
+keeper = Client(f"keep{SUF}")
+keeper.join(f"#hidden{SUF}")
+keeper.send(f"TOPIC #hidden{SUF} :nothing to see")
+keeper.send(f"MODE #hidden{SUF} +s")
+keeper.read(1.2)
+outsider = Client(f"out{SUF}")
+mark = outsider.mark()
+outsider.send(f"TOPIC #hidden{SUF}")
+outsider.send(f"MODE #hidden{SUF}")
+outsider.send(f"NAMES #hidden{SUF}")
+outsider.read(1.5)
+asked = outsider.since(mark)
+check("its topic is not read from outside", not outsider.find("nothing to see", lines=asked)
+      and bool(outsider.find(" 403 ", f"#hidden{SUF}", lines=asked)), asked[-4:])
+check("nor its modes", not outsider.find(" 324 ", lines=asked), asked[-4:])
+check("nor its members", not outsider.find(" 353 ", lines=asked) and bool(outsider.find(" 366 ", lines=asked)),
+      asked[-4:])
+mark = outsider.mark()
+outsider.send("NAMES")
+outsider.read(1.5)
+check("and a bare NAMES does not list it either",
+      not outsider.find(f"#hidden{SUF}", lines=outsider.since(mark)), outsider.since(mark)[-3:])
+mark = keeper.mark()
+keeper.send(f"TOPIC #hidden{SUF}")
+keeper.send(f"MODE #hidden{SUF}")
+keeper.read(1.2)
+check("while a member sees all of it",
+      bool(keeper.find("nothing to see", lines=keeper.since(mark))) and bool(keeper.find(" 324 ", lines=keeper.since(mark))),
+      keeper.since(mark)[-3:])
+outsider.close()
+keeper.close()
+
 section("identity fields that would break a prefix")
 
 # :nick!user@host is read by splitting on space, ! and @. A username or host

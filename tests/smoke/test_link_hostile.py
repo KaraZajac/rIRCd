@@ -335,6 +335,42 @@ if linked:
           after[-160:])
     settler.close()
 
+    # A link is trusted with what it says about its users, not with how many
+    # of them this server has room for. The harness sets max_remote_users = 60
+    # and max_servers = 6, so a peer that keeps introducing is refused past
+    # that, and the link stays up.
+    before = a_log()
+    for n in range(120):
+        peer.send(f":{B_SID} UID crowd{n} 1 {int(time.time())} c{n} crowd.test {B_SID}C{n:05d} * :Crowd {n}")
+    time.sleep(1.5)
+    counter = Client(f"cnt{RUN}", port=A_PORT)
+    mark = counter.mark()
+    counter.send("WHOIS crowd10")
+    counter.read(1.5)
+    early = bool(counter.find(" 311 ", "crowd10", lines=counter.since(mark)))
+    mark = counter.mark()
+    counter.send("WHOIS crowd115")
+    counter.read(1.5)
+    late = bool(counter.find(" 401 ", lines=counter.since(mark)))
+    check("a peer's users are accepted up to the room this server has for them", early,
+          counter.since(mark)[-2:])
+    check("and refused past it, with the link still up", late and "max_remote_users" in a_log()[len(before):],
+          [l for l in a_log()[len(before):].splitlines() if "Refus" in l][-2:])
+
+    before = a_log()
+    for n in range(12):
+        peer.send(f":{B_SID} SERVER fake{n}.crowd.test 2 {n % 10}Z{chr(65 + n)} :A server that is not there")
+    time.sleep(1.2)
+    mark = counter.mark()
+    counter.send("LINKS")
+    counter.wait_for(" 365 ", seconds=5)
+    listed = len([l for l in counter.since(mark) if " 364 " in l])
+    check("nor can it introduce more servers than a network has",
+          listed <= 8 and "max_servers" in a_log()[len(before):],
+          (listed, [l for l in a_log()[len(before):].splitlines() if "Refus" in l][-2:]))
+    check("and A is still serving", still_serving("a peer introducing without end"))
+    counter.close()
+
     # Nonsense at volume, on a connection that has been believed.
     junk = 0
     stop = time.time() + 4
