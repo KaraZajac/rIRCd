@@ -582,7 +582,13 @@ pub struct LimitsConfig {
     #[serde(default = "default_max_targets")]
     pub max_targets: usize,
     /// Connections allowed in total; 0 for no limit.
-    #[serde(default)]
+    ///
+    /// Ten thousand by default rather than none: every other limit here is
+    /// per address, and an attacker with many addresses — anybody with IPv6
+    /// has a great many /64s to rent — meets nothing until this one. It is
+    /// a ceiling on the server, not a number anybody honest reaches by
+    /// accident, and a server that does reach it wants to have decided so.
+    #[serde(default = "default_max_clients")]
     pub max_clients: usize,
     /// Listeners where every client arrives from the same address — a Tor
     /// hidden service, or anything behind a local proxy.
@@ -638,6 +644,9 @@ fn default_max_channels() -> usize {
 fn default_max_per_ip() -> usize {
     16
 }
+fn default_max_clients() -> usize {
+    10_000
+}
 /// Thirty a minute: a person reconnecting after a bad network does it a
 /// handful of times; a client on a broken auto-reconnect might reach this and
 /// is better off being told to wait a minute than let loose on the server.
@@ -683,13 +692,13 @@ impl Default for LimitsConfig {
             max_channels_per_client: default_max_channels(),
             max_targets: default_max_targets(),
             max_connections_per_ip: default_max_per_ip(),
+            max_clients: default_max_clients(),
             max_connections_per_ip_per_minute: default_max_per_ip_per_minute(),
             max_registrations_per_ip: default_max_registrations_per_ip(),
             shared_address_listeners: Vec::new(),
             max_clients_behind_one_address: default_max_behind_one_address(),
             max_remote_users: default_max_remote_users(),
             max_servers: default_max_servers(),
-            max_clients: 0,
             max_line_length: default_max_line_length(),
             flood_burst: default_flood_burst(),
             flood_rate: default_flood_rate(),

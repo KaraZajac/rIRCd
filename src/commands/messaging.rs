@@ -689,6 +689,34 @@ pub async fn handle_privmsg(
             }
 
             // +R: registered users only for speaking
+            // +M: the room is open, the floor is not. A voice or ops is
+            // permission to speak, so it lifts this the way it lifts +m.
+            if ch.modes.registered_speak
+                && sender_account.is_none()
+                && !ch
+                    .members
+                    .get(&state_guard.user_id(client_id))
+                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .unwrap_or(false)
+            {
+                reply_to_sender(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "404",
+                        vec![
+                            sender_nick.clone(),
+                            target.into(),
+                            "You must be logged in to speak here (+M)".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                    parent_batch,
+                )
+                .await;
+                return Ok(());
+            }
             if ch.modes.registered_only && sender_account.is_none() {
                 reply_to_sender(
                     &senders,
@@ -1090,6 +1118,18 @@ pub async fn handle_notice(
                 return Ok(()); // NOTICE silently drops per RFC
             }
             // +R: registered-only channel
+            // +M: the room is open, the floor is not. A voice or ops is
+            // permission to speak, so it lifts this the way it lifts +m.
+            if ch.modes.registered_speak
+                && sender_account.is_none()
+                && !ch
+                    .members
+                    .get(&state_guard.user_id(client_id))
+                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .unwrap_or(false)
+            {
+                return Ok(());
+            }
             if ch.modes.registered_only && sender_account.is_none() {
                 return Ok(());
             }
@@ -1764,6 +1804,33 @@ pub async fn handle_tagmsg(
             }
 
             // +R: registered users only for speaking
+            // +M: the room is open, the floor is not. A voice or ops is
+            // permission to speak, so it lifts this the way it lifts +m.
+            if ch.modes.registered_speak
+                && sender_account.is_none()
+                && !ch
+                    .members
+                    .get(&state_guard.user_id(client_id))
+                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .unwrap_or(false)
+            {
+                reply_to_sender(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "404",
+                        vec![
+                            target.into(),
+                            "You must be logged in to speak here (+M)".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                    parent_batch,
+                )
+                .await;
+                return Ok(());
+            }
             if ch.modes.registered_only && sender_account.is_none() {
                 reply_to_sender(
                     &senders,

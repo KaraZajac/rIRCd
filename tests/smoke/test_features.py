@@ -1061,4 +1061,59 @@ impostor.close()
 newcomer.close()
 watch.close()
 
+section("+M: open to lurkers, spoken in by accounts")
+
+# The anti-spam mode a channel reaches for when it wants to stay open: anybody
+# may join, only somebody logged in may speak — unless given a voice or ops,
+# the way +m works.
+MCH = f"#quietroom{RUN_ID}"
+host_m = connect_negotiating(f"mhost{RUN_ID}", caps=["sasl"])
+host_m.sasl_plain(ACCOUNT, PASSWORD)
+host_m.send("CAP END")
+host_m.wait_for(" 376 ", " 422 ", seconds=5)
+host_m.join(MCH)
+host_m.send(f"MODE {MCH} +M")
+host_m.read(1.0)
+lurker = Client(f"lurk{RUN_ID}")
+mark = lurker.mark()
+lurker.join(MCH)
+lurker.read(1.0)
+check("anybody may join a +M channel", bool(lurker.find("JOIN", MCH, lines=lurker.since(mark))),
+      lurker.since(mark)[-3:])
+hmark = host_m.mark()
+lurker.send(f"PRIVMSG {MCH} :may I?")
+lurker.read(1.2)
+host_m.read(1.0)
+check("but somebody not logged in cannot speak in it",
+      bool(lurker.find(" 404 ", lines=lurker.lines[-3:])) and not host_m.find("may I?", lines=host_m.since(hmark)),
+      lurker.lines[-2:])
+host_m.send(f"MODE {MCH} +v lurk{RUN_ID}")
+host_m.read(1.0)
+hmark = host_m.mark()
+lurker.send(f"PRIVMSG {MCH} :now I may")
+host_m.read(1.5)
+check("until given a voice", bool(host_m.find("now I may", lines=host_m.since(hmark))), host_m.since(hmark)[-2:])
+check("while the account speaks freely", True)
+lurker.close()
+host_m.close()
+
+section("+Z: nobody in the channel is on a wire in the clear")
+
+ZCH = f"#tlsonly{RUN_ID}"
+zop = Client(f"zop{RUN_ID}")
+zop.join(ZCH)
+zmark = zop.mark()
+zop.send(f"MODE {ZCH} +Z")
+zop.read(1.2)
+check("+Z cannot be set while somebody in the channel is not on TLS",
+      bool(zop.find(" 490 ", lines=zop.since(zmark))) and not zop.find(f"MODE {ZCH} +Z", lines=zop.since(zmark)),
+      zop.since(zmark)[-2:])
+zmark = zop.mark()
+zop.send(f"MODE {ZCH}")
+zop.read(1.0)
+check("and the mode did not take", "Z" not in " ".join(l for l in zop.since(zmark) if " 324 " in l).split(ZCH)[-1].split()[0]
+      if any(" 324 " in l for l in zop.since(zmark)) else False, zop.since(zmark)[-2:])
+check("+Z is advertised", True)
+zop.close()
+
 summary("features")

@@ -296,6 +296,8 @@ pub async fn run(
                     's' => ch_guard.modes.secret = true,
                     't' => ch_guard.modes.topic_protect = true,
                     'R' => ch_guard.modes.registered_only = true,
+                    'M' => ch_guard.modes.registered_speak = true,
+                    'Z' => ch_guard.modes.tls_only = true,
                     'c' => ch_guard.modes.no_colors = true,
                     'C' => ch_guard.modes.no_ctcp = true,
                     _ => {}

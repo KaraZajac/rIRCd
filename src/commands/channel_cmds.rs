@@ -121,6 +121,7 @@ async fn handle_join_inner(
 
     let account = client_data.account.clone();
     let is_oper = client_data.oper;
+    let is_tls = client_data.is_tls;
     drop(client_data);
     // What this connection negotiated, not what the person behind it did on
     // some other client: a reply belongs to the one that asked.
@@ -358,6 +359,19 @@ async fn handle_join_inner(
                     nick.clone(),
                     ch_name.to_string(),
                     "Cannot join channel (+b)".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name));
+            continue;
+        }
+
+        if ch.modes.tls_only && !is_tls {
+            reply_self!(Message::new(
+                "489",
+                vec![
+                    nick.clone(),
+                    ch_name.to_string(),
+                    "Cannot join channel (+Z) - TLS connection required".into(),
                 ],
             )
             .with_prefix(&cfg.server.name));
@@ -1507,6 +1521,12 @@ pub async fn handle_mode(
                 if ch.modes.registered_only {
                     modes.push('R');
                 }
+                if ch.modes.registered_speak {
+                    modes.push('M');
+                }
+                if ch.modes.tls_only {
+                    modes.push('Z');
+                }
                 if ch.modes.no_colors {
                     modes.push('c');
                 }
@@ -1602,6 +1622,47 @@ pub async fn handle_mode(
                     'n' => ch.modes.no_external = plus,
                     'm' => ch.modes.moderated = plus,
                     'R' => ch.modes.registered_only = plus,
+                    'M' => ch.modes.registered_speak = plus,
+                    'Z' => {
+                        // +Z promises that everyone in the channel is on TLS.
+                        // Setting it over somebody who is not would make the
+                        // promise false from its first moment, so it is
+                        // refused until they leave or reconnect properly.
+                        if plus {
+                            let mut plain = Vec::new();
+                            for member_id in ch.members.keys() {
+                                if let Some(c) = state.clients.get(member_id) {
+                                    let g = c.read().await;
+                                    if !g.is_tls && g.server.is_none() {
+                                        plain.push(g.nick_or_id().to_string());
+                                    }
+                                }
+                            }
+                            if !plain.is_empty() {
+                                reply_to_client(
+                                    &senders,
+                                    client_id,
+                                    Message::new(
+                                        "490",
+                                        vec![
+                                            nick.clone(),
+                                            target.into(),
+                                            format!(
+                                                "Cannot set +Z: not connected over TLS: {}",
+                                                plain.join(", ")
+                                            ),
+                                        ],
+                                    )
+                                    .with_prefix(&cfg.server.name),
+                                    label,
+                                )
+                                .await;
+                                rejected_modes.push(('Z', plus));
+                                continue;
+                            }
+                        }
+                        ch.modes.tls_only = plus;
+                    }
                     'c' => ch.modes.no_colors = plus,
                     'C' => ch.modes.no_ctcp = plus,
                     'k' => {
@@ -2200,6 +2261,12 @@ pub async fn handle_mode(
                 }
                 if ch.modes.registered_only {
                     flags.push('R');
+                }
+                if ch.modes.registered_speak {
+                    flags.push('M');
+                }
+                if ch.modes.tls_only {
+                    flags.push('Z');
                 }
                 if ch.modes.no_colors {
                     flags.push('c');

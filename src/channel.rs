@@ -99,6 +99,14 @@ pub struct ChannelModeSet {
     pub no_external: bool,     // +n
     pub moderated: bool,       // +m
     pub registered_only: bool, // +R: only authed users may join/speak
+    /// +M: anybody may join, but only somebody logged in may speak — unless
+    /// they have been given a voice or ops, the way +m works. The anti-spam
+    /// mode a channel reaches for when it wants to stay open to lurkers.
+    pub registered_speak: bool,
+    /// +Z: only connections over TLS may join, and it cannot be set while
+    /// anybody in the channel is not. What is said in a +Z channel has never
+    /// crossed a wire in the clear, on any hop this server controls.
+    pub tls_only: bool,
     pub no_colors: bool,       // +c: strip mIRC color codes
     pub no_ctcp: bool,         // +C: block CTCP to channel
     pub user_limit: Option<u32>,
@@ -270,6 +278,8 @@ impl Channel {
             (self.modes.topic_protect, 't'),
             (self.modes.private, 'p'),
             (self.modes.registered_only, 'R'),
+            (self.modes.registered_speak, 'M'),
+            (self.modes.tls_only, 'Z'),
             (self.modes.no_colors, 'c'),
             (self.modes.no_ctcp, 'C'),
         ] {
@@ -307,6 +317,8 @@ impl Channel {
                 't' => self.modes.topic_protect = true,
                 'p' => self.modes.private = true,
                 'R' => self.modes.registered_only = true,
+                'M' => self.modes.registered_speak = true,
+                'Z' => self.modes.tls_only = true,
                 'c' => self.modes.no_colors = true,
                 'C' => self.modes.no_ctcp = true,
                 'k' => self.key = arg.next().cloned(),
@@ -334,6 +346,8 @@ impl Channel {
                 't' => self.modes.topic_protect = true,
                 'p' => self.modes.private = true,
                 'R' => self.modes.registered_only = true,
+                'M' => self.modes.registered_speak = true,
+                'Z' => self.modes.tls_only = true,
                 'c' => self.modes.no_colors = true,
                 'C' => self.modes.no_ctcp = true,
                 'k' => {

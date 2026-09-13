@@ -267,7 +267,7 @@ key  = "/etc/rIRCd/key.pem"
 | `max_clients_behind_one_address` | `256` | The cap that stands in for the per-address one on those listeners; 0 leaves only `max_clients` |
 | `max_remote_users` | `250000` | Users this server will hold on behalf of other servers; 0 for no limit. A link is trusted with what it says about its users, not with how many of them there is room for: past this, further introductions are refused and logged, and the link stays up |
 | `max_servers` | `512` | Servers this one will know about, direct peers included; 0 for no limit. No network has more than a few hundred |
-| `max_clients` | `0` | Connections allowed in total; 0 for no limit |
+| `max_clients` | `10000` | Connections allowed in total; 0 for no limit. Every other limit is per address, and anybody with IPv6 has a great many /64s to rent, so this is the one they meet |
 | `max_line_length` | `512` | Longest message body accepted, before tags; advertised as `LINELEN` |
 | `flood_burst` | `10` | Commands a client may send back to back before being throttled |
 | `flood_rate` | `1` | Commands per second the flood allowance refills at |
@@ -833,6 +833,8 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+k` | Channel key (password) |
 | `+l` | User limit |
 | `+R` | Registered users only — unregistered users cannot join or speak |
+| `+M` | Only registered users may speak; anybody may join. Somebody given a voice or ops may speak regardless, as with `+m`. The anti-spam mode for a channel that wants to stay open to lurkers |
+| `+Z` | TLS only — a connection not over TLS cannot join, and the mode cannot be set while anybody in the channel is not on TLS (490). What is said in a `+Z` channel has never crossed a wire in the clear on any hop this server controls |
 | `+c` | Strip mIRC colour and formatting codes from messages |
 | `+C` | Block CTCP messages (including `/me` actions) |
 
