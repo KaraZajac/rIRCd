@@ -389,6 +389,27 @@ they return. Leaving the channel, or being kicked from it, ends that.
 
 Endpoints the push service reports as gone (404/410), or that fail `max_failures` times in a row, are removed automatically. Clients should re-send an identical `WEBPUSH REGISTER` periodically (daily is typical) to keep a subscription fresh.
 
+### `[dnsbl]`
+
+Ask a DNS blocklist about every public address that connects. The addresses
+that open connections to IRC servers by the thousand are the same ones that do
+it to everybody else, and somebody has already written them down.
+
+```toml
+[dnsbl]
+zones = ["dnsbl.dronebl.org"]   # the first that answers decides
+action = "reject"               # or "warn": let them in, and log
+timeout_secs = 2
+cache_secs = 600
+```
+
+Each address is asked about once and the answer remembered. A lookup that
+times out counts as not listed — a resolver outage must never lock everybody
+out — and addresses that are not public are never asked about, nor is anything
+arriving on a `shared_address_listeners` port, since the address there is
+everybody's. A listed address is turned away before its first line with
+`ERROR :Closing link: Your address is listed in <zone>`.
+
 ### `[webirc]`
 
 Optional. Enables WEBIRC gateway support so reverse proxies can pass the real client IP.

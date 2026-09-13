@@ -32,6 +32,9 @@ pub struct Config {
     /// (draft/account-registration VERIFY). Present = verification required.
     #[serde(default)]
     pub email: Option<EmailConfig>,
+    /// Ask a DNS blocklist about every public address that connects.
+    #[serde(default)]
+    pub dnsbl: Option<DnsblConfig>,
     /// Web Push notifications (draft/webpush).
     #[serde(default)]
     pub webpush: Option<WebpushConfig>,
@@ -215,6 +218,41 @@ fn default_mail_gap() -> u64 {
 }
 fn default_code_expiry() -> i64 {
     86_400
+}
+
+// ─── DNS blocklists ───────────────────────────────────────────────────────────
+
+/// A DNS blocklist to ask about every public address that connects.
+///
+/// The addresses that open connections to IRC servers by the thousand are the
+/// same ones that do it to everybody else, and somebody has already written
+/// them down. Asked once per address and cached; a lookup that times out
+/// counts as not listed, so a resolver outage never locks everybody out.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DnsblConfig {
+    /// Zones to ask, e.g. `["dnsbl.dronebl.org"]`. The first that answers
+    /// decides.
+    pub zones: Vec<String>,
+    /// `reject` (the default) turns a listed address away with an ERROR
+    /// naming the zone; `warn` lets it in and logs.
+    #[serde(default = "default_dnsbl_action")]
+    pub action: String,
+    /// How long to wait for a zone before treating the address as unlisted.
+    #[serde(default = "default_dnsbl_timeout")]
+    pub timeout_secs: u64,
+    /// How long an answer is remembered.
+    #[serde(default = "default_dnsbl_cache")]
+    pub cache_secs: u64,
+}
+
+fn default_dnsbl_action() -> String {
+    "reject".into()
+}
+fn default_dnsbl_timeout() -> u64 {
+    2
+}
+fn default_dnsbl_cache() -> u64 {
+    600
 }
 
 // ─── Web Push ─────────────────────────────────────────────────────────────────

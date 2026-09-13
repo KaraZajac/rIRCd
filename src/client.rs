@@ -42,6 +42,8 @@ pub struct ConnectionLimits {
     /// Set when this view serves a listener whose clients all arrive from the
     /// same address. See `on_listener`.
     shared: Option<SharedListener>,
+    /// A blocklist to ask about every public address, if one is configured.
+    dnsbl: Option<Arc<crate::dnsbl::Dnsbl>>,
 }
 
 /// A listener where counting by address cannot mean anything.
@@ -144,6 +146,27 @@ impl ConnectionLimits {
     pub fn with_rate(mut self, max_per_ip_per_minute: usize) -> Self {
         self.max_per_ip_per_minute = max_per_ip_per_minute;
         self
+    }
+
+    /// The same limits, asking a blocklist about every public address.
+    pub fn with_dnsbl(mut self, dnsbl: Option<Arc<crate::dnsbl::Dnsbl>>) -> Self {
+        self.dnsbl = dnsbl;
+        self
+    }
+
+    /// The zone that lists this address, if a blocklist is configured and one
+    /// does. Nothing on a listener behind one address: the address there is
+    /// everybody's.
+    pub async fn dnsbl_listing(&self, host: &str) -> Option<String> {
+        if self.shared.is_some() {
+            return None;
+        }
+        self.dnsbl.as_ref()?.listing(host).await
+    }
+
+    /// Whether a listing turns the connection away rather than being noted.
+    pub fn dnsbl_rejects(&self) -> bool {
+        self.dnsbl.as_ref().is_some_and(|d| d.rejects())
     }
 
     /// Addresses whose arrival history is remembered at once. Entries with
@@ -321,6 +344,15 @@ pub async fn handle_client_tls(
             return;
         }
     };
+    if let Some(zone) = limits.dnsbl_listing(&host).await {
+        if limits.dnsbl_rejects() {
+            tracing::warn!(%host, %zone, "Refused a TLS connection from a listed address");
+            refuse_connection_tls(stream, &server_name, &format!("Your address is listed in {zone}"))
+                .await;
+            return;
+        }
+        tracing::warn!(%host, %zone, "Connection from a listed address, allowed by configuration");
+    }
     handle_client_stream(
         stream,
         client_id,
@@ -356,6 +388,14 @@ pub async fn handle_client(
             return;
         }
     };
+    if let Some(zone) = limits.dnsbl_listing(&host).await {
+        if limits.dnsbl_rejects() {
+            tracing::warn!(%host, %zone, "Refused a connection from a listed address");
+            refuse_connection(stream, &server_name, &format!("Your address is listed in {zone}")).await;
+            return;
+        }
+        tracing::warn!(%host, %zone, "Connection from a listed address, allowed by configuration");
+    }
     handle_client_stream(
         stream,
         client_id,
@@ -766,6 +806,19 @@ pub async fn handle_client_ws(
             return;
         }
     };
+    if let Some(zone) = limits.dnsbl_listing(&host).await {
+        if limits.dnsbl_rejects() {
+            tracing::warn!(%host, %zone, "Refused a WebSocket connection from a listed address");
+            let _ = socket
+                .send(axum::extract::ws::Message::Text(
+                    format!(":{} ERROR :Closing link: Your address is listed in {}", server_name, zone)
+                        .into(),
+                ))
+                .await;
+            return;
+        }
+        tracing::warn!(%host, %zone, "Connection from a listed address, allowed by configuration");
+    }
 
     let (send_tx, mut send_rx) = mpsc::channel::<Message>(SEND_QUEUE);
     let kill = Arc::new(tokio::sync::Notify::new());

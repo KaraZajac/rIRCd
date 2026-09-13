@@ -460,7 +460,15 @@ pub async fn run(
     let server_name = cfg.server.name.clone();
     let limits =
         client::ConnectionLimits::new(cfg.limits.max_connections_per_ip, cfg.limits.max_clients)
-            .with_rate(cfg.limits.max_connections_per_ip_per_minute);
+            .with_rate(cfg.limits.max_connections_per_ip_per_minute)
+            .with_dnsbl(
+                cfg.dnsbl
+                    .as_ref()
+                    .map(|d| Arc::new(crate::dnsbl::Dnsbl::from_config(d))),
+            );
+    if let Some(ref d) = cfg.dnsbl {
+        info!("DNS blocklists: {} ({})", d.zones.join(", "), d.action);
+    }
     if limits.max_per_ip > 0 || limits.max_total > 0 {
         info!(
             "Connection limits: {} per address, {} in total",

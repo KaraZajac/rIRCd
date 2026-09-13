@@ -5,6 +5,7 @@ pub mod channel;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod dnsbl;
 pub mod filehost;
 pub mod linereader;
 pub mod link;
