@@ -1033,4 +1033,32 @@ op.close()
 joiner.close()
 chanop.close()
 cloaked.close()
+section("operators hear about operators")
+
+# Somebody becoming an operator, or failing to, is news to the others: it is
+# how a stolen operator password gets noticed.
+from harness import OPER_NAME as OPN, OPER_PASSWORD as OPP  # noqa: E402
+
+watch = Client(f"watch{RUN_ID}")
+watch.send(f"OPER {OPN} {OPP}")
+watch.wait_for(" 381 ", " 464 ", seconds=5)
+newcomer = Client(f"newop{RUN_ID}")
+wmark = watch.mark()
+newcomer.send(f"OPER {OPN} {OPP}")
+newcomer.wait_for(" 381 ", " 464 ", seconds=5)
+watch.read(1.5)
+check("an operator is told when somebody else becomes one",
+      bool(watch.find("is now an IRC operator", f"newop{RUN_ID}", lines=watch.since(wmark))),
+      watch.since(wmark)[-2:])
+impostor = Client(f"imp{RUN_ID}")
+wmark = watch.mark()
+impostor.send(f"OPER {OPN} not-the-password")
+impostor.wait_for(" 381 ", " 464 ", seconds=8)
+watch.read(1.5)
+check("and when somebody fails to", bool(watch.find("Failed OPER attempt", f"imp{RUN_ID}", lines=watch.since(wmark))),
+      watch.since(wmark)[-2:])
+impostor.close()
+newcomer.close()
+watch.close()
+
 summary("features")

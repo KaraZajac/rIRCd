@@ -158,6 +158,8 @@ database = "{db_name}"
 [limits]
 # Every test connects from 127.0.0.1 and several open many connections at once.
 max_connections_per_ip = 0
+max_connections_per_ip_per_minute = 0
+max_registrations_per_ip = 0
 max_channels_per_client = 100
 # The tests send bursts far faster than a person types, and are checking the
 # protocol rather than the rate limiter. The default 10-command allowance

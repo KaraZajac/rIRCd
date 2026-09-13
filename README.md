@@ -260,7 +260,9 @@ key  = "/etc/rIRCd/key.pem"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `max_channels_per_client` | `50` | Max channels a single client may join |
-| `max_connections_per_ip` | `16` | Connections allowed from one address; 0 for no limit. Read at startup, not on rehash |
+| `max_connections_per_ip` | `16` | Connections allowed from one address at a time; 0 for no limit. An IPv6 address counts by its /64 — the smallest allocation anybody is given — so a client that picks a fresh address per connection is still one client. Read at startup, not on rehash |
+| `max_connections_per_ip_per_minute` | `30` | New connections one address may make in a minute; 0 for no limit. The concurrent limit never sees a client that connects and hangs up in a loop, and each of those costs a handshake. Read at startup |
+| `max_registrations_per_ip` | `30` | Registrations one address may make in ten minutes; 0 for no limit. Each is a hash, a row, and with `[email]` a message to an address the client chose. Thirty in ten minutes is an office behind one NAT on its first day; a hundred is a script. Read at each attempt, so a rehash changes it |
 | `shared_address_listeners` | `[]` | Listeners where every client arrives from the same address — a Tor hidden service, or anything behind a local proxy. The per-address limit cannot mean anything there, so connections on these are counted against the listener instead. Must name a `listen`, `listen_tls`, `listen_ws` or `listen_wss` address exactly; the server refuses to start if it does not, because a typo would silently leave the listener capped at `max_connections_per_ip`. Read at startup, not on rehash |
 | `max_clients_behind_one_address` | `256` | The cap that stands in for the per-address one on those listeners; 0 leaves only `max_clients` |
 | `max_remote_users` | `250000` | Users this server will hold on behalf of other servers; 0 for no limit. A link is trusted with what it says about its users, not with how many of them there is room for: past this, further introductions are refused and logged, and the link stays up |
@@ -332,6 +334,7 @@ Mail is sent over SMTP with rustls — no system TLS libraries needed.
 | `subject` | `Your IRC account verification code` | Subject line |
 | `code_expiry_secs` | `86400` | How long a code stays valid |
 | `reset_subject` | `Your IRC password reset code` | Subject line of a `RESETPASS` mail. Reset codes are good for fifteen minutes regardless of `code_expiry_secs`: they arrive by mail that anybody holding the inbox can use |
+| `mail_gap_secs` | `900` | The least time between two messages to one address, whoever asks and by whichever of `REGISTER` or `RESETPASS`. Asking for a message is free and the address is the client's to choose, so the address itself gets a say. The gap starts only when a message actually goes out, so a registration refused for its password does not cost the person their real attempt |
 
 ```toml
 [email]
@@ -569,7 +572,7 @@ traditional network is done by the server itself, against MariaDB.
 | Channel access lists | `MODE +o` / `+v` on an **account** is remembered and restored on the next join. Somebody not logged in holds the status while they are there and no longer: a name proves nothing, so remembering one would hand the status to whoever took it next |
 | Channel modes, topic, key | Persisted; kept when an owned channel empties, and restored on startup |
 | Ban lists (`AKICK`-ish) | `+b`, `+e`, `+I` and `+q` masks are persisted and restored |
-| Network bans | `KLINE` / `UNKLINE`, persisted and enforced on connect |
+| Network bans | `KLINE` / `UNKLINE`, persisted and enforced on connect — on every server: a ban set on one crosses the links, closes what it matches there, and is written down there too. A mask made of wildcards is refused, typed or received |
 | Vhosts | `SETHOST` (oper), plus automatic cloaking via `cloak_key` |
 
 Still absent: per-channel access *levels* beyond operator and voice, `AKICK`,
@@ -649,8 +652,14 @@ previous life attached. Channels it founded are left with no founder; their
 operators keep their standing and a network operator can give them a new one.
 
 Every one of these is charged against the same failed-login budget as a bad
-SASL or `OPER` attempt. A password check is a password check whatever command
-it arrives in.
+SASL or `OPER` attempt, and so is `REGISTER` itself: each registration is a
+hash, a row, and with `[email]` a message to an address the client chose,
+which unbounded is an open mail relay for anybody who can connect. No address
+is mailed twice in a quarter hour whoever asks, by `REGISTER` or `RESETPASS`.
+A password check is a password check whatever command it arrives in.
+
+Operators are told, by server notice, when somebody becomes an operator and
+when somebody fails to. It is how a stolen operator password gets noticed.
 
 A channel made by somebody who is not logged in has no founder, and never gets
 one — there was no account to write down. `channel_creation = "accounts"` is

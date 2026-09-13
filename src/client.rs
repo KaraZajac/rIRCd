@@ -30,7 +30,14 @@ async fn refuse_connection_tls(
 pub struct ConnectionLimits {
     pub max_per_ip: usize,
     pub max_total: usize,
+    /// New connections one address may make in a minute; 0 for no limit.
+    pub max_per_ip_per_minute: usize,
     counts: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    /// When each address last connected, newest last, kept only as far back
+    /// as a minute. What bounds a client that connects and hangs up in a
+    /// loop: each connection costs a handshake — a TLS one costs real work —
+    /// and the concurrent limit never sees it, because it is never concurrent.
+    arrivals: Arc<std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<std::time::Instant>>>>,
     total: Arc<std::sync::atomic::AtomicUsize>,
     /// Set when this view serves a listener whose clients all arrive from the
     /// same address. See `on_listener`.
@@ -86,6 +93,29 @@ impl Drop for ConnectionSlot {
     }
 }
 
+/// The key an address is counted under.
+///
+/// An IPv4 address is one machine, near enough. An IPv6 address is not: the
+/// smallest allocation anybody is given is a /64, which is eighteen quintillion
+/// addresses, and a client picks a fresh one for every connection if it likes.
+/// Counting each of those separately would make every per-address limit on
+/// this server — connections, failed logins, registrations — a limit on nobody
+/// who has IPv6. So an IPv6 address is counted by its /64, which is the unit
+/// that is actually handed to one person. Anything that is not an address is
+/// counted as itself.
+pub fn limit_key_for(host: &str) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let seg = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", seg[0], seg[1], seg[2], seg[3])
+            }
+        },
+        _ => host.to_string(),
+    }
+}
+
 /// One spelling for a listen address, so configuration and bind agree.
 ///
 /// `:6667` is how the rest of the configuration lets somebody write "every
@@ -108,6 +138,53 @@ impl ConnectionLimits {
             max_total,
             ..Default::default()
         }
+    }
+
+    /// The same limits, with a ceiling on how often one address may connect.
+    pub fn with_rate(mut self, max_per_ip_per_minute: usize) -> Self {
+        self.max_per_ip_per_minute = max_per_ip_per_minute;
+        self
+    }
+
+    /// Addresses whose arrival history is remembered at once. Entries with
+    /// nothing in the last minute are dropped as they are met, so the ceiling
+    /// is reached only when that many addresses are arriving at once.
+    const MAX_TRACKED_ARRIVALS: usize = 16384;
+
+    /// Note an arrival and say whether this address has had too many lately.
+    fn arriving_too_fast(&self, key: &str) -> bool {
+        if self.max_per_ip_per_minute == 0 {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(60);
+        let mut arrivals = match self.arrivals.lock() {
+            Ok(a) => a,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !arrivals.contains_key(key) {
+            arrivals.retain(|_, when| {
+                while when.front().is_some_and(|t| now.duration_since(*t) > window) {
+                    when.pop_front();
+                }
+                !when.is_empty()
+            });
+            if arrivals.len() >= Self::MAX_TRACKED_ARRIVALS {
+                // More addresses arriving at once than this can remember. The
+                // concurrent limit still stands; being untracked here is not
+                // a way in, only a way past the rate.
+                return false;
+            }
+        }
+        let when = arrivals.entry(key.to_string()).or_default();
+        while when.front().is_some_and(|t| now.duration_since(*t) > window) {
+            when.pop_front();
+        }
+        if when.len() >= self.max_per_ip_per_minute {
+            return true;
+        }
+        when.push_back(now);
+        false
     }
 
     /// A view of these limits for one listener.
@@ -136,7 +213,13 @@ impl ConnectionLimits {
     }
 
     /// Claim a slot for `host`, or report why it was refused.
+    ///
+    /// `host` is the address as the connection has it; what it is counted
+    /// under is `limit_key_for(host)`, so an IPv6 client is one client however
+    /// many of its /64 it uses.
     pub fn claim(&self, host: &str) -> Result<ConnectionSlot, &'static str> {
+        let host = limit_key_for(host);
+        let host = host.as_str();
         let total = self
             .total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -145,6 +228,11 @@ impl ConnectionLimits {
             self.total
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return Err("Server is full");
+        }
+        if self.shared.is_none() && self.arriving_too_fast(host) {
+            self.total
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return Err("Connecting too often; try again in a minute");
         }
         if let Some(ref shared) = self.shared {
             let taken = shared
@@ -1115,6 +1203,47 @@ mod tests {
         for _ in 0..100 {
             held.push(limits.claim("198.51.100.5").expect("no limit"));
         }
+    }
+
+    #[test]
+    fn an_ipv6_client_is_counted_by_its_prefix() {
+        assert_eq!(limit_key_for("198.51.100.7"), "198.51.100.7");
+        assert_eq!(
+            limit_key_for("2001:db8:1:2:aaaa:bbbb:cccc:dddd"),
+            "2001:db8:1:2::/64"
+        );
+        assert_eq!(
+            limit_key_for("2001:db8:1:2::1"),
+            limit_key_for("2001:db8:1:2:ffff:ffff:ffff:ffff"),
+            "the whole /64 is one client"
+        );
+        assert_ne!(limit_key_for("2001:db8:1:2::1"), limit_key_for("2001:db8:1:3::1"));
+        assert_eq!(limit_key_for("::ffff:198.51.100.7"), "198.51.100.7");
+        assert_eq!(limit_key_for("not-an-address"), "not-an-address");
+
+        let limits = ConnectionLimits::new(2, 0);
+        let _a = limits.claim("2001:db8:1:2::1").expect("first");
+        let _b = limits.claim("2001:db8:1:2::2").expect("second");
+        assert!(
+            limits.claim("2001:db8:1:2::3").is_err(),
+            "a third address in the same /64 is the same client, over the limit"
+        );
+        assert!(limits.claim("2001:db8:1:3::1").is_ok(), "another /64 is somebody else");
+    }
+
+    #[test]
+    fn connecting_in_a_loop_is_refused_after_a_while() {
+        let limits = ConnectionLimits::new(0, 0).with_rate(5);
+        for i in 0..5 {
+            // Each connection ends at once, so the concurrent count never grows.
+            let slot = limits.claim("198.51.100.7").unwrap_or_else(|e| panic!("{i}: {e}"));
+            drop(slot);
+        }
+        assert!(
+            limits.claim("198.51.100.7").is_err(),
+            "the sixth in a minute is one too many"
+        );
+        assert!(limits.claim("203.0.113.9").is_ok(), "another address is not held to it");
     }
 
     #[test]

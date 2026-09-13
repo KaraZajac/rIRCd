@@ -68,6 +68,7 @@ impl AuthCost {
     /// spend — never refused, because the credentials it is offering this time
     /// may well be right.
     pub fn spend(&mut self, address: &str) -> Duration {
+        let address = &crate::client::limit_key_for(address);
         let now = Instant::now();
         if let Some(spent) = self.by_address.get_mut(address) {
             spent.forgive(now);
@@ -94,6 +95,7 @@ impl AuthCost {
     /// Give the allowance back: the credentials were right, so that check was
     /// one somebody wanted.
     pub fn refund(&mut self, address: &str) {
+        let address = &crate::client::limit_key_for(address);
         let now = Instant::now();
         if let Some(spent) = self.by_address.get_mut(address) {
             spent.forgive(now);
@@ -135,9 +137,127 @@ impl Spent {
     }
 }
 
+/// Something that may happen to one key only so often.
+///
+/// Registering and resetting both send mail to an address the client chose,
+/// and asking is free. Whatever else limits the asker, the address itself
+/// needs a say: one message per gap, however many people ask for it and from
+/// wherever they ask. Keys that are past their gap are dropped as they are
+/// met, so the table holds only what is still cooling.
+#[derive(Debug, Default)]
+pub struct Cooldown {
+    last: HashMap<String, Instant>,
+}
+
+impl Cooldown {
+    /// Whether `key` could go ahead now. Records nothing: the answer is asked
+    /// for before the work that might still fail for another reason, and a
+    /// slot spent on a registration refused for its password would keep the
+    /// person's real attempt out.
+    pub fn would_allow(&self, key: &str, gap: Duration) -> bool {
+        let now = Instant::now();
+        match self.last.get(&key.to_lowercase()) {
+            Some(when) => now.duration_since(*when) >= gap,
+            None => self.last.len() < MAX_TRACKED,
+        }
+    }
+
+    /// Record that `key` went ahead: the message is going out.
+    pub fn record(&mut self, key: &str, gap: Duration) {
+        let now = Instant::now();
+        self.last.retain(|_, when| now.duration_since(*when) < gap);
+        if self.last.len() >= MAX_TRACKED {
+            // More keys cooling than this will remember. Refusing later is the
+            // safe side: the cost of a wrongly refused mail is a retry, the
+            // cost of a wrongly sent one is somebody's inbox.
+            return;
+        }
+        self.last.insert(key.to_lowercase(), now);
+    }
+
+    /// Whether `key` may go ahead now, recording it if so.
+    pub fn allow(&mut self, key: &str, gap: Duration) -> bool {
+        if !self.would_allow(key, gap) {
+            return false;
+        }
+        self.record(key, gap);
+        true
+    }
+}
+
+/// So many of something per key per window, and then no more until the
+/// window has moved on.
+///
+/// The failed-login budget forgives slowly and never refuses, which is right
+/// for a person who may well be about to get it right. Registering is not
+/// that: thirty in ten minutes from one address is what an office behind one
+/// NAT does on its first day, and a hundred is a script.
+#[derive(Debug, Default)]
+pub struct RateWindow {
+    seen: HashMap<String, std::collections::VecDeque<Instant>>,
+}
+
+impl RateWindow {
+    /// Whether `key` may have another now, and records it if so. `max` of 0
+    /// means no limit.
+    pub fn allow(&mut self, key: &str, max: usize, window: Duration) -> bool {
+        if max == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        let key = crate::client::limit_key_for(key);
+        if !self.seen.contains_key(&key) {
+            self.seen.retain(|_, when| {
+                while when.front().is_some_and(|t| now.duration_since(*t) > window) {
+                    when.pop_front();
+                }
+                !when.is_empty()
+            });
+            if self.seen.len() >= MAX_TRACKED {
+                return false;
+            }
+        }
+        let when = self.seen.entry(key).or_default();
+        while when.front().is_some_and(|t| now.duration_since(*t) > window) {
+            when.pop_front();
+        }
+        if when.len() >= max {
+            return false;
+        }
+        when.push_back(now);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_holds_so_many_and_no_more() {
+        let mut rate = RateWindow::default();
+        for i in 0..3 {
+            assert!(rate.allow("198.51.100.7", 3, Duration::from_secs(600)), "{i}");
+        }
+        assert!(!rate.allow("198.51.100.7", 3, Duration::from_secs(600)));
+        assert!(rate.allow("203.0.113.9", 3, Duration::from_secs(600)), "somebody else");
+        assert!(rate.allow("198.51.100.7", 0, Duration::from_secs(600)), "zero is no limit");
+        // The same /64 is the same key.
+        assert!(rate.allow("2001:db8::1", 1, Duration::from_secs(600)));
+        assert!(!rate.allow("2001:db8::2", 1, Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn a_key_goes_once_per_gap() {
+        let mut cool = Cooldown::default();
+        assert!(cool.allow("Alice@Example.org", Duration::from_secs(60)));
+        assert!(!cool.allow("alice@example.org", Duration::from_secs(60)), "case is one key");
+        assert!(cool.allow("bob@example.org", Duration::from_secs(60)));
+        if let Some(when) = cool.last.get_mut("alice@example.org") {
+            *when -= Duration::from_secs(61);
+        }
+        assert!(cool.allow("alice@example.org", Duration::from_secs(60)), "the gap has passed");
+    }
 
     #[test]
     fn a_burst_of_failures_costs_nothing_and_then_it_costs_time() {

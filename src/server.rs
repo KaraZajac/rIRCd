@@ -457,7 +457,8 @@ pub async fn run(
 
     let server_name = cfg.server.name.clone();
     let limits =
-        client::ConnectionLimits::new(cfg.limits.max_connections_per_ip, cfg.limits.max_clients);
+        client::ConnectionLimits::new(cfg.limits.max_connections_per_ip, cfg.limits.max_clients)
+            .with_rate(cfg.limits.max_connections_per_ip_per_minute);
     if limits.max_per_ip > 0 || limits.max_total > 0 {
         info!(
             "Connection limits: {} per address, {} in total",

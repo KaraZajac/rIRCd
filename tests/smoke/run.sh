@@ -189,6 +189,12 @@ max_channels_per_client = 50
 # Every suite connects from 127.0.0.1, so the per-address limit is off here.
 # It defaults to 16 and is exercised by the unit tests instead.
 max_connections_per_ip = 0
+# And the suites open dozens a minute from that one address, so the rate is
+# off too; it has its own unit tests.
+max_connections_per_ip_per_minute = 0
+# The suites register dozens of accounts from one address; the burst test
+# turns this on for itself with REHASH.
+max_registrations_per_ip = 0
 max_line_length = 512
 
 [email]
@@ -197,6 +203,9 @@ smtp_port = $SMTP_PORT
 encryption = "none"
 from = "SmokeNet <noreply@smoke.test>"
 code_expiry_secs = 900
+# The suites register and reset the same addresses within seconds; the one
+# test that needs the real gap turns it on with REHASH.
+mail_gap_secs = 1
 
 [[opers]]
 name = "smokeoper"

@@ -187,6 +187,12 @@ pub struct EmailConfig {
     /// Subject line of a password reset mail.
     #[serde(default = "default_reset_subject")]
     pub reset_subject: String,
+    /// The least time between two messages to one address, in seconds
+    /// (default a quarter hour). Asking for a message is free and the address
+    /// is the client's to choose, so the address itself gets a say, whoever
+    /// asks and by whichever of REGISTER or RESETPASS.
+    #[serde(default = "default_mail_gap")]
+    pub mail_gap_secs: u64,
     /// How long a verification code stays valid, in seconds (default 24h).
     #[serde(default = "default_code_expiry")]
     pub code_expiry_secs: i64,
@@ -203,6 +209,9 @@ fn default_email_subject() -> String {
 }
 fn default_reset_subject() -> String {
     "Your IRC password reset code".into()
+}
+fn default_mail_gap() -> u64 {
+    900
 }
 fn default_code_expiry() -> i64 {
     86_400
@@ -550,6 +559,23 @@ pub struct LimitsConfig {
     /// Connections allowed from one address at a time; 0 for no limit.
     #[serde(default = "default_max_per_ip")]
     pub max_connections_per_ip: usize,
+    /// New connections one address may make in a minute; 0 for no limit.
+    ///
+    /// The concurrent limit never sees a client that connects and hangs up
+    /// in a loop, and each of those connections costs a handshake — a TLS
+    /// one costs real work. An IPv6 address counts by its /64 here as it
+    /// does everywhere: the smallest allocation anybody is given, and a
+    /// client that picks a fresh address per connection is still one client.
+    #[serde(default = "default_max_per_ip_per_minute")]
+    pub max_connections_per_ip_per_minute: usize,
+    /// Registrations one address may make in ten minutes; 0 for no limit.
+    ///
+    /// Each REGISTER is a hash, a row, and with `[email]` a message to an
+    /// address the client chose. Thirty in ten minutes is an office behind one
+    /// NAT on its first day; a hundred is a script. Read at each attempt, so a
+    /// rehash changes it.
+    #[serde(default = "default_max_registrations_per_ip")]
+    pub max_registrations_per_ip: usize,
     /// Recipients one PRIVMSG, NOTICE, TAGMSG or KICK may name at once.
     /// Advertised as TARGMAX; a low number keeps one line from becoming a
     /// fan-out.
@@ -612,6 +638,15 @@ fn default_max_channels() -> usize {
 fn default_max_per_ip() -> usize {
     16
 }
+/// Thirty a minute: a person reconnecting after a bad network does it a
+/// handful of times; a client on a broken auto-reconnect might reach this and
+/// is better off being told to wait a minute than let loose on the server.
+fn default_max_per_ip_per_minute() -> usize {
+    30
+}
+fn default_max_registrations_per_ip() -> usize {
+    30
+}
 /// How many may be behind one address before a shared listener is full.
 ///
 /// Generous, because the whole point is that there is no way to tell one
@@ -648,6 +683,8 @@ impl Default for LimitsConfig {
             max_channels_per_client: default_max_channels(),
             max_targets: default_max_targets(),
             max_connections_per_ip: default_max_per_ip(),
+            max_connections_per_ip_per_minute: default_max_per_ip_per_minute(),
+            max_registrations_per_ip: default_max_registrations_per_ip(),
             shared_address_listeners: Vec::new(),
             max_clients_behind_one_address: default_max_behind_one_address(),
             max_remote_users: default_max_remote_users(),

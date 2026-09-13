@@ -322,6 +322,36 @@ pub async fn handle_resetpass(
                 let now = chrono::Utc::now().timestamp();
                 match persist::begin_password_reset(pool, &account, &code, now).await {
                     ResetStart::Started { email } => {
+                        // The address has its own say, shared with REGISTER:
+                        // one message per gap however it is asked for. A code
+                        // stored for a message that is not going out is
+                        // cleared, or it would hold the next request off.
+                        let gap = std::time::Duration::from_secs(email_cfg.mail_gap_secs);
+                        if !state.read().await.mail_cooldown.would_allow(&email, gap) {
+                            tracing::info!(client_id, %account, "RESETPASS: that address was mailed lately, not sending");
+                            let _ = sqlx::query(
+                                "UPDATE users SET reset_code = NULL, reset_expires = NULL \
+                                 WHERE nick_lower = ?",
+                            )
+                            .bind(account.to_lowercase())
+                            .execute(pool)
+                            .await;
+                            reply_to_client(
+                                &senders,
+                                client_id,
+                                note(
+                                    cfg,
+                                    "RESETPASS",
+                                    "SENT",
+                                    &account,
+                                    "If that account exists and has an address, a code has been sent to it",
+                                ),
+                                label,
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        state.write().await.mail_cooldown.record(&email, gap);
                         let (network, pool_bg, account_bg, client_bg) = (
                             cfg.network.name.clone(),
                             pool.clone(),

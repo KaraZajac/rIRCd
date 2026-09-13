@@ -1514,6 +1514,44 @@ pub async fn handle_nick(
     Ok(())
 }
 
+/// Tell every operator on this server something they would want to know.
+///
+/// Somebody becoming an operator, or failing to, is news to the others: it is
+/// how a stolen operator password gets noticed, and how a colleague's login
+/// gets recognised as a colleague's. Sent as a notice from the server, to the
+/// operators themselves rather than to a mode nobody remembers to set.
+pub async fn notify_opers(
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    server_name: &str,
+    text: &str,
+) {
+    let opers: Vec<String> = {
+        let state_r = state.read().await;
+        let mut ids = Vec::new();
+        for (id, client) in state_r.users() {
+            if client.read().await.oper {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    };
+    if opers.is_empty() {
+        return;
+    }
+    let registry = senders.read().await;
+    for id in &opers {
+        let nick = match state.read().await.clients.get(id) {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => continue,
+        };
+        registry.deliver(
+            id,
+            &Message::new("NOTICE", vec![nick, format!("*** {text}")]).with_prefix(server_name),
+        );
+    }
+}
+
 /// Whether a username or hostname can be put in a prefix without breaking it.
 ///
 /// `:nick!user@host` is read by every client a message reaches, and it is read
@@ -3450,6 +3488,13 @@ pub async fn handle_oper(
         Some(oper) => oper,
         None => {
             tracing::warn!(client_id, oper_name = %name, "OPER login failed: no such operator");
+            notify_opers(
+                &state,
+                &senders,
+                &cfg.server.name,
+                &format!("Failed OPER attempt for '{name}' by {oper_nick} (no such operator)"),
+            )
+            .await;
             reply_to_client(
                 &senders,
                 client_id,
@@ -3476,6 +3521,13 @@ pub async fn handle_oper(
     }
     if over_budget || !crate::persist::bcrypt_verify(password, &matched.password_hash).await {
         tracing::warn!(client_id, oper_name = %name, "OPER login failed: bad password");
+        notify_opers(
+            &state,
+            &senders,
+            &cfg.server.name,
+            &format!("Failed OPER attempt for '{name}' by {oper_nick} from {oper_host}"),
+        )
+        .await;
         reply_to_client(
             &senders,
             client_id,
@@ -3518,6 +3570,13 @@ pub async fn handle_oper(
         )
         .with_prefix(&cfg.server.name),
         label,
+    )
+    .await;
+    notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        &format!("{oper_nick} is now an IRC operator ({name})"),
     )
     .await;
     // Becoming an operator is a user mode change, and clients track their modes
@@ -3836,6 +3895,48 @@ pub async fn handle_register(
         return Ok(());
     }
 
+    // So many per address per ten minutes. Each registration is a hash and a
+    // database row, and with [email] set a message to an address the client
+    // chose: unbounded, that is an open mail relay for anybody who can
+    // connect. Its own window rather than the failed-login budget, which
+    // forgives slowly and is meant for somebody about to get it right.
+    let asking_from = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => c.read().await.host.clone(),
+            None => state_r
+                .pending
+                .get(client_id)
+                .map(|p| p.host.clone())
+                .unwrap_or_else(|| client_id.to_string()),
+        }
+    };
+    let allowed = state.write().await.register_rate.allow(
+        &asking_from,
+        cfg.limits.max_registrations_per_ip,
+        std::time::Duration::from_secs(600),
+    );
+    if !allowed {
+        tracing::warn!(client_id, host = %asking_from, "REGISTER: too many from this address, refusing");
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "REGISTER".into(),
+                    "TEMPORARILY_UNAVAILABLE".into(),
+                    account.clone(),
+                    "Too many registrations from your address; try again later".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
     // With [email] configured, registrations are held until VERIFY confirms the
     // address, so an address we can actually mail is required (cap: email-required).
     let verification = match cfg.email {
@@ -3852,6 +3953,32 @@ pub async fn handle_register(
                             "INVALID_EMAIL".into(),
                             account.clone(),
                             "A valid email address is required to register".into(),
+                        ],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+            // One message per address per gap, whoever asks and from
+            // wherever. Refused here, before any account is made: an
+            // unverified account holds its name until its code expires, and a
+            // name held by a registration whose mail never went out is a name
+            // somebody took with a script.
+            let gap = std::time::Duration::from_secs(email_cfg.mail_gap_secs);
+            if !state.read().await.mail_cooldown.would_allow(addr, gap) {
+                tracing::warn!(client_id, %account, "REGISTER: that address was mailed lately, refusing");
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "FAIL",
+                        vec![
+                            "REGISTER".into(),
+                            "TEMPORARILY_UNAVAILABLE".into(),
+                            account.clone(),
+                            "That address was sent a code recently; try again later".into(),
                         ],
                     )
                     .with_prefix(&cfg.server.name),
@@ -3966,6 +4093,13 @@ pub async fn handle_register(
             // command on this server is handled by one task, so send in the
             // background and tell the client afterwards if it failed.
             let email_cfg = cfg.email.clone().expect("checked above");
+            // The message is going out: this is when the address's gap starts,
+            // and not before — a registration refused for its password must
+            // not cost the person their real attempt.
+            state.write().await.mail_cooldown.record(
+                &email_addr,
+                std::time::Duration::from_secs(email_cfg.mail_gap_secs),
+            );
             let network = cfg.network.name.clone();
             let server_name = cfg.server.name.clone();
             let pool = pool.clone();

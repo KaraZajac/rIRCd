@@ -173,6 +173,9 @@ database = "$6"
 max_line_length = 8191
 flood_burst = 1000
 flood_rate = 1000
+max_connections_per_ip = 0
+max_connections_per_ip_per_minute = 0
+max_registrations_per_ip = 0
 # Small on purpose, so the hostile suite can reach them: a peer that introduces
 # users or servers without end is refused past this, and the link stays up.
 max_remote_users = 60

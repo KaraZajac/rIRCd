@@ -3,6 +3,8 @@
 
 import re
 
+import time
+
 from harness import (
     Client,
     check,
@@ -157,5 +159,84 @@ check("REGISTER works before CAP END",
 early.send("CAP END")
 check("connection still completes afterwards", bool(early.wait_for(" 376 ", " 422 ", seconds=5)), early.lines[-3:])
 early.close()
+
+section("registering costs what a failed login costs")
+
+# Each REGISTER is a hash, a database row and a message to an address the
+# client chose. Unbounded, that is an open mail relay for anybody who can
+# connect. It is charged to the address like a failed login, and never
+# refunded; and no address is mailed twice in a quarter hour whoever asks.
+STAMP = format(int(time.time()) % 100000, "05d")
+import os as _os
+
+CONFIG = _os.environ.get("SMOKE_CONFIG", "")
+original = open(CONFIG).read() if CONFIG else ""
+
+
+def rehash_with(*changes):
+    """Rewrite the server's configuration and make it read it again. The
+    registration window and the per-address mail gap are off for the suites,
+    which register and reset dozens of accounts from one address within
+    seconds; this is the one place either is turned on."""
+    text = original
+    for old, new in changes:
+        assert old in text, old
+        text = text.replace(old, new, 1)
+    open(CONFIG, "w").write(text)
+    op = Client(f"cfg{STAMP}{abs(hash(changes)) % 100}")
+    op.send(f"OPER {_os.environ.get('SMOKE_OPER_NAME', 'smokeoper')} "
+            f"{_os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+    op.wait_for(" 381 ", " 464 ", seconds=5)
+    op.send("REHASH")
+    op.wait_for(" 382 ", seconds=5)
+    op.close()
+    time.sleep(0.5)
+
+
+if CONFIG:
+    try:
+        rehash_with(("max_registrations_per_ip = 0", "max_registrations_per_ip = 4"))
+        clear_mail()
+        answers = []
+        for n in range(8):
+            c = Client(f"burst{STAMP}{n}")
+            mark = c.mark()
+            c.send(f"REGISTER * burst{STAMP}{n}@example.org {PASSWORD}")
+            c.read(1.2)
+            answers.append(" ".join(c.since(mark)))
+            c.close()
+        refused = [a for a in answers if "Too many registrations" in a]
+        started = [a for a in answers if "VERIFICATION_REQUIRED" in a]
+        check("a burst of registrations is cut off at the window",
+              len(started) == 4 and len(refused) == 4 and "Too many registrations" in answers[-1],
+              (len(started), len(refused), answers[-1][-90:]))
+        time.sleep(1.0)
+        check("and the mail that went out is no more than the allowance",
+              len(wait_for_mail(1, seconds=5)) <= 4, len(wait_for_mail(1, seconds=2)))
+    finally:
+        rehash_with()
+
+    # And the address's own say: one message per gap, whoever asks.
+    try:
+        rehash_with(("mail_gap_secs = 1", "mail_gap_secs = 900"))
+        clear_mail()
+        twice = Client(f"same{STAMP}")
+        twice.send(f"REGISTER * shared{STAMP}@example.org {PASSWORD}")
+        twice.read(1.2)
+        first_mail = len(wait_for_mail(1, seconds=8))
+        again = Client(f"same{STAMP}b")
+        mark = again.mark()
+        again.send(f"REGISTER * shared{STAMP}@example.org {PASSWORD}")
+        again.read(1.2)
+        check("a second registration to the same address within the gap is refused",
+              bool(again.find("TEMPORARILY_UNAVAILABLE", lines=again.since(mark))) and first_mail == 1,
+              (first_mail, again.since(mark)[-2:]))
+        time.sleep(1.0)
+        check("and that address got one message, not two", len(wait_for_mail(1, seconds=2)) == 1,
+              len(wait_for_mail(1, seconds=1)))
+        twice.close()
+        again.close()
+    finally:
+        rehash_with()
 
 summary("account")

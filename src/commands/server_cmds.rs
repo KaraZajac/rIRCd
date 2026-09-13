@@ -1784,6 +1784,67 @@ fn normalize_ban_mask(mask: &str) -> String {
     }
 }
 
+/// Whether a ban mask says who it is for.
+///
+/// One made only of wildcards is for everybody — the operator setting it
+/// included, and everybody who tries to connect after the next restart, when
+/// it is read back from the database with nobody left inside to lift it. Four
+/// literal characters is the line other servers draw, and the same one is
+/// drawn here, for a mask typed by an operator and for one sent by a peer.
+pub fn mask_too_broad(normalized: &str) -> bool {
+    normalized
+        .chars()
+        .filter(|c| !matches!(c, '*' | '?' | '!' | '@' | '.'))
+        .count()
+        < 4
+}
+
+/// Put a ban into effect here: remember it, and close every connection it
+/// covers. Returns who was closed. The same whether an operator on this server
+/// set it or one on another did.
+pub async fn enforce_ban(
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    server_name: &str,
+    ban: &crate::persist::ServerBan,
+) -> Vec<(String, String)> {
+    let mut hits: Vec<(String, String)> = Vec::new();
+    {
+        let mut state_w = state.write().await;
+        state_w.server_bans.retain(|b| b.mask != ban.mask);
+        state_w.server_bans.push(ban.clone());
+        for (id, client) in state_w.users() {
+            let g = client.read().await;
+            // Only this server's own users are closed. Somebody on another
+            // server is that server's to close, and it hears the same ban.
+            if g.server.is_some() {
+                continue;
+            }
+            let source = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
+            if crate::user::glob_match(&ban.mask.to_lowercase(), &source.to_lowercase())
+                || crate::user::glob_match(
+                    &ban.mask.to_lowercase(),
+                    &format!("*!*@{}", g.host.to_lowercase()),
+                )
+            {
+                hits.push((id.clone(), g.nick_or_id().to_string()));
+            }
+        }
+    }
+    for (id, hit_nick) in &hits {
+        senders.write().await.close_user(
+            id,
+            Message::new(
+                "ERROR",
+                vec![format!("Closing link: banned ({})", ban.reason)],
+            )
+            .with_prefix(server_name),
+        );
+        tracing::info!(nick = %hit_nick, mask = %ban.mask, "Disconnecting banned user");
+    }
+    hits
+}
+
 /// `KLINE [<duration>] <mask> :<reason>` — refuse connections matching a mask.
 ///
 /// Duration is in seconds; omit it, or pass 0, for a ban with no end. Existing
@@ -1855,11 +1916,7 @@ pub async fn handle_kline(
     // database with nobody left inside to lift it. Four literal characters
     // is the line other servers draw, and the same one is drawn here.
     let normalized = normalize_ban_mask(mask);
-    let literal = normalized
-        .chars()
-        .filter(|c| !matches!(c, '*' | '?' | '!' | '@' | '.'))
-        .count();
-    if literal < 4 {
+    if mask_too_broad(&normalized) {
         reply_to_client(
             &senders,
             client_id,
@@ -1922,38 +1979,10 @@ pub async fn handle_kline(
         oper = %nick, mask = %ban.mask, expires = ?ban.expires_at, "Server ban added"
     );
 
-    // Close any connection the new ban covers.
-    let mut hits: Vec<(String, String)> = Vec::new();
-    {
-        let mut state_w = state.write().await;
-        state_w.server_bans.retain(|b| b.mask != ban.mask);
-        state_w.server_bans.push(ban.clone());
-        for (id, client) in state_w.users() {
-            let g = client.read().await;
-            let source = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
-            if crate::user::glob_match(&ban.mask.to_lowercase(), &source.to_lowercase())
-                || crate::user::glob_match(
-                    &ban.mask.to_lowercase(),
-                    &format!("*!*@{}", g.host.to_lowercase()),
-                )
-            {
-                hits.push((id.clone(), g.nick_or_id().to_string()));
-            }
-        }
-    }
-    for (id, hit_nick) in &hits {
-        {
-            senders.write().await.close_user(
-                id,
-                Message::new(
-                    "ERROR",
-                    vec![format!("Closing link: banned ({})", ban.reason)],
-                )
-                .with_prefix(&cfg.server.name),
-            );
-        }
-        tracing::info!(nick = %hit_nick, mask = %ban.mask, "Disconnecting banned user");
-    }
+    // A ban is a fact about the network, not about the server it was typed
+    // at: somebody shut out here and welcome one server over is not shut out.
+    crate::link::announce_kline(cfg, &ban).await;
+    let hits = enforce_ban(&state, &senders, &cfg.server.name, &ban).await;
 
     reply_to_client(
         &senders,
@@ -2018,6 +2047,7 @@ pub async fn handle_unkline(
     };
     state.write().await.server_bans.retain(|b| b.mask != mask);
     tracing::warn!(oper = %nick, %mask, removed, "Server ban removed");
+    crate::link::announce_unkline(cfg, &mask).await;
 
     reply_to_client(
         &senders,

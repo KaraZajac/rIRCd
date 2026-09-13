@@ -810,6 +810,11 @@ pub struct ServerState {
     /// expensive on purpose, so an address that keeps getting it wrong is told
     /// no before anything is checked.
     pub auth_cost: crate::authcost::AuthCost,
+    /// Addresses mailed lately, so that no address is sent more than one
+    /// message per gap, whoever asks.
+    pub mail_cooldown: crate::authcost::Cooldown,
+    /// Registrations per address, so many per window.
+    pub register_rate: crate::authcost::RateWindow,
     /// Users held on behalf of other servers, kept as a count so the ceiling
     /// on them is a comparison rather than a walk through every user on every
     /// line of a burst.

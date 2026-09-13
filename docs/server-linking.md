@@ -132,7 +132,14 @@ A message that changes shared state goes to every link except the one it came
 from, with the originator's UID or SID as its prefix and its tags intact. That
 is the whole rule: `PRIVMSG`, `NOTICE`, `TAGMSG`, `JOIN`, `PART`, `KICK`,
 `MODE`, `TOPIC`, `NICK`, `QUIT`, `AWAY`, `ACCOUNT`, `CHGHOST`, `SETNAME`,
-`INVITE`, `METADATA`, `CACCESS`.
+`INVITE`, `METADATA`, `CACCESS`, `KLINE`, `UNKLINE`.
+
+A `KLINE` carries `<mask> <set_at> <expires|0> <set_by> :<reason>`. A server
+that receives one stores it, remembers it, and closes its own users that it
+matches; the peer's users are the peer's to close, and it hears the same line.
+A mask made only of wildcards is refused from a peer exactly as it is from an
+operator, because one line saying `*!*@*` must not be able to empty every
+server on the network.
 
 ### `CACCESS`
 
@@ -204,6 +211,7 @@ got, so that nobody has to read the source to find out:
 | Channel ownership: founder, operator and voice lists, by account | yes |
 | `JOIN`, `PART`, `KICK`, `MODE`, `TOPIC`, and messages to a channel | yes |
 | `ACCOUNT`, `CHGHOST`, `SETNAME`, `INVITE`, `METADATA` | yes |
+| `KLINE` and `UNKLINE`: a ban set anywhere holds everywhere, and is written down everywhere | yes |
 | Chathistory: both ends of a conversation keep it | yes |
 | TLS, with each side pinned to the other's certificate | yes |
 | `WHOIS` forwarded, for the idle time only that server knows | yes |

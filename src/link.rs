@@ -2562,6 +2562,67 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
+/// A server ban set on another server.
+///
+/// Held to the same rule as one typed here: a mask that says nobody in
+/// particular is refused, because a peer that sends `*!*@*` — by mistake or
+/// otherwise — must not be able to empty every server on the network with
+/// one line. Remembered, written down, and put into effect on this server's
+/// own users; the peer's users are the peer's to close.
+async fn accept_remote_kline(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(mask), Some(set_at), Some(expires), Some(set_by)) = (
+        msg.params.first().cloned(),
+        msg.params.get(1).and_then(|t| t.parse::<i64>().ok()),
+        msg.params.get(2).and_then(|t| t.parse::<i64>().ok()),
+        msg.params.get(3).cloned(),
+    ) else {
+        warn!(peer = %peer_sid, "Malformed KLINE from a linked server");
+        return;
+    };
+    if crate::commands::server_cmds::mask_too_broad(&mask) {
+        warn!(peer = %peer_sid, %mask, "Refusing a server ban that names nobody in particular");
+        return;
+    }
+    let ban = crate::persist::ServerBan {
+        mask,
+        reason: msg.params.get(4).cloned().unwrap_or_else(|| "No reason given".into()),
+        set_by,
+        set_at,
+        expires_at: (expires > 0).then_some(expires),
+    };
+    let (pool, server_name) = {
+        let cfg = ctx.cfg.read().await;
+        (cfg.db.clone(), cfg.server.name.clone())
+    };
+    if let Some(pool) = pool {
+        if let Err(e) = crate::persist::save_server_ban(&pool, &ban).await {
+            warn!(peer = %peer_sid, mask = %ban.mask, "Could not store a ban from a peer: {e}");
+        }
+    }
+    warn!(peer = %peer_sid, mask = %ban.mask, set_by = %ban.set_by, "Server ban added from the network");
+    let hits =
+        crate::commands::server_cmds::enforce_ban(&ctx.state, &ctx.senders, &server_name, &ban)
+            .await;
+    if !hits.is_empty() {
+        info!(peer = %peer_sid, mask = %ban.mask, closed = hits.len(), "Network ban closed connections here");
+    }
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// A server ban lifted on another server.
+async fn accept_remote_unkline(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let Some(mask) = msg.params.first().cloned() else {
+        return;
+    };
+    let pool = ctx.cfg.read().await.db.clone();
+    if let Some(pool) = pool {
+        crate::persist::delete_server_ban(&pool, &mask).await;
+    }
+    ctx.state.write().await.server_bans.retain(|b| b.mask != mask);
+    info!(peer = %peer_sid, %mask, "Server ban removed from the network");
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
 /// A channel mode set on another server. Prefix modes name their target by id,
 /// so a nick change in flight cannot move an operator status onto somebody
 /// else; the people watching are shown nicks.
@@ -3065,6 +3126,45 @@ pub async fn announce_channel_access(
     }
 }
 
+/// Tell the network a server ban was set here.
+///
+/// `KLINE <mask> <set_at> <expires|0> <set_by> :<reason>`. A ban is a fact
+/// about the network: somebody shut out of one server and welcome on the next
+/// is not shut out, and an operator who bans somewhere expects it to mean
+/// somewhere.
+pub async fn announce_kline(cfg: &Config, ban: &crate::persist::ServerBan) {
+    if cfg.links_runtime.is_none() {
+        return;
+    }
+    broadcast(
+        cfg,
+        Message::new(
+            "KLINE",
+            vec![
+                ban.mask.clone(),
+                ban.set_at.to_string(),
+                ban.expires_at.unwrap_or(0).to_string(),
+                ban.set_by.clone(),
+                ban.reason.clone(),
+            ],
+        )
+        .with_prefix(our_sid(cfg)),
+    )
+    .await;
+}
+
+/// Tell the network a server ban was lifted here.
+pub async fn announce_unkline(cfg: &Config, mask: &str) {
+    if cfg.links_runtime.is_none() {
+        return;
+    }
+    broadcast(
+        cfg,
+        Message::new("UNKLINE", vec![mask.to_string()]).with_prefix(our_sid(cfg)),
+    )
+    .await;
+}
+
 /// Send a message to a channel's members on the other servers.
 ///
 /// Every server that holds a member delivers to its own, so this goes out once
@@ -3288,6 +3388,14 @@ async fn handle_link_message(
         }
         "ACCOUNT" => {
             accept_remote_account(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "KLINE" => {
+            accept_remote_kline(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "UNKLINE" => {
+            accept_remote_unkline(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }
         "CHGHOST" => {

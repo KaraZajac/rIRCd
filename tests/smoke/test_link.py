@@ -548,6 +548,40 @@ if made:
     guest.close()
     founder.close()
 
+section("a ban is a fact about the network")
+# Somebody shut out of one server and welcome on the next is not shut out. A
+# KLINE typed at A reaches B, closes the matching user there, and is written
+# down on B, so it holds after B restarts too; UNKLINE lifts it everywhere.
+banner = Client(f"ban{RUN}", port=A_PORT)
+banner.send(f"OPER linkoper {os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+banner.wait_for(" 381 ", " 464 ", seconds=5)
+if banner.find(" 381 "):
+    target = Client(f"tgt{RUN}", port=B_PORT)
+    tmark = target.mark()
+    banner.send(f"KLINE tgt{RUN}!*@* :not welcome anywhere")
+    banner.read(1.5)
+    target.read(2.0)
+    check("a user on B matching a ban set on A is closed",
+          bool(target.find("Closing link", "banned", lines=target.since(tmark))), target.since(tmark)[-2:])
+    stored = eventually(lambda: side_db("b", "SELECT COUNT(*) FROM server_bans WHERE mask LIKE 'tgt%'") == "1",
+                        seconds=6)
+    check("and B wrote it down", bool(stored), side_db("b", "SELECT mask FROM server_bans"))
+    retry = Client(f"tgt{RUN}", port=B_PORT)
+    retry.read(1.5)
+    check("so they cannot come back through B either",
+          bool(retry.find("banned")) or not retry.find(" 001 "), retry.lines[-2:])
+    retry.close()
+    banner.send(f"UNKLINE tgt{RUN}!*@*")
+    banner.read(1.5)
+    lifted = eventually(lambda: side_db("b", "SELECT COUNT(*) FROM server_bans WHERE mask LIKE 'tgt%'") == "0",
+                        seconds=6)
+    check("lifting it on A lifts it on B", bool(lifted), side_db("b", "SELECT mask FROM server_bans"))
+    back = Client(f"tgt{RUN}", port=B_PORT)
+    check("and they are welcome again", bool(back.find(" 001 ")), back.lines[-2:])
+    back.close()
+    target.close()
+banner.close()
+
 section("a split is noticed")
 # Stop B and watch A report the split rather than carrying on as if nothing
 # happened.
