@@ -90,7 +90,7 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// only to clients that enabled the capability.
 fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES=beIq,k,l,imnstpRcCMZ USERMODES=,,,BgiorRw MAXLIST=beIq:100 SILENCE=32 CALLERID=g PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current());
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES=beIq,k,jl,imnstpRcCMZ USERMODES=,,,BgiorRw MAXLIST=beIq:100 SILENCE=32 CALLERID=g PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current());
     let deny = cfg
         .server
         .client_tag_deny
@@ -1520,6 +1520,18 @@ pub async fn handle_nick(
 /// how a stolen operator password gets noticed, and how a colleague's login
 /// gets recognised as a colleague's. Sent as a notice from the server, to the
 /// operators themselves rather than to a mode nobody remembers to set.
+/// Somebody just proved who they are. Remembered so that an account nobody
+/// has used in a long time can be told apart from one that is simply quiet —
+/// see `[expiry]`. Off the dispatch loop: a login should not wait on a write.
+pub fn note_account_seen(cfg: &Config, account: &str) {
+    if let Some(ref pool) = cfg.db {
+        let (pool, account) = (pool.clone(), account.to_string());
+        tokio::spawn(async move {
+            crate::persist::touch_account_seen(&pool, &account).await;
+        });
+    }
+}
+
 pub async fn notify_opers(
     state: &Arc<RwLock<ServerState>>,
     senders: &Senders,
@@ -2279,6 +2291,7 @@ pub async fn handle_authenticate(
             }
         }
         tracing::info!(client_id, account = %account, "SASL EXTERNAL authentication successful");
+        note_account_seen(cfg, &account);
         let nick = state
             .read()
             .await
@@ -2859,6 +2872,7 @@ pub async fn handle_authenticate(
         }
 
         tracing::info!(client_id = %client_id, account = %account, "SASL PLAIN authentication successful");
+        note_account_seen(cfg, account);
 
         // Auto-associate TLS certfp with the account for SASL EXTERNAL
         if let Some(ref pool) = cfg.db {
@@ -3366,6 +3380,7 @@ async fn handle_authenticate_scram_step(
         }
 
         tracing::info!(client_id, account = %account, "SASL SCRAM-SHA-256 authentication successful");
+        note_account_seen(cfg, &account);
 
         // Auto-associate TLS certfp with the account for SASL EXTERNAL
         if let Some(ref pool) = cfg.db {
@@ -3618,6 +3633,7 @@ pub async fn login_client(
         }
     }
 
+    note_account_seen(cfg, account);
     // Auto-associate the TLS client certificate fingerprint so SASL EXTERNAL works next time.
     if let Some(ref pool) = cfg.db {
         let certfp = state.read().await.certfps.get(client_id).cloned();

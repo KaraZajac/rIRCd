@@ -305,6 +305,10 @@ pub async fn run(
             }
             ch_guard.key = e.mode_key;
             ch_guard.modes.user_limit = e.mode_limit;
+            ch_guard.modes.join_throttle = e
+                .mode_throttle
+                .as_deref()
+                .and_then(crate::channel::parse_throttle);
             if e.created_at > 0 {
                 ch_guard.created_at = e.created_at;
             }
@@ -864,6 +868,7 @@ pub async fn run(
             crate::link::autoconnect(link.clone(), link_ctx.clone());
         }
     }
+    crate::expiry::start(cfg_arc.clone(), state.clone(), channels.clone(), senders.clone());
 
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

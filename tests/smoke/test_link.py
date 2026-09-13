@@ -582,6 +582,75 @@ if banner.find(" 381 "):
     target.close()
 banner.close()
 
+section("an operator can drop a link, and dial it again")
+# Until now the only way to take a link down or bring one up was to restart
+# the server. SQUIT tells the peer why before the link goes; CONNECT dials a
+# configured link now rather than waiting for autoconnect's next try.
+
+
+def servers_listed(client):
+    mark = client.mark()
+    client.send("LINKS")
+    client.wait_for(" 365 ", seconds=5)
+    return " ".join(client.find(" 364 ", lines=client.since(mark)))
+
+
+shaper = Client(f"shp{RUN}", port=A_PORT)
+shaper.send(f"OPER linkoper {os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+shaper.wait_for(" 381 ", " 464 ", seconds=5)
+if shaper.find(" 381 "):
+    plain = Client(f"pln{RUN}", port=A_PORT)
+    pmark = plain.mark()
+    plain.send(f"SQUIT {B_NAME} :not mine to drop")
+    plain.read(1.2)
+    check("a user without the privilege cannot drop a link",
+          bool(plain.find(" 481 ", lines=plain.since(pmark))), plain.since(pmark)[-2:])
+    plain.close()
+
+    b_before = log("b")
+    mark = shaper.mark()
+    squit_mark = mark
+    shaper.send(f"SQUIT {B_NAME} :maintenance")
+    shaper.read(2.0)
+    check("SQUIT is acknowledged",
+          bool(shaper.find("Closing link to", B_NAME, lines=shaper.since(mark))), shaper.since(mark)[-2:])
+    told = eventually(lambda: ("maintenance" in log("b")[len(b_before):]) or None, seconds=8)
+    check("and B is told why", bool(told),
+          [l for l in log("b")[len(b_before):].splitlines() if "closing" in l.lower()][-2:])
+    gone = eventually(lambda: (B_NAME not in servers_listed(shaper)) or None, seconds=8)
+    check("A no longer lists B", bool(gone), servers_listed(shaper))
+    shaper.read(0.5)
+    check("and every operator hears that the link was lost",
+          bool(shaper.find("NOTICE", "Link with", B_NAME, "lost", lines=shaper.since(mark))),
+          [l for l in shaper.since(mark) if "NOTICE" in l][-3:])
+
+    mark = shaper.mark()
+    shaper.send(f"SQUIT nosuch.{RUN}.test :nothing there")
+    shaper.read(1.2)
+    check("dropping a server that is not attached is refused",
+          bool(shaper.find("FAIL SQUIT NO_SUCH_LINK", lines=shaper.since(mark))), shaper.since(mark)[-2:])
+
+    mark = shaper.mark()
+    shaper.send(f"CONNECT {B_NAME}")
+    shaper.read(2.0)
+    acknowledged = shaper.find("Connecting to", B_NAME, lines=shaper.since(mark)) or \
+        shaper.find("ALREADY_LINKED", lines=shaper.since(mark))
+    check("CONNECT dials it again, or finds autoconnect already has", bool(acknowledged), shaper.since(mark)[-2:])
+    back = eventually(lambda: (B_NAME in servers_listed(shaper)) or None, seconds=20)
+    check("and B is listed again", bool(back), servers_listed(shaper))
+    shaper.read(0.5)
+    # Autoconnect may well have brought B back before CONNECT was even sent,
+    # so the notice is looked for from the SQUIT onward.
+    check("and every operator hears that it is back",
+          bool(shaper.find("NOTICE", "Link with", B_NAME, "established", lines=shaper.since(squit_mark))),
+          [l for l in shaper.since(squit_mark) if "NOTICE" in l][-3:])
+    mark = shaper.mark()
+    shaper.send(f"CONNECT nosuch.{RUN}.test")
+    shaper.read(1.2)
+    check("dialling a link that is not configured is refused",
+          bool(shaper.find("FAIL CONNECT NO_SUCH_LINK", lines=shaper.since(mark))), shaper.since(mark)[-2:])
+shaper.close()
+
 section("a split is noticed")
 # Stop B and watch A report the split rather than carrying on as if nothing
 # happened.

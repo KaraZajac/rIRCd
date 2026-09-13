@@ -297,6 +297,9 @@ pub struct LinkRegistry {
     /// either late or untrue, and either way is not a reason to make a place
     /// for it.
     bursting: std::collections::HashSet<String>,
+    /// A way to tell each directly-attached link to close, with a reason. An
+    /// operator's `SQUIT` goes down this; the link's own task does the rest.
+    closers: std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>,
 }
 
 impl LinkRegistry {
@@ -305,6 +308,24 @@ impl LinkRegistry {
         self.bursting.insert(server.sid.clone());
         self.peers.insert(server.sid.clone(), tx);
         self.servers.insert(server.sid.clone(), server);
+    }
+
+    /// Keep the handle that closes a link, for as long as the link is up.
+    pub fn arm_closer(&mut self, sid: &str, close: tokio::sync::mpsc::Sender<String>) {
+        self.closers.insert(sid.to_string(), close);
+    }
+
+    /// Tell a directly-attached server, named by name or id, to be dropped.
+    /// Returns its name if there was one to tell. A server behind a peer is
+    /// that peer's to drop, and is not one of these.
+    pub fn close_peer(&self, name_or_sid: &str, reason: &str) -> Option<String> {
+        let server = self.servers.values().find(|s| {
+            s.behind.is_none()
+                && (s.sid.eq_ignore_ascii_case(name_or_sid) || s.name.eq_ignore_ascii_case(name_or_sid))
+        })?;
+        let close = self.closers.get(&server.sid)?;
+        let _ = close.try_send(reason.to_string());
+        Some(server.name.clone())
     }
 
     /// Whether this peer is still sending everything it knows.
@@ -329,6 +350,7 @@ impl LinkRegistry {
         // A peer that never finished bursting is not still bursting once it is
         // gone, and a reconnecting peer must not inherit the last one's state.
         self.bursting.remove(sid);
+        self.closers.remove(sid);
         let mut gone: Vec<RemoteServer> = Vec::new();
         if let Some(server) = self.servers.remove(sid) {
             gone.push(server);
@@ -736,7 +758,24 @@ pub async fn serve_link<S>(
         hops: 1,
         behind: None,
     };
-    ctx.links.write().await.attach(remote, tx.clone());
+    // One link per server. A peer that dials while its previous connection
+    // is still being torn down — or a peer and this server dialling each other
+    // in the same instant — would otherwise be attached twice, and the second
+    // to go would take the first one's users with it.
+    if ctx.links.read().await.is_linked(&greeting.sid) {
+        warn!(peer = %greeting.name, sid = %greeting.sid, "Refusing a second link to a server already linked");
+        let _ = tx
+            .send(Message::new("ERROR", vec!["Already linked".into()]))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        return;
+    }
+    let (close_tx, mut close_rx) = tokio::sync::mpsc::channel::<String>(1);
+    {
+        let mut links = ctx.links.write().await;
+        links.attach(remote, tx.clone());
+        links.arm_closer(&greeting.sid, close_tx);
+    }
     info!(
         peer = %greeting.name,
         sid = %greeting.sid,
@@ -744,6 +783,16 @@ pub async fn serve_link<S>(
         capab = ?greeting.capab,
         "Linked"
     );
+    {
+        let our_name = ctx.cfg.read().await.server.name.clone();
+        crate::commands::registration::notify_opers(
+            &ctx.state,
+            &ctx.senders,
+            &our_name,
+            &format!("Link with {} ({}) established", greeting.name, greeting.sid),
+        )
+        .await;
+    }
 
     // A link that has gone quiet is not obviously different from one with
     // nothing to say, so each side asks.
@@ -788,7 +837,27 @@ pub async fn serve_link<S>(
 
     let mut lines = crate::linereader::BoundedLines::new(MAX_LINK_LINE);
     loop {
-        match lines.next(&mut reader).await {
+        // The reader waits on the peer and on an operator's SQUIT alike. The
+        // second sends the peer a SQUIT of its own, so it knows this was a
+        // decision and not a failure, and then ends the loop; everything a
+        // failure would do — detach, split — follows as it always did.
+        let next = tokio::select! {
+            n = lines.next(&mut reader) => n,
+            reason = close_rx.recv() => {
+                let reason = reason.unwrap_or_else(|| "link closed".to_string());
+                let (our_sid, our_name) = (
+                    ctx.state.read().await.sid.clone(),
+                    ctx.cfg.read().await.server.name.clone(),
+                );
+                let _ = tx
+                    .send(Message::new("SQUIT", vec![our_name, reason.clone()]).with_prefix(&our_sid))
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                warn!(peer = %peer_name, %reason, "Link closed by an operator");
+                break;
+            }
+        };
+        match next {
             Ok(crate::linereader::Line::Eof) => break,
             // A linked server is trusted with what it says, not with how much
             // of it to hold before it says anything.
@@ -852,6 +921,17 @@ pub async fn serve_link<S>(
     let gone = ctx.links.write().await.detach(&greeting.sid);
     for server in &gone {
         warn!(server = %server.name, "Netsplit: server is gone");
+    }
+    if !gone.is_empty() {
+        let our_name = ctx.cfg.read().await.server.name.clone();
+        let names: Vec<&str> = gone.iter().map(|s| s.name.as_str()).collect();
+        crate::commands::registration::notify_opers(
+            &ctx.state,
+            &ctx.senders,
+            &our_name,
+            &format!("Link with {} lost; {} gone", greeting.name, names.join(", ")),
+        )
+        .await;
     }
     split_users(&ctx, &gone).await;
 }
@@ -2647,6 +2727,18 @@ async fn accept_remote_kline(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     if !hits.is_empty() {
         info!(peer = %peer_sid, mask = %ban.mask, closed = hits.len(), "Network ban closed connections here");
     }
+    crate::commands::registration::notify_opers(
+        &ctx.state,
+        &ctx.senders,
+        &server_name,
+        &format!(
+            "{} added a server ban on {} elsewhere on the network; {} connection(s) closed here",
+            ban.set_by,
+            ban.mask,
+            hits.len()
+        ),
+    )
+    .await;
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
@@ -2661,6 +2753,14 @@ async fn accept_remote_unkline(ctx: &LinkContext, msg: &Message, peer_sid: &str)
     }
     ctx.state.write().await.server_bans.retain(|b| b.mask != mask);
     info!(peer = %peer_sid, %mask, "Server ban removed from the network");
+    let server_name = ctx.cfg.read().await.server.name.clone();
+    crate::commands::registration::notify_opers(
+        &ctx.state,
+        &ctx.senders,
+        &server_name,
+        &format!("The server ban on {mask} was removed elsewhere on the network"),
+    )
+    .await;
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
@@ -2738,6 +2838,16 @@ async fn accept_remote_mode(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
                         shown.push(value.unwrap_or_default());
                     } else {
                         ch.modes.user_limit = None;
+                    }
+                }
+                'j' => {
+                    if adding {
+                        let value = arg.next().cloned();
+                        ch.modes.join_throttle =
+                            value.as_deref().and_then(crate::channel::parse_throttle);
+                        shown.push(value.unwrap_or_default());
+                    } else {
+                        ch.modes.join_throttle = None;
                     }
                 }
                 'i' => ch.modes.invite_only = adding,
@@ -3715,6 +3825,35 @@ async fn dial_tls(
 /// once; the second link to arrive is refused as already linked, and whichever
 /// one survives is the one the network uses. That is why the delay grows —
 /// two servers retrying in lockstep would refuse each other for ever.
+/// Dial a configured link once, now. What `CONNECT` does; `autoconnect` is
+/// this in a loop with a widening delay.
+pub fn connect_once(link: LinkConfig, ctx: LinkContext) {
+    let Some(host) = link.host.clone() else {
+        warn!(link = %link.name, "No host configured; this side waits to be connected to");
+        return;
+    };
+    tokio::spawn(async move {
+        if ctx.links.read().await.is_linked(&link.sid) {
+            return;
+        }
+        let target = format!("{}:{}", host, link.port);
+        match tokio::net::TcpStream::connect(&target).await {
+            Ok(stream) => {
+                info!(link = %link.name, target = %target, "Connecting (operator)");
+                if link.tls {
+                    dial_tls(stream, &host, &target, &link, ctx.clone()).await;
+                } else {
+                    serve_link(stream, target.clone(), ctx.clone(), Some(link.clone()), None).await;
+                }
+                warn!(link = %link.name, "Link closed");
+            }
+            Err(e) => {
+                warn!(link = %link.name, target = %target, "Cannot connect: {}", e);
+            }
+        }
+    });
+}
+
 pub fn autoconnect(link: LinkConfig, ctx: LinkContext) {
     let Some(host) = link.host.clone() else {
         warn!(link = %link.name, "No host configured; waiting to be connected to instead");
@@ -3881,6 +4020,48 @@ mod tests {
             matches!(e, LinkError::Unsupported(ref v) if v == "99"),
             "{e}"
         );
+    }
+
+    /// SQUIT names a server by name or id, either case, and only reaches the
+    /// ones this server is holding a socket to. A server behind a peer is the
+    /// peer's to drop; naming it here does nothing.
+    #[tokio::test]
+    async fn an_operator_can_only_drop_the_links_this_server_holds() {
+        let mut reg = LinkRegistry::default();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (close_tx, mut close_rx) = tokio::sync::mpsc::channel(1);
+        reg.attach(
+            RemoteServer {
+                name: "irc2.example.org".into(),
+                sid: "2AA".into(),
+                description: "peer".into(),
+                hops: 1,
+                behind: None,
+            },
+            tx,
+        );
+        reg.arm_closer("2AA", close_tx);
+        reg.introduce(RemoteServer {
+            name: "irc3.example.org".into(),
+            sid: "3AA".into(),
+            description: "behind the peer".into(),
+            hops: 2,
+            behind: Some("2AA".into()),
+        });
+
+        assert_eq!(reg.close_peer("irc3.example.org", "no"), None);
+        assert_eq!(reg.close_peer("3AA", "no"), None);
+        assert_eq!(reg.close_peer("nowhere.example.org", "no"), None);
+        assert!(close_rx.try_recv().is_err(), "nothing was told to close");
+
+        assert_eq!(
+            reg.close_peer("IRC2.Example.ORG", "maintenance"),
+            Some("irc2.example.org".to_string())
+        );
+        assert_eq!(close_rx.recv().await.as_deref(), Some("maintenance"));
+
+        reg.detach("2AA");
+        assert_eq!(reg.close_peer("2AA", "again"), None, "a gone link cannot be closed");
     }
 
     /// A split takes everything that was reachable through the link, not just

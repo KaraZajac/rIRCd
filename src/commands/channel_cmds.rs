@@ -447,6 +447,27 @@ async fn handle_join_inner(
             }
         }
 
+        // A throttle is for the crowd. The people a full room lets past —
+        // whoever holds the channel, whoever it invited — and an operator
+        // are let past this too, so a join flood never locks the door on the
+        // person who could do something about it.
+        if !holds_the_channel
+            && !is_oper
+            && !ch.invite_list.contains(&user_id)
+            && ch.join_throttled(chrono::Utc::now().timestamp())
+        {
+            reply_self!(Message::new(
+                "480",
+                vec![
+                    nick.clone(),
+                    ch_name.to_string(),
+                    "Cannot join channel (+j) - throttle exceeded, try again later".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name));
+            continue;
+        }
+
         let is_first = ch.members.is_empty();
         let (persisted_op, persisted_voice) = ch.persisted_modes_for(account.as_deref());
         // Whoever creates a channel while logged in becomes its founder, and is
@@ -484,6 +505,19 @@ async fn handle_join_inner(
                 modes: modes.clone(),
             },
         );
+        let now = chrono::Utc::now().timestamp();
+        ch.note_join(now);
+        // A holder walking in is the registration being used, which is what
+        // channel expiry counts. Told to the database once an hour at most.
+        if holds_the_channel && now - ch.use_noted_at > 3600 {
+            ch.use_noted_at = now;
+            if let Some(ref pool) = cfg.db {
+                let (pool, name) = (pool.clone(), ch_key.clone());
+                tokio::spawn(async move {
+                    crate::persist::touch_channel_used(&pool, &name).await;
+                });
+            }
+        }
         // An invitation is spent by walking through the door it opened. Left
         // standing, it would be a permanent exemption from a ban that whoever
         // set the ban never granted.
@@ -1542,6 +1576,9 @@ pub async fn handle_mode(
                 if ch.modes.user_limit.is_some() {
                     modes.push('l');
                 }
+                if ch.modes.join_throttle.is_some() {
+                    modes.push('j');
+                }
                 let mut reply_params = vec![nick.clone(), target.into(), format!("+{}", modes)];
                 if let Some(ref key) = ch.key {
                     // Only show key value to channel operators
@@ -1553,6 +1590,9 @@ pub async fn handle_mode(
                 }
                 if let Some(limit) = ch.modes.user_limit {
                     reply_params.push(limit.to_string());
+                }
+                if let Some(t) = ch.modes.join_throttle {
+                    reply_params.push(crate::channel::throttle_string(t));
                 }
                 let created_at = ch.created_at;
                 let msg = Message::new("324", reply_params).with_prefix(&cfg.server.name);
@@ -2077,6 +2117,39 @@ pub async fn handle_mode(
                             ch.modes.user_limit = None;
                         }
                     }
+                    'j' => {
+                        if plus {
+                            let raw = msg.params.get(param_idx).cloned().unwrap_or_default();
+                            param_idx += 1;
+                            match crate::channel::parse_throttle(&raw) {
+                                Some(t) => ch.modes.join_throttle = Some(t),
+                                None => {
+                                    reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "696",
+                                            vec![
+                                                nick.clone(),
+                                                target.into(),
+                                                "j".into(),
+                                                if raw.is_empty() { "*".to_string() } else { raw },
+                                                "Invalid join throttle, use <joins>:<seconds>".into(),
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
+                                    rejected_modes.push(('j', plus));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            ch.modes.join_throttle = None;
+                            ch.recent_joins.clear();
+                        }
+                    }
                     'e' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
@@ -2278,6 +2351,7 @@ pub async fn handle_mode(
             };
             let mode_key_val = ch.key.clone();
             let mode_limit_val = ch.modes.user_limit;
+            let mode_throttle_val = ch.modes.join_throttle.map(crate::channel::throttle_string);
             let channel_created_at = ch.created_at;
             let member_ids_mode: Vec<String> = ch.members.keys().cloned().collect();
             let echo_params = filter_mode_echo(&msg.params, &rejected_modes);
@@ -2308,6 +2382,7 @@ pub async fn handle_mode(
                     &mode_flags_str,
                     mode_key_val.as_deref(),
                     mode_limit_val,
+                    mode_throttle_val.as_deref(),
                 )
                 .await;
                 // ... and the operator and voice lists, so status survives a part
@@ -2495,7 +2570,7 @@ fn mode_params_for_link(params: &[String], state: &ServerState) -> Option<(Strin
             '+' => plus = true,
             '-' => plus = false,
             _ => {
-                if !(ALWAYS_PARAM.contains(c) || (c == 'l' && plus)) {
+                if !(ALWAYS_PARAM.contains(c) || (matches!(c, 'l' | 'j') && plus)) {
                     continue;
                 }
                 let Some(p) = rest.next() else { continue };
@@ -2514,8 +2589,8 @@ fn mode_params_for_link(params: &[String], state: &ServerState) -> Option<(Strin
 }
 
 fn filter_mode_echo(params: &[String], rejected: &[(char, bool)]) -> Option<Vec<String>> {
-    // Modes taking a parameter whichever way they are set, and `l` which takes
-    // one only when set.
+    // Modes taking a parameter whichever way they are set, and `l` and `j`
+    // which take one only when set.
     const ALWAYS_PARAM: &str = "ovhbeIqk";
     let channel = params.first()?;
     let mode_str = params.get(1)?;
@@ -2531,7 +2606,7 @@ fn filter_mode_echo(params: &[String], rejected: &[(char, bool)]) -> Option<Vec<
             '+' => plus = true,
             '-' => plus = false,
             _ => {
-                let takes_param = ALWAYS_PARAM.contains(c) || (c == 'l' && plus);
+                let takes_param = ALWAYS_PARAM.contains(c) || (matches!(c, 'l' | 'j') && plus);
                 let param = if takes_param { rest.next() } else { None };
                 if rejected.contains(&(c, plus)) {
                     continue;

@@ -35,6 +35,8 @@ pub struct ChannelEntry {
     pub mode_key: Option<String>,
     /// Persisted user limit (+l)
     pub mode_limit: Option<u32>,
+    /// Persisted join throttle (+j), as it was set: `<joins>:<seconds>`.
+    pub mode_throttle: Option<String>,
     /// Channel creation Unix timestamp
     pub created_at: i64,
     /// Account that created the channel, if any.
@@ -152,6 +154,7 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
             mode_flags  VARCHAR(32)  NOT NULL DEFAULT '',
             mode_key    VARCHAR(64)  NULL,
             mode_limit  INT UNSIGNED NULL,
+            mode_throttle VARCHAR(32) NULL,
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) CHARACTER SET utf8mb4",
     )
@@ -164,8 +167,21 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
         "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_flags VARCHAR(32) NOT NULL DEFAULT ''",
         "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_key VARCHAR(64) NULL",
         "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_limit INT UNSIGNED NULL",
+        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_throttle VARCHAR(32) NULL",
     ] {
         let _ = sqlx::query(col_def).execute(pool).await;
+    }
+
+    // Expiry counts from when somebody was last seen. Rows from before the
+    // clock existed start it now, so an upgrade never expires anybody on the
+    // day it lands.
+    for sql in [
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen BIGINT NULL",
+        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS last_used BIGINT NULL",
+        "UPDATE users SET last_seen = UNIX_TIMESTAMP() WHERE last_seen IS NULL",
+        "UPDATE channels SET last_used = UNIX_TIMESTAMP() WHERE last_used IS NULL",
+    ] {
+        let _ = sqlx::query(sql).execute(pool).await;
     }
 
     sqlx::query(
@@ -539,7 +555,7 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
     use sqlx::Row;
 
     let rows = match sqlx::query(
-        "SELECT id, name, topic, mode_flags, mode_key, mode_limit, founder, UNIX_TIMESTAMP(created_at) AS created_ts FROM channels",
+        "SELECT id, name, topic, mode_flags, mode_key, mode_limit, mode_throttle, founder, UNIX_TIMESTAMP(created_at) AS created_ts FROM channels",
     )
     .fetch_all(pool)
     .await
@@ -559,6 +575,7 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
         let mode_flags: String = row.try_get("mode_flags").unwrap_or_default();
         let mode_key: Option<String> = row.try_get("mode_key").unwrap_or(None);
         let mode_limit: Option<u32> = row.try_get("mode_limit").unwrap_or(None);
+        let mode_throttle: Option<String> = row.try_get("mode_throttle").unwrap_or(None);
         let created_at: i64 = row.try_get("created_ts").unwrap_or(0);
         let founder: String = row.try_get("founder").unwrap_or_default();
 
@@ -618,6 +635,7 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
             mode_flags,
             mode_key,
             mode_limit,
+            mode_throttle,
             created_at,
             founder,
             bans,
@@ -632,23 +650,25 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
 
 // ─── Channel mode persistence ─────────────────────────────────────────────────
 
-/// Upsert the mode_flags, mode_key, and mode_limit for a channel by name.
+/// Upsert the mode_flags, mode_key, mode_limit and mode_throttle for a channel by name.
 pub async fn save_channel_modes(
     pool: &sqlx::MySqlPool,
     channel_name: &str,
     mode_flags: &str,
     mode_key: Option<&str>,
     mode_limit: Option<u32>,
+    mode_throttle: Option<&str>,
 ) {
     let _ = sqlx::query(
-        "INSERT INTO channels (name, mode_flags, mode_key, mode_limit)
-         VALUES (?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE mode_flags = VALUES(mode_flags), mode_key = VALUES(mode_key), mode_limit = VALUES(mode_limit)",
+        "INSERT INTO channels (name, mode_flags, mode_key, mode_limit, mode_throttle)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE mode_flags = VALUES(mode_flags), mode_key = VALUES(mode_key), mode_limit = VALUES(mode_limit), mode_throttle = VALUES(mode_throttle)",
     )
     .bind(channel_name)
     .bind(mode_flags)
     .bind(mode_key)
     .bind(mode_limit)
+    .bind(mode_throttle)
     .execute(pool)
     .await;
 }
@@ -1429,6 +1449,72 @@ pub async fn erase_account(pool: &sqlx::MySqlPool, account: &str) -> Result<Eras
     Ok(ErasedAccount {
         channels_founded: founded,
     })
+}
+
+// ─── Expiry ───────────────────────────────────────────────────────────────────
+
+/// Somebody logged in to the account just now.
+pub async fn touch_account_seen(pool: &sqlx::MySqlPool, account: &str) {
+    let _ = sqlx::query("UPDATE users SET last_seen = UNIX_TIMESTAMP() WHERE nick_lower = ?")
+        .bind(account.to_lowercase())
+        .execute(pool)
+        .await;
+}
+
+/// Somebody who holds the channel was in it just now.
+pub async fn touch_channel_used(pool: &sqlx::MySqlPool, channel_name: &str) {
+    let _ = sqlx::query("UPDATE channels SET last_used = UNIX_TIMESTAMP() WHERE name = ?")
+        .bind(channel_name)
+        .execute(pool)
+        .await;
+}
+
+/// Verified accounts nobody has logged in to since `cutoff`. A row from
+/// before the clock existed counts from when it was made.
+pub async fn accounts_unseen_since(pool: &sqlx::MySqlPool, cutoff: i64) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT nick FROM users
+         WHERE verified = 1 AND COALESCE(last_seen, UNIX_TIMESTAMP(created_at)) < ?
+         ORDER BY nick_lower LIMIT 1000",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// Registered channels — ones with a founder or an operator list — that
+/// nobody holding them has been in since `cutoff`.
+pub async fn channels_unused_since(pool: &sqlx::MySqlPool, cutoff: i64) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT c.name FROM channels c
+         WHERE COALESCE(c.last_used, UNIX_TIMESTAMP(c.created_at)) < ?
+           AND (c.founder <> ''
+                OR EXISTS (SELECT 1 FROM channel_operators o WHERE o.channel_id = c.id))
+         ORDER BY c.name LIMIT 1000",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// A registration given up: no founder, no standing list. The channel row
+/// stays, with its topic and its modes; it is simply nobody's now.
+pub async fn unregister_channel(pool: &sqlx::MySqlPool, channel_name: &str) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    for sql in [
+        "UPDATE channels SET founder = '' WHERE name = ?",
+        "DELETE FROM channel_operators WHERE channel_id = (SELECT id FROM channels WHERE name = ?)",
+        "DELETE FROM channel_voice WHERE channel_id = (SELECT id FROM channels WHERE name = ?)",
+    ] {
+        sqlx::query(sql)
+            .bind(channel_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("{sql}: {e}"))?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())
 }
 
 /// A channel with no founder any more: given up, or its founder is gone.

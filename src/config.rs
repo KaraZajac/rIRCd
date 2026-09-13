@@ -35,6 +35,11 @@ pub struct Config {
     /// Ask a DNS blocklist about every public address that connects.
     #[serde(default)]
     pub dnsbl: Option<DnsblConfig>,
+    /// Let go of accounts and channel registrations nobody has used in a
+    /// long time. Off unless set: this is a policy, and a server with real
+    /// people on it should choose it rather than be handed one.
+    #[serde(default)]
+    pub expiry: Option<ExpiryConfig>,
     /// Web Push notifications (draft/webpush).
     #[serde(default)]
     pub webpush: Option<WebpushConfig>,
@@ -228,6 +233,22 @@ fn default_code_expiry() -> i64 {
 /// same ones that do it to everybody else, and somebody has already written
 /// them down. Asked once per address and cached; a lookup that times out
 /// counts as not listed, so a resolver outage never locks everybody out.
+/// What a services package would call nick and channel expiry.
+///
+/// An account nobody has logged in to for `accounts_days` is erased, and the
+/// nick it reserved is free again; a channel registration nobody who holds it
+/// has visited for `channels_days` is given up, and the channel goes on as an
+/// ordinary one. Somebody who stays connected the whole time is not "unseen":
+/// a live login and a holder standing in the room both count as use. Zero,
+/// the default, means never.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ExpiryConfig {
+    #[serde(default)]
+    pub accounts_days: u32,
+    #[serde(default)]
+    pub channels_days: u32,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DnsblConfig {
     /// Zones to ask, e.g. `["dnsbl.dronebl.org"]`. The first that answers
@@ -772,6 +793,9 @@ pub enum OperPrivilege {
     /// network orderly and deciding who owns a room are different jobs, and an
     /// operator trusted with one is not automatically trusted with the other.
     Channels,
+    /// Dialling and dropping links to other servers. The shape of the network
+    /// is a bigger thing to be trusted with than any one user on it.
+    Links,
 }
 
 impl OperPrivilege {
@@ -784,6 +808,7 @@ impl OperPrivilege {
             Self::SetHost => "sethost",
             Self::Wallops => "wallops",
             Self::Channels => "channels",
+            Self::Links => "links",
         }
     }
 }

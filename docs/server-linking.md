@@ -286,6 +286,30 @@ That shape — a token the asker chose, one addressed recipient, a bounded wait
 that gives up on its own — is the one anything else that needs an answer from
 another server should follow.
 
+## Dropping and dialling a link by hand
+
+An operator with the `links` privilege can take a link down with
+`SQUIT <server> [:<reason>]` and bring one up with `CONNECT <server>`. Only a
+directly attached server can be dropped; a server behind a peer is that peer's
+to drop.
+
+Before the socket closes, the dropping side sends its peer
+
+    :<sid> SQUIT <own name> :<reason>
+
+so the far end logs a decision rather than a failure. A server that receives
+`SQUIT` or `ERROR` on a link treats the link as closed: it detaches the peer
+and everything that was reachable through it, and the users behind it quit
+from its point of view — exactly what happens when a link simply drops. A
+link that `autoconnect` keeps up is dialled again after a `SQUIT`, with the
+usual widening delay, unless its `[[links]]` block is changed and re-read
+first.
+
+A server refuses a second link to a server it is already linked to, with
+`ERROR :Already linked`: two servers dialling each other in the same instant
+would otherwise attach twice, and the second connection to go would take the
+first one's users with it.
+
 ## Testing
 
     tests/smoke/run-link.sh

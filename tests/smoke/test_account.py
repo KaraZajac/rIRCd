@@ -239,4 +239,73 @@ if CONFIG:
     finally:
         rehash_with()
 
+section("expiry: a name and a room nobody has used in a long time are let go")
+
+# [expiry] is off in the harness. It is turned on here with the clocks of two
+# accounts and their channels wound back past the policy. One pair is idle and
+# goes; the other is in use — a live login, a founder standing in the room —
+# and stays, because a sweep looks at who is here before it looks at the clock.
+if CONFIG:
+    def verified_account(nick):
+        c = Client(nick)
+        c.send(f"REGISTER * {nick}@example.org {PASSWORD}")
+        c.read(2.0)
+        c.close()
+        db(f"UPDATE users SET verified = 1 WHERE nick_lower = '{nick.lower()}'")
+
+    def login(account):
+        # A registered nick is reserved until its owner has logged in, and
+        # NICK goes before AUTHENTICATE — so the connection uses another.
+        s = connect_negotiating(f"{account}c", caps=["sasl"])
+        s.sasl_plain(account, PASSWORD)
+        s.send("CAP END")
+        s.wait_for(" 001 ", seconds=5)
+        return s
+
+    idle, busy = f"idle{STAMP}", f"busy{STAMP}"
+    idle_ch, busy_ch = f"#idle{STAMP}", f"#busy{STAMP}"
+    verified_account(idle)
+    time.sleep(1.2)  # the per-address mail gap
+    verified_account(busy)
+    i = login(idle)
+    i.send(f"JOIN {idle_ch}")
+    i.read(1.0)
+    i.close()
+    b = login(busy)
+    b.send(f"JOIN {busy_ch}")
+    b.read(1.0)
+    founders = (db(f"SELECT founder FROM channels WHERE LOWER(name) = '{idle_ch}'"),
+                db(f"SELECT founder FROM channels WHERE LOWER(name) = '{busy_ch}'"))
+    check("each account founded a channel", founders == (idle, busy), founders)
+    long_ago = "UNIX_TIMESTAMP() - 40 * 86400"
+    db(f"UPDATE users SET last_seen = {long_ago} WHERE nick_lower IN ('{idle}', '{busy}')")
+    db(f"UPDATE channels SET last_used = {long_ago} WHERE LOWER(name) IN ('{idle_ch}', '{busy_ch}')")
+    bmark = b.mark()
+    rehash_with(("[limits]", "[expiry]\naccounts_days = 30\nchannels_days = 30\n\n[limits]"))
+    time.sleep(2.5)
+    check("the idle account is erased",
+          db(f"SELECT COUNT(*) FROM users WHERE nick_lower = '{idle}'") == "0")
+    check("and its channel has no founder",
+          db(f"SELECT founder FROM channels WHERE LOWER(name) = '{idle_ch}'") == "")
+    check("the account somebody is logged in to stays",
+          db(f"SELECT COUNT(*) FROM users WHERE nick_lower = '{busy}'") == "1")
+    seen = db(f"SELECT last_seen FROM users WHERE nick_lower = '{busy}'")
+    check("with its clock set to now", seen.isdigit() and int(time.time()) - int(seen) < 120, seen)
+    check("and the channel its founder is standing in stays",
+          db(f"SELECT founder FROM channels WHERE LOWER(name) = '{busy_ch}'") == busy)
+    b.read(0.5)
+    check("and that founder was not told anything", not b.find("no longer", lines=b.since(bmark)), b.since(bmark)[-2:])
+    taker = Client(idle)
+    taker.read(0.5)
+    check("the freed nick can be taken", bool(taker.find(" 001 ")) and not taker.find(" 433 "), taker.lines[-2:])
+    taker.close()
+    newcomer = Client(f"newc{STAMP}")
+    newcomer.send(f"JOIN {idle_ch}")
+    newcomer.read(1.0)
+    check("and the freed channel is anybody's again",
+          bool(newcomer.find(" 353 ", f"@newc{STAMP}")), newcomer.lines[-3:])
+    newcomer.close()
+    b.close()
+    rehash_with()
+
 summary("account")

@@ -61,6 +61,88 @@ fn note(cfg: &Config, command: &str, code: &str, target: &str, text: &str) -> Me
     .with_prefix(&cfg.server.name)
 }
 
+/// What the database no longer says, memory must stop saying too, and the
+/// rest of the network has to hear. Founder first, then standing; then the
+/// people in a channel that just lost its founder are told so, because a room
+/// that quietly became nobody's is a room somebody will quietly take. `why`
+/// finishes the sentence "the account X …". Returns the channels orphaned.
+pub async fn forget_account(
+    account: &str,
+    state: &Arc<RwLock<ServerState>>,
+    channels: &Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: &Senders,
+    cfg: &Config,
+    why: &str,
+) -> Vec<String> {
+    let mut orphaned: Vec<(String, i64, Vec<String>)> = Vec::new();
+    let mut standing_lost: Vec<(String, i64, char)> = Vec::new();
+    {
+        let store = channels.read().await;
+        for (key, entry) in store.channels.iter() {
+            let mut ch = entry.write().await;
+            if ch.is_founder(Some(account)) {
+                ch.founder.clear();
+                orphaned.push((
+                    key.clone(),
+                    ch.created_at,
+                    ch.members.keys().cloned().collect(),
+                ));
+            }
+            let before = ch.persisted_operators.len();
+            ch.persisted_operators
+                .retain(|o| !o.eq_ignore_ascii_case(account));
+            if ch.persisted_operators.len() != before {
+                standing_lost.push((key.clone(), ch.created_at, 'o'));
+            }
+            let before = ch.persisted_voice.len();
+            ch.persisted_voice
+                .retain(|v| !v.eq_ignore_ascii_case(account));
+            if ch.persisted_voice.len() != before {
+                standing_lost.push((key.clone(), ch.created_at, 'v'));
+            }
+        }
+    }
+    {
+        let mut state_w = state.write().await;
+        state_w
+            .metadata
+            .remove(&crate::commands::metadata::account_key(account));
+        state_w.read_markers.remove(account);
+        state_w.read_markers.remove(&account.to_lowercase());
+        let lower = account.to_lowercase();
+        state_w.channel_accounts.retain(|_, set| {
+            set.remove(&lower);
+            !set.is_empty()
+        });
+    }
+    let gone = format!("-{account}");
+    for (key, created_at, _) in &orphaned {
+        crate::link::announce_channel_access(cfg, key, *created_at, 'f', std::slice::from_ref(&gone))
+            .await;
+    }
+    for (key, created_at, letter) in &standing_lost {
+        crate::link::announce_channel_access(cfg, key, *created_at, *letter, std::slice::from_ref(&gone))
+            .await;
+    }
+    // The people in a channel that just lost its founder are told so. A room
+    // that quietly became nobody's is a room somebody will quietly take.
+    for (key, _, members) in &orphaned {
+        let word = Message::new(
+            "NOTICE",
+            vec![
+                key.clone(),
+                format!("{key} no longer has a founder: the account {account} {why}"),
+            ],
+        )
+        .with_prefix(&cfg.server.name);
+        let registry = senders.read().await;
+        for member in members {
+            registry.deliver(member, &word);
+        }
+    }
+    orphaned.into_iter().map(|(key, _, _)| key).collect()
+}
+
 /// Close every connection logged in to `account`, except the user `keep`.
 ///
 /// Returns how many users were closed. A password that has just changed hands
@@ -69,7 +151,7 @@ fn note(cfg: &Config, command: &str, code: &str, target: &str, text: &str) -> Me
 /// is kept when there is one: with `multiclient` its other devices are the same
 /// user and stay too, which is the difference between "your other logins" and
 /// "your other windows".
-async fn close_every_login(
+pub async fn close_every_login(
     state: &Arc<RwLock<ServerState>>,
     senders: &Senders,
     cfg: &Config,
@@ -619,74 +701,7 @@ pub async fn handle_dropaccount(
         }
     };
 
-    // What the database no longer says, memory must stop saying too, and the
-    // rest of the network has to hear. Founder first, then standing.
-    let mut orphaned: Vec<(String, i64, Vec<String>)> = Vec::new();
-    let mut standing_lost: Vec<(String, i64, char)> = Vec::new();
-    {
-        let store = channels.read().await;
-        for (key, entry) in store.channels.iter() {
-            let mut ch = entry.write().await;
-            if ch.is_founder(Some(&account)) {
-                ch.founder.clear();
-                orphaned.push((
-                    key.clone(),
-                    ch.created_at,
-                    ch.members.keys().cloned().collect(),
-                ));
-            }
-            let before = ch.persisted_operators.len();
-            ch.persisted_operators
-                .retain(|o| !o.eq_ignore_ascii_case(&account));
-            if ch.persisted_operators.len() != before {
-                standing_lost.push((key.clone(), ch.created_at, 'o'));
-            }
-            let before = ch.persisted_voice.len();
-            ch.persisted_voice
-                .retain(|v| !v.eq_ignore_ascii_case(&account));
-            if ch.persisted_voice.len() != before {
-                standing_lost.push((key.clone(), ch.created_at, 'v'));
-            }
-        }
-    }
-    {
-        let mut state_w = state.write().await;
-        state_w
-            .metadata
-            .remove(&crate::commands::metadata::account_key(&account));
-        state_w.read_markers.remove(&account);
-        state_w.read_markers.remove(&account.to_lowercase());
-        let lower = account.to_lowercase();
-        state_w.channel_accounts.retain(|_, set| {
-            set.remove(&lower);
-            !set.is_empty()
-        });
-    }
-    let gone = format!("-{account}");
-    for (key, created_at, _) in &orphaned {
-        crate::link::announce_channel_access(cfg, key, *created_at, 'f', std::slice::from_ref(&gone))
-            .await;
-    }
-    for (key, created_at, letter) in &standing_lost {
-        crate::link::announce_channel_access(cfg, key, *created_at, *letter, std::slice::from_ref(&gone))
-            .await;
-    }
-    // The people in a channel that just lost its founder are told so. A room
-    // that quietly became nobody's is a room somebody will quietly take.
-    for (key, _, members) in &orphaned {
-        let word = Message::new(
-            "NOTICE",
-            vec![
-                key.clone(),
-                format!("{key} no longer has a founder: the account {account} was dropped"),
-            ],
-        )
-        .with_prefix(&cfg.server.name);
-        let registry = senders.read().await;
-        for member in members {
-            registry.deliver(member, &word);
-        }
-    }
+    forget_account(&account, &state, &channels, &senders, cfg, "was dropped").await;
 
     tracing::info!(
         client_id,

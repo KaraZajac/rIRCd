@@ -88,6 +88,12 @@ pub struct Channel {
     pub list_meta: HashMap<String, (String, i64)>,
     /// Account that created the channel; always opped on join.
     pub founder: String,
+    /// When people joined lately, for `+j`. Only kept while the mode is set,
+    /// and only as far back as its window; never written anywhere.
+    pub recent_joins: std::collections::VecDeque<i64>,
+    /// When the database was last told somebody who holds this channel was
+    /// in it. Once an hour is often enough for a clock that counts in days.
+    pub use_noted_at: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,6 +116,28 @@ pub struct ChannelModeSet {
     pub no_colors: bool,       // +c: strip mIRC color codes
     pub no_ctcp: bool,         // +C: block CTCP to channel
     pub user_limit: Option<u32>,
+    /// +j `<joins>:<seconds>`: no more than this many joins in this many
+    /// seconds. The people the channel would let past a full room — whoever
+    /// holds it, whoever it invited — are let past this too, so a join flood
+    /// slows the crowd without locking the owner out of the door.
+    pub join_throttle: Option<(u32, u32)>,
+}
+
+/// Read a `+j` argument. Both halves have to be there and be positive; a
+/// window longer than a day is a mistake, not a slower throttle.
+pub fn parse_throttle(raw: &str) -> Option<(u32, u32)> {
+    let (joins, secs) = raw.split_once(':')?;
+    let joins: u32 = joins.parse().ok()?;
+    let secs: u32 = secs.parse().ok()?;
+    if joins == 0 || secs == 0 || secs > 86_400 || joins > 100_000 {
+        return None;
+    }
+    Some((joins, secs))
+}
+
+/// How a `+j` throttle is shown: the way it was set.
+pub fn throttle_string(t: (u32, u32)) -> String {
+    format!("{}:{}", t.0, t.1)
 }
 
 impl Channel {
@@ -132,6 +160,8 @@ impl Channel {
             created_at: chrono::Utc::now().timestamp(),
             list_meta: HashMap::new(),
             founder: String::new(),
+            recent_joins: std::collections::VecDeque::new(),
+            use_noted_at: 0,
         }
     }
 
@@ -295,7 +325,36 @@ impl Channel {
             letters.push('l');
             args.push(limit.to_string());
         }
+        if let Some(t) = self.modes.join_throttle {
+            letters.push('j');
+            args.push(throttle_string(t));
+        }
         (letters, args)
+    }
+
+    /// Whether `+j` says no to one more join right now. Forgets joins older
+    /// than the window as it goes, so the record stays as small as the mode.
+    pub fn join_throttled(&mut self, now: i64) -> bool {
+        let Some((joins, secs)) = self.modes.join_throttle else {
+            self.recent_joins.clear();
+            return false;
+        };
+        let horizon = now.saturating_sub(i64::from(secs));
+        while self.recent_joins.front().is_some_and(|t| *t < horizon) {
+            self.recent_joins.pop_front();
+        }
+        self.recent_joins.len() >= joins as usize
+    }
+
+    /// Count a join against `+j`. Somebody the throttle let past still
+    /// counts: the window is about how fast the room is filling, not who
+    /// was refused.
+    pub fn note_join(&mut self, now: i64) {
+        if self.modes.join_throttle.is_none() {
+            return;
+        }
+        self.join_throttled(now);
+        self.recent_joins.push_back(now);
     }
 
     /// Take the modes from a link, replacing whatever was set here.
@@ -323,6 +382,7 @@ impl Channel {
                 'C' => self.modes.no_ctcp = true,
                 'k' => self.key = arg.next().cloned(),
                 'l' => self.modes.user_limit = arg.next().and_then(|v| v.parse().ok()),
+                'j' => self.modes.join_throttle = arg.next().and_then(|v| parse_throttle(v)),
                 // A letter from a newer peer. Dropping it is better than
                 // guessing whether it takes an argument and losing the rest.
                 _ => {}
@@ -362,6 +422,19 @@ impl Channel {
                     // by two servers meeting.
                     self.modes.user_limit = match (self.modes.user_limit, v) {
                         (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
+                'j' => {
+                    let v = arg.next().and_then(|v| parse_throttle(v));
+                    // The looser throttle wins, for the same reason: the one
+                    // that lets more people in per second.
+                    self.modes.join_throttle = match (self.modes.join_throttle, v) {
+                        (Some(a), Some(b)) => {
+                            let a_rate = u64::from(a.0) * u64::from(b.1);
+                            let b_rate = u64::from(b.0) * u64::from(a.1);
+                            Some(if a_rate >= b_rate { a } else { b })
+                        }
                         (a, b) => a.or(b),
                     };
                 }
@@ -455,6 +528,63 @@ use std::sync::Arc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `+j` is `<joins>:<seconds>`, both positive, and nothing else.
+    #[test]
+    fn a_join_throttle_is_joins_and_seconds() {
+        assert_eq!(parse_throttle("2:60"), Some((2, 60)));
+        assert_eq!(parse_throttle("0:60"), None);
+        assert_eq!(parse_throttle("2:0"), None);
+        assert_eq!(parse_throttle("2"), None);
+        assert_eq!(parse_throttle("two:60"), None);
+        assert_eq!(parse_throttle("2:100000"), None, "longer than a day is a mistake");
+        assert_eq!(parse_throttle(""), None);
+        assert_eq!(throttle_string((2, 60)), "2:60");
+    }
+
+    /// The throttle counts joins inside its window and forgets the rest as
+    /// it goes; with no throttle set, nothing is counted at all.
+    #[test]
+    fn a_join_throttle_forgets_joins_outside_its_window() {
+        let mut ch = Channel::new("#j".into());
+        ch.note_join(1_000);
+        assert!(ch.recent_joins.is_empty(), "nothing is kept without the mode");
+        ch.modes.join_throttle = Some((2, 10));
+        assert!(!ch.join_throttled(1_000));
+        ch.note_join(1_000);
+        ch.note_join(1_001);
+        assert!(ch.join_throttled(1_002), "two joins in ten seconds is the limit");
+        assert!(ch.join_throttled(1_010), "the first join is still inside the window");
+        assert!(!ch.join_throttled(1_011), "and then it is not");
+        assert_eq!(ch.recent_joins.len(), 1);
+        ch.modes.join_throttle = None;
+        assert!(!ch.join_throttled(1_011));
+        assert!(ch.recent_joins.is_empty(), "the record goes with the mode");
+    }
+
+    /// Two servers meeting keep the throttle that lets more people in, for
+    /// the same reason they keep the larger +l.
+    #[test]
+    fn two_servers_meeting_keep_the_looser_throttle() {
+        let mut ch = Channel::new("#j".into());
+        ch.modes.join_throttle = Some((2, 60));
+        ch.merge_mode_string("+j", &["10:60".to_string()]);
+        assert_eq!(ch.modes.join_throttle, Some((10, 60)));
+        ch.merge_mode_string("+j", &["1:60".to_string()]);
+        assert_eq!(ch.modes.join_throttle, Some((10, 60)));
+        ch.merge_mode_string("+j", &["1:10".to_string()]);
+        assert_eq!(ch.modes.join_throttle, Some((10, 60)), "six a minute is slower than ten");
+        ch.merge_mode_string("+j", &["1:5".to_string()]);
+        assert_eq!(ch.modes.join_throttle, Some((1, 5)), "twelve a minute is not");
+        ch.modes.join_throttle = Some((10, 60));
+        ch.merge_mode_string("+j", &["30:60".to_string()]);
+        assert_eq!(ch.modes.join_throttle, Some((30, 60)));
+        let mut fresh = Channel::new("#k".into());
+        fresh.merge_mode_string("+j", &["3:30".to_string()]);
+        assert_eq!(fresh.modes.join_throttle, Some((3, 30)));
+        fresh.set_mode_string("+nt", &[]);
+        assert_eq!(fresh.modes.join_throttle, None, "taking a peer's modes wholesale drops it");
+    }
 
     fn chan() -> Channel {
         Channel::new("#chan".to_string())

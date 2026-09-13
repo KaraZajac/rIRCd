@@ -737,8 +737,9 @@ pub async fn handle_help(
             &[
                 "MODE <channel> [+/-modes] [args]",
                 "  Channel modes: i (invite-only), t (topic protect), s (secret), p (private),",
-                "  n (no external), m (moderated), k (key), b (ban), o (op), v (voice),",
-                "  R (registered-only), c (no colors), C (no CTCP), q (quiet mask).",
+                "  n (no external), m (moderated), k (key), l (limit), b (ban), o (op),",
+                "  v (voice), R (registered-only), M (registered speak), Z (TLS only),",
+                "  c (no colors), C (no CTCP), q (quiet mask), j (join throttle, <joins>:<seconds>).",
                 "MODE <nick> [+/-modes]",
                 "  User modes: B (bot).",
             ],
@@ -877,6 +878,21 @@ pub async fn handle_help(
                 "  theirs arrives, and nothing tells them so.",
             ],
         ),
+        Some("CONNECT") => (
+            "CONNECT",
+            &[
+                "CONNECT <server>",
+                "  Dial a configured [[links]] block now. Operators with the",
+                "  links privilege.",
+            ],
+        ),
+        Some("SQUIT") => (
+            "SQUIT",
+            &[
+                "SQUIT <server> [:<reason>]",
+                "  Drop the link to a directly attached server. It is told why.",
+            ],
+        ),
         Some("GHOST") => (
             "GHOST",
             &[
@@ -910,7 +926,7 @@ pub async fn handle_help(
                 "  KICK TOPIC INVITE KNOCK AWAY LIST NAMES OPER REGISTER",
                 "  VERIFY PASSWD RESETPASS DROPACCOUNT GHOST",
                 "  CHANOWN CHANACCESS CHANDROP ACCEPT SILENCE",
-                "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS",
+                "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS CONNECT SQUIT",
                 "  STATS LUSERS",
             ],
         ),
@@ -1591,6 +1607,7 @@ pub async fn reload_config(
 pub async fn handle_rehash(
     client_id: &str,
     state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<crate::channel::ChannelStore>>,
     senders: Senders,
     cfg: Arc<RwLock<Config>>,
     label: Option<&str>,
@@ -1681,6 +1698,11 @@ pub async fn handle_rehash(
         label,
     )
     .await;
+
+    // A changed expiry policy should be seen to work, not waited an hour for.
+    tokio::spawn(async move {
+        crate::expiry::sweep(&cfg, &state, &channels, &senders).await;
+    });
 
     Ok(())
 }
@@ -2002,6 +2024,22 @@ pub async fn handle_kline(
     // at: somebody shut out here and welcome one server over is not shut out.
     crate::link::announce_kline(cfg, &ban).await;
     let hits = enforce_ban(&state, &senders, &cfg.server.name, &ban).await;
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        &format!(
+            "{} added a server ban on {}{} ({})",
+            nick,
+            ban.mask,
+            match ban.expires_at {
+                Some(at) => format!(" until {}", clock_time(at)),
+                None => String::new(),
+            },
+            ban.reason,
+        ),
+    )
+    .await;
 
     reply_to_client(
         &senders,
@@ -2067,6 +2105,13 @@ pub async fn handle_unkline(
     state.write().await.server_bans.retain(|b| b.mask != mask);
     tracing::warn!(oper = %nick, %mask, removed, "Server ban removed");
     crate::link::announce_unkline(cfg, &mask).await;
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        &format!("{nick} removed the server ban on {mask}"),
+    )
+    .await;
 
     reply_to_client(
         &senders,
@@ -2083,6 +2128,256 @@ pub async fn handle_unkline(
             ],
         )
         .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    Ok(())
+}
+
+/// A moment, as a person reads one.
+fn clock_time(at: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(at, 0)
+        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| at.to_string())
+}
+
+/// What an operator gets back from CONNECT or SQUIT when it cannot be done.
+fn link_fail(cfg: &Config, command: &str, code: &str, target: &str, text: &str) -> Message {
+    Message::new(
+        "FAIL",
+        vec![command.into(), code.into(), target.into(), text.into()],
+    )
+    .with_prefix(&cfg.server.name)
+}
+
+/// Whether this client may change the shape of the network, and its nick.
+async fn may_shape_links(
+    state: &Arc<RwLock<ServerState>>,
+    client_id: &str,
+) -> Option<(String, bool)> {
+    let state_r = state.read().await;
+    let client = state_r.clients.get(client_id)?;
+    let g = client.read().await;
+    Some((
+        g.nick_or_id().to_string(),
+        g.may(crate::config::OperPrivilege::Links),
+    ))
+}
+
+/// `SQUIT <server> [:<reason>]` — drop a link to a directly attached server.
+///
+/// The peer is sent a SQUIT of its own first, so it knows this was a decision
+/// and not a failure, and then everything a failure would have done follows:
+/// the users behind it are gone from here, and if this side has autoconnect
+/// for it, it will be dialled again in a while. A server behind a peer is that
+/// peer's to drop.
+pub async fn handle_squit(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((nick, allowed)) = may_shape_links(&state, client_id).await else {
+        return Ok(());
+    };
+    if !allowed {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "481",
+                vec![nick, "Permission Denied- You're not an IRC operator".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let Some(target) = msg.params.first().cloned() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![nick, "SQUIT".into(), "Not enough parameters".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let reason = msg
+        .params
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| format!("Link closed by {nick}"));
+    let Some(ref links) = cfg.links_runtime else {
+        reply_to_client(
+            &senders,
+            client_id,
+            link_fail(cfg, "SQUIT", "NO_LINKS", &target, "This server has no links"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let closed = links.read().await.close_peer(&target, &reason);
+    match closed {
+        Some(name) => {
+            tracing::warn!(oper = %nick, server = %name, %reason, "SQUIT");
+            crate::commands::registration::notify_opers(
+                &state,
+                &senders,
+                &cfg.server.name,
+                &format!("{nick} closed the link to {name} ({reason})"),
+            )
+            .await;
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("NOTICE", vec![nick, format!("Closing link to {name}: {reason}")])
+                    .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+        }
+        None => {
+            reply_to_client(
+                &senders,
+                client_id,
+                link_fail(
+                    cfg,
+                    "SQUIT",
+                    "NO_SUCH_LINK",
+                    &target,
+                    "Not a directly attached server",
+                ),
+                label,
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// `CONNECT <server>` — dial a configured `[[links]]` block now.
+///
+/// The block has to exist and have a host to dial; a block without one is the
+/// side that waits to be connected to. A server already linked is not dialled
+/// again, because one link per server is a rule the link code keeps too.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_connect(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: Senders,
+    cfg_shared: Arc<RwLock<Config>>,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((nick, allowed)) = may_shape_links(&state, client_id).await else {
+        return Ok(());
+    };
+    if !allowed {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "481",
+                vec![nick, "Permission Denied- You're not an IRC operator".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let Some(target) = msg.params.first().cloned() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![nick, "CONNECT".into(), "Not enough parameters".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let Some(ref links) = cfg.links_runtime else {
+        reply_to_client(
+            &senders,
+            client_id,
+            link_fail(cfg, "CONNECT", "NO_LINKS", &target, "This server has no links configured"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let Some(link) = cfg
+        .links
+        .iter()
+        .find(|l| l.name.eq_ignore_ascii_case(&target) || l.sid.eq_ignore_ascii_case(&target))
+        .cloned()
+    else {
+        reply_to_client(
+            &senders,
+            client_id,
+            link_fail(cfg, "CONNECT", "NO_SUCH_LINK", &target, "No [[links]] block by that name"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    if links.read().await.is_linked(&link.sid) {
+        reply_to_client(
+            &senders,
+            client_id,
+            link_fail(cfg, "CONNECT", "ALREADY_LINKED", &link.name, "Already linked"),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let Some(ref host) = link.host else {
+        reply_to_client(
+            &senders,
+            client_id,
+            link_fail(
+                cfg,
+                "CONNECT",
+                "NO_HOST",
+                &link.name,
+                "That link has no host to dial; this side waits to be connected to",
+            ),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let where_to = format!("{}:{}", host, link.port);
+    tracing::warn!(oper = %nick, server = %link.name, target = %where_to, "CONNECT");
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        &format!("{nick} is connecting to {} ({where_to})", link.name),
+    )
+    .await;
+    let ctx = crate::link::LinkContext {
+        cfg: cfg_shared,
+        state,
+        channels,
+        senders: senders.clone(),
+        links: links.clone(),
+    };
+    crate::link::connect_once(link.clone(), ctx);
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new("NOTICE", vec![nick, format!("Connecting to {} ({where_to})", link.name)])
+            .with_prefix(&cfg.server.name),
         label,
     )
     .await;

@@ -1,4 +1,4 @@
-mod account;
+pub mod account;
 mod channel_cmds;
 pub mod ignore;
 mod messaging;
@@ -155,9 +155,12 @@ pub async fn handle_message(
 
     // REHASH needs write access to cfg — handle before acquiring the read lock
     if msg.command == "REHASH" {
-        return server_cmds::handle_rehash(&client_id, state, senders, cfg, label.as_deref()).await;
+        return server_cmds::handle_rehash(&client_id, state, channels, senders, cfg, label.as_deref())
+            .await;
     }
 
+    // CONNECT hands the shared config to a link task that outlives this call.
+    let cfg_shared = cfg.clone();
     let cfg_guard = cfg.read().await;
     let cfg = &*cfg_guard;
 
@@ -1058,6 +1061,22 @@ pub async fn handle_message(
         "UNKLINE" => {
             server_cmds::handle_unkline(&client_id, msg, state, senders, cfg, label.as_deref())
                 .await
+        }
+        "CONNECT" => {
+            server_cmds::handle_connect(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg_shared,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "SQUIT" => {
+            server_cmds::handle_squit(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
         "ISON" => {
             query_cmds::handle_ison(&client_id, msg, state, senders, cfg, label.as_deref()).await

@@ -164,6 +164,15 @@ autoconnect = true
 | `send_password` / `receive_password` | — | Separate on purpose: each direction has its own secret, so one leaked configuration does not let the holder link both ways |
 | `autoconnect` | `false` | Keep the link up, retrying with a widening delay |
 
+An operator with the `links` privilege can also shape the network by hand:
+`CONNECT <server>` dials a `[[links]]` block now rather than waiting for its
+next retry, and `SQUIT <server> [:<reason>]` drops the link to a directly
+attached server, telling it why first so the far end logs a decision rather
+than a failure. A server behind a peer is that peer's to drop. Both are
+announced to every operator, and a link that `autoconnect` keeps up comes back
+on its own after a `SQUIT` — set `autoconnect = false` and `REHASH` first if
+it is meant to stay down.
+
 A link carries everything two servers need to agree on: who is connected, what
 they are called, which channels they are in and what is said in them — and who
 those channels belong to. Ownership is carried as accounts rather than nicks,
@@ -292,7 +301,7 @@ privileges = ["kill", "ban"]   # omit for all privileges
 
 `privileges` limits what an operator may do: `kill`, `ban` (KLINE/UNKLINE),
 `rehash`, `die`, `sethost`, `wallops`, `channels` (`CHANOWN` on a channel that
-is not theirs). Omitting the key keeps the previous behaviour, where every
+is not theirs), `links` (`CONNECT` and `SQUIT`). Omitting the key keeps the previous behaviour, where every
 operator may do everything — so this only narrows operators who were already
 narrowed, and `channels` has to be listed for them to move a channel.
 
@@ -502,6 +511,33 @@ rotating that last one would invalidate every push subscription registered
 under it. A configuration that will not load leaves the running one alone and
 says why in the log.
 
+### `[expiry]`
+
+What a services package would call nick and channel expiry. Off unless set:
+this is a policy about other people's names and rooms, and a server with real
+people on it should choose it rather than be handed one.
+
+```toml
+[expiry]
+accounts_days = 365   # erase an account nobody has logged in to for a year
+channels_days = 90    # give up a registration nobody holding it has visited for 90 days
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `accounts_days` | `0` (never) | An account nobody has logged in to for this long is erased: its nick is free again, its profile and read markers go with it, and the channels it founded are left without a founder — the people in them are told, as with `DROPACCOUNT` |
+| `channels_days` | `0` (never) | A registration nobody who holds the channel — founder or standing operator — has been in for this long is given up. The channel keeps its topic and its modes; it is simply nobody's, and the next person in gets `@` the way they would in any fresh channel |
+
+"Unseen" is measured the way a person would measure it. A login is use, and so
+is a holder standing in the room — including one who connected months ago and
+never left: the sweep looks at who is connected before it looks at the clock,
+and refreshes the clock for them rather than expiring them. It runs a couple of
+minutes after startup, once an hour after that, and on every `REHASH`, so a
+changed policy can be seen to work. The clock starts the first time this
+version runs, so nobody expires on the day of an upgrade. Operators are told
+what each sweep let go of, and what it let go of is announced across links the
+way `DROPACCOUNT` and `CHANACCESS` withdrawals are.
+
 ## CLI Commands
 
 | Command | Description |
@@ -703,7 +739,8 @@ not keep one alive, because with nobody able to lift them a `+k` whose key is
 forgotten would seal the channel rather than save it.
 
 - **Topic** — persisted whenever a channel topic is set; 333 RPL_TOPICWHOTIME and 329 RPL_CREATIONTIME sent on JOIN.
-- **Channel modes** — mode flags (`+imnstRcC`), key (`+k`), and user limit (`+l`) are saved to the database on every MODE change, kept when an owned channel empties, and restored on startup.
+- **Channel modes** — mode flags (`+imnstRcC`), key (`+k`), user limit (`+l`) and join throttle (`+j`) are saved to the database on every MODE change, kept when an owned channel empties, and restored on startup.
+- **Expiry** — a registration is kept for as long as `[expiry]` says, which by default is forever; see that section.
 - **Ban and exception lists** — `+b`, `+e`, `+I` and `+q` masks are saved per channel and restored, so neither an empty room nor a restart makes an owned channel forget who was banned.
 - **Operators / Voice** — stored per channel **by account**; whoever logs in to one receives `@`/`+` automatically when they join, under any nick. Status granted to somebody with no account applies while they are present and is not written down. Rows stored under a bare nick by an older version are dropped at startup, with a count in the log — they granted nothing that could be trusted, because nick reservation is what would have protected them and it fails open when the database is unreachable.
 - **Direct messages** — private conversations are stored per nick pair and replayed by `CHATHISTORY <nick>`; `CHATHISTORY TARGETS` lists only the requesting user's own conversations.
@@ -855,6 +892,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+t` | Topic restricted to ops |
 | `+k` | Channel key (password) |
 | `+l` | User limit |
+| `+j` | Join throttle, `<joins>:<seconds>` — no more than that many joins in that many seconds (480 past it). Whoever holds the channel, whoever it invited, and operators are let past, so a join flood slows the crowd without locking the owner out |
 | `+R` | Registered users only — unregistered users cannot join or speak |
 | `+M` | Only registered users may speak; anybody may join. Somebody given a voice or ops may speak regardless, as with `+m`. The anti-spam mode for a channel that wants to stay open to lurkers |
 | `+Z` | TLS only — a connection not over TLS cannot join, and the mode cannot be set while anybody in the channel is not on TLS (490). What is said in a `+Z` channel has never crossed a wire in the clear on any hop this server controls |
