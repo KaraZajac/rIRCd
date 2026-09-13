@@ -302,6 +302,10 @@ privileges = ["kill", "ban"]   # omit for all privileges
 `privileges` limits what an operator may do: `kill`, `ban` (KLINE/UNKLINE),
 `rehash`, `die`, `sethost`, `wallops`, `channels` (`CHANOWN` on a channel that
 is not theirs), `links` (`CONNECT` and `SQUIT`). Omitting the key keeps the previous behaviour, where every
+`kill` also covers `SANICK <nick> <newnick>`, the milder cousin of `KILL`: somebody
+sitting on a name they should not have is moved off it rather than off the
+network, told who did it, and the network sees an ordinary nick change — a user
+on another server is renamed by that server at this one's request.
 operator may do everything — so this only narrows operators who were already
 narrowed, and `channels` has to be listed for them to move a channel.
 
@@ -739,7 +743,7 @@ not keep one alive, because with nobody able to lift them a `+k` whose key is
 forgotten would seal the channel rather than save it.
 
 - **Topic** — persisted whenever a channel topic is set; 333 RPL_TOPICWHOTIME and 329 RPL_CREATIONTIME sent on JOIN.
-- **Channel modes** — mode flags (`+imnstRcC`), key (`+k`), user limit (`+l`) and join throttle (`+j`) are saved to the database on every MODE change, kept when an owned channel empties, and restored on startup.
+- **Channel modes** — mode flags (`+imnstRcC`), key (`+k`), user limit (`+l`), join throttle (`+j`) and flood limit (`+f`) are saved to the database on every MODE change, kept when an owned channel empties, and restored on startup.
 - **Expiry** — a registration is kept for as long as `[expiry]` says, which by default is forever; see that section.
 - **Ban and exception lists** — `+b`, `+e`, `+I` and `+q` masks are saved per channel and restored, so neither an empty room nor a restart makes an owned channel forget who was banned.
 - **Operators / Voice** — stored per channel **by account**; whoever logs in to one receives `@`/`+` automatically when they join, under any nick. Status granted to somebody with no account applies while they are present and is not written down. Rows stored under a bare nick by an older version are dropped at startup, with a count in the log — they granted nothing that could be trusted, because nick reservation is what would have protected them and it fails open when the database is unreachable.
@@ -893,6 +897,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+k` | Channel key (password) |
 | `+l` | User limit |
 | `+j` | Join throttle, `<joins>:<seconds>` — no more than that many joins in that many seconds (480 past it). Whoever holds the channel, whoever it invited, and operators are let past, so a join flood slows the crowd without locking the owner out |
+| `+f` | Flood limit, `<lines>:<seconds>` — one line over it from one person and the server kicks them (`Channel flood (limit is 5 lines in 10 seconds)`); the line itself is not delivered. Ops, half-ops and operators are not the crowd it is for, and the founder cannot be kicked by it any more than by anyone else |
 | `+R` | Registered users only — unregistered users cannot join or speak |
 | `+M` | Only registered users may speak; anybody may join. Somebody given a voice or ops may speak regardless, as with `+m`. The anti-spam mode for a channel that wants to stay open to lurkers |
 | `+Z` | TLS only — a connection not over TLS cannot join, and the mode cannot be set while anybody in the channel is not on TLS (490). What is said in a `+Z` channel has never crossed a wire in the clear on any hop this server controls |

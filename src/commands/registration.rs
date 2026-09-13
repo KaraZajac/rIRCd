@@ -90,7 +90,7 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// only to clients that enabled the capability.
 fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES=beIq,k,jl,imnstpRcCMZ USERMODES=,,,BgiorRw MAXLIST=beIq:100 SILENCE=32 CALLERID=g PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current());
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES=beIq,k,fjl,imnstpRcCMZ USERMODES=,,,BgiorRw MAXLIST=beIq:100 SILENCE=32 CALLERID=g PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current());
     let deny = cfg
         .server
         .client_tag_deny
@@ -1143,6 +1143,249 @@ pub async fn handle_cap(
     Ok(())
 }
 
+/// Change a registered client's nick, and tell everybody who needs telling:
+/// WHOWAS, the nick table, metadata filed under the old name, MONITOR
+/// watchers, the rest of the network, every channel they are in, and their
+/// own other connections. What NICK does once it has decided the change is
+/// allowed — and what SANICK does on an operator's say-so, which is what
+/// `forced_by` names. Returns whether the nick changed.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_nick_change(
+    client_id: &str,
+    nick: &str,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+    forced_by: Option<&str>,
+) -> anyhow::Result<bool> {
+    let nick = nick.to_string();
+    let mut state_guard = state.write().await;
+    let Some(client) = state_guard.clients.get(client_id).cloned() else {
+        return Ok(false);
+    };
+    let client_guard = client.write().await;
+    if let Some(oper) = forced_by {
+        tracing::warn!(client_id, new_nick = %nick, %oper, "Nick changed by an operator");
+    }
+    // Held by someone else, meaning some *other* user — another of
+    // this user's own connections is not a collision.
+    let self_user = state_guard.user_id(client_id);
+    if state_guard
+        .nick_to_id
+        .get(&nick.to_uppercase())
+        .map(|id| *id != self_user)
+        == Some(true)
+    {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "433",
+                vec![
+                    client_guard.nick_or_id().to_string(),
+                    nick.clone(),
+                    "Nickname is already in use".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(false);
+    }
+    let old_nick = client_guard.nick.clone();
+    let old_source = client_guard
+        .source()
+        .unwrap_or_else(|| client_guard.nick_or_id().to_string());
+    // Record old nick in WHOWAS before changing it.
+    // Build the entry while we hold client_guard, then drop it before mutating state_guard.
+    let whowas_entry = old_nick.as_ref().map(|n| crate::user::WhowasEntry {
+        nick: n.clone(),
+        user: client_guard.display_user().to_string(),
+        host: client_guard.display_host().to_string(),
+        realname: client_guard.realname.as_deref().unwrap_or("").to_string(),
+        server: cfg.server.name.clone(),
+        timestamp: chrono::Utc::now().timestamp(),
+    });
+    drop(client_guard);
+    if let Some(entry) = whowas_entry {
+        // Persist to DB
+        if let Some(ref pool) = cfg.db {
+            persist::save_whowas(
+                pool,
+                &entry.nick,
+                &entry.user,
+                &entry.host,
+                &entry.realname,
+                &entry.server,
+            )
+            .await;
+        }
+        state_guard.push_whowas(entry);
+    }
+    if let Some(ref o) = old_nick {
+        tracing::info!(client_id, old_nick = %o, new_nick = %nick, "Nick change");
+        state_guard.nick_to_id.remove(&crate::casefold::upper(o));
+        // Somebody logged in has their profile filed under their
+        // account, so changing what they are called moves nothing:
+        // it was never filed under the name. Somebody with no account
+        // has keys filed under the nick they are leaving, and those
+        // describe the person rather than the seat, so they come along
+        // — left behind, the next holder of the old name wears them.
+        let account = match state_guard.clients.get(client_id) {
+            Some(c) => c.read().await.account.clone(),
+            None => None,
+        };
+        if account.is_none() {
+            let (from, to) = (
+                crate::commands::metadata::nick_key(o),
+                crate::commands::metadata::nick_key(&nick),
+            );
+            if from != to {
+                if let Some(keys) = state_guard.metadata.remove(&from) {
+                    state_guard.metadata.insert(to, keys);
+                }
+            }
+        }
+    }
+    // One nick change happened at one time, and every server has to
+    // agree on when: it is what settles a collision.
+    let nick_ts = chrono::Utc::now().timestamp();
+    if let Some(client) = state_guard.clients.get(client_id) {
+        let mut g = client.write().await;
+        g.nick = Some(nick.clone());
+        g.nick_ts = nick_ts;
+    }
+    // The nick belongs to the user, so it must point at the user and
+    // not at whichever of its connections changed it — otherwise a
+    // message addressed to the nick reaches only that one.
+    let user_id = state_guard.user_id(client_id);
+    state_guard
+        .nick_to_id
+        .insert(crate::casefold::upper(&nick), user_id.clone());
+    // monitor: 731 to watchers of old nick, 730 to watchers of new nick.
+    // A change of case is the same nick, so nobody went offline or came
+    // online and there is nothing to report.
+    let case_change_only = old_nick
+        .as_deref()
+        .is_some_and(|old| old.eq_ignore_ascii_case(&nick));
+    let watchers_old: Vec<String> = state_guard
+        .monitor_watchers
+        .by_nick
+        .get(
+            &old_nick
+                .as_ref()
+                .map(|n| n.to_lowercase())
+                .unwrap_or_default(),
+        )
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default();
+    let watchers_new: Vec<String> = state_guard
+        .monitor_watchers
+        .by_nick
+        .get(&crate::casefold::lower(&nick))
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default();
+    drop(state_guard);
+    // Nothing to move on disk: what is written down is filed under an
+    // account, and an account does not change when a nick does.
+    // The rest of the network is told once the local tables are
+    // settled, and never while a lock over them is held.
+    crate::link::announce_nick(cfg, &user_id, &nick, nick_ts).await;
+    let server = &cfg.server.name;
+    let client_arc = state.read().await.clients.get(client_id).cloned();
+    let new_source = match client_arc {
+        Some(c) => c.read().await.source().unwrap_or_else(|| nick.clone()),
+        None => nick.clone(),
+    };
+    for w in &watchers_old {
+        if *w == user_id || case_change_only {
+            continue;
+        }
+        let client_arc = state.read().await.clients.get(w).cloned();
+        let recv_nick = match client_arc {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => "*".to_string(),
+        };
+        let m = Message::new(
+            "731",
+            vec![recv_nick, old_nick.as_deref().unwrap_or("").to_string()],
+        )
+        .with_prefix(server);
+        send_to_client(&senders, w, m).await;
+    }
+    for w in &watchers_new {
+        if *w == user_id || case_change_only {
+            continue;
+        }
+        let client_arc = state.read().await.clients.get(w).cloned();
+        let recv_nick = match client_arc {
+            Some(c) => c.read().await.nick_or_id().to_string(),
+            None => "*".to_string(),
+        };
+        let m =
+            Message::new("730", vec![recv_nick, new_source.clone()]).with_prefix(server);
+        send_to_client(&senders, w, m).await;
+    }
+
+    // Broadcast NICK change to channel members (and self). One event
+    // happened at one time: stamping each copy separately gives two
+    // people in the same channel two different times for it, and
+    // history a third.
+    let happened_at = crate::protocol::server_time_now();
+    let mut nick_msg = Message::new("NICK", vec![nick.clone()]).with_prefix(&old_source);
+    nick_msg
+        .tags
+        .insert("time".to_string(), Some(happened_at.clone()));
+    // The sender's own copy is the answer to their NICK, so it carries
+    // the label; the copies other members see do not.
+    reply_to_client(&senders, client_id, nick_msg.clone(), label).await;
+    // The user's other connections are watching the same nick change.
+    let self_id = state.read().await.user_id(client_id);
+    send_to_other_sessions(&senders, &self_id, client_id, nick_msg.clone()).await;
+    let channel_names: Vec<String> = match state.read().await.clients.get(client_id) {
+        Some(c) => c.read().await.channels.keys().cloned().collect(),
+        None => Vec::new(),
+    };
+    let mut notified = std::collections::HashSet::new();
+    notified.insert(self_id);
+    for ch_name in &channel_names {
+        let ch_store = channels.read().await;
+        let member_ids: Vec<String> = match ch_store.channels.get(ch_name.as_str()) {
+            Some(ch) => ch.read().await.members.keys().cloned().collect(),
+            None => Vec::new(),
+        };
+        drop(ch_store);
+        for mid in member_ids {
+            if notified.insert(mid.clone()) {
+                send_to_client(&senders, &mid, nick_msg.clone()).await;
+            }
+        }
+
+        // Record NICK event for draft/event-playback (one per channel)
+        cfg.record_history_at(ch_name, &old_source, &nick, None, "NICK", &happened_at);
+    }
+
+    if let Some(oper) = forced_by {
+        send_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "NOTICE",
+                vec![
+                    nick.clone(),
+                    format!("Your nick has been changed to {nick} by operator {oper}"),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+        )
+        .await;
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_nick(
     client_id: &str,
@@ -1242,210 +1485,14 @@ pub async fn handle_nick(
         }
     }
 
-    if let Some(client) = state_guard.clients.get(client_id) {
-        let client_guard = client.write().await;
-        if client_guard.registered {
-            // Held by someone else, meaning some *other* user — another of
-            // this user's own connections is not a collision.
-            let self_user = state_guard.user_id(client_id);
-            if state_guard
-                .nick_to_id
-                .get(&nick.to_uppercase())
-                .map(|id| *id != self_user)
-                == Some(true)
-            {
-                reply_to_client(
-                    &senders,
-                    client_id,
-                    Message::new(
-                        "433",
-                        vec![
-                            client_guard.nick_or_id().to_string(),
-                            nick.clone(),
-                            "Nickname is already in use".into(),
-                        ],
-                    )
-                    .with_prefix(&cfg.server.name),
-                    label,
-                )
-                .await;
-                return Ok(());
-            }
-            let old_nick = client_guard.nick.clone();
-            let old_source = client_guard
-                .source()
-                .unwrap_or_else(|| client_guard.nick_or_id().to_string());
-            // Record old nick in WHOWAS before changing it.
-            // Build the entry while we hold client_guard, then drop it before mutating state_guard.
-            let whowas_entry = old_nick.as_ref().map(|n| crate::user::WhowasEntry {
-                nick: n.clone(),
-                user: client_guard.display_user().to_string(),
-                host: client_guard.display_host().to_string(),
-                realname: client_guard.realname.as_deref().unwrap_or("").to_string(),
-                server: cfg.server.name.clone(),
-                timestamp: chrono::Utc::now().timestamp(),
-            });
-            drop(client_guard);
-            if let Some(entry) = whowas_entry {
-                // Persist to DB
-                if let Some(ref pool) = cfg.db {
-                    persist::save_whowas(
-                        pool,
-                        &entry.nick,
-                        &entry.user,
-                        &entry.host,
-                        &entry.realname,
-                        &entry.server,
-                    )
-                    .await;
-                }
-                state_guard.push_whowas(entry);
-            }
-            if let Some(ref o) = old_nick {
-                tracing::info!(client_id, old_nick = %o, new_nick = %nick, "Nick change");
-                state_guard.nick_to_id.remove(&crate::casefold::upper(o));
-                // Somebody logged in has their profile filed under their
-                // account, so changing what they are called moves nothing:
-                // it was never filed under the name. Somebody with no account
-                // has keys filed under the nick they are leaving, and those
-                // describe the person rather than the seat, so they come along
-                // — left behind, the next holder of the old name wears them.
-                let account = match state_guard.clients.get(client_id) {
-                    Some(c) => c.read().await.account.clone(),
-                    None => None,
-                };
-                if account.is_none() {
-                    let (from, to) = (
-                        crate::commands::metadata::nick_key(o),
-                        crate::commands::metadata::nick_key(&nick),
-                    );
-                    if from != to {
-                        if let Some(keys) = state_guard.metadata.remove(&from) {
-                            state_guard.metadata.insert(to, keys);
-                        }
-                    }
-                }
-            }
-            // One nick change happened at one time, and every server has to
-            // agree on when: it is what settles a collision.
-            let nick_ts = chrono::Utc::now().timestamp();
-            if let Some(client) = state_guard.clients.get(client_id) {
-                let mut g = client.write().await;
-                g.nick = Some(nick.clone());
-                g.nick_ts = nick_ts;
-            }
-            // The nick belongs to the user, so it must point at the user and
-            // not at whichever of its connections changed it — otherwise a
-            // message addressed to the nick reaches only that one.
-            let user_id = state_guard.user_id(client_id);
-            state_guard
-                .nick_to_id
-                .insert(crate::casefold::upper(&nick), user_id.clone());
-            // monitor: 731 to watchers of old nick, 730 to watchers of new nick.
-            // A change of case is the same nick, so nobody went offline or came
-            // online and there is nothing to report.
-            let case_change_only = old_nick
-                .as_deref()
-                .is_some_and(|old| old.eq_ignore_ascii_case(&nick));
-            let watchers_old: Vec<String> = state_guard
-                .monitor_watchers
-                .by_nick
-                .get(
-                    &old_nick
-                        .as_ref()
-                        .map(|n| n.to_lowercase())
-                        .unwrap_or_default(),
-                )
-                .map(|s| s.iter().cloned().collect())
-                .unwrap_or_default();
-            let watchers_new: Vec<String> = state_guard
-                .monitor_watchers
-                .by_nick
-                .get(&crate::casefold::lower(&nick))
-                .map(|s| s.iter().cloned().collect())
-                .unwrap_or_default();
-            drop(state_guard);
-            // Nothing to move on disk: what is written down is filed under an
-            // account, and an account does not change when a nick does.
-            // The rest of the network is told once the local tables are
-            // settled, and never while a lock over them is held.
-            crate::link::announce_nick(cfg, &user_id, &nick, nick_ts).await;
-            let server = &cfg.server.name;
-            let client_arc = state.read().await.clients.get(client_id).cloned();
-            let new_source = match client_arc {
-                Some(c) => c.read().await.source().unwrap_or_else(|| nick.clone()),
-                None => nick.clone(),
-            };
-            for w in &watchers_old {
-                if *w == user_id || case_change_only {
-                    continue;
-                }
-                let client_arc = state.read().await.clients.get(w).cloned();
-                let recv_nick = match client_arc {
-                    Some(c) => c.read().await.nick_or_id().to_string(),
-                    None => "*".to_string(),
-                };
-                let m = Message::new(
-                    "731",
-                    vec![recv_nick, old_nick.as_deref().unwrap_or("").to_string()],
-                )
-                .with_prefix(server);
-                send_to_client(&senders, w, m).await;
-            }
-            for w in &watchers_new {
-                if *w == user_id || case_change_only {
-                    continue;
-                }
-                let client_arc = state.read().await.clients.get(w).cloned();
-                let recv_nick = match client_arc {
-                    Some(c) => c.read().await.nick_or_id().to_string(),
-                    None => "*".to_string(),
-                };
-                let m =
-                    Message::new("730", vec![recv_nick, new_source.clone()]).with_prefix(server);
-                send_to_client(&senders, w, m).await;
-            }
-
-            // Broadcast NICK change to channel members (and self). One event
-            // happened at one time: stamping each copy separately gives two
-            // people in the same channel two different times for it, and
-            // history a third.
-            let happened_at = crate::protocol::server_time_now();
-            let mut nick_msg = Message::new("NICK", vec![nick.clone()]).with_prefix(&old_source);
-            nick_msg
-                .tags
-                .insert("time".to_string(), Some(happened_at.clone()));
-            // The sender's own copy is the answer to their NICK, so it carries
-            // the label; the copies other members see do not.
-            reply_to_client(&senders, client_id, nick_msg.clone(), label).await;
-            // The user's other connections are watching the same nick change.
-            let self_id = state.read().await.user_id(client_id);
-            send_to_other_sessions(&senders, &self_id, client_id, nick_msg.clone()).await;
-            let channel_names: Vec<String> = match state.read().await.clients.get(client_id) {
-                Some(c) => c.read().await.channels.keys().cloned().collect(),
-                None => Vec::new(),
-            };
-            let mut notified = std::collections::HashSet::new();
-            notified.insert(self_id);
-            for ch_name in &channel_names {
-                let ch_store = channels.read().await;
-                let member_ids: Vec<String> = match ch_store.channels.get(ch_name.as_str()) {
-                    Some(ch) => ch.read().await.members.keys().cloned().collect(),
-                    None => Vec::new(),
-                };
-                drop(ch_store);
-                for mid in member_ids {
-                    if notified.insert(mid.clone()) {
-                        send_to_client(&senders, &mid, nick_msg.clone()).await;
-                    }
-                }
-
-                // Record NICK event for draft/event-playback (one per channel)
-                cfg.record_history_at(ch_name, &old_source, &nick, None, "NICK", &happened_at);
-            }
-
-            return Ok(());
-        }
+    let registered = match state_guard.clients.get(client_id) {
+        Some(client) => client.read().await.registered,
+        None => false,
+    };
+    if registered {
+        drop(state_guard);
+        apply_nick_change(client_id, &nick, state, channels, senders, cfg, label, None).await?;
+        return Ok(());
     }
 
     // With persistent sessions, a client already authenticated to the account
@@ -1596,7 +1643,7 @@ fn usable_username(given: &str) -> String {
     }
 }
 
-fn is_valid_nick(n: &str) -> bool {
+pub fn is_valid_nick(n: &str) -> bool {
     if n.is_empty() || n.len() > 32 {
         return false;
     }

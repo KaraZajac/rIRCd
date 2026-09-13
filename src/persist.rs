@@ -37,6 +37,8 @@ pub struct ChannelEntry {
     pub mode_limit: Option<u32>,
     /// Persisted join throttle (+j), as it was set: `<joins>:<seconds>`.
     pub mode_throttle: Option<String>,
+    /// Persisted flood limit (+f), as it was set: `<lines>:<seconds>`.
+    pub mode_flood: Option<String>,
     /// Channel creation Unix timestamp
     pub created_at: i64,
     /// Account that created the channel, if any.
@@ -155,6 +157,7 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
             mode_key    VARCHAR(64)  NULL,
             mode_limit  INT UNSIGNED NULL,
             mode_throttle VARCHAR(32) NULL,
+            mode_flood  VARCHAR(32) NULL,
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) CHARACTER SET utf8mb4",
     )
@@ -168,6 +171,7 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
         "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_key VARCHAR(64) NULL",
         "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_limit INT UNSIGNED NULL",
         "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_throttle VARCHAR(32) NULL",
+        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS mode_flood VARCHAR(32) NULL",
     ] {
         let _ = sqlx::query(col_def).execute(pool).await;
     }
@@ -555,7 +559,7 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
     use sqlx::Row;
 
     let rows = match sqlx::query(
-        "SELECT id, name, topic, mode_flags, mode_key, mode_limit, mode_throttle, founder, UNIX_TIMESTAMP(created_at) AS created_ts FROM channels",
+        "SELECT id, name, topic, mode_flags, mode_key, mode_limit, mode_throttle, mode_flood, founder, UNIX_TIMESTAMP(created_at) AS created_ts FROM channels",
     )
     .fetch_all(pool)
     .await
@@ -576,6 +580,7 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
         let mode_key: Option<String> = row.try_get("mode_key").unwrap_or(None);
         let mode_limit: Option<u32> = row.try_get("mode_limit").unwrap_or(None);
         let mode_throttle: Option<String> = row.try_get("mode_throttle").unwrap_or(None);
+        let mode_flood: Option<String> = row.try_get("mode_flood").unwrap_or(None);
         let created_at: i64 = row.try_get("created_ts").unwrap_or(0);
         let founder: String = row.try_get("founder").unwrap_or_default();
 
@@ -636,6 +641,7 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
             mode_key,
             mode_limit,
             mode_throttle,
+            mode_flood,
             created_at,
             founder,
             bans,
@@ -650,7 +656,9 @@ pub async fn load_channels(pool: &sqlx::MySqlPool) -> Vec<ChannelEntry> {
 
 // ─── Channel mode persistence ─────────────────────────────────────────────────
 
-/// Upsert the mode_flags, mode_key, mode_limit and mode_throttle for a channel by name.
+/// Upsert the mode_flags, mode_key, mode_limit, mode_throttle and mode_flood
+/// for a channel by name.
+#[allow(clippy::too_many_arguments)]
 pub async fn save_channel_modes(
     pool: &sqlx::MySqlPool,
     channel_name: &str,
@@ -658,17 +666,19 @@ pub async fn save_channel_modes(
     mode_key: Option<&str>,
     mode_limit: Option<u32>,
     mode_throttle: Option<&str>,
+    mode_flood: Option<&str>,
 ) {
     let _ = sqlx::query(
-        "INSERT INTO channels (name, mode_flags, mode_key, mode_limit, mode_throttle)
-         VALUES (?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE mode_flags = VALUES(mode_flags), mode_key = VALUES(mode_key), mode_limit = VALUES(mode_limit), mode_throttle = VALUES(mode_throttle)",
+        "INSERT INTO channels (name, mode_flags, mode_key, mode_limit, mode_throttle, mode_flood)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE mode_flags = VALUES(mode_flags), mode_key = VALUES(mode_key), mode_limit = VALUES(mode_limit), mode_throttle = VALUES(mode_throttle), mode_flood = VALUES(mode_flood)",
     )
     .bind(channel_name)
     .bind(mode_flags)
     .bind(mode_key)
     .bind(mode_limit)
     .bind(mode_throttle)
+    .bind(mode_flood)
     .execute(pool)
     .await;
 }

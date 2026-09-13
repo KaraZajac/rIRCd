@@ -473,6 +473,7 @@ pub async fn handle_privmsg(
         .unwrap_or_else(|| client_id.to_string());
     let sender_nick = sender_data.nick_or_id().to_string();
     let sender_account = sender_data.account.clone();
+    let sender_is_oper = sender_data.oper;
     let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
     let echo_message = senders
         .read()
@@ -743,6 +744,42 @@ pub async fn handle_privmsg(
                 )
                 .await;
                 return Ok(());
+            }
+
+            // +f: one line too many in the window, and the server shows the
+            // sender the door. Channel staff and operators are not the crowd
+            // the limit is for. The line itself is not delivered: it was the
+            // one over the limit.
+            if ch.modes.msg_flood.is_some() {
+                let user_id = state_guard.user_id(client_id);
+                let staff = ch
+                    .members
+                    .get(&user_id)
+                    .map(|m| m.modes.op || m.modes.halfop)
+                    .unwrap_or(false);
+                if !staff
+                    && !sender_is_oper
+                    && ch.floods(&user_id, chrono::Utc::now().timestamp())
+                {
+                    let limit = ch.modes.msg_flood.unwrap_or_default();
+                    drop(ch);
+                    drop(ch_store);
+                    drop(state_guard);
+                    crate::commands::channel_cmds::server_kick(
+                        &state,
+                        &channels,
+                        &senders,
+                        cfg,
+                        &ch_key,
+                        &user_id,
+                        &format!(
+                            "Channel flood (limit is {} lines in {} seconds)",
+                            limit.0, limit.1
+                        ),
+                    )
+                    .await;
+                    return Ok(());
+                }
             }
 
             // +c: strip colors from message text
@@ -1074,6 +1111,7 @@ pub async fn handle_notice(
         .source()
         .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
+    let sender_is_oper = sender_data.oper;
     let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
     let echo_message = senders
         .read()
@@ -1159,6 +1197,38 @@ pub async fn handle_notice(
                 && ch.is_muted(sender_account.as_deref(), &source)
             {
                 return Ok(());
+            }
+            // +f, as for PRIVMSG: a notice is a line like any other.
+            if ch.modes.msg_flood.is_some() {
+                let user_id = state_guard.user_id(client_id);
+                let staff = ch
+                    .members
+                    .get(&user_id)
+                    .map(|m| m.modes.op || m.modes.halfop)
+                    .unwrap_or(false);
+                if !staff
+                    && !sender_is_oper
+                    && ch.floods(&user_id, chrono::Utc::now().timestamp())
+                {
+                    let limit = ch.modes.msg_flood.unwrap_or_default();
+                    drop(ch);
+                    drop(ch_store);
+                    drop(state_guard);
+                    crate::commands::channel_cmds::server_kick(
+                        &state,
+                        &channels,
+                        &senders,
+                        cfg,
+                        &ch_key,
+                        &user_id,
+                        &format!(
+                            "Channel flood (limit is {} lines in {} seconds)",
+                            limit.0, limit.1
+                        ),
+                    )
+                    .await;
+                    return Ok(());
+                }
             }
             let mut copies = PreparedCopies::new(
                 &base_msg,

@@ -94,7 +94,14 @@ pub struct Channel {
     /// When the database was last told somebody who holds this channel was
     /// in it. Once an hour is often enough for a clock that counts in days.
     pub use_noted_at: i64,
+    /// When each member last spoke, for `+f`. Behind its own small lock so
+    /// the message path, which only reads the channel, can still count.
+    pub spoke_at: std::sync::Mutex<HashMap<String, std::collections::VecDeque<i64>>>,
 }
+
+/// Members whose speaking record is kept before the oldest are forgotten.
+/// A channel does not have this many people talking in one window.
+const MAX_SPEAKERS_TRACKED: usize = 4096;
 
 #[derive(Debug, Clone, Default)]
 pub struct ChannelModeSet {
@@ -121,6 +128,10 @@ pub struct ChannelModeSet {
     /// holds it, whoever it invited — are let past this too, so a join flood
     /// slows the crowd without locking the owner out of the door.
     pub join_throttle: Option<(u32, u32)>,
+    /// +f `<lines>:<seconds>`: more lines than that from one person in that
+    /// many seconds, and the server shows them the door. Channel staff — ops
+    /// and half-ops — and operators are not the crowd it is for.
+    pub msg_flood: Option<(u32, u32)>,
 }
 
 /// Read a `+j` argument. Both halves have to be there and be positive; a
@@ -135,9 +146,21 @@ pub fn parse_throttle(raw: &str) -> Option<(u32, u32)> {
     Some((joins, secs))
 }
 
-/// How a `+j` throttle is shown: the way it was set.
+/// How a `+j` or `+f` limit is shown: the way it was set.
 pub fn throttle_string(t: (u32, u32)) -> String {
     format!("{}:{}", t.0, t.1)
+}
+
+/// Of two rate limits, the one that allows more per second.
+fn looser(a: Option<(u32, u32)>, b: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let a_rate = u64::from(a.0) * u64::from(b.1);
+            let b_rate = u64::from(b.0) * u64::from(a.1);
+            Some(if a_rate >= b_rate { a } else { b })
+        }
+        (a, b) => a.or(b),
+    }
 }
 
 impl Channel {
@@ -162,6 +185,7 @@ impl Channel {
             founder: String::new(),
             recent_joins: std::collections::VecDeque::new(),
             use_noted_at: 0,
+            spoke_at: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -329,7 +353,44 @@ impl Channel {
             letters.push('j');
             args.push(throttle_string(t));
         }
+        if let Some(t) = self.modes.msg_flood {
+            letters.push('f');
+            args.push(throttle_string(t));
+        }
         (letters, args)
+    }
+
+    /// Count one line from a member against `+f`, and say whether it was one
+    /// too many. Nothing is kept for a channel without the mode.
+    pub fn floods(&self, user_id: &str, now: i64) -> bool {
+        let Some((lines, secs)) = self.modes.msg_flood else {
+            return false;
+        };
+        let Ok(mut spoke) = self.spoke_at.lock() else {
+            return false;
+        };
+        let horizon = now.saturating_sub(i64::from(secs));
+        if spoke.len() >= MAX_SPEAKERS_TRACKED && !spoke.contains_key(user_id) {
+            spoke.retain(|_, when| when.back().is_some_and(|t| *t >= horizon));
+        }
+        let when = spoke.entry(user_id.to_string()).or_default();
+        while when.front().is_some_and(|t| *t < horizon) {
+            when.pop_front();
+        }
+        when.push_back(now);
+        when.len() > lines as usize
+    }
+
+    /// `-f`, or a member leaving: nothing to hold against anybody.
+    pub fn forget_speaking(&self, user_id: Option<&str>) {
+        if let Ok(mut spoke) = self.spoke_at.lock() {
+            match user_id {
+                Some(id) => {
+                    spoke.remove(id);
+                }
+                None => spoke.clear(),
+            }
+        }
     }
 
     /// Whether `+j` says no to one more join right now. Forgets joins older
@@ -383,6 +444,7 @@ impl Channel {
                 'k' => self.key = arg.next().cloned(),
                 'l' => self.modes.user_limit = arg.next().and_then(|v| v.parse().ok()),
                 'j' => self.modes.join_throttle = arg.next().and_then(|v| parse_throttle(v)),
+                'f' => self.modes.msg_flood = arg.next().and_then(|v| parse_throttle(v)),
                 // A letter from a newer peer. Dropping it is better than
                 // guessing whether it takes an argument and losing the rest.
                 _ => {}
@@ -429,14 +491,11 @@ impl Channel {
                     let v = arg.next().and_then(|v| parse_throttle(v));
                     // The looser throttle wins, for the same reason: the one
                     // that lets more people in per second.
-                    self.modes.join_throttle = match (self.modes.join_throttle, v) {
-                        (Some(a), Some(b)) => {
-                            let a_rate = u64::from(a.0) * u64::from(b.1);
-                            let b_rate = u64::from(b.0) * u64::from(a.1);
-                            Some(if a_rate >= b_rate { a } else { b })
-                        }
-                        (a, b) => a.or(b),
-                    };
+                    self.modes.join_throttle = looser(self.modes.join_throttle, v);
+                }
+                'f' => {
+                    let v = arg.next().and_then(|v| parse_throttle(v));
+                    self.modes.msg_flood = looser(self.modes.msg_flood, v);
                 }
                 _ => {}
             }
@@ -560,6 +619,28 @@ mod tests {
         ch.modes.join_throttle = None;
         assert!(!ch.join_throttled(1_011));
         assert!(ch.recent_joins.is_empty(), "the record goes with the mode");
+    }
+
+    /// `+f` counts each member's lines in its window and says when one is
+    /// one too many; a member kicked or a mode lifted is forgotten.
+    #[test]
+    fn a_flood_limit_counts_each_member_separately() {
+        let ch = Channel::new("#f".into());
+        assert!(!ch.floods("a", 1_000), "no mode, no limit");
+        let mut ch = ch;
+        ch.modes.msg_flood = Some((2, 10));
+        assert!(!ch.floods("a", 1_000));
+        assert!(!ch.floods("a", 1_001));
+        assert!(ch.floods("a", 1_002), "the third line in ten seconds is one too many");
+        assert!(!ch.floods("b", 1_002), "somebody else's lines are their own");
+        assert!(ch.floods("a", 1_011), "still over: three of the last four are inside the window");
+        assert!(!ch.floods("a", 1_030), "the window has moved on");
+        ch.forget_speaking(Some("a"));
+        assert!(!ch.floods("a", 1_031));
+        assert!(!ch.floods("a", 1_031));
+        assert!(ch.floods("a", 1_031));
+        ch.forget_speaking(None);
+        assert!(!ch.floods("a", 1_031), "nothing held against anybody after -f");
     }
 
     /// Two servers meeting keep the throttle that lets more people in, for

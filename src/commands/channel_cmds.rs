@@ -1579,6 +1579,9 @@ pub async fn handle_mode(
                 if ch.modes.join_throttle.is_some() {
                     modes.push('j');
                 }
+                if ch.modes.msg_flood.is_some() {
+                    modes.push('f');
+                }
                 let mut reply_params = vec![nick.clone(), target.into(), format!("+{}", modes)];
                 if let Some(ref key) = ch.key {
                     // Only show key value to channel operators
@@ -1592,6 +1595,9 @@ pub async fn handle_mode(
                     reply_params.push(limit.to_string());
                 }
                 if let Some(t) = ch.modes.join_throttle {
+                    reply_params.push(crate::channel::throttle_string(t));
+                }
+                if let Some(t) = ch.modes.msg_flood {
                     reply_params.push(crate::channel::throttle_string(t));
                 }
                 let created_at = ch.created_at;
@@ -2150,6 +2156,39 @@ pub async fn handle_mode(
                             ch.recent_joins.clear();
                         }
                     }
+                    'f' => {
+                        if plus {
+                            let raw = msg.params.get(param_idx).cloned().unwrap_or_default();
+                            param_idx += 1;
+                            match crate::channel::parse_throttle(&raw) {
+                                Some(t) => ch.modes.msg_flood = Some(t),
+                                None => {
+                                    reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "696",
+                                            vec![
+                                                nick.clone(),
+                                                target.into(),
+                                                "f".into(),
+                                                if raw.is_empty() { "*".to_string() } else { raw },
+                                                "Invalid flood limit, use <lines>:<seconds>".into(),
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
+                                    rejected_modes.push(('f', plus));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            ch.modes.msg_flood = None;
+                            ch.forget_speaking(None);
+                        }
+                    }
                     'e' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
@@ -2352,6 +2391,7 @@ pub async fn handle_mode(
             let mode_key_val = ch.key.clone();
             let mode_limit_val = ch.modes.user_limit;
             let mode_throttle_val = ch.modes.join_throttle.map(crate::channel::throttle_string);
+            let mode_flood_val = ch.modes.msg_flood.map(crate::channel::throttle_string);
             let channel_created_at = ch.created_at;
             let member_ids_mode: Vec<String> = ch.members.keys().cloned().collect();
             let echo_params = filter_mode_echo(&msg.params, &rejected_modes);
@@ -2383,6 +2423,7 @@ pub async fn handle_mode(
                     mode_key_val.as_deref(),
                     mode_limit_val,
                     mode_throttle_val.as_deref(),
+                    mode_flood_val.as_deref(),
                 )
                 .await;
                 // ... and the operator and voice lists, so status survives a part
@@ -2570,7 +2611,7 @@ fn mode_params_for_link(params: &[String], state: &ServerState) -> Option<(Strin
             '+' => plus = true,
             '-' => plus = false,
             _ => {
-                if !(ALWAYS_PARAM.contains(c) || (matches!(c, 'l' | 'j') && plus)) {
+                if !(ALWAYS_PARAM.contains(c) || (matches!(c, 'l' | 'j' | 'f') && plus)) {
                     continue;
                 }
                 let Some(p) = rest.next() else { continue };
@@ -2589,8 +2630,8 @@ fn mode_params_for_link(params: &[String], state: &ServerState) -> Option<(Strin
 }
 
 fn filter_mode_echo(params: &[String], rejected: &[(char, bool)]) -> Option<Vec<String>> {
-    // Modes taking a parameter whichever way they are set, and `l` and `j`
-    // which take one only when set.
+    // Modes taking a parameter whichever way they are set, and `l`, `j` and
+    // `f`, which take one only when set.
     const ALWAYS_PARAM: &str = "ovhbeIqk";
     let channel = params.first()?;
     let mode_str = params.get(1)?;
@@ -2606,7 +2647,7 @@ fn filter_mode_echo(params: &[String], rejected: &[(char, bool)]) -> Option<Vec<
             '+' => plus = true,
             '-' => plus = false,
             _ => {
-                let takes_param = ALWAYS_PARAM.contains(c) || (matches!(c, 'l' | 'j') && plus);
+                let takes_param = ALWAYS_PARAM.contains(c) || (matches!(c, 'l' | 'j' | 'f') && plus);
                 let param = if takes_param { rest.next() } else { None };
                 if rejected.contains(&(c, plus)) {
                     continue;
@@ -3019,6 +3060,87 @@ pub async fn handle_kick(
     }
 
     Ok(())
+}
+
+/// A kick the server issues on its own account — `+f` tripping, for one.
+/// Everything a KICK from an operator does, minus the permission checks,
+/// with the server as the source; the founder is as exempt from this as
+/// from any other kick. The rest of the network hears it from the server's
+/// id, which every peer shows as its name.
+pub async fn server_kick(
+    state: &Arc<RwLock<ServerState>>,
+    channels: &Arc<RwLock<ChannelStore>>,
+    senders: &Senders,
+    cfg: &Config,
+    ch_key: &str,
+    target: &str,
+    reason: &str,
+) {
+    let (target_nick, target_account) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(target) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.nick_or_id().to_string(), g.account.clone())
+            }
+            None => return,
+        }
+    };
+    let mut removed = false;
+    {
+        let mut store = channels.write().await;
+        let mut empty = false;
+        if let Some(ch) = store.channels.get_mut(ch_key) {
+            let mut ch = ch.write().await;
+            if ch.is_founder(target_account.as_deref()) {
+                return;
+            }
+            if ch.members.remove(target).is_some() {
+                removed = true;
+                ch.forget_speaking(Some(target));
+                let kick = Message::new(
+                    "KICK",
+                    vec![ch_key.to_string(), target_nick.clone(), reason.to_string()],
+                )
+                .with_prefix(&cfg.server.name);
+                let registry = senders.read().await;
+                for mid in ch.members.keys() {
+                    registry.deliver(mid, &kick);
+                }
+                registry.deliver(target, &kick);
+                empty = ch.members.is_empty() && !ch.is_registered();
+            }
+        }
+        if empty {
+            store.channels.remove(ch_key);
+        }
+    }
+    if !removed {
+        return;
+    }
+    tracing::info!(channel = %ch_key, target = %target_nick, %reason, "Server KICK");
+    let our_sid = {
+        let state_r = state.read().await;
+        if let Some(c) = state_r.clients.get(target) {
+            c.write().await.channels.remove(ch_key);
+        }
+        state_r.sid.clone()
+    };
+    if let Some(account) = target_account {
+        {
+            let mut state_w = state.write().await;
+            if let Some(set) = state_w.channel_accounts.get_mut(ch_key) {
+                set.remove(&account.to_lowercase());
+                if set.is_empty() {
+                    state_w.channel_accounts.remove(ch_key);
+                }
+            }
+        }
+        if let Some(ref pool) = cfg.db {
+            crate::persist::forget_account_channel(pool, &account, Some(ch_key)).await;
+        }
+    }
+    crate::link::announce_kick(cfg, &our_sid, ch_key, target, reason).await;
 }
 
 /// Invitations one channel may have standing at once before the ones nobody is

@@ -309,6 +309,10 @@ pub async fn run(
                 .mode_throttle
                 .as_deref()
                 .and_then(crate::channel::parse_throttle);
+            ch_guard.modes.msg_flood = e
+                .mode_flood
+                .as_deref()
+                .and_then(crate::channel::parse_throttle);
             if e.created_at > 0 {
                 ch_guard.created_at = e.created_at;
             }

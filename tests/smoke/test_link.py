@@ -607,7 +607,7 @@ if shaper.find(" 381 "):
           bool(plain.find(" 481 ", lines=plain.since(pmark))), plain.since(pmark)[-2:])
     plain.close()
 
-    b_before = log("b")
+    a_before, b_before = log("a"), log("b")
     mark = shaper.mark()
     squit_mark = mark
     shaper.send(f"SQUIT {B_NAME} :maintenance")
@@ -617,8 +617,11 @@ if shaper.find(" 381 "):
     told = eventually(lambda: ("maintenance" in log("b")[len(b_before):]) or None, seconds=8)
     check("and B is told why", bool(told),
           [l for l in log("b")[len(b_before):].splitlines() if "closing" in l.lower()][-2:])
-    gone = eventually(lambda: (B_NAME not in servers_listed(shaper)) or None, seconds=8)
-    check("A no longer lists B", bool(gone), servers_listed(shaper))
+    # Autoconnect brings B back within a couple of seconds, so the gap is
+    # read from A's log rather than raced for with LINKS.
+    gone = eventually(lambda: ("Netsplit: server is gone" in log("a")[len(a_before):]) or None, seconds=8)
+    check("A let B go", bool(gone),
+          [l for l in log("a")[len(a_before):].splitlines() if "Netsplit" in l or "closed" in l][-2:])
     shaper.read(0.5)
     check("and every operator hears that the link was lost",
           bool(shaper.find("NOTICE", "Link with", B_NAME, "lost", lines=shaper.since(mark))),
@@ -651,25 +654,71 @@ if shaper.find(" 381 "):
           bool(shaper.find("FAIL CONNECT NO_SUCH_LINK", lines=shaper.since(mark))), shaper.since(mark)[-2:])
 shaper.close()
 
+section("WHOWAS remembers people who were on the other server")
+# A user who was on B was here as far as anybody on A in a channel with them
+# could tell, so A remembers them too — under B's name.
+gone = Client(f"gone{RUN}", port=B_PORT)
+gone.send(f"JOIN #ww{RUN}")
+gone.read(0.8)
+asker = Client(f"ask{RUN}", port=A_PORT)
+seen = eventually(lambda: [l for l in whois(asker, f"gone{RUN}") if " 311 " in l] or None, seconds=8)
+check("A can see the user on B", bool(seen), seen)
+gone.send("QUIT :off to bed")
+gone.read(0.5)
+time.sleep(1.0)
+amark = asker.mark()
+asker.send(f"WHOWAS gone{RUN}")
+asker.wait_for(" 369 ", seconds=5)
+check("after they quit, A's WHOWAS knows them", bool(asker.find(" 314 ", f"gone{RUN}", lines=asker.since(amark))), asker.since(amark)[-3:])
+check("under the name of the server they were on", bool(asker.find(" 312 ", B_NAME, lines=asker.since(amark))), asker.since(amark)[-3:])
+asker.close()
+
+section("SANICK reaches across the link")
+# An operator on A renames somebody on B: B makes the change, and both sides
+# see an ordinary nick change.
+far = Client(f"far{RUN}", port=B_PORT)
+far.send(f"JOIN #sn{RUN}")
+far.read(0.8)
+near = Client(f"near{RUN}", port=A_PORT)
+near.send(f"JOIN #sn{RUN}")
+near.read(0.8)
+sanop = Client(f"sanop{RUN}", port=A_PORT)
+sanop.send(f"OPER linkoper {os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+sanop.wait_for(" 381 ", " 464 ", seconds=5)
+seen = eventually(lambda: [l for l in whois(sanop, f"far{RUN}") if " 311 " in l] or None, seconds=8)
+fmark, nmark = far.mark(), near.mark()
+sanop.send(f"SANICK far{RUN} renamed{RUN}")
+sanop.read(1.0)
+check("the user on B is renamed by B", bool(arrives(far, f"NICK renamed{RUN}", fmark)), far.since(fmark)[-3:])
+check("and told by whom", bool(arrives(far, "operator sanop", fmark)), far.since(fmark)[-3:])
+check("and A's user in the same channel sees it", bool(arrives(near, f"NICK renamed{RUN}", nmark)), near.since(nmark)[-3:])
+omark = sanop.mark()
+sanop.send(f"WHOIS renamed{RUN}")
+sanop.wait_for(" 318 ", " 401 ", seconds=5)
+check("and A knows the new name", bool(sanop.find(" 311 ", f"renamed{RUN}", lines=sanop.since(omark))), sanop.since(omark)[-3:])
+far.close()
+near.close()
+sanop.close()
+
 section("a split is noticed")
 # Stop B and watch A report the split rather than carrying on as if nothing
 # happened.
 pid_path = os.path.join(LINK_DIR, "b.pid")
 if os.path.exists(pid_path):
+    # Earlier sections have already split and rejoined the two on purpose,
+    # so only what A logs from here on counts.
+    a_before = log("a")
     os.kill(int(open(pid_path).read().strip()), 15)
     deadline = time.time() + 15
     saw_split = False
     while time.time() < deadline:
-        if "Netsplit" in log("a"):
+        if "Netsplit" in log("a")[len(a_before):]:
             saw_split = True
             break
         time.sleep(0.5)
     check("A noticed B going away", saw_split, log("a")[-400:])
 
-    mark = a.mark()
-    a.send("LINKS")
-    a.wait_for(" 365 ", seconds=5)
-    after = " ".join(a.find(" 364 ", lines=a.since(mark)))
+    after = eventually(lambda: (lambda l: l if B_NAME not in l else None)(servers_listed(a)), seconds=8) or servers_listed(a)
     check("A no longer lists B", B_NAME not in after, after)
     check("A still lists itself", A_NAME in after, after)
     check("A is still serving", bool(Client(f"after{RUN}", port=A_PORT).find(" 001 ")))

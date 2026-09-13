@@ -1506,16 +1506,20 @@ async fn accept_remote_nick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
         .get(1)
         .and_then(|t| t.parse::<i64>().ok())
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
-    let old = {
+    let (old, old_source) = {
         let state = ctx.state.read().await;
         match state.clients.get(uid) {
-            Some(c) => c.read().await.nick.clone(),
+            Some(c) => {
+                let g = c.read().await;
+                (g.nick.clone(), g.source())
+            }
             None => {
                 warn!(peer = %peer_sid, uid = %uid, "NICK for a user we do not know");
                 return;
             }
         }
     };
+    remember_remote_nick(ctx, uid).await;
     {
         let mut state = ctx.state.write().await;
         if let Some(ref o) = old {
@@ -1550,6 +1554,38 @@ async fn accept_remote_nick(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
             .nick_to_id
             .insert(crate::casefold::upper(new_nick), uid.clone());
     }
+    // The people here who share a channel with them see the change the way
+    // they would see any nick change — without this they would go on seeing
+    // the old name, and go on addressing somebody who no longer answers to
+    // it. Each person once, however many channels they share.
+    if let Some(ref source) = old_source {
+        let channels = {
+            let state = ctx.state.read().await;
+            match state.clients.get(uid) {
+                Some(c) => c.read().await.channels.keys().cloned().collect::<Vec<_>>(),
+                None => Vec::new(),
+            }
+        };
+        let mut told = std::collections::HashSet::new();
+        told.insert(uid.clone());
+        let mut audience = Vec::new();
+        for key in &channels {
+            for member in members_of(ctx, key).await {
+                if told.insert(member.clone()) {
+                    audience.push(member);
+                }
+            }
+        }
+        let mut word = Message::new("NICK", vec![new_nick.clone()]).with_prefix(source);
+        word.tags.insert(
+            "time".to_string(),
+            Some(crate::protocol::server_time_now()),
+        );
+        let registry = ctx.senders.read().await;
+        for member in &audience {
+            registry.deliver(member, &word);
+        }
+    }
     if let Some(o) = old {
         monitor_notify(ctx, &o, false, &o).await;
     }
@@ -1576,6 +1612,72 @@ async fn accept_remote_ghost(ctx: &LinkContext, msg: &Message) {
         &server_name,
         &asker,
         &target,
+    )
+    .await;
+}
+
+/// `:<oper> SANICK <target> <newnick>` — an operator somewhere on the network
+/// wants one of our users called something else. The change is made here,
+/// the way any nick change is made, and announced back across the network
+/// as an ordinary NICK. Passed along if the user is not ours.
+///
+/// The asker is trusted to have been an operator where they typed it; what
+/// is checked again here is what this server can see for itself — that the
+/// nick is well-formed, free, and not somebody else's registered name.
+async fn accept_remote_sanick(ctx: &LinkContext, msg: &Message) {
+    let (Some(oper), Some(target), Some(new_nick)) = (
+        msg.prefix.clone(),
+        msg.params.first().cloned(),
+        msg.params.get(1).cloned(),
+    ) else {
+        return;
+    };
+    if pass_along(ctx, msg, &target).await {
+        return;
+    }
+    if !crate::commands::registration::is_valid_nick(&new_nick) {
+        return;
+    }
+    let oper_nick = source_of(ctx, &oper)
+        .await
+        .map(|s| s.split('!').next().unwrap_or(&s).to_string())
+        .unwrap_or(oper);
+    let cfg = ctx.cfg.read().await.clone();
+    let (taken, account) = {
+        let state = ctx.state.read().await;
+        let taken = state
+            .nick_to_id
+            .get(&crate::casefold::upper(&new_nick))
+            .is_some_and(|holder| *holder != target);
+        let account = match state.clients.get(&target) {
+            Some(c) => c.read().await.account.clone(),
+            None => return,
+        };
+        (taken, account)
+    };
+    if taken {
+        warn!(%oper_nick, %target, %new_nick, "SANICK for a nick already in use, refused");
+        return;
+    }
+    if cfg.server.nick_protection
+        && !account.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&new_nick))
+    {
+        if let Some(ref pool) = cfg.db {
+            if crate::persist::nick_is_registered(pool, &cfg.db_health, &new_nick).await {
+                warn!(%oper_nick, %target, %new_nick, "SANICK onto a registered nick, refused");
+                return;
+            }
+        }
+    }
+    let _ = crate::commands::registration::apply_nick_change(
+        &target,
+        &new_nick,
+        ctx.state.clone(),
+        ctx.channels.clone(),
+        ctx.senders.clone(),
+        &cfg,
+        None,
+        Some(&oper_nick),
     )
     .await;
 }
@@ -1647,6 +1749,62 @@ async fn pass_along(ctx: &LinkContext, msg: &Message, uid: &str) -> bool {
     true
 }
 
+/// WHOWAS is a record of who was here, and somebody on another server was
+/// here as far as anyone in a channel with them could tell. Remembered under
+/// their own server's name, the way their own server would remember them.
+async fn remember_remote_nick(ctx: &LinkContext, uid: &str) {
+    // One lock at a time: what is read under one is carried to the next.
+    let (nick, user, host, realname, on) = {
+        let state = ctx.state.read().await;
+        let Some(c) = state.clients.get(uid) else {
+            return;
+        };
+        let g = c.read().await;
+        let Some(nick) = g.nick.clone() else {
+            return;
+        };
+        (
+            nick,
+            g.display_user().to_string(),
+            g.display_host().to_string(),
+            g.realname.as_deref().unwrap_or("").to_string(),
+            g.server.clone(),
+        )
+    };
+    let server = match on {
+        Some(s) => ctx
+            .links
+            .read()
+            .await
+            .servers
+            .get(&s)
+            .map(|srv| srv.name.clone())
+            .unwrap_or(s),
+        None => ctx.cfg.read().await.server.name.clone(),
+    };
+    let entry = crate::user::WhowasEntry {
+        nick,
+        user,
+        host,
+        realname,
+        server,
+        timestamp: chrono::Utc::now().timestamp(),
+    };
+    let pool = ctx.cfg.read().await.db.clone();
+    if let Some(pool) = pool {
+        crate::persist::save_whowas(
+            &pool,
+            &entry.nick,
+            &entry.user,
+            &entry.host,
+            &entry.realname,
+            &entry.server,
+        )
+        .await;
+    }
+    ctx.state.write().await.push_whowas(entry);
+}
+
 /// Take a user off this server altogether: out of every channel it was in, out
 /// of the client tables, and out of the watch lists — telling the people who
 /// shared a channel with it, because from here it has quit.
@@ -1675,6 +1833,7 @@ async fn forget_remote_user(ctx: &LinkContext, uid: &str, reason: &str) {
         to_members(ctx, &members, &quit, Some(uid)).await;
         unseat_member(ctx, key, uid).await;
     }
+    remember_remote_nick(ctx, uid).await;
     ctx.state.write().await.remove_client(uid).await;
     if let Some(nick) = nick {
         monitor_notify(ctx, &nick, false, &nick).await;
@@ -2021,6 +2180,12 @@ fn member_modes_from(prefixes: &str) -> crate::channel::ChannelMemberModeSet {
 
 /// How a user appears to the people who see what it did.
 async fn source_of(ctx: &LinkContext, uid: &str) -> Option<String> {
+    if uid.len() == 3 {
+        // A server speaking for itself: the message shows its name.
+        if let Some(server) = ctx.links.read().await.servers.get(uid) {
+            return Some(server.name.clone());
+        }
+    }
     let state = ctx.state.read().await;
     let c = state.clients.get(uid)?;
     let g = c.read().await;
@@ -2850,6 +3015,17 @@ async fn accept_remote_mode(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
                         ch.modes.join_throttle = None;
                     }
                 }
+                'f' => {
+                    if adding {
+                        let value = arg.next().cloned();
+                        ch.modes.msg_flood =
+                            value.as_deref().and_then(crate::channel::parse_throttle);
+                        shown.push(value.unwrap_or_default());
+                    } else {
+                        ch.modes.msg_flood = None;
+                        ch.forget_speaking(None);
+                    }
+                }
                 'i' => ch.modes.invite_only = adding,
                 'm' => ch.modes.moderated = adding,
                 'n' => ch.modes.no_external = adding,
@@ -3483,6 +3659,10 @@ async fn handle_link_message(
         }
         "GHOST" => {
             accept_remote_ghost(ctx, msg).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "SANICK" => {
+            accept_remote_sanick(ctx, msg).await;
             std::ops::ControlFlow::Continue(())
         }
         "WHOISREQ" => {

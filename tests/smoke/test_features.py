@@ -1278,4 +1278,56 @@ check("-j lifts it", bool(j4.find("JOIN", f"#jt{RUN_ID}")), j4.lines[-2:])
 for c in (gate, j1, j2, j3, jop, j4):
     c.close()
 
+section("+f: one line too many and the server shows the sender the door")
+
+# +f <lines>:<seconds>. The line over the limit is not delivered; the person
+# who sent it is kicked by the server, not by anybody in the room. Channel
+# staff are not the crowd it is for.
+fl = Client(f"flood{RUN_ID}")
+fl.send(f"JOIN #fl{RUN_ID}")
+fl.read(0.8)
+fmark = fl.mark()
+fl.send(f"MODE #fl{RUN_ID} +f 3:0")
+fl.read(0.8)
+check("a limit that is not <lines>:<seconds> is refused",
+      bool(fl.find(" 696 ", lines=fl.since(fmark))), fl.since(fmark)[-2:])
+fmark = fl.mark()
+fl.send(f"MODE #fl{RUN_ID} +f 3:10")
+fl.read(0.8)
+check("+f takes it", bool(fl.find("MODE", "+f 3:10", lines=fl.since(fmark))), fl.since(fmark)[-2:])
+fmark = fl.mark()
+fl.send(f"MODE #fl{RUN_ID}")
+fl.read(0.8)
+check("and shows it", bool(fl.find(" 324 ", "f", "3:10", lines=fl.since(fmark))), fl.since(fmark)[-2:])
+talker = Client(f"talk{RUN_ID}")
+talker.send(f"JOIN #fl{RUN_ID}")
+talker.read(0.8)
+for n in range(4):
+    talker.send(f"PRIVMSG #fl{RUN_ID} :line {n}")
+talker.read(1.5)
+fl.read(0.5)
+check("the fourth line in ten seconds gets them kicked",
+      bool(talker.find("KICK", f"#fl{RUN_ID}", f"talk{RUN_ID}", "Channel flood")), talker.lines[-3:])
+check("by the server, in front of the room",
+      bool(fl.find("KICK", "Channel flood")) and not fl.find(f":talk{RUN_ID}!", "KICK"), fl.lines[-3:])
+check("and the line over the limit was not delivered",
+      bool(fl.find("line 2")) and not fl.find("line 3"), fl.lines[-4:])
+fmark = fl.mark()
+for n in range(5):
+    fl.send(f"PRIVMSG #fl{RUN_ID} :op line {n}")
+fl.read(1.0)
+check("channel staff are not the crowd it is for",
+      not fl.find("KICK", lines=fl.since(fmark)), fl.since(fmark)[-2:])
+fl.send(f"MODE #fl{RUN_ID} -f")
+fl.read(0.5)
+talker.send(f"JOIN #fl{RUN_ID}")
+talker.read(0.8)
+tmark = talker.mark()
+for n in range(5):
+    talker.send(f"PRIVMSG #fl{RUN_ID} :again {n}")
+talker.read(1.0)
+check("-f lifts it", not talker.find("KICK", lines=talker.since(tmark)), talker.since(tmark)[-2:])
+talker.close()
+fl.close()
+
 summary("features")

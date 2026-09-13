@@ -739,7 +739,8 @@ pub async fn handle_help(
                 "  Channel modes: i (invite-only), t (topic protect), s (secret), p (private),",
                 "  n (no external), m (moderated), k (key), l (limit), b (ban), o (op),",
                 "  v (voice), R (registered-only), M (registered speak), Z (TLS only),",
-                "  c (no colors), C (no CTCP), q (quiet mask), j (join throttle, <joins>:<seconds>).",
+                "  c (no colors), C (no CTCP), q (quiet mask), j (join throttle, <joins>:<seconds>),",
+                "  f (flood limit, <lines>:<seconds>: one line over it and the server kicks).",
                 "MODE <nick> [+/-modes]",
                 "  User modes: B (bot).",
             ],
@@ -893,6 +894,14 @@ pub async fn handle_help(
                 "  Drop the link to a directly attached server. It is told why.",
             ],
         ),
+        Some("SANICK") => (
+            "SANICK",
+            &[
+                "SANICK <nick> <newnick>",
+                "  Change somebody else's nick. Operators with the kill privilege.",
+                "  They are told who did it; the network sees an ordinary nick change.",
+            ],
+        ),
         Some("GHOST") => (
             "GHOST",
             &[
@@ -926,7 +935,7 @@ pub async fn handle_help(
                 "  KICK TOPIC INVITE KNOCK AWAY LIST NAMES OPER REGISTER",
                 "  VERIFY PASSWD RESETPASS DROPACCOUNT GHOST",
                 "  CHANOWN CHANACCESS CHANDROP ACCEPT SILENCE",
-                "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS CONNECT SQUIT",
+                "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS CONNECT SQUIT SANICK",
                 "  STATS LUSERS",
             ],
         ),
@@ -2378,6 +2387,183 @@ pub async fn handle_connect(
         client_id,
         Message::new("NOTICE", vec![nick, format!("Connecting to {} ({where_to})", link.name)])
             .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    Ok(())
+}
+
+/// `SANICK <nick> <newnick>` — an operator changes somebody else's nick.
+///
+/// The milder cousin of KILL: somebody sitting on a name they should not
+/// have is moved off it rather than off the network. The change happens the
+/// way any nick change happens, so every channel, watcher and server hears
+/// it the same way, and the person is told who did it. Somebody on another
+/// server is that server's to rename, so the request goes there.
+pub async fn handle_sanick(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let s = &cfg.server.name;
+    let (oper_nick, allowed, oper_id) = {
+        let state_r = state.read().await;
+        let Some(client) = state_r.clients.get(client_id) else {
+            return Ok(());
+        };
+        let g = client.read().await;
+        (
+            g.nick_or_id().to_string(),
+            g.may(crate::config::OperPrivilege::Kill),
+            state_r.user_id(client_id),
+        )
+    };
+    if !allowed {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "481",
+                vec![oper_nick, "Permission Denied- You're not an IRC operator".into()],
+            )
+            .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let (Some(target_nick), Some(new_nick)) = (msg.params.first().cloned(), msg.params.get(1).cloned())
+    else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![oper_nick, "SANICK".into(), "Not enough parameters".into()])
+                .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    if !crate::commands::registration::is_valid_nick(&new_nick) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("432", vec![oper_nick, new_nick, "Erroneous nickname".into()]).with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let (target_id, target_account, remote, current) = {
+        let state_r = state.read().await;
+        let Some(tid) = state_r
+            .nick_to_id
+            .get(&crate::casefold::upper(&target_nick))
+            .cloned()
+        else {
+            drop(state_r);
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("401", vec![oper_nick, target_nick, "No such nick".into()]).with_prefix(s),
+                label,
+            )
+            .await;
+            return Ok(());
+        };
+        let (account, remote, current) = match state_r.clients.get(&tid) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.account.clone(), g.server.is_some(), g.nick.clone())
+            }
+            None => (None, false, None),
+        };
+        if state_r
+            .nick_to_id
+            .get(&crate::casefold::upper(&new_nick))
+            .is_some_and(|holder| *holder != tid)
+        {
+            drop(state_r);
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("433", vec![oper_nick, new_nick, "Nickname is already in use".into()])
+                    .with_prefix(s),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+        (tid, account, remote, current)
+    };
+    if current.as_deref() == Some(new_nick.as_str()) {
+        return Ok(());
+    }
+    // A registered nick belongs to its account, and an operator moving
+    // somebody onto one they do not own would be handing it over.
+    if cfg.server.nick_protection
+        && !target_account
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(&new_nick))
+    {
+        let registered = match cfg.db {
+            Some(ref pool) => crate::persist::nick_is_registered(pool, &cfg.db_health, &new_nick).await,
+            None => false,
+        };
+        if registered {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "433",
+                    vec![oper_nick, new_nick, "Nickname is registered to another account".into()],
+                )
+                .with_prefix(s),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    }
+    tracing::warn!(client_id, oper = %oper_nick, target = %target_nick, %new_nick, remote, "SANICK");
+    if remote {
+        let ask = Message::new("SANICK", vec![target_id.clone(), new_nick.clone()]);
+        crate::link::route_to_user(cfg, &oper_id, &target_id, &ask).await;
+    } else {
+        let changed = crate::commands::registration::apply_nick_change(
+            &target_id,
+            &new_nick,
+            state.clone(),
+            channels,
+            senders.clone(),
+            cfg,
+            None,
+            Some(&oper_nick),
+        )
+        .await?;
+        if !changed {
+            return Ok(());
+        }
+    }
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        s,
+        &format!("{oper_nick} changed {target_nick}'s nick to {new_nick}"),
+    )
+    .await;
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTICE",
+            vec![oper_nick, format!("Changed {target_nick}'s nick to {new_nick}")],
+        )
+        .with_prefix(s),
         label,
     )
     .await;

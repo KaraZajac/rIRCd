@@ -257,6 +257,22 @@ asking to close themselves. A link is trusted to speak for its own users, not to
 have got the rules right — and accounts cross a link, so the far side can check
 this for itself.
 
+`SANICK` is asked the same way. An operator renaming somebody on another server
+sends
+
+    :<oper> SANICK <target> <newnick>
+
+to the server that holds them, which makes the change as it would make any nick
+change and announces it back as an ordinary `NICK`. The asker is trusted to have
+been an operator where they typed it; what the receiving server checks for
+itself is that the new nick is well-formed, not in use, and not somebody else's
+registered name.
+
+`WHOWAS` needs no asking. Every server keeps its own record of who was here,
+and somebody on another server was here as far as anyone who shared a channel
+with them could tell — so a user leaving, being killed, split away, or renamed
+is remembered on every server, under the name of the server they were on.
+
 ### Asking, rather than announcing
 
 Everything above is an announcement: something happened here and the network is
