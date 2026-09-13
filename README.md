@@ -329,6 +329,7 @@ Mail is sent over SMTP with rustls — no system TLS libraries needed.
 | `from` | _(required)_ | From address, e.g. `ExampleNet <noreply@example.com>` |
 | `subject` | `Your IRC account verification code` | Subject line |
 | `code_expiry_secs` | `86400` | How long a code stays valid |
+| `reset_subject` | `Your IRC password reset code` | Subject line of a `RESETPASS` mail. Reset codes are good for fifteen minutes regardless of `code_expiry_secs`: they arrive by mail that anybody holding the inbox can use |
 
 ```toml
 [email]
@@ -556,6 +557,11 @@ traditional network is done by the server itself, against MariaDB.
 | Identify | SASL PLAIN, SCRAM-SHA-256 or EXTERNAL — no `/msg NickServ` |
 | Nick protection | Registered nicks are reserved for their account (`nick_protection`) |
 | Nick recovery | `GHOST <nick>` closes a stale session of your own that is holding it, wherever on the network it is |
+| Password change | `PASSWD <current> <new>` — the current one is asked for even though you are logged in, and your other logins are closed |
+| Password recovery | `RESETPASS <account>` mails a code; `RESETPASS <account> <code> <new>` uses it and closes every login to the account |
+| Dropping an account | `DROPACCOUNT <password>` — removes the account and everything that named it; channels it founded are left with no founder |
+| Channel access list | `CHANACCESS #channel` — the founder, and everyone whose operator or voice status is remembered |
+| Giving a channel up | `CHANDROP #channel` — by the founder, or by an operator with the `channels` privilege; operators keep their standing |
 | Channel founder | The account that creates a channel; always opped on join, never shut out of it by its own `+b`/`+i`/`+k`/`+l`, and not kickable or deoppable in it |
 | Channel transfer | `CHANOWN #channel <account>` — by the founder, or by an operator, said out loud in the channel |
 | Channel access lists | `MODE +o` / `+v` on an **account** is remembered and restored on the next join. Somebody not logged in holds the status while they are there and no longer: a name proves nothing, so remembering one would hand the status to whoever took it next |
@@ -597,6 +603,52 @@ The outgoing founder keeps operator status. Handing a channel on is not the
 same as being thrown out of it. The new owner must be an account that exists,
 and the change crosses the network as a `CACCESS` line, so every server agrees
 about whose channel it is.
+
+`CHANACCESS #channel` lists who has the run of a channel — its founder, and
+everyone whose operator or voice status is remembered between visits. A status
+that is remembered is a status that can be forgotten about, and this is how a
+founder sees what they have given away. Like `CHANOWN`, it answers "no such
+channel" to somebody who cannot see a `+s` or `+i` channel.
+
+`CHANDROP #channel` gives a channel up: the founder may give up their own, and
+an operator with the `channels` privilege may take the founder off any. The
+operators keep their standing, so the channel goes on being somebody's to run;
+it just stops being anybody's to own, and `CHANOWN` by an operator is how it
+gets an owner again. It is said in the channel, whoever did it.
+
+### Your account
+
+There is no NickServ to `SET PASSWORD` at, so the server answers for it:
+
+```
+PASSWD <current> <new>                        change your password
+RESETPASS <account>                           have a reset code mailed to you
+RESETPASS <account> <code> <new password>     use it
+DROPACCOUNT <password>                        remove your account
+```
+
+`PASSWD` asks for the current password even though you are logged in — a
+logged-in session is not proof of knowing it — and closes your other logins,
+since a changed password is meant to lock somebody out and a live session is
+the somebody. With `multiclient`, your other devices are the same login and
+stay.
+
+`RESETPASS <account>` answers the same way whatever happened, because a
+command that said "no such account" would be a way of finding out which names
+are accounts. It sends at most one code per quarter hour to an account, the
+code is good for that long, and using it closes every login to the account:
+whoever is resetting the password cannot log in, so any session that exists is
+somebody else's. It needs `[email]`; without it there is nowhere to send a code.
+
+`DROPACCOUNT` removes the account and everything that named it — its profile,
+its read markers, its push endpoints, its place on every operator and voice
+list — because a name that is free to register again must not come with a
+previous life attached. Channels it founded are left with no founder; their
+operators keep their standing and a network operator can give them a new one.
+
+Every one of these is charged against the same failed-login budget as a bad
+SASL or `OPER` attempt. A password check is a password check whatever command
+it arrives in.
 
 A channel made by somebody who is not logged in has no founder, and never gets
 one — there was no account to write down. `channel_creation = "accounts"` is

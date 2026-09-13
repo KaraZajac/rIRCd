@@ -3668,3 +3668,322 @@ pub async fn handle_chanown(
     .await;
     Ok(())
 }
+
+/// What one person may see of who runs a channel.
+///
+/// `None` when the channel does not exist — or hides itself and this person
+/// is not in it, does not own it, and is not an operator with the run of
+/// channels. The two cases are one answer on purpose: the difference between
+/// "no such channel" and "you may not see that channel" is exactly what `+s`
+/// exists to withhold.
+struct ChannelStanding {
+    founder: String,
+    operators: Vec<String>,
+    voices: Vec<String>,
+    created_at: i64,
+    members: Vec<String>,
+}
+
+async fn channel_standing(
+    state: &Arc<RwLock<ServerState>>,
+    channels: &Arc<RwLock<ChannelStore>>,
+    client_id: &str,
+    ch_key: &str,
+    account: Option<&str>,
+    privileged: bool,
+) -> Option<ChannelStanding> {
+    let user_id = state.read().await.user_id(client_id);
+    let store = channels.read().await;
+    let ch = store.channels.get(ch_key)?.read().await;
+    let hidden = ch.modes.secret || ch.modes.invite_only;
+    let may_see = !hidden || privileged || ch.is_member(&user_id) || ch.is_founder(account);
+    may_see.then(|| ChannelStanding {
+        founder: ch.founder.clone(),
+        operators: ch.persisted_operators.clone(),
+        voices: ch.persisted_voice.clone(),
+        created_at: ch.created_at,
+        members: ch.members.keys().cloned().collect(),
+    })
+}
+
+/// `CHANACCESS <#channel>` — who has standing in a channel: its founder, the
+/// operators whose status outlives a visit, and the voices.
+///
+/// A founder can see who they have given the run of their channel to, which
+/// matters most when they did not: a status that is remembered is a status that
+/// can be forgotten about. Nobody could see this list before; it lived in the
+/// database and nowhere else.
+pub async fn handle_chanaccess(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let reply = |code: &str, target: &str, text: &str, kind: &str| {
+        Message::new(
+            kind,
+            vec!["CHANACCESS".into(), code.into(), target.into(), text.into()],
+        )
+        .with_prefix(&cfg.server.name)
+    };
+    let Some(ch_name) = msg.params.first().cloned() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            reply("NEED_PARAMS", "*", "Which channel?", "FAIL"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let ch_key = canonical_channel_key(&ch_name);
+    let (account, privileged) = {
+        let state_r = state.read().await;
+        let Some(client) = state_r.clients.get(client_id) else {
+            return Ok(());
+        };
+        let g = client.read().await;
+        (
+            g.account.clone(),
+            g.may(crate::config::OperPrivilege::Channels),
+        )
+    };
+    let Some(standing) = channel_standing(
+        &state,
+        &channels,
+        client_id,
+        &ch_key,
+        account.as_deref(),
+        privileged,
+    )
+    .await
+    else {
+        reply_to_client(
+            &senders,
+            client_id,
+            reply("NO_SUCH_CHANNEL", &ch_name, "No such channel", "FAIL"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+
+    let mut lines = Vec::new();
+    if standing.founder.is_empty() {
+        lines.push(reply("NO_FOUNDER", &ch_name, "This channel has no founder", "NOTE"));
+    } else {
+        lines.push(
+            Message::new(
+                "NOTE",
+                vec![
+                    "CHANACCESS".into(),
+                    "FOUNDER".into(),
+                    ch_name.clone(),
+                    standing.founder.clone(),
+                    format!("{ch_name} belongs to {}", standing.founder),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+        );
+    }
+    for (letter, word, names) in [
+        ("OPERATOR", "operator", &standing.operators),
+        ("VOICE", "voice", &standing.voices),
+    ] {
+        for name in names {
+            lines.push(
+                Message::new(
+                    "NOTE",
+                    vec![
+                        "CHANACCESS".into(),
+                        letter.into(),
+                        ch_name.clone(),
+                        name.clone(),
+                        format!("{name} is a standing {word} of {ch_name}"),
+                    ],
+                )
+                .with_prefix(&cfg.server.name),
+            );
+        }
+    }
+    lines.push(reply(
+        "END",
+        &ch_name,
+        &format!(
+            "{} standing operator{}, {} voice{}",
+            standing.operators.len(),
+            if standing.operators.len() == 1 { "" } else { "s" },
+            standing.voices.len(),
+            if standing.voices.len() == 1 { "" } else { "s" },
+        ),
+        "NOTE",
+    ));
+    for line in lines {
+        reply_to_client(&senders, client_id, line, label).await;
+    }
+    Ok(())
+}
+
+/// `CHANDROP <#channel>` — give a channel up.
+///
+/// The founder may give up their own; a network operator with the run of
+/// channels may take the founder off any. Either way the operators keep their
+/// standing, so the channel goes on being somebody's to run — it just stops
+/// being anybody's to own, and `CHANOWN` by an operator is how it gets an owner
+/// again. Said in the channel, whoever did it: a room that quietly became
+/// nobody's is a room somebody will quietly take.
+pub async fn handle_chandrop(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let fail = |code: &str, target: &str, text: &str| {
+        Message::new(
+            "FAIL",
+            vec!["CHANDROP".into(), code.into(), target.into(), text.into()],
+        )
+        .with_prefix(&cfg.server.name)
+    };
+    let Some(ch_name) = msg.params.first().cloned() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail("NEED_PARAMS", "*", "Which channel?"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let ch_key = canonical_channel_key(&ch_name);
+    let (nick, account, privileged, oper_name) = {
+        let state_r = state.read().await;
+        let Some(client) = state_r.clients.get(client_id) else {
+            return Ok(());
+        };
+        let g = client.read().await;
+        (
+            g.nick_or_id().to_string(),
+            g.account.clone(),
+            g.may(crate::config::OperPrivilege::Channels),
+            g.oper_name.clone(),
+        )
+    };
+    let Some(standing) = channel_standing(
+        &state,
+        &channels,
+        client_id,
+        &ch_key,
+        account.as_deref(),
+        privileged,
+    )
+    .await
+    else {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail("NO_SUCH_CHANNEL", &ch_name, "No such channel"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    if standing.founder.is_empty() {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail("NO_FOUNDER", &ch_name, "This channel has no founder to give it up"),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let owns_it = account
+        .as_deref()
+        .is_some_and(|a| a.eq_ignore_ascii_case(&standing.founder));
+    if !owns_it && !privileged {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail("NOT_FOUNDER", &ch_name, "Only the founder of a channel can give it up"),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
+    {
+        let store = channels.read().await;
+        if let Some(entry) = store.channels.get(&ch_key) {
+            entry.write().await.founder.clear();
+        }
+    }
+    if let Some(ref pool) = cfg.db {
+        crate::persist::clear_channel_founder(pool, &ch_key).await;
+    }
+    let gone = format!("-{}", standing.founder);
+    crate::link::announce_channel_access(
+        cfg,
+        &ch_key,
+        standing.created_at,
+        'f',
+        std::slice::from_ref(&gone),
+    )
+    .await;
+
+    let by = match (owns_it, oper_name.as_deref()) {
+        (true, _) => nick.clone(),
+        (false, Some(name)) => format!("network operator {name}"),
+        (false, None) => "a network operator".to_string(),
+    };
+    let word = Message::new(
+        "NOTICE",
+        vec![
+            ch_name.clone(),
+            format!(
+                "{ch_name} no longer has a founder, given up by {by}; its operators keep their standing"
+            ),
+        ],
+    )
+    .with_prefix(&cfg.server.name);
+    {
+        let registry = senders.read().await;
+        for member in &standing.members {
+            registry.deliver(member, &word);
+        }
+    }
+    if owns_it {
+        tracing::info!(client_id, channel = %ch_key, founder = %standing.founder, "CHANDROP");
+    } else {
+        tracing::warn!(
+            client_id,
+            channel = %ch_key,
+            founder = %standing.founder,
+            oper = %oper_name.unwrap_or_else(|| nick.clone()),
+            "CHANDROP: an operator took a channel off its founder"
+        );
+    }
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTE",
+            vec![
+                "CHANDROP".into(),
+                "DROPPED".into(),
+                ch_name.clone(),
+                format!("{ch_name} no longer has a founder"),
+            ],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    Ok(())
+}

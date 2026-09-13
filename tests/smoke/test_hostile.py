@@ -739,6 +739,85 @@ else:
           not new_panics, new_panics[:3])
 check("and it is still serving afterwards", still_alive("nonsense", f"h25{RUN}"))
 
+SUF = format(int(time.time()) % 100000, "05d")
+
+section("what a stranger is not told")
+
+# OPER refuses a name it has no block for without checking anything, which is
+# what makes guessing operator passwords pointless — as long as the names are
+# not handed out on request. The ban list, likewise, tells whoever is banned
+# exactly what to change.
+nosy = Client(f"nosy{SUF}")
+mark = nosy.mark()
+nosy.send("STATS o")
+nosy.send("STATS k")
+nosy.send("STATS u")
+nosy.read(1.5)
+told = nosy.since(mark)
+check("a plain user is not given the operator list",
+      not nosy.find(" 243 ", lines=told) and bool(nosy.find(" 481 ", lines=told)), told[-3:])
+check("nor the ban list", not nosy.find(" 216 ", lines=told), told[-3:])
+check("but uptime is still anybody's", bool(nosy.find(" 242 ", lines=told)), told[-3:])
+nosy.close()
+
+section("identity fields that would break a prefix")
+
+# :nick!user@host is read by splitting on space, ! and @. A username or host
+# with one of those in it is a line every recipient reads differently from how
+# it was sent.
+odd = Client(f"odd{SUF}")
+peer = Client(f"peer{SUF}")
+# A username with everything in it that must not be there, and far too long.
+raw = socket.create_connection((IRC_HOST, IRC_PORT), timeout=5)
+raw.sendall(f"NICK weird{SUF}\r\nUSER ev!il@x:y{'z' * 100} 0 * :real name\r\n".encode())
+time.sleep(1.0)
+raw.close()
+time.sleep(0.5)
+mark = odd.mark()
+odd.send(f"WHOWAS weird{SUF}")
+odd.read(1.5)
+line = " ".join(odd.find(" 314 ", lines=odd.since(mark)))
+shown_user = line.split()[4] if len(line.split()) > 4 else ""
+check("a username is stripped of what would divide a prefix", "!" not in shown_user and "@" not in shown_user
+      and ":" not in shown_user, line[:160])
+check("and held to USERLEN", 0 < len(shown_user) <= 32, shown_user)
+
+oper = Client(f"hop{SUF}")
+oper.send(f"OPER {os.environ.get('SMOKE_OPER_NAME', 'smokeoper')} "
+          f"{os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+oper.wait_for(" 381 ", " 464 ", seconds=5)
+if oper.find(" 381 "):
+    mark = oper.mark()
+    oper.send("SETHOST :has a space.example")
+    oper.send("SETUSER :two words")
+    oper.send("SETHOST " + "h" * 70)
+    oper.read(1.5)
+    refused = oper.since(mark)
+    check("an operator cannot set a host with a space in it", bool(oper.find(" 461 ", "SETHOST", lines=refused)),
+          refused[-3:])
+    check("nor a username with one", bool(oper.find(" 461 ", "SETUSER", lines=refused)), refused[-3:])
+    check("nor a host longer than HOSTLEN", len([l for l in refused if " 461 " in l and "SETHOST" in l]) >= 2,
+          refused[-3:])
+
+    section("a ban that would lock everyone out")
+    mark = oper.mark()
+    oper.send("KLINE *@* :everyone")
+    oper.send("KLINE *!*@* :everyone again")
+    # The operator's own nick: enough literal characters to pass the breadth
+    # rule, and a mask that plainly matches the connection setting it.
+    oper.send(f"KLINE hop{SUF}!*@* :myself")
+    oper.read(1.5)
+    banned = oper.since(mark)
+    check("a mask made of wildcards is refused", len([l for l in banned if "MASK_TOO_BROAD" in l]) >= 2, banned[-4:])
+    check("and so is one that matches the operator setting it",
+          bool(oper.find("MATCHES_YOURSELF", lines=banned)), banned[-4:])
+    oper.send(f"PING still{SUF}")
+    check("the operator is still connected afterwards", bool(oper.wait_for(f"still{SUF}", seconds=5)),
+          oper.lines[-2:])
+oper.close()
+odd.close()
+peer.close()
+
 section("still standing")
 check("the server is still accepting and serving clients", still_alive("everything", f"h12{RUN}"))
 

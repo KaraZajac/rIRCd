@@ -336,6 +336,11 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified TINYINT NOT NULL DEFAULT 1",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_code VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_expires BIGINT DEFAULT NULL",
+        // Password resets keep their own code. Sharing the verification column
+        // would let a reset code verify an account, or a verification code
+        // reset a password, and the two prove different things.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires BIGINT DEFAULT NULL",
     ] {
         let _ = sqlx::query(col_def).execute(pool).await;
     }
@@ -1195,6 +1200,243 @@ pub async fn delete_account(pool: &sqlx::MySqlPool, account: &str) {
     {
         tracing::warn!(account = %account, "Failed to delete account: {}", e);
     }
+}
+
+// ─── Account management ──────────────────────────────────────────────────────
+
+/// How long a password reset code is good for, and how long before another
+/// can be asked for. Short, because it arrives by mail that anybody who can
+/// read the inbox can use, and because asking for one is free: the same window
+/// bounds how much mail one account can be sent to one per quarter hour.
+pub const RESET_CODE_LIFETIME_SECS: i64 = 900;
+
+/// Replace an account's password, for both ways of proving it.
+///
+/// A password is stored twice: as a bcrypt hash for PLAIN, and as SCRAM keys
+/// derived from a salt. Changing one and not the other would leave the old
+/// password working for whichever mechanism was forgotten — so the salt is
+/// drawn fresh and everything is written in one statement. Any reset that was
+/// outstanding is cancelled by the same statement: whoever is doing this has
+/// just proved they can set the password, so a code sitting in an inbox is no
+/// longer needed by anybody honest.
+pub async fn set_password(
+    pool: &sqlx::MySqlPool,
+    account: &str,
+    new_password: &str,
+    min_password_length: usize,
+) -> Result<(), RegisterError> {
+    if new_password.len() < min_password_length {
+        return Err(RegisterError::WeakPassword);
+    }
+    let hash = bcrypt_hash(new_password)
+        .await
+        .map_err(|e| RegisterError::Io(e.to_string()))?;
+    let salt: [u8; 16] = rand::thread_rng().gen();
+    let (stored_key, server_key) = scram_compute(new_password, &salt, SCRAM_ITERATIONS);
+    let done = sqlx::query(
+        "UPDATE users SET password = ?, scram_salt = ?, scram_iterations = ?,
+                scram_stored_key = ?, scram_server_key = ?,
+                reset_code = NULL, reset_expires = NULL
+         WHERE nick_lower = ?",
+    )
+    .bind(&hash)
+    .bind(B64.encode(salt))
+    .bind(SCRAM_ITERATIONS)
+    .bind(B64.encode(stored_key))
+    .bind(B64.encode(server_key))
+    .bind(account.to_lowercase())
+    .execute(pool)
+    .await
+    .map_err(|e| RegisterError::Io(e.to_string()))?;
+    if done.rows_affected() == 0 {
+        return Err(RegisterError::Io("no such account".into()));
+    }
+    Ok(())
+}
+
+/// What happened when a reset was asked for. Only the caller sees this; the
+/// person asking is told the same thing whichever it was, or the command would
+/// be a way to find out which names are accounts.
+#[derive(Debug)]
+pub enum ResetStart {
+    /// A code was stored, and this is where to send it.
+    Started { email: String },
+    /// No account by that name, or one that never proved its address.
+    NoSuchAccount,
+    /// The account has no address to send anything to.
+    NoEmail,
+    /// A code is already out and has not expired.
+    TooSoon,
+    Io(String),
+}
+
+/// Store a password reset code for an account, if there is anywhere to send it.
+///
+/// An unverified account is treated as absent: its address was never proved,
+/// so mailing a reset code to it would prove nothing and could hand the name
+/// to whoever typed the address in. One code at a time, for its lifetime — a
+/// reset request costs nothing to make, so this is what stops one account
+/// being sent mail as fast as somebody can type its name.
+pub async fn begin_password_reset(
+    pool: &sqlx::MySqlPool,
+    account: &str,
+    code: &str,
+    now: i64,
+) -> ResetStart {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT email, verified, reset_expires FROM users WHERE nick_lower = ?",
+    )
+    .bind(account.to_lowercase())
+    .fetch_optional(pool)
+    .await;
+    let row = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => return ResetStart::NoSuchAccount,
+        Err(e) => return ResetStart::Io(e.to_string()),
+    };
+    let verified: i8 = row.get("verified");
+    if verified == 0 {
+        return ResetStart::NoSuchAccount;
+    }
+    let email: String = row.get("email");
+    if !crate::mail::is_valid_email(&email) {
+        return ResetStart::NoEmail;
+    }
+    let outstanding: Option<i64> = row.get("reset_expires");
+    if outstanding.is_some_and(|e| e > now) {
+        return ResetStart::TooSoon;
+    }
+    match sqlx::query("UPDATE users SET reset_code = ?, reset_expires = ? WHERE nick_lower = ?")
+        .bind(code)
+        .bind(now + RESET_CODE_LIFETIME_SECS)
+        .bind(account.to_lowercase())
+        .execute(pool)
+        .await
+    {
+        Ok(_) => ResetStart::Started { email },
+        Err(e) => ResetStart::Io(e.to_string()),
+    }
+}
+
+/// What happened when a reset code was used.
+#[derive(Debug)]
+pub enum ResetOutcome {
+    Changed,
+    /// No such account, wrong code, or the code has expired.
+    InvalidCode,
+    WeakPassword,
+    Io(String),
+}
+
+/// Use a reset code to set a new password.
+///
+/// The code is compared in constant time, the way the verification code is: it
+/// is the one secret in this exchange, and a comparison that stops at the first
+/// wrong byte tells a patient guesser how many bytes were right.
+pub async fn finish_password_reset(
+    pool: &sqlx::MySqlPool,
+    account: &str,
+    code: &str,
+    new_password: &str,
+    min_password_length: usize,
+) -> ResetOutcome {
+    use sqlx::Row;
+    use subtle::ConstantTimeEq;
+    let row = sqlx::query("SELECT reset_code, reset_expires FROM users WHERE nick_lower = ?")
+        .bind(account.to_lowercase())
+        .fetch_optional(pool)
+        .await;
+    let row = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => return ResetOutcome::InvalidCode,
+        Err(e) => return ResetOutcome::Io(e.to_string()),
+    };
+    let stored: Option<String> = row.get("reset_code");
+    let expires: Option<i64> = row.get("reset_expires");
+    let Some(stored) = stored else {
+        return ResetOutcome::InvalidCode;
+    };
+    if expires.is_none_or(|e| chrono::Utc::now().timestamp() > e) {
+        return ResetOutcome::InvalidCode;
+    }
+    let matches: bool = code
+        .trim()
+        .to_uppercase()
+        .as_bytes()
+        .ct_eq(stored.to_uppercase().as_bytes())
+        .into();
+    if !matches {
+        return ResetOutcome::InvalidCode;
+    }
+    match set_password(pool, account, new_password, min_password_length).await {
+        Ok(()) => ResetOutcome::Changed,
+        Err(RegisterError::WeakPassword) => ResetOutcome::WeakPassword,
+        Err(RegisterError::AccountExists) => ResetOutcome::InvalidCode,
+        Err(RegisterError::Io(e)) => ResetOutcome::Io(e),
+    }
+}
+
+/// What erasing an account left behind for the caller to deal with in memory.
+#[derive(Debug, Default)]
+pub struct ErasedAccount {
+    /// Channels this account founded. They have no founder now.
+    pub channels_founded: Vec<String>,
+}
+
+/// Remove an account and everything that named it.
+///
+/// `delete_account` removes the row and nothing else, which is right for a
+/// registration that failed before the account owned anything and wrong for
+/// one that has been used. The channels it founded, the operator and voice
+/// lists it was on, its profile, its read markers, the channels it was to be
+/// rejoined to and the push endpoints it registered would all stay — filed
+/// under a name that anybody could now register and inherit. So the lot goes,
+/// in one transaction, and the channels are left with no founder rather than
+/// with a founder who does not exist.
+pub async fn erase_account(pool: &sqlx::MySqlPool, account: &str) -> Result<ErasedAccount, String> {
+    use sqlx::Row;
+    let lower = account.to_lowercase();
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    let founded: Vec<String> = sqlx::query("SELECT name FROM channels WHERE LOWER(founder) = ?")
+        .bind(&lower)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+
+    let steps: [(&str, &str); 8] = [
+        ("UPDATE channels SET founder = '' WHERE LOWER(founder) = ?", &lower),
+        ("DELETE FROM channel_operators WHERE LOWER(nick_or_account) = ?", &lower),
+        ("DELETE FROM channel_voice WHERE LOWER(nick_or_account) = ?", &lower),
+        ("DELETE FROM metadata WHERE target = ?", &format!("a:{lower}")),
+        ("DELETE FROM read_markers WHERE LOWER(account) = ?", &lower),
+        ("DELETE FROM account_channels WHERE LOWER(account) = ?", &lower),
+        ("DELETE FROM webpush_subscriptions WHERE LOWER(account) = ?", &lower),
+        ("DELETE FROM users WHERE nick_lower = ?", &lower),
+    ];
+    for (sql, arg) in steps {
+        sqlx::query(sql)
+            .bind(arg)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("{sql}: {e}"))?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(ErasedAccount {
+        channels_founded: founded,
+    })
+}
+
+/// A channel with no founder any more: given up, or its founder is gone.
+pub async fn clear_channel_founder(pool: &sqlx::MySqlPool, channel_name: &str) {
+    let _ = sqlx::query("UPDATE channels SET founder = '' WHERE name = ?")
+        .bind(channel_name)
+        .execute(pool)
+        .await;
 }
 
 /// Is this nick a registered account someone else owns?

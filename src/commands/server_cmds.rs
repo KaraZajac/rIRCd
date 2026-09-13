@@ -448,10 +448,33 @@ pub async fn handle_stats(
     let s = cfg.server.name.as_str();
     let query = msg.params.first().map(|s| s.as_str()).unwrap_or("u");
 
-    let nick = match state.read().await.clients.get(client_id) {
-        Some(c) => c.read().await.nick_or_id().to_string(),
+    let (nick, is_oper) = match state.read().await.clients.get(client_id) {
+        Some(c) => {
+            let g = c.read().await;
+            (g.nick_or_id().to_string(), g.oper)
+        }
         None => return Ok(()),
     };
+
+    // Who the operators are, and who is banned, are for operators. OPER
+    // refuses a name it has no block for without checking anything, which is
+    // what makes guessing operator passwords pointless — and only as long as
+    // the names are not handed out on request. The ban list, likewise, tells
+    // whoever is banned exactly what to change.
+    if matches!(query, "o" | "k" | "K") && !is_oper {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "481",
+                vec![nick, "Permission Denied- You're not an IRC operator".into()],
+            )
+            .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
 
     match query {
         "u" => {
@@ -785,6 +808,64 @@ pub async fn handle_help(
                 "  Confirm the code emailed to you when you registered.",
             ],
         ),
+        Some("PASSWD") => (
+            "PASSWD",
+            &[
+                "PASSWD <current> <new>",
+                "  Change the password of the account you are logged in to.",
+                "  Your other logins are closed; this one stays.",
+            ],
+        ),
+        Some("RESETPASS") => (
+            "RESETPASS",
+            &[
+                "RESETPASS <account>",
+                "  Have a reset code sent to the account's address.",
+                "RESETPASS <account> <code> <new password>",
+                "  Use the code. Every login to the account is closed.",
+            ],
+        ),
+        Some("DROPACCOUNT") => (
+            "DROPACCOUNT",
+            &[
+                "DROPACCOUNT <password>",
+                "  Remove your account and everything that named it. Channels",
+                "  you founded are left without a founder; their operators stay.",
+            ],
+        ),
+        Some("CHANOWN") => (
+            "CHANOWN",
+            &[
+                "CHANOWN <#channel>",
+                "  Who the channel belongs to.",
+                "CHANOWN <#channel> <account>",
+                "  Hand it on. The founder may; so may an operator, out loud.",
+            ],
+        ),
+        Some("CHANACCESS") => (
+            "CHANACCESS",
+            &[
+                "CHANACCESS <#channel>",
+                "  The founder, and everyone whose operator or voice status",
+                "  is remembered between visits.",
+            ],
+        ),
+        Some("CHANDROP") => (
+            "CHANDROP",
+            &[
+                "CHANDROP <#channel>",
+                "  Give a channel up. Its operators keep their standing; it",
+                "  just stops being anybody's to own.",
+            ],
+        ),
+        Some("GHOST") => (
+            "GHOST",
+            &[
+                "GHOST <nick>",
+                "  Close a stale session of your own account that is holding",
+                "  the nick, wherever on the network it is.",
+            ],
+        ),
         Some("WEBPUSH") => (
             "WEBPUSH",
             &[
@@ -808,7 +889,9 @@ pub async fn handle_help(
                 "Available commands (HELP <command> for details):",
                 "  JOIN PART PRIVMSG NOTICE NICK QUIT WHO WHOIS WHOWAS MODE",
                 "  KICK TOPIC INVITE KNOCK AWAY LIST NAMES OPER REGISTER",
-                "  VERIFY WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS",
+                "  VERIFY PASSWD RESETPASS DROPACCOUNT GHOST",
+                "  CHANOWN CHANACCESS CHANDROP",
+                "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS",
                 "  STATS LUSERS",
             ],
         ),
@@ -1714,12 +1797,16 @@ pub async fn handle_kline(
     label: Option<&str>,
 ) -> anyhow::Result<()> {
     const PRIVILEGE: crate::config::OperPrivilege = crate::config::OperPrivilege::Ban;
-    let (nick, allowed) = {
+    let (nick, allowed, own_source) = {
         let state_r = state.read().await;
         match state_r.clients.get(client_id) {
             Some(c) => {
                 let g = c.read().await;
-                (g.nick_or_id().to_string(), g.may(PRIVILEGE))
+                (
+                    g.nick_or_id().to_string(),
+                    g.may(PRIVILEGE),
+                    g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
+                )
             }
             None => return Ok(()),
         }
@@ -1762,8 +1849,57 @@ pub async fn handle_kline(
         return Ok(());
     }
 
+    // A mask has to say who it is for. One made only of wildcards is for
+    // everybody — the operator setting it included, and everybody who tries
+    // to connect after the next restart, when it is read back from the
+    // database with nobody left inside to lift it. Four literal characters
+    // is the line other servers draw, and the same one is drawn here.
+    let normalized = normalize_ban_mask(mask);
+    let literal = normalized
+        .chars()
+        .filter(|c| !matches!(c, '*' | '?' | '!' | '@' | '.'))
+        .count();
+    if literal < 4 {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "KLINE".into(),
+                    "MASK_TOO_BROAD".into(),
+                    normalized.clone(),
+                    "A ban mask needs at least four characters that are not wildcards".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    if crate::user::glob_match(&normalized.to_lowercase(), &own_source.to_lowercase()) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "KLINE".into(),
+                    "MATCHES_YOURSELF".into(),
+                    normalized.clone(),
+                    "That mask matches your own connection".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
     let ban = crate::persist::ServerBan {
-        mask: normalize_ban_mask(mask),
+        mask: normalized,
         reason,
         set_by: nick.clone(),
         set_at: chrono::Utc::now().timestamp(),

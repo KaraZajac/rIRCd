@@ -2420,6 +2420,7 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
     // What this server ends up believing, so it can be written down once the
     // locks are back. Nothing is persisted for a change that did not happen.
     let mut new_founder: Option<String> = None;
+    let mut founder_cleared = false;
     let mut newly_granted: Vec<String> = Vec::new();
     let mut newly_revoked: Vec<String> = Vec::new();
     {
@@ -2440,6 +2441,16 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
             ch.created_at = ts;
         }
         match letter {
+            'f' if names[0].starts_with('-') => {
+                // A founder giving the channel up, or an account that no
+                // longer exists. Only the founder named can be taken away: a
+                // peer saying "-alice" about a channel bob owns says nothing.
+                let gone = &names[0][1..];
+                if !ch.founder.is_empty() && ch.founder.eq_ignore_ascii_case(gone) {
+                    ch.founder.clear();
+                    founder_cleared = true;
+                }
+            }
             'f' => {
                 let theirs = &names[0];
                 let take = ch.founder.is_empty()
@@ -2500,11 +2511,18 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
 
     // Write down what was learned, or it is forgotten at the next restart and
     // this server starts disagreeing with the network all over again.
-    if new_founder.is_some() || !newly_granted.is_empty() || !newly_revoked.is_empty() {
+    if new_founder.is_some()
+        || founder_cleared
+        || !newly_granted.is_empty()
+        || !newly_revoked.is_empty()
+    {
         let pool = ctx.cfg.read().await.db.clone();
         if let Some(pool) = pool {
             if let Some(ref founder) = new_founder {
                 crate::persist::record_channel_founder(&pool, &key, founder).await;
+            }
+            if founder_cleared {
+                crate::persist::clear_channel_founder(&pool, &key).await;
             }
             for who in &newly_granted {
                 crate::persist::set_channel_access(&pool, &key, who, letter == 'o', true).await;

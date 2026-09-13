@@ -184,6 +184,9 @@ pub struct EmailConfig {
     /// Subject line of the verification mail.
     #[serde(default = "default_email_subject")]
     pub subject: String,
+    /// Subject line of a password reset mail.
+    #[serde(default = "default_reset_subject")]
+    pub reset_subject: String,
     /// How long a verification code stays valid, in seconds (default 24h).
     #[serde(default = "default_code_expiry")]
     pub code_expiry_secs: i64,
@@ -197,6 +200,9 @@ fn default_smtp_encryption() -> String {
 }
 fn default_email_subject() -> String {
     "Your IRC account verification code".into()
+}
+fn default_reset_subject() -> String {
+    "Your IRC password reset code".into()
 }
 fn default_code_expiry() -> i64 {
     86_400

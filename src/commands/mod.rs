@@ -1,3 +1,4 @@
+mod account;
 mod channel_cmds;
 mod messaging;
 pub(crate) mod metadata;
@@ -773,6 +774,66 @@ pub async fn handle_message(
         }
         "OPER" => {
             registration::handle_oper(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "PASSWD" => {
+            account::handle_passwd(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "RESETPASS" => {
+            account::handle_resetpass(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "DROPACCOUNT" => {
+            account::handle_dropaccount(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "CHANACCESS" => {
+            channel_cmds::handle_chanaccess(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
+        "CHANDROP" => {
+            channel_cmds::handle_chandrop(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
         }
         "REGISTER" => {
             registration::handle_register(

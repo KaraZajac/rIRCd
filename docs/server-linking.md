@@ -141,7 +141,9 @@ belongs to: `f` for its founder, `o` for the operators whose status was granted
 to last, `v` for the voices. The names are accounts rather than nicks, because
 a nick is only what somebody is called at the moment and this has to mean the
 same person at both ends. A name prefixed with `-` says the status was taken
-away; without it, given.
+away; without it, given. For `f` a `-` name removes the founder, if it names
+the founder the channel has — `CHANDROP`, or an account that was dropped — and
+says nothing otherwise.
 
 It merges rather than replaces, so two servers that each learned part of a
 channel's access list end up holding all of it. The founder is the exception,

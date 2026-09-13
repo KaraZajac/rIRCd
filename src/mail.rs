@@ -55,6 +55,27 @@ fn verification_body(network: &str, account: &str, code: &str, expiry_secs: i64)
     )
 }
 
+/// Render the password reset mail body.
+///
+/// The command is given with a placeholder for the password, never with one
+/// filled in: a mail is read by whoever holds the inbox, and the password is
+/// the one thing in this exchange that should exist only in the reader's head.
+fn reset_body(network: &str, account: &str, code: &str, expiry_secs: i64) -> String {
+    let minutes = (expiry_secs / 60).max(1);
+    format!(
+        "Somebody asked to reset the password of the account \"{account}\" on\n\
+         {network}. If it was you, send this from your IRC client, with the new\n\
+         password where <new password> is:\n\
+         \n\
+         \x20   RESETPASS {account} {code} <new password>\n\
+         \n\
+         The code is valid for {minutes} minute{}. If you did not ask for this,\n\
+         ignore this message: nothing changes unless the code is used, and it\n\
+         cannot be used without also choosing a new password.\n",
+        if minutes == 1 { "" } else { "s" }
+    )
+}
+
 /// Send a verification code. Returns an error if the address is unusable or the
 /// SMTP conversation fails.
 pub async fn send_verification(
@@ -64,6 +85,39 @@ pub async fn send_verification(
     account: &str,
     code: &str,
 ) -> anyhow::Result<()> {
+    send(
+        cfg,
+        to,
+        &cfg.subject,
+        verification_body(network, account, code, cfg.code_expiry_secs),
+    )
+    .await
+}
+
+/// Send a password reset code.
+pub async fn send_password_reset(
+    cfg: &EmailConfig,
+    network: &str,
+    to: &str,
+    account: &str,
+    code: &str,
+) -> anyhow::Result<()> {
+    send(
+        cfg,
+        to,
+        &cfg.reset_subject,
+        reset_body(
+            network,
+            account,
+            code,
+            crate::persist::RESET_CODE_LIFETIME_SECS,
+        ),
+    )
+    .await
+}
+
+/// One plain-text mail, over whatever the configuration says SMTP looks like.
+async fn send(cfg: &EmailConfig, to: &str, subject: &str, body: String) -> anyhow::Result<()> {
     let mail = Mail::builder()
         .from(
             cfg.from
@@ -73,14 +127,9 @@ pub async fn send_verification(
         .to(to
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid recipient address: {}", e))?)
-        .subject(cfg.subject.clone())
+        .subject(subject.to_string())
         .header(ContentType::TEXT_PLAIN)
-        .body(verification_body(
-            network,
-            account,
-            code,
-            cfg.code_expiry_secs,
-        ))?;
+        .body(body)?;
 
     let mut builder = match cfg.encryption.to_lowercase().as_str() {
         "none" => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.smtp_host),
@@ -111,6 +160,14 @@ mod tests {
         assert!(body.contains("VERIFY alice K7M2QJ4T"), "body was:\n{body}");
         assert!(body.contains("ExampleNet"));
         assert!(body.contains("valid for 24 hours"));
+    }
+
+    #[test]
+    fn reset_body_never_contains_a_password_and_says_what_to_type() {
+        let body = reset_body("ExampleNet", "alice", "K7M2QJ4T", 900);
+        assert!(body.contains("RESETPASS alice K7M2QJ4T <new password>"), "body was:\n{body}");
+        assert!(body.contains("valid for 15 minutes"));
+        assert!(!body.contains("hunter2"));
     }
 
     #[test]

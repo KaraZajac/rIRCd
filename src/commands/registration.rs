@@ -1514,6 +1514,38 @@ pub async fn handle_nick(
     Ok(())
 }
 
+/// Whether a username or hostname can be put in a prefix without breaking it.
+///
+/// `:nick!user@host` is read by every client a message reaches, and it is read
+/// by splitting: a space ends the prefix, `!` and `@` divide it, and a control
+/// character does whatever the client's string handling does with it. Any of
+/// those inside a user or host is a line the recipient reads differently from
+/// how it was sent, which is the definition of an injection — and the lengths
+/// this server advertises in ISUPPORT are promises to those clients too.
+fn fits_in_a_prefix(s: &str, max: usize) -> bool {
+    !s.is_empty()
+        && s.len() <= max
+        && s
+            .chars()
+            .all(|c| !c.is_whitespace() && !c.is_control() && !matches!(c, '!' | '@' | ':'))
+}
+
+/// A username as this server will carry it: only what fits in a prefix, and no
+/// longer than USERLEN. Clients send all sorts, so this trims rather than
+/// refuses, and a name with nothing left in it becomes `user`.
+fn usable_username(given: &str) -> String {
+    let kept: String = given
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control() && !matches!(c, '!' | '@' | ':'))
+        .collect();
+    let kept = crate::protocol::truncate_bytes(&kept, 32).to_string();
+    if kept.is_empty() {
+        "user".to_string()
+    } else {
+        kept
+    }
+}
+
 fn is_valid_nick(n: &str) -> bool {
     if n.is_empty() || n.len() > 32 {
         return false;
@@ -1557,10 +1589,15 @@ pub async fn handle_user(
         return Ok(());
     }
 
-    let user = msg.params.first().cloned().unwrap_or_else(|| "user".into());
+    let user = usable_username(msg.params.first().map(String::as_str).unwrap_or("user"));
     // USER takes four parameters, the last being the real name. Fewer than that,
-    // or an empty real name, is not a usable registration.
-    let realname = msg.params.get(3).cloned().unwrap_or_default();
+    // or an empty real name, is not a usable registration. NAMELEN is a promise
+    // made in ISUPPORT, so a real name is held to it here.
+    let realname = msg
+        .params
+        .get(3)
+        .map(|r| crate::protocol::truncate_bytes(r, 128).to_string())
+        .unwrap_or_default();
     if msg.params.len() < 4 || realname.is_empty() {
         drop(state_guard);
         reply_to_client(
@@ -4733,13 +4770,17 @@ pub async fn handle_sethost(
         .await;
         return Ok(());
     }
-    if new_host.contains(' ') {
+    if !fits_in_a_prefix(&new_host, 64) {
         reply_to_client(
             &senders,
             client_id,
             Message::new(
                 "461",
-                vec!["SETHOST".into(), "Host cannot contain spaces".into()],
+                vec![
+                    "SETHOST".into(),
+                    "Host must be 1-64 characters with no spaces, control characters, ! or @"
+                        .into(),
+                ],
             )
             .with_prefix(&cfg.server.name),
             label,
@@ -4838,6 +4879,26 @@ pub async fn handle_setuser(
             Message::new(
                 "461",
                 vec!["SETUSER".into(), "Not enough parameters".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    // The same rule SETHOST keeps. A username with a space in it would end
+    // every prefix this user appears in early, for everybody who reads one.
+    if !fits_in_a_prefix(&new_user, 32) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "461",
+                vec![
+                    "SETUSER".into(),
+                    "Username must be 1-32 characters with no spaces, control characters, ! or @"
+                        .into(),
+                ],
             )
             .with_prefix(&cfg.server.name),
             label,
