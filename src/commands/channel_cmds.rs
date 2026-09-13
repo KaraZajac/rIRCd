@@ -2370,6 +2370,9 @@ pub async fn handle_mode(
                 if g.registered_only {
                     modes.push('R');
                 }
+                if g.callerid {
+                    modes.push('g');
+                }
                 if g.bot {
                     modes.push('B');
                 }
@@ -2425,6 +2428,17 @@ pub async fn handle_mode(
                     let m = Message::new(
                         "MODE",
                         vec![nick.clone(), format!("{}R", if plus { "+" } else { "-" })],
+                    )
+                    .with_prefix(&nick);
+                    reply_to_client(&senders, client_id, m, label).await;
+                }
+                'g' => {
+                    if let Some(client_ref) = state.clients.get(client_id) {
+                        client_ref.write().await.callerid = plus;
+                    }
+                    let m = Message::new(
+                        "MODE",
+                        vec![nick.clone(), format!("{}g", if plus { "+" } else { "-" })],
                     )
                     .with_prefix(&nick);
                     reply_to_client(&senders, client_id, m, label).await;
@@ -3127,7 +3141,29 @@ pub async fn handle_invite(
                 cfg.server.client_tag_deny.as_deref(),
                 &crate::protocol::SenderTags::default(),
             );
-            senders.read().await.deliver(target_id, &tagged_invite);
+            // Somebody who has silenced the inviter does not hear from them,
+            // and the inviter is not told: the 341 below is sent regardless,
+            // so a silence cannot be found out by inviting.
+            let inviter_is_oper = match state.clients.get(client_id) {
+                Some(c) => c.read().await.oper,
+                None => false,
+            };
+            let silenced = matches!(
+                crate::commands::ignore::refuses_direct(
+                    &state,
+                    target_id,
+                    client_id,
+                    &inviter_nick,
+                    inviter_account.as_deref(),
+                    &source,
+                    inviter_is_oper,
+                )
+                .await,
+                Some(crate::commands::ignore::Refusal::Silenced)
+            );
+            if !silenced {
+                senders.read().await.deliver(target_id, &tagged_invite);
+            }
             reply_to_client(
                 &senders,
                 client_id,

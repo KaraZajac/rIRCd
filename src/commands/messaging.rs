@@ -255,25 +255,6 @@ fn is_nick_char(c: char) -> bool {
 ///
 /// A push is the only way a mention reaches someone who is away, and the message
 /// itself is waiting for them in the channel's history when they return.
-/// Whether a direct message may be delivered to this person.
-///
-/// User mode `+R` says only people with an account may write to them, which is
-/// the one thing that makes an inbox usable when somebody has decided to fill
-/// it. The sender is told, rather than being left to believe it went.
-async fn refuses_unregistered(
-    state: &ServerState,
-    target_id: &str,
-    sender_account: Option<&str>,
-) -> bool {
-    if sender_account.is_some() {
-        return false;
-    }
-    match state.clients.get(target_id) {
-        Some(c) => c.read().await.registered_only,
-        None => false,
-    }
-}
-
 /// A user on another server is reached over the link it came from, not through
 /// a connection here. Returns whether the message went that way, so the caller
 /// delivers locally only when it did not.
@@ -897,26 +878,61 @@ pub async fn handle_privmsg(
             .get(&crate::casefold::upper(target))
             .cloned();
         if let Some(tid) = target_id {
-            if refuses_unregistered(&state_guard, &tid, sender_account.as_deref()).await {
-                drop(state_guard);
-                reply_to_sender(
-                    &senders,
-                    client_id,
-                    Message::new(
-                        "477",
-                        vec![
-                            sender_nick.clone(),
-                            target.to_string(),
-                            "You must be identified to a registered account to message this user"
-                                .into(),
-                        ],
+            // Whether this inbox takes messages from this sender: +R, +g and
+            // SILENCE, decided here on the recipient's server.
+            let sender_is_oper = match state_guard.clients.get(client_id) {
+                Some(c) => c.read().await.oper,
+                None => false,
+            };
+            match crate::commands::ignore::refuses_direct(
+                &state_guard,
+                &tid,
+                client_id,
+                &sender_nick,
+                sender_account.as_deref(),
+                &source,
+                sender_is_oper,
+            )
+            .await
+            {
+                // Silence says nothing to anybody. That is what it is for.
+                Some(crate::commands::ignore::Refusal::Silenced) => return Ok(()),
+                Some(crate::commands::ignore::Refusal::Unregistered) => {
+                    drop(state_guard);
+                    reply_to_sender(
+                        &senders,
+                        client_id,
+                        Message::new(
+                            "477",
+                            vec![
+                                sender_nick.clone(),
+                                target.to_string(),
+                                "You must be identified to a registered account to message this user"
+                                    .into(),
+                            ],
+                        )
+                        .with_prefix(&cfg.server.name),
+                        label,
+                        parent_batch,
                     )
-                    .with_prefix(&cfg.server.name),
-                    label,
-                    parent_batch,
-                )
-                .await;
-                return Ok(());
+                    .await;
+                    return Ok(());
+                }
+                Some(crate::commands::ignore::Refusal::Callerid) => {
+                    crate::commands::ignore::explain_callerid(
+                        &state_guard,
+                        &senders,
+                        &cfg.server.name,
+                        Some(client_id),
+                        &sender_nick,
+                        &source,
+                        &tid,
+                        target,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                None => {}
             }
             let mut privmsg =
                 Message::new("PRIVMSG", vec![target.into(), text.clone()]).with_prefix(&source);
@@ -1230,6 +1246,40 @@ pub async fn handle_notice(
                 Some(c) => c.read().await.capabilities.clone(),
                 None => Default::default(),
             };
+            let sender_is_oper = match state_guard.clients.get(client_id) {
+                Some(c) => c.read().await.oper,
+                None => false,
+            };
+            let sender_nick_here = source.split('!').next().unwrap_or("").to_string();
+            if let Some(why) = crate::commands::ignore::refuses_direct(
+                &state_guard,
+                &tid,
+                client_id,
+                &sender_nick_here,
+                sender_account.as_deref(),
+                &source,
+                sender_is_oper,
+            )
+            .await
+            {
+                // A notice is never answered with an error, so a refused one
+                // is simply not delivered; the owner of a +g inbox is still
+                // told, once, that somebody is trying.
+                if why == crate::commands::ignore::Refusal::Callerid {
+                    crate::commands::ignore::explain_callerid(
+                        &state_guard,
+                        &senders,
+                        &cfg.server.name,
+                        None,
+                        &sender_nick_here,
+                        &source,
+                        &tid,
+                        target,
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
             if !deliver_across_link(&state_guard, cfg, client_id, &tid, &base_msg, &msgid).await {
                 send_to_client_with_caps(
                     &senders,
@@ -1952,6 +2002,40 @@ pub async fn handle_tagmsg(
                 Some(c) => c.read().await.capabilities.clone(),
                 None => Default::default(),
             };
+            let sender_is_oper = match state_guard.clients.get(client_id) {
+                Some(c) => c.read().await.oper,
+                None => false,
+            };
+            let sender_nick_here = source.split('!').next().unwrap_or("").to_string();
+            if let Some(why) = crate::commands::ignore::refuses_direct(
+                &state_guard,
+                &tid,
+                client_id,
+                &sender_nick_here,
+                sender_account.as_deref(),
+                &source,
+                sender_is_oper,
+            )
+            .await
+            {
+                // A notice is never answered with an error, so a refused one
+                // is simply not delivered; the owner of a +g inbox is still
+                // told, once, that somebody is trying.
+                if why == crate::commands::ignore::Refusal::Callerid {
+                    crate::commands::ignore::explain_callerid(
+                        &state_guard,
+                        &senders,
+                        &cfg.server.name,
+                        None,
+                        &sender_nick_here,
+                        &source,
+                        &tid,
+                        target,
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
             if !deliver_across_link(&state_guard, cfg, client_id, &tid, &base_msg, &msgid).await
                 && target_caps.contains("message-tags")
             {

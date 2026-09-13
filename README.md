@@ -574,6 +574,7 @@ traditional network is done by the server itself, against MariaDB.
 | Ban lists (`AKICK`-ish) | `+b`, `+e`, `+I` and `+q` masks are persisted and restored |
 | Network bans | `KLINE` / `UNKLINE`, persisted and enforced on connect — on every server: a ban set on one crosses the links, closes what it matches there, and is written down there too. A mask made of wildcards is refused, typed or received |
 | Vhosts | `SETHOST` (oper), plus automatic cloaking via `cloak_key` |
+| Server-side ignore | `SILENCE +<mask>` / `-<mask>` / `SILENCE` to list — a mask is somebody who does not exist to you: no message, notice or invitation of theirs arrives, and nothing tells them so. `nick`, `nick!user@host` and `~a:account` are all masks; 32 per person, advertised as `SILENCE=32` |
 
 Still absent: per-channel access *levels* beyond operator and voice, `AKICK`,
 and memos.
@@ -811,6 +812,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+o` | Server | IRC operator — set by successful OPER command |
 | `+r` | Server | Registered — set automatically on SASL login |
 | `+w` | User | Receives WALLOPS broadcasts from opers |
+| `+g` | Callerid — only people on your `ACCEPT` list may send you direct messages. A sender who is not is told once (716/717) and you are told who knocked (718), once a minute per knocker. `ACCEPT <nick>`, `ACCEPT -<nick>`, `ACCEPT *` to list |
 
 ---
 

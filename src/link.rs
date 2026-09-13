@@ -1690,6 +1690,47 @@ async fn accept_remote_message(ctx: &LinkContext, msg: &Message, peer_sid: &str)
         client_tag_deny.as_deref(),
         &sender_tags,
     );
+    // Whether this inbox takes messages from this sender — +R, +g, SILENCE —
+    // is decided here, where the inbox is, for a sender on another server
+    // exactly as for one on this. A refused message is not delivered and not
+    // kept; the sender, being elsewhere, is told nothing, and the owner of a
+    // +g inbox is still told once that somebody is trying.
+    let sender_nick = source_line.split('!').next().unwrap_or("").to_string();
+    let refused = {
+        let state = ctx.state.read().await;
+        let sender_is_oper = match state.clients.get(&from) {
+            Some(c) => c.read().await.oper,
+            None => false,
+        };
+        let why = crate::commands::ignore::refuses_direct(
+            &state,
+            &target,
+            &from,
+            &sender_nick,
+            sender_account.as_deref(),
+            &source_line,
+            sender_is_oper,
+        )
+        .await;
+        if why == Some(crate::commands::ignore::Refusal::Callerid) && msg.command == "PRIVMSG" {
+            let server_name = ctx.cfg.read().await.server.name.clone();
+            crate::commands::ignore::explain_callerid(
+                &state,
+                &ctx.senders,
+                &server_name,
+                None,
+                &sender_nick,
+                &source_line,
+                &target,
+                &out.params[0],
+            )
+            .await;
+        }
+        why.is_some()
+    };
+    if refused {
+        return;
+    }
     ctx.senders.read().await.deliver(&target, &out);
 
     // Both ends of a conversation keep it, so the person who was written to can

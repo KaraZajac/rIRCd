@@ -70,6 +70,14 @@ pub struct Client {
     /// User mode +R: only people with an account may send direct messages.
     /// Advertised in `USERMODES`, so it has to do something.
     pub registered_only: bool,
+    /// User mode +g: only people on the accept list may send direct messages.
+    pub callerid: bool,
+    /// Who may reach a +g inbox: nicks and accounts, lowercased.
+    pub accept: Vec<String>,
+    /// Who does not exist to this person: masks, lowercased.
+    pub silence: Vec<String>,
+    /// Who has knocked on a +g inbox lately, so the owner is told once.
+    pub knocks: std::collections::HashMap<String, std::time::Instant>,
     /// Unix timestamp when the client completed registration (for WHOIS 317)
     pub signon_at: i64,
     /// Unix timestamp of the last message received from this client (for WHOIS 317 idle)
@@ -124,6 +132,10 @@ impl Client {
             invisible: false,
             wallops: false,
             registered_only: false,
+            callerid: false,
+            accept: Vec::new(),
+            silence: Vec::new(),
+            knocks: std::collections::HashMap::new(),
             signon_at: Utc::now().timestamp(),
             last_active: Utc::now().timestamp(),
             metadata_subscriptions: std::collections::HashSet::new(),

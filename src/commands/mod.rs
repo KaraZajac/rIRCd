@@ -1,5 +1,6 @@
 mod account;
 mod channel_cmds;
+pub mod ignore;
 mod messaging;
 pub(crate) mod metadata;
 mod query_cmds;
@@ -924,6 +925,12 @@ pub async fn handle_message(
                 label.as_deref(),
             )
             .await
+        }
+        "ACCEPT" => {
+            ignore::handle_accept(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "SILENCE" => {
+            ignore::handle_silence(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
         "MONITOR" => {
             query_cmds::handle_monitor(&client_id, msg, state, senders, cfg, label.as_deref()).await

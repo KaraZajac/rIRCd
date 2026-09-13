@@ -858,6 +858,25 @@ pub async fn handle_help(
                 "  just stops being anybody's to own.",
             ],
         ),
+        Some("ACCEPT") => (
+            "ACCEPT",
+            &[
+                "ACCEPT <nick>[,<nick>...]   — let them through your +g",
+                "ACCEPT -<nick>              — stop letting them",
+                "ACCEPT *                    — list",
+                "  With user mode +g, only people on this list may message you.",
+            ],
+        ),
+        Some("SILENCE") => (
+            "SILENCE",
+            &[
+                "SILENCE +<mask>   — somebody who does not exist to you",
+                "SILENCE -<mask>   — lift it",
+                "SILENCE           — list",
+                "  nick, nick!user@host and ~a:account are all masks. Nothing of",
+                "  theirs arrives, and nothing tells them so.",
+            ],
+        ),
         Some("GHOST") => (
             "GHOST",
             &[
@@ -890,7 +909,7 @@ pub async fn handle_help(
                 "  JOIN PART PRIVMSG NOTICE NICK QUIT WHO WHOIS WHOWAS MODE",
                 "  KICK TOPIC INVITE KNOCK AWAY LIST NAMES OPER REGISTER",
                 "  VERIFY PASSWD RESETPASS DROPACCOUNT GHOST",
-                "  CHANOWN CHANACCESS CHANDROP",
+                "  CHANOWN CHANACCESS CHANDROP ACCEPT SILENCE",
                 "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS",
                 "  STATS LUSERS",
             ],

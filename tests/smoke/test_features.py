@@ -1116,4 +1116,110 @@ check("and the mode did not take", "Z" not in " ".join(l for l in zop.since(zmar
 check("+Z is advertised", True)
 zop.close()
 
+section("+g: a door shut by default, opened by name")
+
+# An inbox has only its owner to keep it usable. +g refuses direct messages
+# from anybody not on the ACCEPT list; the sender is told once, the owner is
+# told once, and ACCEPT opens the door by name.
+owner_g = Client(f"gown{RUN_ID}")
+owner_g.send("MODE " + f"gown{RUN_ID}" + " +g")
+owner_g.read(1.0)
+check("+g is a user mode here", bool(owner_g.find("+g")), owner_g.lines[-2:])
+caller = Client(f"gcall{RUN_ID}")
+omark, cmark = owner_g.mark(), caller.mark()
+caller.send(f"PRIVMSG gown{RUN_ID} :hello?")
+caller.read(1.5)
+owner_g.read(1.0)
+check("a message from a stranger is not delivered", not owner_g.find("hello?", lines=owner_g.since(omark)),
+      owner_g.since(omark)[-3:])
+check("the stranger is told the door is shut (716)", bool(caller.find(" 716 ", lines=caller.since(cmark))),
+      caller.since(cmark)[-3:])
+check("and that the owner was told (717)", bool(caller.find(" 717 ", lines=caller.since(cmark))),
+      caller.since(cmark)[-3:])
+check("the owner is told who knocked (718)", bool(owner_g.find(" 718 ", f"gcall{RUN_ID}", lines=owner_g.since(omark))),
+      owner_g.since(omark)[-3:])
+omark, cmark = owner_g.mark(), caller.mark()
+caller.send(f"PRIVMSG gown{RUN_ID} :hello again?")
+caller.read(1.5)
+owner_g.read(1.0)
+check("but only once a minute per knocker", not owner_g.find(" 718 ", lines=owner_g.since(omark))
+      and bool(caller.find(" 716 ", lines=caller.since(cmark))), owner_g.since(omark)[-2:])
+owner_g.send(f"ACCEPT gcall{RUN_ID}")
+owner_g.read(0.8)
+omark = owner_g.mark()
+caller.send(f"PRIVMSG gown{RUN_ID} :may I now?")
+owner_g.read(1.5)
+check("ACCEPT opens it by name", bool(owner_g.find("may I now?", lines=owner_g.since(omark))),
+      owner_g.since(omark)[-2:])
+omark = owner_g.mark()
+owner_g.send("ACCEPT *")
+owner_g.read(1.0)
+check("the list can be read back", bool(owner_g.find(" 281 ", f"gcall{RUN_ID}", lines=owner_g.since(omark)))
+      and bool(owner_g.find(" 282 ", lines=owner_g.since(omark))), owner_g.since(omark)[-3:])
+owner_g.send(f"ACCEPT -gcall{RUN_ID}")
+owner_g.read(0.8)
+omark = owner_g.mark()
+caller.send(f"PRIVMSG gown{RUN_ID} :and now?")
+caller.read(1.0)
+owner_g.read(1.0)
+check("and shut again by name", not owner_g.find("and now?", lines=owner_g.since(omark)), owner_g.since(omark)[-2:])
+caller.close()
+owner_g.close()
+
+section("SILENCE: somebody who does not exist to you")
+
+quiet = Client(f"quiet{RUN_ID}")
+noisy = Client(f"noisy{RUN_ID}")
+quiet.send(f"SILENCE +noisy{RUN_ID}")
+quiet.read(1.0)
+check("a silence is echoed back like a mode", bool(quiet.find("SILENCE", f"+noisy{RUN_ID}")), quiet.lines[-2:])
+qmark, nmark = quiet.mark(), noisy.mark()
+noisy.send(f"PRIVMSG quiet{RUN_ID} :are you there")
+noisy.send(f"NOTICE quiet{RUN_ID} :are you there")
+noisy.read(1.5)
+quiet.read(1.0)
+check("nothing of theirs arrives", not quiet.find("are you there", lines=quiet.since(qmark)), quiet.since(qmark)[-2:])
+check("and nothing tells them so", not noisy.find(" 4", lines=noisy.since(nmark)) and not noisy.find(" 716 ", lines=noisy.since(nmark)),
+      noisy.since(nmark)[-2:])
+noisy.join(f"#invites{RUN_ID}")
+qmark, nmark = quiet.mark(), noisy.mark()
+noisy.send(f"INVITE quiet{RUN_ID} #invites{RUN_ID}")
+noisy.read(1.2)
+quiet.read(1.0)
+check("an invitation from them does not arrive either", not quiet.find("INVITE", lines=quiet.since(qmark)),
+      quiet.since(qmark)[-2:])
+check("while they are told it was sent, so they cannot tell", bool(noisy.find(" 341 ", lines=noisy.since(nmark))),
+      noisy.since(nmark)[-2:])
+qmark = quiet.mark()
+quiet.send("SILENCE")
+quiet.read(1.0)
+check("the list can be read back", bool(quiet.find(" 271 ", lines=quiet.since(qmark))) and bool(quiet.find(" 272 ", lines=quiet.since(qmark))),
+      quiet.since(qmark)[-3:])
+quiet.send(f"SILENCE -noisy{RUN_ID}")
+quiet.read(0.8)
+qmark = quiet.mark()
+noisy.send(f"PRIVMSG quiet{RUN_ID} :back?")
+quiet.read(1.5)
+check("and lifted", bool(quiet.find("back?", lines=quiet.since(qmark))), quiet.since(qmark)[-2:])
+noisy.close()
+quiet.close()
+
+section("+R covers notices too")
+
+# A +R inbox refused PRIVMSG from somebody with no account and let NOTICE
+# through, which is not what anybody setting +R meant.
+walled = Client(f"walled{RUN_ID}")
+walled.send(f"MODE walled{RUN_ID} +R")
+walled.read(0.8)
+anon_r = Client(f"anonr{RUN_ID}")
+wmark = walled.mark()
+anon_r.send(f"NOTICE walled{RUN_ID} :psst")
+anon_r.send(f"PRIVMSG walled{RUN_ID} :psst")
+anon_r.read(1.2)
+walled.read(1.0)
+check("neither a notice nor a message from somebody with no account reaches a +R inbox",
+      not walled.find("psst", lines=walled.since(wmark)), walled.since(wmark)[-2:])
+anon_r.close()
+walled.close()
+
 summary("features")
