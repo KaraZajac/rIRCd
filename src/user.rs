@@ -59,6 +59,9 @@ pub struct Client {
     pub oper_name: Option<String>,
     /// What this operator may do; None means everything.
     pub oper_privileges: Option<Vec<String>>,
+    /// Which server notices this operator wants: the letters of user mode
+    /// `+s`. Empty for everybody who is not an operator.
+    pub snomask: String,
     /// Virtual host (cloak) shown to others; used in source() when set
     pub vhost: Option<String>,
     /// Virtual username shown to others; used in source() when set
@@ -127,6 +130,7 @@ impl Client {
             oper: false,
             oper_name: None,
             oper_privileges: None,
+            snomask: String::new(),
             vhost: None,
             vuser: None,
             invisible: false,
@@ -816,6 +820,10 @@ pub struct ServerState {
     /// Server bans, matched on connection. Kept in memory so a connection never
     /// waits on the database.
     pub server_bans: Vec<crate::persist::ServerBan>,
+    /// The D-lines among them, as the listeners see them: judged the moment a
+    /// connection arrives, with no lock on this state. `publish_dlines` keeps
+    /// it current.
+    pub dlines: Arc<std::sync::RwLock<Vec<crate::persist::ServerBan>>>,
     /// `WHOIS` answers this server has asked another one for and not yet had.
     pub pending_whois: PendingWhois,
     /// What each address has spent failing to log in. Checking a password is
@@ -1190,15 +1198,25 @@ impl ServerState {
     /// The ban matching this user, if any. Expired entries are ignored.
     pub fn matching_ban(&self, source: &str, ip: &str) -> Option<&crate::persist::ServerBan> {
         let now = Utc::now().timestamp();
-        let source_lower = crate::casefold::lower(source);
-        let ip_forms = [format!("*!*@{}", ip.to_lowercase()), ip.to_lowercase()];
-        self.server_bans.iter().find(|ban| {
-            if ban.is_expired(now) {
-                return false;
-            }
-            let mask = crate::casefold::lower(&ban.mask);
-            glob_match(&mask, &source_lower) || ip_forms.iter().any(|f| glob_match(&mask, f))
-        })
+        self.server_bans
+            .iter()
+            .find(|ban| !ban.is_expired(now) && ban.matches(source, ip))
+    }
+
+    /// Copy the D-lines out to where a connection is judged the moment it
+    /// arrives — the listeners, which have no lock on this state and must
+    /// not wait for one. Called after anything changes `server_bans`.
+    pub fn publish_dlines(&self) {
+        let now = Utc::now().timestamp();
+        let dlines: Vec<crate::persist::ServerBan> = self
+            .server_bans
+            .iter()
+            .filter(|b| b.kind == crate::persist::BanKind::Dline && !b.is_expired(now))
+            .cloned()
+            .collect();
+        if let Ok(mut shared) = self.dlines.write() {
+            *shared = dlines;
+        }
     }
 
     pub fn record_msgid(&mut self, msgid: String, target: String, sender_id: String) {

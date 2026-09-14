@@ -1062,6 +1062,13 @@ pub async fn handle_message(
             server_cmds::handle_unkline(&client_id, msg, state, senders, cfg, label.as_deref())
                 .await
         }
+        "DLINE" => {
+            server_cmds::handle_dline(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "UNDLINE" => {
+            server_cmds::handle_undline(&client_id, msg, state, senders, cfg, label.as_deref())
+                .await
+        }
         "CONNECT" => {
             server_cmds::handle_connect(
                 &client_id,

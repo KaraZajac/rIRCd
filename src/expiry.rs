@@ -146,6 +146,7 @@ pub async fn sweep(
             state,
             senders,
             &server_name,
+            's',
             &format!(
                 "Expiry: {} account(s) erased, {} channel registration(s) given up",
                 swept.accounts.len(),

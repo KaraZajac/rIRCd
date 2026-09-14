@@ -855,6 +855,68 @@ oper.close()
 odd.close()
 peer.close()
 
+section("an address turned away at the door")
+# A D-line is judged on the address alone, the moment the socket opens: no
+# handshake, no nick, no database. The whole of 127/8 is local, so a second
+# loopback address stands in for a stranger; the operator is on 127.0.0.1
+# and cannot ban a network that covers themselves.
+door = Client(f"door{SUF}")
+door.send(f"OPER {OPER_NAME} {OPER_PASSWORD}")
+door.wait_for(" 381 ", " 464 ", seconds=5)
+if door.find(" 381 "):
+    dmark = door.mark()
+    door.send("DLINE 127.0.0.1 :myself")
+    door.send("DLINE 127.0.0.0/8 :everyone local")
+    door.send("DLINE 0.0.0.0/0 :everyone")
+    door.send("DLINE not.an.address :nonsense")
+    door.read(1.5)
+    refused = door.since(dmark)
+    check("a D-line that covers the operator is refused", len(door.find("MATCHES_YOURSELF", lines=refused)) == 2, refused[-4:])
+    check("and so is one that is not an address, or is the whole internet",
+          len(door.find("MASK_TOO_BROAD", lines=refused)) == 2, refused[-4:])
+    dmark = door.mark()
+    door.send("DLINE 127.0.0.2/32 :not today")
+    door.read(1.0)
+    check("a D-line on a single address is accepted", bool(door.find("D-line on 127.0.0.2/32 added", lines=door.since(dmark))), door.since(dmark)[-2:])
+    stranger = Client(port=None, source="127.0.0.2")
+    stranger.read(1.5)
+    check("a connection from it is turned away before it says anything",
+          bool(stranger.find("ERROR", "banned", "not today")) and not stranger.find(" 001 "), stranger.lines[-2:])
+    stranger.close()
+    neighbour = Client(f"nbr{SUF}", source="127.0.0.3")
+    check("the address next door is not", bool(neighbour.find(" 001 ")), neighbour.lines[-2:])
+    neighbour.close()
+    dmark = door.mark()
+    door.send("STATS d")
+    door.wait_for(" 219 ", seconds=5)
+    check("STATS d lists it", bool(door.find(" 216 ", "D", "127.0.0.2/32", lines=door.since(dmark))), door.since(dmark)[-3:])
+    door.send("UNDLINE 127.0.0.2/32")
+    door.read(1.0)
+    back = Client(f"back{SUF}", source="127.0.0.2")
+    check("UNDLINE lets it in again", bool(back.find(" 001 ")), back.lines[-2:])
+    back.close()
+
+    # A K-line may name a network too: judged once there is a nick and a
+    # user, as any K-line is, but by the address rather than by its spelling.
+    dmark = door.mark()
+    door.send("KLINE *@127.0.0.4/31 :a small network")
+    door.read(1.0)
+    check("a K-line on a network is accepted", bool(door.find("K-line on *!*@127.0.0.4/31 added", lines=door.since(dmark))), door.since(dmark)[-2:])
+    inside = Client(port=None, source="127.0.0.5")
+    inside.send(f"NICK in{SUF}")
+    inside.send(f"USER in{SUF} 0 * :inside")
+    inside.read(1.5)
+    check("an address inside it cannot register", bool(inside.find("banned", "a small network")) and not inside.find(" 001 "), inside.lines[-2:])
+    inside.close()
+    outside = Client(f"out{SUF}", source="127.0.0.6")
+    check("one outside it can", bool(outside.find(" 001 ")), outside.lines[-2:])
+    outside.close()
+    door.send("UNKLINE *!*@127.0.0.4/31")
+    door.read(1.0)
+    door.send(f"PING door{SUF}")
+    check("the operator is still connected afterwards", bool(door.wait_for(f"door{SUF}", seconds=5)), door.lines[-2:])
+door.close()
+
 section("still standing")
 check("the server is still accepting and serving clients", still_alive("everything", f"h12{RUN}"))
 

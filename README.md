@@ -299,7 +299,7 @@ password_hash = "$2a$..."
 privileges = ["kill", "ban"]   # omit for all privileges
 ```
 
-`privileges` limits what an operator may do: `kill`, `ban` (KLINE/UNKLINE),
+`privileges` limits what an operator may do: `kill`, `ban` (KLINE/UNKLINE, DLINE/UNDLINE),
 `rehash`, `die`, `sethost`, `wallops`, `channels` (`CHANOWN` on a channel that
 is not theirs), `links` (`CONNECT` and `SQUIT`). Omitting the key keeps the previous behaviour, where every
 `kill` also covers `SANICK <nick> <newnick>`, the milder cousin of `KILL`: somebody
@@ -633,7 +633,8 @@ traditional network is done by the server itself, against MariaDB.
 | Channel access lists | `MODE +o` / `+v` on an **account** is remembered and restored on the next join. Somebody not logged in holds the status while they are there and no longer: a name proves nothing, so remembering one would hand the status to whoever took it next |
 | Channel modes, topic, key | Persisted; kept when an owned channel empties, and restored on startup |
 | Ban lists (`AKICK`-ish) | `+b`, `+e`, `+I` and `+q` masks are persisted and restored |
-| Network bans | `KLINE` / `UNKLINE`, persisted and enforced on connect — on every server: a ban set on one crosses the links, closes what it matches there, and is written down there too. A mask made of wildcards is refused, typed or received |
+| Network bans | `KLINE` / `UNKLINE`, persisted and enforced on connect — on every server: a ban set on one crosses the links, closes what it matches there, and is written down there too. A mask made of wildcards is refused, typed or received. Hosts may be networks (`*@203.0.113.0/24`). `DLINE` / `UNDLINE` ban an address or network at the socket, before anything is spent on the connection |
+| Server notices | User mode `+s` with a mask of letters says which server notices an operator hears — `a` accounts, `b` bans, `c` connections, `f` floods, `k` kills and forced nick changes, `l` links, `n` nick changes, `o` OPER attempts, `s` server (REHASH, expiry). `MODE <you> +s +cn` adds, `-s` clears; a new operator starts with everything but connections and nick changes. `HELP SNOMASK` |
 | Vhosts | `SETHOST` (oper), plus automatic cloaking via `cloak_key` |
 | Server-side ignore | `SILENCE +<mask>` / `-<mask>` / `SILENCE` to list — a mask is somebody who does not exist to you: no message, notice or invitation of theirs arrives, and nothing tells them so. `nick`, `nick!user@host` and `~a:account` are all masks; 32 per person, advertised as `SILENCE=32` |
 
@@ -853,8 +854,10 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `HELP` / `HELPOP` | 704/705/706 | Per-command help text |
 | `KNOCK` | 710/711 | Request invite to an invite-only channel; notifies ops |
 | `KILL` | — | Oper-only: forcibly disconnect a user; broadcasts QUIT to their channels |
-| `KLINE` | — | Oper-only: `KLINE [<seconds>] <mask> :<reason>` — refuse connections matching a mask; existing ones are closed. Persisted in MariaDB |
+| `KLINE` | — | Oper-only: `KLINE [<seconds>] <mask> :<reason>` — refuse connections matching a mask; existing ones are closed. The host may be a network in CIDR form (`*@203.0.113.0/24`, `*@2001:db8::/32`). Persisted in MariaDB |
 | `UNKLINE` | — | Oper-only: remove a ban |
+| `DLINE` | — | Oper-only: `DLINE [<seconds>] <address\|network> :<reason>` — turn an address away the moment it connects, before the handshake, the blocklist lookup or a connection slot has been spent on it. CIDR for a network; nothing wider than a /8 (IPv4) or /16 (IPv6). Crosses links like `KLINE`; `STATS d` lists them |
+| `UNDLINE` | — | Oper-only: lift a D-line |
 | `DIE` | — | Oper-only: shut the server down |
 | `ADMIN` | 256/257/258/259 | Who runs this server (`[server] admin_*`) |
 | `GHOST` | — | Close a stale session holding a nick your account owns, on this server or another one |
@@ -874,6 +877,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+o` | Server | IRC operator — set by successful OPER command |
 | `+r` | Server | Registered — set automatically on SASL login |
 | `+w` | User | Receives WALLOPS broadcasts from opers |
+| `+s` | Oper | Server notice mask — `MODE <you> +s [+\|-]<letters>` chooses which server notices you hear (`a` accounts, `b` bans, `c` connections, `f` floods, `k` kills, `l` links, `n` nick changes, `o` OPER attempts, `s` server); `-s` clears it. `HELP SNOMASK` |
 | `+g` | Callerid — only people on your `ACCEPT` list may send you direct messages. A sender who is not is told once (716/717) and you are told who knocked (718), once a minute per knocker. `ACCEPT <nick>`, `ACCEPT -<nick>`, `ACCEPT *` to list |
 
 ---

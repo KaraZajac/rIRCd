@@ -582,6 +582,29 @@ if banner.find(" 381 "):
     target.close()
 banner.close()
 
+section("a D-line crosses the link too")
+gate = Client(f"gate{RUN}", port=A_PORT)
+gate.send(f"OPER linkoper {os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+gate.wait_for(" 381 ", " 464 ", seconds=5)
+if gate.find(" 381 "):
+    gate.send("DLINE 127.0.0.9/32 :kept out everywhere")
+    gate.read(1.0)
+    stored = eventually(lambda: side_db("b", "SELECT COUNT(*) FROM server_bans WHERE mask = '127.0.0.9/32' AND kind = 'D'") == "1",
+                        seconds=6)
+    check("a D-line set on A is written down on B as one", bool(stored), side_db("b", "SELECT mask, kind FROM server_bans"))
+    shut = Client(port=B_PORT, source="127.0.0.9")
+    shut.read(1.5)
+    check("and B turns the address away at the door", bool(shut.find("ERROR", "banned")) and not shut.find(" 001 "), shut.lines[-2:])
+    shut.close()
+    gate.send("UNDLINE 127.0.0.9/32")
+    gate.read(1.0)
+    lifted = eventually(lambda: side_db("b", "SELECT COUNT(*) FROM server_bans WHERE mask = '127.0.0.9/32'") == "0", seconds=6)
+    check("lifting it on A lifts it on B", bool(lifted), side_db("b", "SELECT mask FROM server_bans"))
+    opened = Client(f"opn{RUN}", port=B_PORT, source="127.0.0.9")
+    check("and the address is welcome on B again", bool(opened.find(" 001 ")), opened.lines[-2:])
+    opened.close()
+gate.close()
+
 section("an operator can drop a link, and dial it again")
 # Until now the only way to take a link down or bring one up was to restart
 # the server. SQUIT tells the peer why before the link goes; CONNECT dials a

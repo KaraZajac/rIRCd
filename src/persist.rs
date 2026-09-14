@@ -316,11 +316,15 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
             reason     TEXT         NOT NULL,
             set_by     VARCHAR(64)  NOT NULL,
             set_at     BIGINT       NOT NULL,
-            expires_at BIGINT       NULL
+            expires_at BIGINT       NULL,
+            kind       CHAR(1)      NOT NULL DEFAULT 'K'
         ) CHARACTER SET utf8mb4",
     )
     .execute(pool)
     .await?;
+    let _ = sqlx::query("ALTER TABLE server_bans ADD COLUMN IF NOT EXISTS kind CHAR(1) NOT NULL DEFAULT 'K'")
+        .execute(pool)
+        .await;
 
     // Which channels an account is in, remembered across disconnects so a user
     // with a push subscription can be notified while they are away.
@@ -1713,27 +1717,136 @@ pub struct ServerBan {
     pub set_at: i64,
     /// Unix timestamp, or None for a ban with no end.
     pub expires_at: Option<i64>,
+    /// A K-line is a `nick!user@host` mask judged once a connection has a
+    /// nick and a user; a D-line is an address or network judged the moment
+    /// a connection arrives, before it has cost anything.
+    pub kind: BanKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BanKind {
+    #[default]
+    Kline,
+    Dline,
+}
+
+impl BanKind {
+    pub fn letter(self) -> &'static str {
+        match self {
+            BanKind::Kline => "K",
+            BanKind::Dline => "D",
+        }
+    }
+
+    pub fn from_letter(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("D") {
+            BanKind::Dline
+        } else {
+            BanKind::Kline
+        }
+    }
 }
 
 impl ServerBan {
     pub fn is_expired(&self, now: i64) -> bool {
         self.expires_at.is_some_and(|e| e <= now)
     }
+
+    /// Whether this ban covers a connection: `source` is its `nick!user@host`
+    /// and `ip` its real address. The host part of a K-line may be a network
+    /// in CIDR form, and a D-line is nothing but one — or a single address.
+    pub fn matches(&self, source: &str, ip: &str) -> bool {
+        match self.kind {
+            BanKind::Dline => address_in(&self.mask, ip).unwrap_or(false),
+            BanKind::Kline => {
+                let mask = crate::casefold::lower(&self.mask);
+                let source = crate::casefold::lower(source);
+                // `nick!user@1.2.3.0/24`: the mask up to the host is a glob and
+                // the host is a network.
+                if let Some((front, net)) = mask.rsplit_once('@') {
+                    if net.contains('/') {
+                        let Some((user_part, _)) = source.rsplit_once('@') else {
+                            return false;
+                        };
+                        return crate::user::glob_match(front, user_part)
+                            && address_in(net, ip).unwrap_or(false);
+                    }
+                }
+                let ip = ip.to_lowercase();
+                crate::user::glob_match(&mask, &source)
+                    || crate::user::glob_match(&mask, &format!("*!*@{ip}"))
+                    || crate::user::glob_match(&mask, &ip)
+            }
+        }
+    }
+}
+
+/// Whether an address is inside a network written as `addr/prefix`, or is
+/// exactly an address written on its own. None when either does not parse:
+/// a mask that is not an address matches no address.
+pub fn address_in(network: &str, ip: &str) -> Option<bool> {
+    use std::net::IpAddr;
+    let ip: IpAddr = ip.parse().ok()?;
+    let (base, prefix) = match network.split_once('/') {
+        Some((b, p)) => (b.parse::<IpAddr>().ok()?, p.parse::<u32>().ok()?),
+        None => (network.parse::<IpAddr>().ok()?, u32::MAX),
+    };
+    Some(match (base, ip) {
+        (IpAddr::V4(b), IpAddr::V4(a)) => {
+            let prefix = prefix.min(32);
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            u32::from(b) & mask == u32::from(a) & mask
+        }
+        (IpAddr::V6(b), IpAddr::V6(a)) => {
+            let prefix = prefix.min(128);
+            let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+            u128::from(b) & mask == u128::from(a) & mask
+        }
+        // A v4 address arriving through a v6 socket is written ::ffff:a.b.c.d.
+        (IpAddr::V4(b), IpAddr::V6(a)) => match a.to_ipv4_mapped() {
+            Some(a) => {
+                let prefix = prefix.min(32);
+                let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+                u32::from(b) & mask == u32::from(a) & mask
+            }
+            None => false,
+        },
+        _ => false,
+    })
+}
+
+/// A network too wide to be one operator's decision: nothing shorter than a
+/// /8 of IPv4 or a /16 of IPv6, and never everything.
+pub fn network_too_broad(network: &str) -> bool {
+    use std::net::IpAddr;
+    let Some((base, prefix)) = network.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u32>() else {
+        return true;
+    };
+    match base.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => prefix < 8,
+        Ok(IpAddr::V6(_)) => prefix < 16,
+        Err(_) => true,
+    }
 }
 
 /// Store a ban, replacing any existing one for the same mask.
 pub async fn save_server_ban(pool: &sqlx::MySqlPool, ban: &ServerBan) -> Result<(), String> {
     sqlx::query(
-        "INSERT INTO server_bans (mask, reason, set_by, set_at, expires_at)
-         VALUES (?, ?, ?, ?, ?)
+        "INSERT INTO server_bans (mask, reason, set_by, set_at, expires_at, kind)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE reason = VALUES(reason), set_by = VALUES(set_by),
-                                 set_at = VALUES(set_at), expires_at = VALUES(expires_at)",
+                                 set_at = VALUES(set_at), expires_at = VALUES(expires_at),
+                                 kind = VALUES(kind)",
     )
     .bind(&ban.mask)
     .bind(&ban.reason)
     .bind(&ban.set_by)
     .bind(ban.set_at)
     .bind(ban.expires_at)
+    .bind(ban.kind.letter())
     .execute(pool)
     .await
     .map(|_| ())
@@ -1759,7 +1872,7 @@ pub async fn load_server_bans(pool: &sqlx::MySqlPool) -> Vec<ServerBan> {
         .execute(pool)
         .await;
 
-    sqlx::query("SELECT mask, reason, set_by, set_at, expires_at FROM server_bans")
+    sqlx::query("SELECT mask, reason, set_by, set_at, expires_at, kind FROM server_bans")
         .fetch_all(pool)
         .await
         .unwrap_or_default()
@@ -1770,6 +1883,7 @@ pub async fn load_server_bans(pool: &sqlx::MySqlPool) -> Vec<ServerBan> {
             set_by: r.get("set_by"),
             set_at: r.get("set_at"),
             expires_at: r.get("expires_at"),
+            kind: BanKind::from_letter(&r.get::<String, _>("kind")),
         })
         .collect()
 }
@@ -2770,4 +2884,71 @@ pub async fn load_whowas(
             timestamp: r.get::<i64, _>("ts"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod ban_tests {
+    use super::*;
+
+    fn ban(mask: &str, kind: BanKind) -> ServerBan {
+        ServerBan {
+            mask: mask.into(),
+            reason: String::new(),
+            set_by: String::new(),
+            set_at: 0,
+            expires_at: None,
+            kind,
+        }
+    }
+
+    /// A network is an address and a prefix; an address on its own is a
+    /// network of one. Anything else matches nothing rather than everything.
+    #[test]
+    fn an_address_is_in_its_network() {
+        assert_eq!(address_in("203.0.113.0/24", "203.0.113.77"), Some(true));
+        assert_eq!(address_in("203.0.113.0/24", "203.0.114.1"), Some(false));
+        assert_eq!(address_in("203.0.113.5", "203.0.113.5"), Some(true));
+        assert_eq!(address_in("203.0.113.5", "203.0.113.6"), Some(false));
+        assert_eq!(address_in("2001:db8::/32", "2001:db8:1::1"), Some(true));
+        assert_eq!(address_in("2001:db8::/32", "2001:db9::1"), Some(false));
+        assert_eq!(address_in("203.0.113.0/24", "::ffff:203.0.113.9"), Some(true), "a v4 address seen through a v6 socket");
+        assert_eq!(address_in("0.0.0.0/0", "8.8.8.8"), Some(true));
+        assert_eq!(address_in("not.an.address", "8.8.8.8"), None);
+        assert_eq!(address_in("203.0.113.0/24", "nobody"), None);
+        assert_eq!(address_in("203.0.113.0/99", "203.0.113.1"), Some(false), "a prefix past the end is the whole address");
+        assert_eq!(address_in("203.0.113.1/99", "203.0.113.1"), Some(true));
+    }
+
+    #[test]
+    fn a_network_wider_than_an_operator_should_set_is_too_broad() {
+        assert!(network_too_broad("0.0.0.0/0"));
+        assert!(network_too_broad("10.0.0.0/7"));
+        assert!(!network_too_broad("10.0.0.0/8"));
+        assert!(network_too_broad("2001::/15"));
+        assert!(!network_too_broad("2001:db8::/32"));
+        assert!(!network_too_broad("203.0.113.5"), "a single address is never too broad");
+        assert!(network_too_broad("203.0.113.0/x"));
+    }
+
+    /// A D-line looks only at the address; a K-line at the whole source, and
+    /// at the address when its host is a network.
+    #[test]
+    fn bans_match_by_kind() {
+        let d = ban("203.0.113.0/24", BanKind::Dline);
+        assert!(d.matches("", "203.0.113.4"));
+        assert!(d.matches("anyone!x@y", "203.0.113.4"));
+        assert!(!d.matches("anyone!x@203.0.113.4", "198.51.100.1"), "the source is not consulted");
+
+        let k = ban("*!*@203.0.113.0/24", BanKind::Kline);
+        assert!(k.matches("bob!user@cloaked.host", "203.0.113.4"));
+        assert!(!k.matches("bob!user@cloaked.host", "198.51.100.1"));
+        let k = ban("*!spam*@203.0.113.0/24", BanKind::Kline);
+        assert!(k.matches("bob!spammer@cloaked.host", "203.0.113.4"));
+        assert!(!k.matches("bob!user@cloaked.host", "203.0.113.4"), "the user part still has to match");
+
+        let k = ban("*!*@Example.COM", BanKind::Kline);
+        assert!(k.matches("nick!user@example.com", "203.0.113.4"));
+        let k = ban("*!*@203.0.113.4", BanKind::Kline);
+        assert!(k.matches("nick!user@cloaked.host", "203.0.113.4"), "a bare address still matches the real one");
+    }
 }

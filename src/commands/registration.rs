@@ -90,7 +90,7 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// only to clients that enabled the capability.
 fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES=beIq,k,fjl,imnstpRcCMZ USERMODES=,,,BgiorRw MAXLIST=beIq:100 SILENCE=32 CALLERID=g PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current());
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES=beIq,k,fjl,imnstpRcCMZ USERMODES=,,s,BgiorRw MAXLIST=beIq:100 SILENCE=32 CALLERID=g PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current());
     let deny = cfg
         .server
         .client_tag_deny
@@ -355,6 +355,31 @@ pub async fn complete_registration(
         tls = logged_tls,
         "Client registered"
     );
+    {
+        let (who, real_ip, account) = {
+            let g = client.read().await;
+            (
+                g.source().unwrap_or_else(|| nick_str.clone()),
+                g.host.clone(),
+                g.account.clone(),
+            )
+        };
+        notify_opers(
+            &state,
+            &senders,
+            server,
+            'c',
+            &format!(
+                "Client connecting: {who} [{real_ip}]{}{}",
+                if logged_tls { " {tls}" } else { "" },
+                match account {
+                    Some(a) => format!(" as {a}"),
+                    None => String::new(),
+                }
+            ),
+        )
+        .await;
+    }
 
     reply_to_client(
         &senders,
@@ -1227,6 +1252,13 @@ pub async fn apply_nick_change(
     }
     if let Some(ref o) = old_nick {
         tracing::info!(client_id, old_nick = %o, new_nick = %nick, "Nick change");
+        // Told from a task of its own: the notice must not wait on the state
+        // lock this change is still holding.
+        let (from, to) = (o.clone(), nick.clone());
+        let (st, sd, sv) = (state.clone(), senders.clone(), cfg.server.name.clone());
+        tokio::spawn(async move {
+            notify_opers(&st, &sd, &sv, 'n', &format!("Nick change: {from} -> {to}")).await;
+        });
         state_guard.nick_to_id.remove(&crate::casefold::upper(o));
         // Somebody logged in has their profile filed under their
         // account, so changing what they are called moves nothing:
@@ -1579,17 +1611,46 @@ pub fn note_account_seen(cfg: &Config, account: &str) {
     }
 }
 
+/// The server notices an operator may ask for with user mode `+s`, one letter
+/// each. What every other server calls a snomask.
+pub const SNOMASK_LETTERS: &str = "abcfklnos";
+
+/// What each snomask letter means, for HELP and for the 008 reply.
+pub fn snomask_meaning(letter: char) -> &'static str {
+    match letter {
+        'a' => "accounts: registered, verified, dropped, expired",
+        'b' => "bans: K-lines and D-lines set and lifted, banned connections refused",
+        'c' => "connections: clients connecting and exiting",
+        'f' => "floods: +j and +f tripping, addresses connecting too fast",
+        'k' => "kills and forced nick changes",
+        'l' => "links: servers linking, splitting, CONNECT and SQUIT",
+        'n' => "nick changes",
+        'o' => "operators: OPER attempts, succeeded and failed",
+        's' => "server: REHASH, expiry sweeps, database health",
+        _ => "",
+    }
+}
+
+/// What a fresh operator hears by default: everything that is about the
+/// server rather than about traffic. Connections and nick changes are asked
+/// for with `MODE <nick> +s +cn`, because on a busy server they are a lot.
+pub const DEFAULT_SNOMASK: &str = "abfklos";
+
+/// Tell the operators who asked for this kind of news. `category` is one of
+/// `SNOMASK_LETTERS`; an operator hears it if the letter is in their `+s`.
 pub async fn notify_opers(
     state: &Arc<RwLock<ServerState>>,
     senders: &Senders,
     server_name: &str,
+    category: char,
     text: &str,
 ) {
     let opers: Vec<String> = {
         let state_r = state.read().await;
         let mut ids = Vec::new();
         for (id, client) in state_r.users() {
-            if client.read().await.oper {
+            let g = client.read().await;
+            if g.oper && g.snomask.contains(category) {
                 ids.push(id.clone());
             }
         }
@@ -1952,6 +2013,14 @@ pub async fn handle_quit(
     };
 
     tracing::info!(client_id, nick = %quit_nick, reason = %reason, channels = channel_names.len(), "Client quit");
+    notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        'c',
+        &format!("Client exiting: {source} [{reason}]"),
+    )
+    .await;
 
     let happened_at = crate::protocol::server_time_now();
     let mut quit_msg = Message::new("QUIT", vec![reason.clone()]).with_prefix(&source);
@@ -3554,6 +3623,7 @@ pub async fn handle_oper(
                 &state,
                 &senders,
                 &cfg.server.name,
+                'o',
                 &format!("Failed OPER attempt for '{name}' by {oper_nick} (no such operator)"),
             )
             .await;
@@ -3587,6 +3657,7 @@ pub async fn handle_oper(
             &state,
             &senders,
             &cfg.server.name,
+            'o',
             &format!("Failed OPER attempt for '{name}' by {oper_nick} from {oper_host}"),
         )
         .await;
@@ -3605,6 +3676,7 @@ pub async fn handle_oper(
     let found = if let Some(c) = state.read().await.clients.get(client_id) {
         let mut g = c.write().await;
         g.oper = true;
+        g.snomask = DEFAULT_SNOMASK.to_string();
         g.oper_name = Some(oper_name.clone());
         g.oper_privileges = oper_privileges;
         true
@@ -3638,6 +3710,7 @@ pub async fn handle_oper(
         &state,
         &senders,
         &cfg.server.name,
+        'o',
         &format!("{oper_nick} is now an IRC operator ({name})"),
     )
     .await;

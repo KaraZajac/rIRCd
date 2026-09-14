@@ -789,6 +789,7 @@ pub async fn serve_link<S>(
             &ctx.state,
             &ctx.senders,
             &our_name,
+            'l',
             &format!("Link with {} ({}) established", greeting.name, greeting.sid),
         )
         .await;
@@ -929,6 +930,7 @@ pub async fn serve_link<S>(
             &ctx.state,
             &ctx.senders,
             &our_name,
+            'l',
             &format!("Link with {} lost; {} gone", greeting.name, names.join(", ")),
         )
         .await;
@@ -2856,16 +2858,21 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
 /// one line. Remembered, written down, and put into effect on this server's
 /// own users; the peer's users are the peer's to close.
 async fn accept_remote_kline(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let kind = if msg.command == "DLINE" {
+        crate::persist::BanKind::Dline
+    } else {
+        crate::persist::BanKind::Kline
+    };
     let (Some(mask), Some(set_at), Some(expires), Some(set_by)) = (
         msg.params.first().cloned(),
         msg.params.get(1).and_then(|t| t.parse::<i64>().ok()),
         msg.params.get(2).and_then(|t| t.parse::<i64>().ok()),
         msg.params.get(3).cloned(),
     ) else {
-        warn!(peer = %peer_sid, "Malformed KLINE from a linked server");
+        warn!(peer = %peer_sid, command = %msg.command, "Malformed ban from a linked server");
         return;
     };
-    if crate::commands::server_cmds::mask_too_broad(&mask) {
+    if crate::commands::server_cmds::ban_too_broad(&mask, kind) {
         warn!(peer = %peer_sid, %mask, "Refusing a server ban that names nobody in particular");
         return;
     }
@@ -2875,6 +2882,7 @@ async fn accept_remote_kline(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
         set_by,
         set_at,
         expires_at: (expires > 0).then_some(expires),
+        kind,
     };
     let (pool, server_name) = {
         let cfg = ctx.cfg.read().await;
@@ -2896,9 +2904,11 @@ async fn accept_remote_kline(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
         &ctx.state,
         &ctx.senders,
         &server_name,
+        'b',
         &format!(
-            "{} added a server ban on {} elsewhere on the network; {} connection(s) closed here",
+            "{} added a {}-line on {} elsewhere on the network; {} connection(s) closed here",
             ban.set_by,
+            ban.kind.letter(),
             ban.mask,
             hits.len()
         ),
@@ -2916,13 +2926,18 @@ async fn accept_remote_unkline(ctx: &LinkContext, msg: &Message, peer_sid: &str)
     if let Some(pool) = pool {
         crate::persist::delete_server_ban(&pool, &mask).await;
     }
-    ctx.state.write().await.server_bans.retain(|b| b.mask != mask);
+    {
+        let mut state = ctx.state.write().await;
+        state.server_bans.retain(|b| b.mask != mask);
+        state.publish_dlines();
+    }
     info!(peer = %peer_sid, %mask, "Server ban removed from the network");
     let server_name = ctx.cfg.read().await.server.name.clone();
     crate::commands::registration::notify_opers(
         &ctx.state,
         &ctx.senders,
         &server_name,
+        'b',
         &format!("The server ban on {mask} was removed elsewhere on the network"),
     )
     .await;
@@ -3466,7 +3481,10 @@ pub async fn announce_kline(cfg: &Config, ban: &crate::persist::ServerBan) {
     broadcast(
         cfg,
         Message::new(
-            "KLINE",
+            match ban.kind {
+                crate::persist::BanKind::Kline => "KLINE",
+                crate::persist::BanKind::Dline => "DLINE",
+            },
             vec![
                 ban.mask.clone(),
                 ban.set_at.to_string(),
@@ -3481,13 +3499,20 @@ pub async fn announce_kline(cfg: &Config, ban: &crate::persist::ServerBan) {
 }
 
 /// Tell the network a server ban was lifted here.
-pub async fn announce_unkline(cfg: &Config, mask: &str) {
+pub async fn announce_unkline(cfg: &Config, mask: &str, kind: crate::persist::BanKind) {
     if cfg.links_runtime.is_none() {
         return;
     }
     broadcast(
         cfg,
-        Message::new("UNKLINE", vec![mask.to_string()]).with_prefix(our_sid(cfg)),
+        Message::new(
+            match kind {
+                crate::persist::BanKind::Kline => "UNKLINE",
+                crate::persist::BanKind::Dline => "UNDLINE",
+            },
+            vec![mask.to_string()],
+        )
+        .with_prefix(our_sid(cfg)),
     )
     .await;
 }
@@ -3721,11 +3746,11 @@ async fn handle_link_message(
             accept_remote_account(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }
-        "KLINE" => {
+        "KLINE" | "DLINE" => {
             accept_remote_kline(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }
-        "UNKLINE" => {
+        "UNKLINE" | "UNDLINE" => {
             accept_remote_unkline(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }

@@ -380,25 +380,30 @@ pub async fn handle_links(
 
 /// STATS — server statistics. Implements 'u' (uptime) and 'o' (opers); stubs others.
 /// Rows for `STATS k`: the server bans in force.
-async fn stats_bans(state: &Arc<RwLock<ServerState>>, nick: &str, server: &str) -> Vec<Message> {
+async fn stats_bans(
+    state: &Arc<RwLock<ServerState>>,
+    nick: &str,
+    server: &str,
+    kind: crate::persist::BanKind,
+) -> Vec<Message> {
     let now = chrono::Utc::now().timestamp();
     state
         .read()
         .await
         .server_bans
         .iter()
-        .filter(|b| !b.is_expired(now))
+        .filter(|b| !b.is_expired(now) && b.kind == kind)
         .map(|b| {
             let remaining = match b.expires_at {
                 Some(e) => format!("{}s", (e - now).max(0)),
                 None => "permanent".to_string(),
             };
-            // 216 RPL_STATSKLINE
+            // 216 RPL_STATSKLINE, and the same row shape for a D-line
             Message::new(
                 "216",
                 vec![
                     nick.to_string(),
-                    "K".into(),
+                    b.kind.letter().into(),
                     b.mask.clone(),
                     remaining,
                     b.set_by.clone(),
@@ -523,7 +528,12 @@ pub async fn handle_stats(
             }
         }
         "k" | "K" => {
-            for m in stats_bans(&state, &nick, &cfg.server.name).await {
+            for m in stats_bans(&state, &nick, &cfg.server.name, crate::persist::BanKind::Kline).await {
+                reply_to_client(&senders, client_id, m, label).await;
+            }
+        }
+        "d" | "D" => {
+            for m in stats_bans(&state, &nick, &cfg.server.name, crate::persist::BanKind::Dline).await {
                 reply_to_client(&senders, client_id, m, label).await;
             }
         }
@@ -902,6 +912,33 @@ pub async fn handle_help(
                 "  They are told who did it; the network sees an ordinary nick change.",
             ],
         ),
+        Some("KLINE") => (
+            "KLINE",
+            &[
+                "KLINE [<seconds>] <nick!user@host> :<reason>",
+                "  Refuse connections matching a mask; the host may be a network",
+                "  (user@203.0.113.0/24). Existing matches are closed. UNKLINE lifts it.",
+            ],
+        ),
+        Some("DLINE") => (
+            "DLINE",
+            &[
+                "DLINE [<seconds>] <address|network> :<reason>",
+                "  Turn an address away the moment it connects, before anything is",
+                "  spent on it. CIDR for a network; nothing wider than a /8 or /16.",
+                "  UNDLINE lifts it; STATS d lists them.",
+            ],
+        ),
+        Some("SNOMASK") => (
+            "SNOMASK",
+            &[
+                "MODE <you> +s [+|-]<letters>   MODE <you> -s",
+                "  Which server notices an operator hears. Letters:",
+                "  a accounts  b bans  c connections  f floods  k kills",
+                "  l links  n nick changes  o operators  s server",
+                "  A new operator starts with all but c and n.",
+            ],
+        ),
         Some("GHOST") => (
             "GHOST",
             &[
@@ -936,6 +973,7 @@ pub async fn handle_help(
                 "  VERIFY PASSWD RESETPASS DROPACCOUNT GHOST",
                 "  CHANOWN CHANACCESS CHANDROP ACCEPT SILENCE",
                 "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS CONNECT SQUIT SANICK",
+                "  KLINE DLINE SNOMASK",
                 "  STATS LUSERS",
             ],
         ),
@@ -1700,6 +1738,14 @@ pub async fn handle_rehash(
     };
 
     info!("Config reloaded by {}", nick);
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &server_name,
+        's',
+        &format!("{nick} rehashed the configuration"),
+    )
+    .await;
     reply_to_client(
         &senders,
         client_id,
@@ -1842,11 +1888,44 @@ fn normalize_ban_mask(mask: &str) -> String {
 /// literal characters is the line other servers draw, and the same one is
 /// drawn here, for a mask typed by an operator and for one sent by a peer.
 pub fn mask_too_broad(normalized: &str) -> bool {
+    // `*!*@10.0.0.0/8` has plenty of literal characters and covers sixteen
+    // million addresses; a network is judged by its size, not its spelling.
+    if let Some((_, host)) = normalized.rsplit_once('@') {
+        if host.contains('/') {
+            return crate::persist::network_too_broad(host);
+        }
+    }
     normalized
         .chars()
         .filter(|c| !matches!(c, '*' | '?' | '!' | '@' | '.'))
         .count()
         < 4
+}
+
+/// Whether a ban of either kind says who it is for. A D-line has to be an
+/// address or a network at all, and not one wider than an operator's call.
+pub fn ban_too_broad(mask: &str, kind: crate::persist::BanKind) -> bool {
+    match kind {
+        crate::persist::BanKind::Kline => mask_too_broad(mask),
+        crate::persist::BanKind::Dline => {
+            let parses = crate::persist::address_in(mask, "0.0.0.0").is_some()
+                || crate::persist::address_in(mask, "::").is_some();
+            !parses || crate::persist::network_too_broad(mask)
+        }
+    }
+}
+
+/// Whether a ban of this kind, with this mask, would cover a connection.
+fn ban_covers(mask: &str, kind: crate::persist::BanKind, source: &str, ip: &str) -> bool {
+    crate::persist::ServerBan {
+        mask: mask.to_string(),
+        reason: String::new(),
+        set_by: String::new(),
+        set_at: 0,
+        expires_at: None,
+        kind,
+    }
+    .matches(source, ip)
 }
 
 /// Put a ban into effect here: remember it, and close every connection it
@@ -1863,6 +1942,7 @@ pub async fn enforce_ban(
         let mut state_w = state.write().await;
         state_w.server_bans.retain(|b| b.mask != ban.mask);
         state_w.server_bans.push(ban.clone());
+        state_w.publish_dlines();
         for (id, client) in state_w.users() {
             let g = client.read().await;
             // Only this server's own users are closed. Somebody on another
@@ -1871,12 +1951,7 @@ pub async fn enforce_ban(
                 continue;
             }
             let source = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
-            if crate::user::glob_match(&ban.mask.to_lowercase(), &source.to_lowercase())
-                || crate::user::glob_match(
-                    &ban.mask.to_lowercase(),
-                    &format!("*!*@{}", g.host.to_lowercase()),
-                )
-            {
+            if ban.matches(&source, &g.host) {
                 hits.push((id.clone(), g.nick_or_id().to_string()));
             }
         }
@@ -1907,66 +1982,22 @@ pub async fn handle_kline(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    const PRIVILEGE: crate::config::OperPrivilege = crate::config::OperPrivilege::Ban;
-    let (nick, allowed, own_source) = {
-        let state_r = state.read().await;
-        match state_r.clients.get(client_id) {
-            Some(c) => {
-                let g = c.read().await;
-                (
-                    g.nick_or_id().to_string(),
-                    g.may(PRIVILEGE),
-                    g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
-                )
-            }
-            None => return Ok(()),
-        }
-    };
-    if !allowed {
-        reply_to_client(
-            &senders,
-            client_id,
-            Message::new(
-                "481",
-                vec![nick, "Permission Denied- You're not an IRC operator".into()],
-            )
-            .with_prefix(&cfg.server.name),
-            label,
-        )
-        .await;
+    let Some((nick, own_source, own_ip)) = may_ban(&state, &senders, client_id, cfg, label).await
+    else {
         return Ok(());
-    }
-
-    let params: Vec<&str> = msg.params.iter().map(|p| p.as_str()).collect();
-    let (duration, mask) = match params.first().and_then(|p| p.parse::<i64>().ok()) {
-        Some(secs) => (secs, params.get(1).copied().unwrap_or("")),
-        None => (0, params.first().copied().unwrap_or("")),
     };
-    let reason = msg
-        .trailing()
-        .filter(|t| *t != mask)
-        .unwrap_or("No reason given")
-        .to_string();
-
-    if mask.is_empty() {
-        reply_to_client(
-            &senders,
-            client_id,
-            Message::new("461", vec!["KLINE".into(), "Not enough parameters".into()])
-                .with_prefix(&cfg.server.name),
-            label,
-        )
-        .await;
+    let Some((duration, mask, reason)) = ban_arguments(&msg, "KLINE", &senders, client_id, cfg, label).await
+    else {
         return Ok(());
-    }
+    };
 
     // A mask has to say who it is for. One made only of wildcards is for
     // everybody — the operator setting it included, and everybody who tries
     // to connect after the next restart, when it is read back from the
     // database with nobody left inside to lift it. Four literal characters
     // is the line other servers draw, and the same one is drawn here.
-    let normalized = normalize_ban_mask(mask);
-    if mask_too_broad(&normalized) {
+    let normalized = normalize_ban_mask(&mask);
+    if ban_too_broad(&normalized, crate::persist::BanKind::Kline) {
         reply_to_client(
             &senders,
             client_id,
@@ -1976,7 +2007,7 @@ pub async fn handle_kline(
                     "KLINE".into(),
                     "MASK_TOO_BROAD".into(),
                     normalized.clone(),
-                    "A ban mask needs at least four characters that are not wildcards".into(),
+                    "A ban mask needs at least four characters that are not wildcards, and a network no wider than a /8".into(),
                 ],
             )
             .with_prefix(&cfg.server.name),
@@ -1985,7 +2016,7 @@ pub async fn handle_kline(
         .await;
         return Ok(());
     }
-    if crate::user::glob_match(&normalized.to_lowercase(), &own_source.to_lowercase()) {
+    if ban_covers(&normalized, crate::persist::BanKind::Kline, &own_source, &own_ip) {
         reply_to_client(
             &senders,
             client_id,
@@ -2005,10 +2036,94 @@ pub async fn handle_kline(
         return Ok(());
     }
 
-    let ban = crate::persist::ServerBan {
-        mask: normalized,
+    let ban = new_ban(normalized, reason, &nick, duration, crate::persist::BanKind::Kline);
+    place_ban(client_id, &nick, ban, &state, &senders, cfg, label).await;
+    Ok(())
+}
+
+/// Who is asking to ban, if they may: their nick, their `nick!user@host`,
+/// and their real address — the last two so a ban that would hit the person
+/// setting it can be refused.
+async fn may_ban(
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    client_id: &str,
+    cfg: &Config,
+    label: Option<&str>,
+) -> Option<(String, String, String)> {
+    let (nick, allowed, own_source, own_ip) = {
+        let state_r = state.read().await;
+        let c = state_r.clients.get(client_id)?;
+        let g = c.read().await;
+        (
+            g.nick_or_id().to_string(),
+            g.may(crate::config::OperPrivilege::Ban),
+            g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
+            g.host.clone(),
+        )
+    };
+    if !allowed {
+        reply_to_client(
+            senders,
+            client_id,
+            Message::new(
+                "481",
+                vec![nick, "Permission Denied- You're not an IRC operator".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return None;
+    }
+    Some((nick, own_source, own_ip))
+}
+
+/// `[<duration>] <mask> :<reason>`, the shape KLINE and DLINE share. Duration
+/// is in seconds; omitted, or 0, for a ban with no end.
+async fn ban_arguments(
+    msg: &Message,
+    command: &str,
+    senders: &Senders,
+    client_id: &str,
+    cfg: &Config,
+    label: Option<&str>,
+) -> Option<(i64, String, String)> {
+    let params: Vec<&str> = msg.params.iter().map(|p| p.as_str()).collect();
+    let (duration, mask) = match params.first().and_then(|p| p.parse::<i64>().ok()) {
+        Some(secs) => (secs, params.get(1).copied().unwrap_or("")),
+        None => (0, params.first().copied().unwrap_or("")),
+    };
+    let reason = msg
+        .trailing()
+        .filter(|t| *t != mask)
+        .unwrap_or("No reason given")
+        .to_string();
+    if mask.is_empty() {
+        reply_to_client(
+            senders,
+            client_id,
+            Message::new("461", vec![command.into(), "Not enough parameters".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return None;
+    }
+    Some((duration, mask.to_string(), reason))
+}
+
+fn new_ban(
+    mask: String,
+    reason: String,
+    set_by: &str,
+    duration: i64,
+    kind: crate::persist::BanKind,
+) -> crate::persist::ServerBan {
+    crate::persist::ServerBan {
+        mask,
         reason,
-        set_by: nick.clone(),
+        set_by: set_by.to_string(),
         set_at: chrono::Utc::now().timestamp(),
         expires_at: if duration > 0 {
             // The duration is whatever number was typed. Added to the clock it
@@ -2018,28 +2133,43 @@ pub async fn handle_kline(
         } else {
             None
         },
-    };
+        kind,
+    }
+}
 
+/// Put a new ban into the world: the database, the network, this server's
+/// own connections, the operators' notices, and the reply to whoever set it.
+async fn place_ban(
+    client_id: &str,
+    nick: &str,
+    ban: crate::persist::ServerBan,
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) {
     if let Some(ref pool) = cfg.db {
         if let Err(e) = crate::persist::save_server_ban(pool, &ban).await {
-            tracing::error!(client_id, error = %e, "KLINE: could not store ban");
+            tracing::error!(client_id, error = %e, kind = ban.kind.letter(), "Could not store the ban");
         }
     }
     tracing::warn!(
-        oper = %nick, mask = %ban.mask, expires = ?ban.expires_at, "Server ban added"
+        oper = %nick, kind = ban.kind.letter(), mask = %ban.mask, expires = ?ban.expires_at, "Server ban added"
     );
 
     // A ban is a fact about the network, not about the server it was typed
     // at: somebody shut out here and welcome one server over is not shut out.
     crate::link::announce_kline(cfg, &ban).await;
-    let hits = enforce_ban(&state, &senders, &cfg.server.name, &ban).await;
+    let hits = enforce_ban(state, senders, &cfg.server.name, &ban).await;
     crate::commands::registration::notify_opers(
-        &state,
-        &senders,
+        state,
+        senders,
         &cfg.server.name,
+        'b',
         &format!(
-            "{} added a server ban on {}{} ({})",
+            "{} added a {}-line on {}{} ({})",
             nick,
+            ban.kind.letter(),
             ban.mask,
             match ban.expires_at {
                 Some(at) => format!(" until {}", clock_time(at)),
@@ -2051,17 +2181,158 @@ pub async fn handle_kline(
     .await;
 
     reply_to_client(
+        senders,
+        client_id,
+        Message::new(
+            "NOTICE",
+            vec![
+                nick.to_string(),
+                format!(
+                    "{}-line on {} added ({} connection(s) closed)",
+                    ban.kind.letter(),
+                    ban.mask,
+                    hits.len()
+                ),
+            ],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+}
+
+/// `DLINE [<duration>] <address|network> :<reason>` — turn an address away
+/// the moment it connects.
+///
+/// A K-line is judged once a connection has a nick and a user, which is
+/// after the handshake, the DNS blocklist, and a slot in the connection
+/// tables have all been spent on it. A D-line is judged before any of that,
+/// on nothing but the address, which is the right thing for an address that
+/// is only ever going to be turned away. A network is written as CIDR:
+/// `203.0.113.0/24`, `2001:db8::/32`. Nothing wider than a /8 or a /16.
+pub async fn handle_dline(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((nick, _own_source, own_ip)) = may_ban(&state, &senders, client_id, cfg, label).await
+    else {
+        return Ok(());
+    };
+    let Some((duration, mask, reason)) = ban_arguments(&msg, "DLINE", &senders, client_id, cfg, label).await
+    else {
+        return Ok(());
+    };
+    let mask = mask.to_lowercase();
+    if ban_too_broad(&mask, crate::persist::BanKind::Dline) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "DLINE".into(),
+                    "MASK_TOO_BROAD".into(),
+                    mask.clone(),
+                    "A D-line is an address or a network in CIDR form, no wider than a /8 (IPv4) or a /16 (IPv6)".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    if ban_covers(&mask, crate::persist::BanKind::Dline, "", &own_ip) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "DLINE".into(),
+                    "MATCHES_YOURSELF".into(),
+                    mask.clone(),
+                    "That address covers your own connection".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let ban = new_ban(mask, reason, &nick, duration, crate::persist::BanKind::Dline);
+    place_ban(client_id, &nick, ban, &state, &senders, cfg, label).await;
+    Ok(())
+}
+
+/// `UNDLINE <address|network>` — lift a D-line.
+pub async fn handle_undline(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((nick, _, _)) = may_ban(&state, &senders, client_id, cfg, label).await else {
+        return Ok(());
+    };
+    let mask = msg
+        .params
+        .first()
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    if mask.is_empty() {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![nick, "UNDLINE".into(), "Not enough parameters".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let removed = match cfg.db {
+        Some(ref pool) => crate::persist::delete_server_ban(pool, &mask).await,
+        None => false,
+    };
+    let known = {
+        let mut state_w = state.write().await;
+        let before = state_w.server_bans.len();
+        state_w
+            .server_bans
+            .retain(|b| !(b.kind == crate::persist::BanKind::Dline && b.mask == mask));
+        state_w.publish_dlines();
+        state_w.server_bans.len() != before
+    };
+    tracing::warn!(oper = %nick, %mask, removed, "D-line removed");
+    crate::link::announce_unkline(cfg, &mask, crate::persist::BanKind::Dline).await;
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        'b',
+        &format!("{nick} removed the D-line on {mask}"),
+    )
+    .await;
+    reply_to_client(
         &senders,
         client_id,
         Message::new(
             "NOTICE",
             vec![
                 nick,
-                format!(
-                    "Ban on {} added ({} connection(s) closed)",
-                    ban.mask,
-                    hits.len()
-                ),
+                if known || removed {
+                    format!("D-line on {mask} removed")
+                } else {
+                    format!("No D-line on {mask}")
+                },
             ],
         )
         .with_prefix(&cfg.server.name),
@@ -2111,13 +2382,18 @@ pub async fn handle_unkline(
         Some(ref pool) => crate::persist::delete_server_ban(pool, &mask).await,
         None => false,
     };
-    state.write().await.server_bans.retain(|b| b.mask != mask);
+    {
+        let mut state_w = state.write().await;
+        state_w.server_bans.retain(|b| b.mask != mask);
+        state_w.publish_dlines();
+    }
     tracing::warn!(oper = %nick, %mask, removed, "Server ban removed");
-    crate::link::announce_unkline(cfg, &mask).await;
+    crate::link::announce_unkline(cfg, &mask, crate::persist::BanKind::Kline).await;
     crate::commands::registration::notify_opers(
         &state,
         &senders,
         &cfg.server.name,
+        'b',
         &format!("{nick} removed the server ban on {mask}"),
     )
     .await;
@@ -2239,6 +2515,7 @@ pub async fn handle_squit(
                 &state,
                 &senders,
                 &cfg.server.name,
+                'l',
                 &format!("{nick} closed the link to {name} ({reason})"),
             )
             .await;
@@ -2371,6 +2648,7 @@ pub async fn handle_connect(
         &state,
         &senders,
         &cfg.server.name,
+        'l',
         &format!("{nick} is connecting to {} ({where_to})", link.name),
     )
     .await;
@@ -2553,6 +2831,7 @@ pub async fn handle_sanick(
         &state,
         &senders,
         s,
+        'k',
         &format!("{oper_nick} changed {target_nick}'s nick to {new_nick}"),
     )
     .await;

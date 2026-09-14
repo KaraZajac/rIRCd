@@ -343,6 +343,7 @@ pub async fn run(
         state_w.read_markers = markers;
         state_w.metadata = meta;
         state_w.server_bans = bans;
+        state_w.publish_dlines();
         for (channel, account) in memberships {
             state_w
                 .channel_accounts
@@ -473,7 +474,8 @@ pub async fn run(
                 cfg.dnsbl
                     .as_ref()
                     .map(|d| Arc::new(crate::dnsbl::Dnsbl::from_config(d))),
-            );
+            )
+            .with_dlines(state.read().await.dlines.clone());
     if let Some(ref d) = cfg.dnsbl {
         info!("DNS blocklists: {} ({})", d.zones.join(", "), d.action);
     }

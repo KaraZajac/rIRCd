@@ -31,8 +31,14 @@ AUTH_SECRET = "BTBZMqHH6r4Tts7J_aSIgg"
 class Client:
     """One IRC connection, with a record of every line the server sent."""
 
-    def __init__(self, nick=None, user=None, realname=None, caps=None, timeout=10, port=None):
-        self.sock = socket.create_connection((IRC_HOST, port or IRC_PORT), timeout=timeout)
+    def __init__(self, nick=None, user=None, realname=None, caps=None, timeout=10, port=None,
+                 source=None):
+        # `source` is another loopback address to arrive from (127.0.0.2 …):
+        # the whole of 127/8 is local, and an address-based ban needs a
+        # second address to be seen doing anything.
+        self.sock = socket.create_connection(
+            (IRC_HOST, port or IRC_PORT), timeout=timeout,
+            source_address=(source, 0) if source else None)
         self.buf = ""
         self.lines = []
         self.nick = nick

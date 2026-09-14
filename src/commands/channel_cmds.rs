@@ -2492,9 +2492,20 @@ pub async fn handle_mode(
                 if g.bot {
                     modes.push('B');
                 }
+                if !g.snomask.is_empty() {
+                    modes.push('s');
+                }
                 let m =
                     Message::new("221", vec![nick.clone(), modes]).with_prefix(&cfg.server.name);
                 reply_to_client(&senders, client_id, m, label).await;
+                if !g.snomask.is_empty() {
+                    let m = Message::new(
+                        "008",
+                        vec![nick.clone(), format!("+{}", g.snomask), "Server notice mask".into()],
+                    )
+                    .with_prefix(&cfg.server.name);
+                    reply_to_client(&senders, client_id, m, label).await;
+                }
             }
             return Ok(());
         }
@@ -2559,6 +2570,56 @@ pub async fn handle_mode(
                     .with_prefix(&nick);
                     reply_to_client(&senders, client_id, m, label).await;
                 }
+                // +s [+|-]<letters>: which server notices an operator hears.
+                // Bare +s is the default set, -s is none. Not a mode anybody
+                // else has: a notice is for the people who can act on it.
+                's' => {
+                    let is_oper = match state.clients.get(client_id) {
+                        Some(c) => c.read().await.oper,
+                        None => false,
+                    };
+                    if !is_oper {
+                        reply_to_client(
+                            &senders,
+                            client_id,
+                            Message::new(
+                                "481",
+                                vec![nick.clone(), "Permission Denied- You're not an IRC operator".into()],
+                            )
+                            .with_prefix(&cfg.server.name),
+                            label,
+                        )
+                        .await;
+                        continue;
+                    }
+                    let current = match state.clients.get(client_id) {
+                        Some(c) => c.read().await.snomask.clone(),
+                        None => String::new(),
+                    };
+                    let wanted = if plus {
+                        match msg.params.get(2) {
+                            Some(spec) => snomask_after(&current, spec),
+                            None => crate::commands::registration::DEFAULT_SNOMASK.to_string(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    if let Some(c) = state.clients.get(client_id) {
+                        c.write().await.snomask = wanted.clone();
+                    }
+                    let m = Message::new(
+                        "MODE",
+                        vec![nick.clone(), format!("{}s", if plus { "+" } else { "-" })],
+                    )
+                    .with_prefix(&nick);
+                    reply_to_client(&senders, client_id, m, label).await;
+                    let m = Message::new(
+                        "008",
+                        vec![nick.clone(), format!("+{wanted}"), "Server notice mask".into()],
+                    )
+                    .with_prefix(&cfg.server.name);
+                    reply_to_client(&senders, client_id, m, label).await;
+                }
                 // Nobody makes themselves an operator with MODE — that is what
                 // OPER and a password are for — but anybody may stop being one.
                 // An operator who wants to put the power down should not have to
@@ -2571,6 +2632,7 @@ pub async fn handle_mode(
                             g.oper = false;
                             g.oper_name = None;
                             g.oper_privileges = None;
+                            g.snomask.clear();
                             was
                         }
                         None => false,
@@ -2588,6 +2650,29 @@ pub async fn handle_mode(
     }
 
     Ok(())
+}
+
+/// A snomask after a change: `+cn` adds, `-k` removes, letters with no sign
+/// add, and anything that is not a notice letter is ignored. Kept in one
+/// order so two operators with the same set see the same string.
+fn snomask_after(current: &str, spec: &str) -> String {
+    let mut have: std::collections::BTreeSet<char> = current.chars().collect();
+    let mut adding = true;
+    for c in spec.chars() {
+        match c {
+            '+' => adding = true,
+            '-' => adding = false,
+            c if crate::commands::registration::SNOMASK_LETTERS.contains(c) => {
+                if adding {
+                    have.insert(c);
+                } else {
+                    have.remove(&c);
+                }
+            }
+            _ => {}
+        }
+    }
+    have.into_iter().collect()
 }
 
 /// Rebuild a MODE echo without the changes the server refused.
@@ -3119,6 +3204,14 @@ pub async fn server_kick(
         return;
     }
     tracing::info!(channel = %ch_key, target = %target_nick, %reason, "Server KICK");
+    crate::commands::registration::notify_opers(
+        state,
+        senders,
+        &cfg.server.name,
+        'f',
+        &format!("{target_nick} kicked from {ch_key}: {reason}"),
+    )
+    .await;
     let our_sid = {
         let state_r = state.read().await;
         if let Some(c) = state_r.clients.get(target) {

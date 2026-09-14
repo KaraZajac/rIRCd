@@ -44,6 +44,10 @@ pub struct ConnectionLimits {
     shared: Option<SharedListener>,
     /// A blocklist to ask about every public address, if one is configured.
     dnsbl: Option<Arc<crate::dnsbl::Dnsbl>>,
+    /// D-lines: addresses and networks turned away the moment they connect,
+    /// before a nick, a handshake, or a database has cost anything. Shared
+    /// with the server state that keeps them current.
+    dlines: Option<Arc<std::sync::RwLock<Vec<crate::persist::ServerBan>>>>,
 }
 
 /// A listener where counting by address cannot mean anything.
@@ -152,6 +156,29 @@ impl ConnectionLimits {
     pub fn with_dnsbl(mut self, dnsbl: Option<Arc<crate::dnsbl::Dnsbl>>) -> Self {
         self.dnsbl = dnsbl;
         self
+    }
+
+    /// The same limits, turning D-lined addresses away on arrival.
+    pub fn with_dlines(
+        mut self,
+        dlines: Arc<std::sync::RwLock<Vec<crate::persist::ServerBan>>>,
+    ) -> Self {
+        self.dlines = Some(dlines);
+        self
+    }
+
+    /// The reason this address is D-lined, if it is. Nothing on a listener
+    /// behind one address, where the address is everybody's.
+    pub fn dline_for(&self, host: &str) -> Option<String> {
+        if self.shared.is_some() {
+            return None;
+        }
+        let dlines = self.dlines.as_ref()?.read().ok()?;
+        let now = chrono::Utc::now().timestamp();
+        dlines
+            .iter()
+            .find(|b| !b.is_expired(now) && b.matches("", host))
+            .map(|b| b.reason.clone())
     }
 
     /// The zone that lists this address, if a blocklist is configured and one
@@ -344,6 +371,11 @@ pub async fn handle_client_tls(
             return;
         }
     };
+    if let Some(reason) = limits.dline_for(&host) {
+        tracing::warn!(%host, %reason, "Refused a TLS connection from a D-lined address");
+        refuse_connection_tls(stream, &server_name, &format!("banned ({reason})")).await;
+        return;
+    }
     if let Some(zone) = limits.dnsbl_listing(&host).await {
         if limits.dnsbl_rejects() {
             tracing::warn!(%host, %zone, "Refused a TLS connection from a listed address");
@@ -388,6 +420,11 @@ pub async fn handle_client(
             return;
         }
     };
+    if let Some(reason) = limits.dline_for(&host) {
+        tracing::warn!(%host, %reason, "Refused a connection from a D-lined address");
+        refuse_connection(stream, &server_name, &format!("banned ({reason})")).await;
+        return;
+    }
     if let Some(zone) = limits.dnsbl_listing(&host).await {
         if limits.dnsbl_rejects() {
             tracing::warn!(%host, %zone, "Refused a connection from a listed address");
@@ -806,6 +843,15 @@ pub async fn handle_client_ws(
             return;
         }
     };
+    if let Some(reason) = limits.dline_for(&host) {
+        tracing::warn!(%host, %reason, "Refused a WebSocket connection from a D-lined address");
+        let _ = socket
+            .send(axum::extract::ws::Message::Text(
+                format!(":{} ERROR :Closing link: banned ({})", server_name, reason).into(),
+            ))
+            .await;
+        return;
+    }
     if let Some(zone) = limits.dnsbl_listing(&host).await {
         if limits.dnsbl_rejects() {
             tracing::warn!(%host, %zone, "Refused a WebSocket connection from a listed address");
