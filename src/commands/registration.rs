@@ -3630,11 +3630,27 @@ pub async fn handle_oper(
 ) -> anyhow::Result<()> {
     let name = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     let password = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
-    let oper_nick = match state.read().await.clients.get(client_id) {
-        Some(c) => c.read().await.nick_or_id().to_string(),
-        None => "*".to_string(),
+    let (oper_nick, is_tls, presented_certfp, real_source) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (
+                    g.nick_or_id().to_string(),
+                    g.is_tls,
+                    state_r.certfps.get(client_id).cloned(),
+                    format!(
+                        "{}!{}@{}",
+                        g.nick_or_id(),
+                        g.user.as_deref().unwrap_or("*"),
+                        g.host
+                    ),
+                )
+            }
+            None => ("*".to_string(), false, None, "*!*@*".to_string()),
+        }
     };
-    if name.is_empty() || password.is_empty() {
+    if name.is_empty() {
         reply_to_client(
             &senders,
             client_id,
@@ -3690,7 +3706,79 @@ pub async fn handle_oper(
         Some(c) => c.read().await.host.clone(),
         None => client_id.to_string(),
     };
-    let over_budget = !state.write().await.auth_cost.spend(&oper_host).is_zero();
+    // A block that asks for TLS is refused over anything else before a
+    // password is typed into the clear; a block that names a certificate is
+    // refused unless that certificate was presented — with a password as
+    // well when one is set, on its own when none is.
+    let refuse = |why: &'static str| {
+        tracing::warn!(client_id, oper_name = %name, host = %oper_host, "OPER login failed: {why}");
+        (
+            format!("Failed OPER attempt for '{name}' by {oper_nick} from {oper_host} ({why})"),
+            Message::new("464", vec![oper_nick.clone(), "Password incorrect".into()])
+                .with_prefix(&cfg.server.name),
+        )
+    };
+    let cert_matches = match matched.certfp {
+        Some(ref want) => {
+            let want: String = want.chars().filter(|c| *c != ':').collect();
+            presented_certfp
+                .as_deref()
+                .is_some_and(|have| have.eq_ignore_ascii_case(&want))
+        }
+        None => true,
+    };
+    let password_needed = !matched.password_hash.is_empty();
+    // The block's hostmask is where this operator is allowed to be, judged
+    // on the real host, not the cloak. `user@host` or `nick!user@host`.
+    let host_ok = match matched.hostmask.as_deref() {
+        None | Some("*") | Some("") => true,
+        Some(mask) => {
+            let mask = if mask.contains('!') { mask.to_string() } else { format!("*!{mask}") };
+            crate::user::glob_match(&mask.to_lowercase(), &real_source.to_lowercase())
+        }
+    };
+    if !host_ok {
+        let (notice, _) = refuse("host does not match the operator block");
+        notify_opers(&state, &senders, &cfg.server.name, 'o', &notice).await;
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("491", vec![oper_nick.clone(), "No O-lines for your host".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    if (matched.require_tls && !is_tls) || !cert_matches || (!password_needed && matched.certfp.is_none())
+    {
+        let why = if matched.require_tls && !is_tls {
+            "not over TLS"
+        } else if !cert_matches {
+            "certificate did not match"
+        } else {
+            "operator block has neither a password nor a certificate"
+        };
+        let (notice, reply) = refuse(why);
+        notify_opers(&state, &senders, &cfg.server.name, 'o', &notice).await;
+        reply_to_client(&senders, client_id, reply, label).await;
+        return Ok(());
+    }
+    if password_needed && password.is_empty() {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "461",
+                vec![oper_nick.clone(), "OPER".into(), "Not enough parameters".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let over_budget = password_needed && !state.write().await.auth_cost.spend(&oper_host).is_zero();
     if over_budget {
         tracing::warn!(
             client_id,
@@ -3699,7 +3787,9 @@ pub async fn handle_oper(
             "OPER: too many failed attempts from this address, not checking"
         );
     }
-    if over_budget || !crate::persist::bcrypt_verify(password, &matched.password_hash).await {
+    if password_needed
+        && (over_budget || !crate::persist::bcrypt_verify(password, &matched.password_hash).await)
+    {
         tracing::warn!(client_id, oper_name = %name, "OPER login failed: bad password");
         notify_opers(
             &state,
@@ -3719,7 +3809,9 @@ pub async fn handle_oper(
         .await;
         return Ok(());
     }
-    state.write().await.auth_cost.refund(&oper_host);
+    if password_needed {
+        state.write().await.auth_cost.refund(&oper_host);
+    }
     let (oper_name, oper_privileges) = (matched.name.clone(), matched.privileges.clone());
     let found = if let Some(c) = state.read().await.clients.get(client_id) {
         let mut g = c.write().await;

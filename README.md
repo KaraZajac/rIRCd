@@ -302,6 +302,24 @@ privileges = ["kill", "ban"]   # omit for all privileges
 `privileges` limits what an operator may do: `kill`, `ban` (KLINE/UNKLINE, DLINE/UNDLINE),
 `rehash`, `die`, `sethost`, `wallops`, `channels` (`CHANOWN` on a channel that
 is not theirs), `links` (`CONNECT` and `SQUIT`). Omitting the key keeps the previous behaviour, where every
+
+An operator block's `hostmask` (`user@host` or `nick!user@host`, judged on the
+real address, not the cloak) is where that operator is allowed to be; `OPER`
+from anywhere else is refused with 491. An operator block may ask for more than a password. `require_tls = true`
+refuses `OPER` over a connection that is not TLS, so the password never crosses
+a wire in the clear. `certfp = "SHA256:…"` (the fingerprint as `openssl x509
+-noout -sha256 -fingerprint` prints it, colons optional) refuses `OPER` unless
+that client certificate was presented — as a second factor when
+`password_hash` is set too, and on its own when it is left empty, in which
+case `OPER <name>` with no password is the whole ceremony.
+
+```toml
+[[opers]]
+name = "kara"
+certfp = "3B:8F:…:A1"
+require_tls = true
+privileges = ["kill", "ban", "channels"]
+```
 `kill` also covers `SANICK <nick> <newnick>`, the milder cousin of `KILL`: somebody
 sitting on a name they should not have is moved off it rather than off the
 network, told who did it, and the network sees an ordinary nick change — a user
@@ -858,6 +876,11 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `UNKLINE` | — | Oper-only: remove a ban |
 | `DLINE` | — | Oper-only: `DLINE [<seconds>] <address\|network> :<reason>` — turn an address away the moment it connects, before the handshake, the blocklist lookup or a connection slot has been spent on it. CIDR for a network; nothing wider than a /8 (IPv4) or /16 (IPv6). Crosses links like `KLINE`; `STATS d` lists them |
 | `UNDLINE` | — | Oper-only: lift a D-line |
+| `TESTMASK` | — | Oper-only: `TESTMASK <mask>` — how many people a K-line on this mask would hit, here and on the rest of the network (724), before anybody sets it |
+| `MAP` | — | The network as a tree with a user count per server (015/017) |
+| `SAJOIN` | — | Oper-only (`channels`): `SAJOIN <nick> <#channel>` — put somebody in a channel. The server invites them, so `+b`, `+i`, `+k`, `+l` and `+j` open; `+O`, `+Z` and `+R` still hold, because a forced join that broke a channel's promise would be the server lying on the operator's behalf. Somebody on another server is joined by that server at this one's request |
+| `SAPART` | — | Oper-only (`channels`): `SAPART <nick> <#channel> [:<reason>]` — take somebody out of a channel; an ordinary PART, with the reason given |
+| `SAMODE` | — | Oper-only (`channels`): `SAMODE <#channel> <modes> [<args>]` — set channel modes without holding ops there. Shown as the operator's own MODE; the operators are told it was done this way |
 | `DIE` | — | Oper-only: shut the server down |
 | `ADMIN` | 256/257/258/259 | Who runs this server (`[server] admin_*`) |
 | `GHOST` | — | Close a stale session holding a nick your account owns, on this server or another one |

@@ -933,6 +933,43 @@ pub async fn handle_help(
                 "  UNDLINE lifts it; STATS d lists them.",
             ],
         ),
+        Some("SAJOIN") => (
+            "SAJOIN",
+            &[
+                "SAJOIN <nick> <#channel>",
+                "  Put somebody in a channel. The server invites them, so +b, +i, +k,",
+                "  +l and +j open; +O, +Z and +R still hold. Operators with channels.",
+            ],
+        ),
+        Some("SAPART") => (
+            "SAPART",
+            &[
+                "SAPART <nick> <#channel> [:<reason>]",
+                "  Take somebody out of a channel. An ordinary PART, with your reason.",
+            ],
+        ),
+        Some("SAMODE") => (
+            "SAMODE",
+            &[
+                "SAMODE <#channel> <modes> [<args>]",
+                "  Set channel modes without holding ops there. Operators with channels.",
+            ],
+        ),
+        Some("TESTMASK") => (
+            "TESTMASK",
+            &[
+                "TESTMASK <mask>",
+                "  How many people a K-line on this mask would hit, here and elsewhere,",
+                "  before anybody sets it.",
+            ],
+        ),
+        Some("MAP") => (
+            "MAP",
+            &[
+                "MAP",
+                "  The network as a tree, with how many people are on each server.",
+            ],
+        ),
         Some("MLOCK") => (
             "MLOCK",
             &[
@@ -986,7 +1023,7 @@ pub async fn handle_help(
                 "  VERIFY PASSWD RESETPASS DROPACCOUNT GHOST",
                 "  CHANOWN CHANACCESS CHANDROP ACCEPT SILENCE",
                 "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS CONNECT SQUIT SANICK",
-                "  KLINE DLINE SNOMASK MLOCK",
+                "  KLINE DLINE SNOMASK MLOCK SAJOIN SAPART SAMODE TESTMASK MAP",
                 "  STATS LUSERS",
             ],
         ),
@@ -2859,5 +2896,491 @@ pub async fn handle_sanick(
         label,
     )
     .await;
+    Ok(())
+}
+
+/// Who is asking for one of the SA* commands, if they may: their nick and
+/// user id. The `channels` privilege covers them, as it covers CHANOWN.
+async fn may_force(
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    client_id: &str,
+    cfg: &Config,
+    label: Option<&str>,
+) -> Option<(String, String)> {
+    let (nick, allowed, uid) = {
+        let state_r = state.read().await;
+        let c = state_r.clients.get(client_id)?;
+        let g = c.read().await;
+        (
+            g.nick_or_id().to_string(),
+            g.may(crate::config::OperPrivilege::Channels),
+            state_r.user_id(client_id),
+        )
+    };
+    if !allowed {
+        reply_to_client(
+            senders,
+            client_id,
+            Message::new(
+                "481",
+                vec![nick, "Permission Denied- You're not an IRC operator".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return None;
+    }
+    Some((nick, uid))
+}
+
+/// The user id behind a nick, whether it is on this server, and one of its
+/// connections here (the one a reply would go to).
+async fn find_target(
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    nick: &str,
+) -> Option<(String, bool, String)> {
+    let state_r = state.read().await;
+    let uid = state_r.nick_to_id.get(&crate::casefold::upper(nick))?.clone();
+    let remote = match state_r.clients.get(&uid) {
+        Some(c) => c.read().await.server.is_some(),
+        None => return None,
+    };
+    let session = senders
+        .read()
+        .await
+        .sessions_of(&uid)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| uid.clone());
+    Some((uid, remote, session))
+}
+
+/// Put somebody in a channel on an operator's say-so. The server invites
+/// them first, so the doors an invitation opens — `+b`, `+i`, `+k`, `+l`,
+/// `+j` — open; the ones it does not (`+O`, `+Z`, `+R`) still hold, and the
+/// operator is told, because a forced join that broke a channel's promise
+/// would be the server lying on the operator's behalf.
+pub async fn force_join(
+    target_uid: &str,
+    session: &str,
+    channel: &str,
+    by: &str,
+    state: &Arc<RwLock<ServerState>>,
+    channels: &Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: &Senders,
+    cfg: &Config,
+) -> anyhow::Result<()> {
+    let key = crate::channel::canonical_channel_key(channel);
+    {
+        let store = channels.read().await;
+        if let Some(ch) = store.channels.get(&key) {
+            ch.write().await.invite_list.insert(target_uid.to_string());
+        }
+    }
+    let nick = match state.read().await.clients.get(target_uid) {
+        Some(c) => c.read().await.nick_or_id().to_string(),
+        None => target_uid.to_string(),
+    };
+    senders.read().await.deliver(
+        target_uid,
+        &Message::new(
+            "NOTICE",
+            vec![nick, format!("You have been joined to {channel} by operator {by}")],
+        )
+        .with_prefix(&cfg.server.name),
+    );
+    crate::commands::channel_cmds::handle_join(
+        session,
+        Message::new("JOIN", vec![channel.to_string()]),
+        state.clone(),
+        channels.clone(),
+        senders.clone(),
+        cfg,
+        None,
+    )
+    .await
+}
+
+/// Take somebody out of a channel on an operator's say-so. An ordinary PART
+/// in every way that shows, with the reason the operator gave.
+pub async fn force_part(
+    target_uid: &str,
+    session: &str,
+    channel: &str,
+    by: &str,
+    reason: &str,
+    state: &Arc<RwLock<ServerState>>,
+    channels: &Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: &Senders,
+    cfg: &Config,
+) -> anyhow::Result<()> {
+    let nick = match state.read().await.clients.get(target_uid) {
+        Some(c) => c.read().await.nick_or_id().to_string(),
+        None => target_uid.to_string(),
+    };
+    senders.read().await.deliver(
+        target_uid,
+        &Message::new(
+            "NOTICE",
+            vec![nick, format!("You have been removed from {channel} by operator {by} ({reason})")],
+        )
+        .with_prefix(&cfg.server.name),
+    );
+    crate::commands::channel_cmds::handle_part(
+        session,
+        Message::new("PART", vec![channel.to_string(), reason.to_string()]),
+        state.clone(),
+        channels.clone(),
+        senders.clone(),
+        cfg,
+        None,
+    )
+    .await
+}
+
+/// `SAJOIN <nick> <#channel>` — put somebody in a channel.
+pub async fn handle_sajoin(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((oper_nick, oper_id)) = may_force(&state, &senders, client_id, cfg, label).await else {
+        return Ok(());
+    };
+    let (Some(target_nick), Some(channel)) = (msg.params.first().cloned(), msg.params.get(1).cloned())
+    else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![oper_nick, "SAJOIN".into(), "Not enough parameters".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    if !channel.starts_with('#') || channel.len() > 64 || channel.contains([' ', ',']) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("403", vec![oper_nick, channel, "No such channel".into()]).with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let Some((target_uid, remote, session)) = find_target(&state, &senders, &target_nick).await else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("401", vec![oper_nick, target_nick, "No such nick".into()]).with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    tracing::warn!(client_id, oper = %oper_nick, target = %target_nick, %channel, remote, "SAJOIN");
+    if remote {
+        let ask = Message::new("SAJOIN", vec![target_uid.clone(), channel.clone()]);
+        crate::link::route_to_user(cfg, &oper_id, &target_uid, &ask).await;
+    } else {
+        force_join(&target_uid, &session, &channel, &oper_nick, &state, &channels, &senders, cfg).await?;
+    }
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        'k',
+        &format!("{oper_nick} joined {target_nick} to {channel}"),
+    )
+    .await;
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new("NOTICE", vec![oper_nick, format!("Joined {target_nick} to {channel}")])
+            .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    Ok(())
+}
+
+/// `SAPART <nick> <#channel> [:<reason>]` — take somebody out of a channel.
+pub async fn handle_sapart(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((oper_nick, oper_id)) = may_force(&state, &senders, client_id, cfg, label).await else {
+        return Ok(());
+    };
+    let (Some(target_nick), Some(channel)) = (msg.params.first().cloned(), msg.params.get(1).cloned())
+    else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![oper_nick, "SAPART".into(), "Not enough parameters".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let reason = msg
+        .params
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| format!("Removed by {oper_nick}"));
+    let Some((target_uid, remote, session)) = find_target(&state, &senders, &target_nick).await else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("401", vec![oper_nick, target_nick, "No such nick".into()]).with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let key = crate::channel::canonical_channel_key(&channel);
+    let there = {
+        let store = channels.read().await;
+        match store.channels.get(&key) {
+            Some(ch) => ch.read().await.members.contains_key(&target_uid),
+            None => false,
+        }
+    };
+    if !there {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "441",
+                vec![oper_nick, target_nick, channel, "They aren't on that channel".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    tracing::warn!(client_id, oper = %oper_nick, target = %target_nick, %channel, %reason, remote, "SAPART");
+    if remote {
+        let ask = Message::new("SAPART", vec![target_uid.clone(), channel.clone(), reason.clone()]);
+        crate::link::route_to_user(cfg, &oper_id, &target_uid, &ask).await;
+    } else {
+        force_part(&target_uid, &session, &channel, &oper_nick, &reason, &state, &channels, &senders, cfg)
+            .await?;
+    }
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        'k',
+        &format!("{oper_nick} removed {target_nick} from {channel} ({reason})"),
+    )
+    .await;
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new("NOTICE", vec![oper_nick, format!("Removed {target_nick} from {channel}")])
+            .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    Ok(())
+}
+
+/// `SAMODE <#channel> <modes> [<args>]` — set channel modes without holding
+/// ops there. Shown as the operator's own MODE, because it is; the
+/// operators are told it was done this way.
+pub async fn handle_samode(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((oper_nick, _)) = may_force(&state, &senders, client_id, cfg, label).await else {
+        return Ok(());
+    };
+    let (Some(channel), Some(_)) = (msg.params.first().cloned(), msg.params.get(1)) else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![oper_nick, "SAMODE".into(), "Not enough parameters".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    if !channel.starts_with('#') {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("403", vec![oper_nick, channel, "No such channel".into()]).with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let change = msg.params[1..].join(" ");
+    tracing::warn!(client_id, oper = %oper_nick, %channel, %change, "SAMODE");
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        'k',
+        &format!("{oper_nick} used SAMODE on {channel}: {change}"),
+    )
+    .await;
+    let mut as_mode = msg.clone();
+    as_mode.command = "MODE".to_string();
+    crate::commands::channel_cmds::handle_mode_as(
+        client_id, as_mode, state, channels, senders, cfg, label, true,
+    )
+    .await
+}
+
+/// `TESTMASK <mask>` — how many people a ban on this mask would hit, here
+/// and on the rest of the network, before anybody sets it.
+pub async fn handle_testmask(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let s = &cfg.server.name;
+    let (nick, is_oper) = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.nick_or_id().to_string(), g.oper)
+            }
+            None => return Ok(()),
+        }
+    };
+    if !is_oper {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("481", vec![nick, "Permission Denied- You're not an IRC operator".into()])
+                .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let Some(mask) = msg.params.first().cloned() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![nick, "TESTMASK".into(), "Not enough parameters".into()]).with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let normalized = normalize_ban_mask(&mask);
+    let (local, remote) = {
+        let state_r = state.read().await;
+        let mut local = 0usize;
+        let mut remote = 0usize;
+        for (_, client) in state_r.users() {
+            let g = client.read().await;
+            let source = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
+            if ban_covers(&normalized, crate::persist::BanKind::Kline, &source, &g.host) {
+                if g.server.is_some() {
+                    remote += 1;
+                } else {
+                    local += 1;
+                }
+            }
+        }
+        (local, remote)
+    };
+    // 724 RPL_TESTMASK
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "724",
+            vec![
+                nick,
+                normalized,
+                local.to_string(),
+                remote.to_string(),
+                "Number of matches (local, remote)".into(),
+            ],
+        )
+        .with_prefix(s),
+        label,
+    )
+    .await;
+    Ok(())
+}
+
+/// `MAP` — the network as a tree, with how many people are on each server.
+pub async fn handle_map(
+    client_id: &str,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let s = &cfg.server.name;
+    let nick = match state.read().await.clients.get(client_id) {
+        Some(c) => c.read().await.nick_or_id().to_string(),
+        None => return Ok(()),
+    };
+    // People per server, counted once.
+    let mut on: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut local = 0usize;
+    {
+        let state_r = state.read().await;
+        for (_, client) in state_r.users() {
+            match client.read().await.server.clone() {
+                Some(server) => *on.entry(server).or_insert(0) += 1,
+                None => local += 1,
+            }
+        }
+    }
+    let mut rows = vec![format!("{} [{} users]", s, local)];
+    if let Some(ref links) = cfg.links_runtime {
+        let links = links.read().await;
+        let mut servers: Vec<_> = links.all().cloned().collect();
+        servers.sort_by(|a, b| a.hops.cmp(&b.hops).then(a.name.cmp(&b.name)));
+        for server in servers {
+            let users = on.get(&server.name).or_else(|| on.get(&server.sid)).copied().unwrap_or(0);
+            rows.push(format!(
+                "{}`-{} [{} users]",
+                "  ".repeat(server.hops.saturating_sub(1) as usize),
+                server.name,
+                users
+            ));
+        }
+    }
+    for row in rows {
+        // 015 RPL_MAP
+        reply_to_client(&senders, client_id, Message::new("015", vec![nick.clone(), row]).with_prefix(s), label).await;
+    }
+    // 017 RPL_MAPEND
+    reply_to_client(&senders, client_id, Message::new("017", vec![nick, "End of /MAP".into()]).with_prefix(s), label).await;
     Ok(())
 }

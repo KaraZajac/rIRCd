@@ -16,6 +16,7 @@ IRC_PORT = int(os.environ.get("SMOKE_IRC_PORT", "16667"))
 # A second plain listener, for the tests that care which one a client used.
 IRC_PORT2 = int(os.environ.get("SMOKE_IRC_PORT2", "16669"))
 DB_SOCKET = os.environ.get("SMOKE_DB_SOCKET", "")  # also used to stop/start it in the outage suite
+TLS_PORT = int(os.environ.get("SMOKE_TLS_PORT", "16670"))
 MAIL_DIR = os.environ.get("SMOKE_MAIL_DIR", "")
 # Distinct per run, so suites can be re-run against a live server (--reuse)
 # without tripping over accounts and channels they created last time.
@@ -32,13 +33,25 @@ class Client:
     """One IRC connection, with a record of every line the server sent."""
 
     def __init__(self, nick=None, user=None, realname=None, caps=None, timeout=10, port=None,
-                 source=None):
+                 source=None, tls=False, certfile=None):
         # `source` is another loopback address to arrive from (127.0.0.2 …):
         # the whole of 127/8 is local, and an address-based ban needs a
-        # second address to be seen doing anything.
+        # second address to be seen doing anything. `tls` connects to the
+        # harness's TLS port instead, presenting `certfile` (a PEM with the
+        # key in it) as a client certificate when one is given.
+        if tls:
+            port = port or TLS_PORT
         self.sock = socket.create_connection(
             (IRC_HOST, port or IRC_PORT), timeout=timeout,
             source_address=(source, 0) if source else None)
+        if tls:
+            import ssl
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            if certfile:
+                ctx.load_cert_chain(certfile)
+            self.sock = ctx.wrap_socket(self.sock, server_hostname=IRC_HOST)
         self.buf = ""
         self.lines = []
         self.nick = nick

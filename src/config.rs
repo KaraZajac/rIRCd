@@ -772,7 +772,19 @@ impl Default for LimitsConfig {
 pub struct OperConfig {
     pub name: String,
     pub hostmask: Option<String>,
+    /// bcrypt, from `rircd genpasswd`. May be empty when `certfp` is set:
+    /// the certificate is then the whole proof.
+    #[serde(default)]
     pub password_hash: String,
+    /// SHA-256 fingerprint of the TLS client certificate this operator must
+    /// present, as `openssl x509 -noout -sha256 -fingerprint` prints it (the
+    /// colons are optional). With a password too, both are required.
+    #[serde(default)]
+    pub certfp: Option<String>,
+    /// Refuse OPER over a connection that is not TLS, so the password never
+    /// crosses a wire in the clear.
+    #[serde(default)]
+    pub require_tls: bool,
     /// What this operator may do: any of "kill", "ban", "rehash", "die",
     /// "sethost", "wallops". Omit for all of them.
     #[serde(default)]

@@ -1085,6 +1085,22 @@ pub async fn handle_message(
         "SQUIT" => {
             server_cmds::handle_squit(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
+        "SAJOIN" => {
+            server_cmds::handle_sajoin(&client_id, msg, state, channels, senders, cfg, label.as_deref())
+                .await
+        }
+        "SAPART" => {
+            server_cmds::handle_sapart(&client_id, msg, state, channels, senders, cfg, label.as_deref())
+                .await
+        }
+        "SAMODE" => {
+            server_cmds::handle_samode(&client_id, msg, state, channels, senders, cfg, label.as_deref())
+                .await
+        }
+        "TESTMASK" => {
+            server_cmds::handle_testmask(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "MAP" => server_cmds::handle_map(&client_id, state, senders, cfg, label.as_deref()).await,
         "MLOCK" => {
             channel_cmds::handle_mlock(&client_id, msg, state, channels, senders, cfg, label.as_deref())
                 .await

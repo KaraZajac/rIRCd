@@ -1522,6 +1522,22 @@ pub async fn handle_mode(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
+    handle_mode_as(client_id, msg, state, channels, senders, cfg, label, false).await
+}
+
+/// MODE, with `forced` meaning the sender is an operator using SAMODE and
+/// need not hold ops in the channel.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_mode_as(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+    forced: bool,
+) -> anyhow::Result<()> {
     let target = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     if target.is_empty() {
         return Ok(());
@@ -1686,7 +1702,7 @@ pub async fn handle_mode(
                 && mode_str
                     .chars()
                     .all(|c| matches!(c, '+' | '-' | 'b' | 'e' | 'I' | 'q'));
-            if !is_op && !list_query_only {
+            if !is_op && !list_query_only && !forced {
                 reply_to_client(
                     &senders,
                     client_id,

@@ -21,6 +21,26 @@ PW = "management-password-1"
 NEW = "a-different-password-2"
 RUN = format(int(time.time()) % 100000, "05d")
 OPER_PW = os.environ.get("SMOKE_OPER_PASSWORD", "smoke-oper-password")
+import os as _os
+CONFIG = _os.environ.get("SMOKE_CONFIG", "")
+original = open(CONFIG).read() if CONFIG else ""
+
+
+def rehash_with(*changes):
+    """Rewrite the server's configuration and make it read it again; with no
+    changes, put the original back."""
+    text = original
+    for old, new in changes:
+        assert old in text, old
+        text = text.replace(old, new, 1)
+    open(CONFIG, "w").write(text)
+    op = Client(f"cfg{RUN}{abs(hash(changes)) % 100}")
+    op.send(f"OPER smokeoper {OPER_PW}")
+    op.wait_for(" 381 ", " 464 ", seconds=5)
+    op.send("REHASH")
+    op.wait_for(" 382 ", seconds=5)
+    op.close()
+    time.sleep(0.5)
 
 
 def make_account(name, password=PW):
@@ -492,5 +512,111 @@ se.read(0.8)
 check("MLOCK OFF lifts it", bool(se.find("MODE", "+t", lines=se.since(smark))), se.since(smark)[-2:])
 lo.close()
 se.close()
+
+section("SAJOIN, SAPART, SAMODE: an operator's hand on a channel")
+
+sa = Client(f"sa{RUN}")
+sa.send(f"OPER smokeoper {OPER_PW}")
+sa.wait_for(" 381 ", " 464 ", seconds=5)
+keeper = Client(f"keep{RUN}")
+keeper.send(f"JOIN #sa{RUN}")
+keeper.read(0.8)
+keeper.send(f"MODE #sa{RUN} +i")
+keeper.read(0.5)
+pulled = Client(f"pull{RUN}")
+pmark = pulled.mark()
+pulled.send(f"SAJOIN keep{RUN} #elsewhere{RUN}")
+pulled.read(0.8)
+check("a user cannot force anybody anywhere", bool(pulled.find(" 481 ", lines=pulled.since(pmark))), pulled.since(pmark)[-2:])
+pmark, kmark = pulled.mark(), keeper.mark()
+sa.send(f"SAJOIN pull{RUN} #sa{RUN}")
+sa.read(1.0)
+pulled.read(1.0)
+keeper.read(0.5)
+check("SAJOIN puts somebody in an invite-only channel", bool(pulled.find("JOIN", f"#sa{RUN}", lines=pulled.since(pmark))), pulled.since(pmark)[-3:])
+check("and tells them who did it", bool(pulled.find("NOTICE", "joined to", f"sa{RUN}", lines=pulled.since(pmark))), pulled.since(pmark)[-3:])
+check("and the room sees an ordinary join", bool(keeper.find("JOIN", f"pull{RUN}", lines=keeper.since(kmark))), keeper.since(kmark)[-2:])
+smark = sa.mark()
+sa.send(f"SAMODE #sa{RUN} +m")
+sa.read(1.0)
+keeper.read(0.5)
+check("SAMODE sets a mode without holding ops", bool(keeper.find("MODE", f"#sa{RUN}", "+m")), keeper.lines[-2:])
+check("shown as the operator's own MODE", bool(keeper.find(f":sa{RUN} MODE", "+m")), keeper.lines[-2:])
+pmark, kmark = pulled.mark(), keeper.mark()
+sa.send(f"SAPART pull{RUN} #sa{RUN} :go elsewhere")
+sa.read(1.0)
+pulled.read(1.0)
+keeper.read(0.5)
+check("SAPART takes them out again, with the reason", bool(pulled.find("PART", f"#sa{RUN}", "go elsewhere", lines=pulled.since(pmark))), pulled.since(pmark)[-3:])
+check("which the room sees as a part", bool(keeper.find("PART", f"pull{RUN}", lines=keeper.since(kmark))), keeper.since(kmark)[-2:])
+smark = sa.mark()
+sa.send(f"SAPART pull{RUN} #sa{RUN}")
+sa.read(0.8)
+check("removing somebody who is not there is 441", bool(sa.find(" 441 ", lines=sa.since(smark))), sa.since(smark)[-2:])
+smark = sa.mark()
+sa.send(f"TESTMASK *!*@127.0.0.1")
+sa.read(0.8)
+hit = next((l for l in sa.since(smark) if " 724 " in l), "")
+check("TESTMASK counts who a ban would hit", bool(hit) and int(hit.split()[4]) >= 3, sa.since(smark)[-2:])
+smark = sa.mark()
+sa.send("MAP")
+sa.wait_for(" 017 ", seconds=5)
+check("MAP shows this server and how many are on it", bool(sa.find(" 015 ", "irc.smoke.test", "users]", lines=sa.since(smark))), sa.since(smark)[-3:])
+pulled.close()
+keeper.close()
+sa.close()
+
+section("an operator block can ask for a certificate, TLS, or a host")
+
+# A client certificate is made here, its fingerprint put into an operator
+# block with no password, and OPER succeeds over TLS with the certificate
+# and nowhere else. `require_tls` refuses the plaintext port; `hostmask`
+# refuses the wrong host, judged on the real address.
+import subprocess as _sp
+import tempfile as _tf
+if CONFIG:
+    certdir = _tf.mkdtemp(prefix="smoke-oper-")
+    pem = os.path.join(certdir, "oper.pem")
+    _sp.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+             "-keyout", pem, "-out", pem, "-subj", "/CN=certoper"], check=True,
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    fp = _sp.run(["openssl", "x509", "-in", pem, "-noout", "-fingerprint", "-sha256"],
+                 capture_output=True, text=True, check=True).stdout.strip().split("=", 1)[1]
+    rehash_with(("[limits]",
+                 "[[opers]]\nname = \"certoper\"\ncertfp = \"" + fp + "\"\n\n"
+                 "[[opers]]\nname = \"tlsoper\"\npassword_hash = \"" + _os.environ.get("SMOKE_OPER_HASH", "") + "\"\nrequire_tls = true\n\n"
+                 "[[opers]]\nname = \"faroper\"\nhostmask = \"*@10.9.9.9\"\npassword_hash = \"" + _os.environ.get("SMOKE_OPER_HASH", "") + "\"\n\n"
+                 "[limits]"))
+    with_cert = Client(f"cert{RUN}", tls=True, certfile=pem)
+    cmark = with_cert.mark()
+    with_cert.send("OPER certoper")
+    with_cert.wait_for(" 381 ", " 464 ", " 461 ", seconds=5)
+    check("OPER with the certificate and no password succeeds", bool(with_cert.find(" 381 ", lines=with_cert.since(cmark))), with_cert.since(cmark)[-2:])
+    with_cert.close()
+    without = Client(f"nocert{RUN}", tls=True)
+    nmark = without.mark()
+    without.send("OPER certoper")
+    without.wait_for(" 381 ", " 464 ", " 461 ", seconds=5)
+    check("over TLS without the certificate it is refused", bool(without.find(" 464 ", lines=without.since(nmark))), without.since(nmark)[-2:])
+    without.close()
+    plain = Client(f"plain{RUN}")
+    pmark = plain.mark()
+    plain.send(f"OPER tlsoper {OPER_PW}")
+    plain.wait_for(" 381 ", " 464 ", seconds=5)
+    check("a require_tls block refuses the plaintext port", bool(plain.find(" 464 ", lines=plain.since(pmark))), plain.since(pmark)[-2:])
+    plain.close()
+    secure = Client(f"secure{RUN}", tls=True)
+    smark = secure.mark()
+    secure.send(f"OPER tlsoper {OPER_PW}")
+    secure.wait_for(" 381 ", " 464 ", seconds=5)
+    check("and accepts the same password over TLS", bool(secure.find(" 381 ", lines=secure.since(smark))), secure.since(smark)[-2:])
+    secure.close()
+    far = Client(f"far{RUN}")
+    fmark = far.mark()
+    far.send(f"OPER faroper {OPER_PW}")
+    far.wait_for(" 381 ", " 464 ", " 491 ", seconds=5)
+    check("a block for another host refuses this one (491)", bool(far.find(" 491 ", lines=far.since(fmark))), far.since(fmark)[-2:])
+    far.close()
+    rehash_with()
 
 summary("management")

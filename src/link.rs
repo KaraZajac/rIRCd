@@ -1687,6 +1687,58 @@ async fn accept_remote_sanick(ctx: &LinkContext, msg: &Message) {
     .await;
 }
 
+/// `:<oper> SAJOIN <target> <#channel>` and `:<oper> SAPART <target>
+/// <#channel> :<reason>` — an operator elsewhere wants one of our users put
+/// in, or taken out of, a channel. Done here as it would be done for a
+/// local operator, and the join or part announced back as an ordinary one.
+async fn accept_remote_sa(ctx: &LinkContext, msg: &Message) {
+    let (Some(oper), Some(target), Some(channel)) = (
+        msg.prefix.clone(),
+        msg.params.first().cloned(),
+        msg.params.get(1).cloned(),
+    ) else {
+        return;
+    };
+    if pass_along(ctx, msg, &target).await {
+        return;
+    }
+    if !channel.starts_with('#') || channel.len() > 64 || channel.contains([' ', ',']) {
+        return;
+    }
+    let oper_nick = source_of(ctx, &oper)
+        .await
+        .map(|s| s.split('!').next().unwrap_or(&s).to_string())
+        .unwrap_or(oper);
+    let session = ctx
+        .senders
+        .read()
+        .await
+        .sessions_of(&target)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| target.clone());
+    let cfg = ctx.cfg.read().await.clone();
+    let result = if msg.command == "SAJOIN" {
+        crate::commands::server_cmds::force_join(
+            &target, &session, &channel, &oper_nick, &ctx.state, &ctx.channels, &ctx.senders, &cfg,
+        )
+        .await
+    } else {
+        let reason = msg
+            .params
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| format!("Removed by {oper_nick}"));
+        crate::commands::server_cmds::force_part(
+            &target, &session, &channel, &oper_nick, &reason, &ctx.state, &ctx.channels, &ctx.senders, &cfg,
+        )
+        .await
+    };
+    if let Err(e) = result {
+        warn!(%oper_nick, %target, %channel, "{}: {e}", msg.command);
+    }
+}
+
 /// `:<asker> WHOISREQ <target> <token>` — somebody on another server wants to
 /// know how long one of ours has been quiet.
 ///
@@ -3723,6 +3775,10 @@ async fn handle_link_message(
         }
         "SANICK" => {
             accept_remote_sanick(ctx, msg).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "SAJOIN" | "SAPART" => {
+            accept_remote_sa(ctx, msg).await;
             std::ops::ControlFlow::Continue(())
         }
         "WHOISREQ" => {
