@@ -15,6 +15,7 @@ pub mod mail;
 pub mod persist;
 pub mod protocol;
 pub mod server;
+pub mod spamfilter;
 pub mod user;
 pub mod webpush;
 

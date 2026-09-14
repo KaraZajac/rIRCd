@@ -53,6 +53,23 @@ fn fail(cfg: &Config, command: &str, code: &str, target: &str, text: &str) -> Me
     .with_prefix(&cfg.server.name)
 }
 
+/// What an address that has spent its allowance is told.
+///
+/// Not that its credentials are wrong: they may well be right, and saying so
+/// when nothing was checked is a lie the person on the other end has no way
+/// to see through — they would go and change a password that was fine. The
+/// budget exists to stop the checks being run, so what it owes them is the
+/// truth about why. See `crate::authcost`.
+fn slow_down(cfg: &Config, command: &str, target: &str) -> Message {
+    fail(
+        cfg,
+        command,
+        "RATE_LIMITED",
+        target,
+        "Too many credential checks from your address just now; try again in a moment",
+    )
+}
+
 fn note(cfg: &Config, command: &str, code: &str, target: &str, text: &str) -> Message {
     Message::new(
         "NOTE",
@@ -109,6 +126,8 @@ pub async fn forget_account(
             .remove(&crate::commands::metadata::account_key(account));
         state_w.read_markers.remove(account);
         state_w.read_markers.remove(&account.to_lowercase());
+        let lower = account.to_lowercase();
+        state_w.grouped_nicks.retain(|_, owner| *owner != lower);
         let lower = account.to_lowercase();
         state_w.channel_accounts.retain(|_, set| {
             set.remove(&lower);
@@ -243,8 +262,20 @@ pub async fn handle_passwd(
     // told no without anything being checked, and the check itself is the
     // expensive part.
     let over_budget = !state.write().await.auth_cost.spend(&host).is_zero();
-    if over_budget || !persist::verify_user(pool, &account, current).await {
-        tracing::warn!(client_id, %account, over_budget, "PASSWD: current password refused");
+    if over_budget {
+        tracing::warn!(client_id, %account, "PASSWD: over budget, not checking");
+        reply_to_client(&senders, client_id, slow_down(cfg, "PASSWD", &account), label).await;
+        return Ok(());
+    }
+    if persist::verify_user(pool, &account, current).await {
+        // Given back, the way a login that works is: the allowance is for
+        // guessing, and somebody who knew their password was not guessing.
+        // Charging it too meant a handful of ordinary changes could spend a
+        // budget meant for an attacker, and the person would be the one made
+        // to wait for it.
+        state.write().await.auth_cost.refund(&host);
+    } else {
+        tracing::warn!(client_id, %account, "PASSWD: current password refused");
         reply_to_client(
             &senders,
             client_id,
@@ -254,11 +285,6 @@ pub async fn handle_passwd(
         .await;
         return Ok(());
     }
-    // Not refunded on success, unlike a login. A login that succeeds is one
-    // somebody wanted and costs the server one check; a password change that
-    // succeeds costs it two, in order, on the loop everybody shares — and an
-    // account holder who could do that for free could do it in a loop. Eight
-    // in ten seconds is nobody changing their password.
 
     match persist::set_password(pool, &account, new, cfg.limits.min_password_length).await {
         Ok(()) => {}
@@ -516,19 +542,28 @@ pub async fn handle_resetpass(
         // ── Use one ─────────────────────────────────────────────────────────
         (Some(code), Some(new_password)) => {
             // A wrong code is a guess, and guessing is what the budget is for.
+            // An address that has spent its allowance is told that, rather
+            // than that its code was wrong: the code may be the right one.
             let over_budget = !state.write().await.auth_cost.spend(&host).is_zero();
-            let outcome = if over_budget {
-                ResetOutcome::InvalidCode
-            } else {
-                persist::finish_password_reset(
-                    pool,
-                    &account,
-                    code,
-                    new_password,
-                    cfg.limits.min_password_length,
-                )
-                .await
-            };
+            if over_budget {
+                tracing::warn!(client_id, %account, "RESETPASS: over budget, not checking");
+                reply_to_client(&senders, client_id, slow_down(cfg, "RESETPASS", &account), label)
+                    .await;
+                return Ok(());
+            }
+            let outcome = persist::finish_password_reset(
+                pool,
+                &account,
+                code,
+                new_password,
+                cfg.limits.min_password_length,
+            )
+            .await;
+            if !matches!(outcome, ResetOutcome::InvalidCode) {
+                // The code was the one that was mailed, so this was not a
+                // guess. Given back, as a login that works is.
+                state.write().await.auth_cost.refund(&host);
+            }
             match outcome {
                 ResetOutcome::Changed => {
                     // Charged like PASSWD, for the same reason: this is a hash
@@ -672,8 +707,15 @@ pub async fn handle_dropaccount(
     };
 
     let over_budget = !state.write().await.auth_cost.spend(&host).is_zero();
-    if over_budget || !persist::verify_user(pool, &account, password).await {
-        tracing::warn!(client_id, %account, over_budget, "DROPACCOUNT: password refused");
+    if over_budget {
+        tracing::warn!(client_id, %account, "DROPACCOUNT: over budget, not checking");
+        reply_to_client(&senders, client_id, slow_down(cfg, "DROPACCOUNT", &account), label).await;
+        return Ok(());
+    }
+    if persist::verify_user(pool, &account, password).await {
+        state.write().await.auth_cost.refund(&host);
+    } else {
+        tracing::warn!(client_id, %account, "DROPACCOUNT: password refused");
         reply_to_client(
             &senders,
             client_id,
@@ -683,7 +725,6 @@ pub async fn handle_dropaccount(
         .await;
         return Ok(());
     }
-    // Charged even when right, like PASSWD. Nobody drops an account twice.
 
     let erased = match persist::erase_account(pool, &account).await {
         Ok(erased) => erased,
@@ -730,5 +771,188 @@ pub async fn handle_dropaccount(
     // Every login to it, this one included: there is no account to be logged
     // in to any more. The reply above is already on its way out ahead of this.
     close_every_login(&state, &senders, cfg, &account, None, "account dropped").await;
+    Ok(())
+}
+
+/// How many nicks an account may hold besides its own name.
+pub const MAX_GROUPED_NICKS: usize = 5;
+
+/// `GROUP` — reserve the nick you are using for your account; `GROUP -<nick>`
+/// gives one back; `GROUP *` lists them.
+///
+/// What a services package calls grouping. An account's own name is
+/// reserved for it already; this reserves the others somebody goes by —
+/// the work nick, the phone nick — so nobody else can sit on them, and so
+/// that being logged in is enough to use any of them. You have to be using
+/// a nick to group it: reserving names you have never been seen under is
+/// squatting, and the server does not help with that.
+pub async fn handle_group(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    _channels: Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((nick, account, _host, _user_id)) = asker(&state, client_id).await else {
+        return Ok(());
+    };
+    let Some(account) = account else {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(cfg, "GROUP", "NOT_LOGGED_IN", "*", "Log in to an account first"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let Some(pool) = cfg.db.as_ref().filter(|_| !cfg.db_health.is_down()) else {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(cfg, "GROUP", "TEMPORARILY_UNAVAILABLE", &account, "Try again later"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let arg = msg.params.first().map(|s| s.as_str()).unwrap_or("");
+    if arg == "*" {
+        let mut names = vec![account.clone()];
+        names.extend(persist::grouped_nicks_of(pool, &account).await);
+        reply_to_client(
+            &senders,
+            client_id,
+            note(cfg, "GROUP", "NICKS", &account, &names.join(" ")),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    if let Some(gone) = arg.strip_prefix('-') {
+        if gone.is_empty() || gone.eq_ignore_ascii_case(&account) {
+            reply_to_client(
+                &senders,
+                client_id,
+                fail(cfg, "GROUP", "INVALID_TARGET", gone, "An account's own name is not grouped; DROPACCOUNT is how that goes"),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+        if !persist::ungroup_nick(pool, gone, &account).await {
+            reply_to_client(
+                &senders,
+                client_id,
+                fail(cfg, "GROUP", "NOT_YOURS", gone, "That nick is not grouped to your account"),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+        state.write().await.grouped_nicks.remove(&crate::casefold::lower(gone));
+        tracing::info!(client_id, %account, nick = %gone, "GROUP: nick released");
+        reply_to_client(
+            &senders,
+            client_id,
+            note(cfg, "GROUP", "RELEASED", gone, &format!("{gone} is no longer reserved for {account}")),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    if !arg.is_empty() {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(cfg, "GROUP", "INVALID_PARAMS", arg, "GROUP reserves the nick you are using; GROUP -<nick> releases one; GROUP * lists them"),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    if nick.eq_ignore_ascii_case(&account) {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(cfg, "GROUP", "ALREADY_YOURS", &nick, "An account's own name is reserved for it already"),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let lower = account.to_lowercase();
+    let (held_by_me, held_by_other, mine) = {
+        let state_r = state.read().await;
+        let owner = state_r.grouped_owner(&nick).map(str::to_string);
+        (
+            owner.as_deref() == Some(lower.as_str()),
+            owner.is_some_and(|o| o != lower),
+            state_r.grouped_nicks.values().filter(|o| **o == lower).count(),
+        )
+    };
+    if held_by_me {
+        reply_to_client(
+            &senders,
+            client_id,
+            note(cfg, "GROUP", "GROUPED", &nick, &format!("{nick} is already reserved for {account}")),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    if held_by_other || persist::nick_is_registered(pool, &cfg.db_health, &nick).await {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(cfg, "GROUP", "NICK_RESERVED", &nick, "That nick is somebody else's"),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    if mine >= MAX_GROUPED_NICKS {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(
+                cfg,
+                "GROUP",
+                "TOO_MANY",
+                &nick,
+                &format!("An account may hold {MAX_GROUPED_NICKS} nicks besides its own; GROUP -<nick> to let one go"),
+            ),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    if let Err(e) = persist::group_nick(pool, &nick, &account).await {
+        tracing::warn!(client_id, %account, %nick, "GROUP: could not store: {e}");
+        cfg.db_health.note(false);
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(cfg, "GROUP", "TEMPORARILY_UNAVAILABLE", &nick, "Try again later"),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    state
+        .write()
+        .await
+        .grouped_nicks
+        .insert(crate::casefold::lower(&nick), lower);
+    tracing::info!(client_id, %account, %nick, "GROUP: nick reserved");
+    reply_to_client(
+        &senders,
+        client_id,
+        note(cfg, "GROUP", "GROUPED", &nick, &format!("{nick} is now reserved for {account}")),
+        label,
+    )
+    .await;
     Ok(())
 }

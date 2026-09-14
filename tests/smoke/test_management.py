@@ -57,6 +57,27 @@ def make_account(name, password=PW):
     c.close()
 
 
+def patiently(client, command, want, seconds=60):
+    """Send a credential command, doing what the server says when it asks the
+    address to slow down.
+
+    Every password check costs real work and is charged to the address that
+    asked for it, successful or not; a suite that does a dozen in two minutes
+    spends an allowance a person never would. The server answers RATE_LIMITED
+    and says to try again in a moment, so that is what this does — which is
+    also the only way to test that the answer means what it says."""
+    deadline = time.time() + seconds
+    while True:
+        mark = client.mark()
+        client.send(command)
+        client.wait_for(want, "RATE_LIMITED", seconds=20)
+        lines = client.since(mark)
+        if client.find(want, lines=lines) or time.time() > deadline:
+            return lines
+        if not client.find("RATE_LIMITED", lines=lines):
+            return lines
+        time.sleep(6)
+
 def logged_in(nick, account, password=PW):
     s = connect_negotiating(nick, caps=["sasl"])
     s.sasl_plain(account, password)
@@ -114,11 +135,9 @@ check("a new password that is too short is refused",
       bool(a.find("FAIL PASSWD WEAK_PASSWORD", lines=a.since(mark))), a.since(mark)[-2:])
 
 mark, omark = a.mark(), other.mark()
-a.send(f"PASSWD {PW} {NEW}")
-a.wait_for("PASSWD", seconds=20)
-other.read(2.0)
-check("the right one changes it", bool(a.find("NOTE PASSWD CHANGED", lines=a.since(mark))),
-      a.since(mark)[-2:])
+seen = patiently(a, f"PASSWD {PW} {NEW}", "NOTE PASSWD CHANGED")
+check("the right one changes it", bool(a.find("NOTE PASSWD CHANGED", lines=seen)), seen[-2:])
+other.read(1.5)
 check("the other login to the account is closed",
       bool(other.find("Closing link", lines=other.since(omark))), other.since(omark)[-2:])
 check("this one is not", not a.find("Closing link", lines=a.since(mark)), a.since(mark)[-2:])
@@ -183,22 +202,20 @@ if code:
     check("the right code with a password too short is refused",
           bool(asker.find("FAIL RESETPASS WEAK_PASSWORD", lines=asker.since(mark))), asker.since(mark)[-2:])
 
-    mark, vmark = asker.mark(), victim.mark()
-    asker.send(f"RESETPASS {bob} {code} {NEW}")
-    asker.wait_for("RESETPASS", seconds=20)
-    victim.read(2.0)
+    vmark = victim.mark()
+    seen = patiently(asker, f"RESETPASS {bob} {code} {NEW}", "NOTE RESETPASS CHANGED")
     check("and the code is still good afterwards, so a typo does not cost a fresh mail",
-          bool(asker.find("NOTE RESETPASS CHANGED", lines=asker.since(mark))), asker.since(mark)[-2:])
+          bool(asker.find("NOTE RESETPASS CHANGED", lines=seen)), seen[-2:])
+    victim.read(1.5)
     check("every login to the account is closed: whoever is in it is not the person resetting",
           bool(victim.find("Closing link", lines=victim.since(vmark))), victim.since(vmark)[-2:])
     check("the new password works", can_log_in(bob, NEW))
     check("the old one does not", not can_log_in(bob, PW))
 
+    seen = patiently(asker, f"RESETPASS {bob} {code} {NEW}", "INVALID_CODE")
     mark = asker.mark()
-    asker.send(f"RESETPASS {bob} {code} {NEW}")
-    asker.wait_for("RESETPASS", seconds=20)
-    check("a used code is a dead code", bool(asker.find("FAIL RESETPASS INVALID_CODE", lines=asker.since(mark))),
-          asker.since(mark)[-2:])
+    check("a used code is a dead code", bool(asker.find("FAIL RESETPASS INVALID_CODE", lines=seen)),
+          seen[-2:])
 victim.close()
 asker.close()
 
@@ -304,13 +321,12 @@ leaver.wait_for("DROPACCOUNT", seconds=20)
 check("the password is asked for", bool(leaver.find("FAIL DROPACCOUNT INCORRECT_PASSWORD", lines=leaver.since(mark))),
       leaver.since(mark)[-2:])
 
-mark, smark = leaver.mark(), stayer.mark()
-leaver.send(f"DROPACCOUNT {NEW}")
-leaver.wait_for("DROPACCOUNT", seconds=20)
+smark = stayer.mark()
+seen = patiently(leaver, f"DROPACCOUNT {NEW}", "NOTE DROPACCOUNT DROPPED")
 leaver.read(1.0)
 stayer.read(2.0)
-check("the right one drops the account", bool(leaver.find("NOTE DROPACCOUNT DROPPED", lines=leaver.since(mark))),
-      leaver.since(mark)[-3:])
+check("the right one drops the account", bool(leaver.find("NOTE DROPACCOUNT DROPPED", lines=seen)),
+      seen[-3:])
 check("and ends the session, since there is no account to be in",
       bool(leaver.find("Closing link", lines=leaver.since(mark))), leaver.since(mark)[-2:])
 check("the channel is told it lost its founder",
@@ -372,6 +388,15 @@ sop.send(f"SANICK squat{RUN} #bad")
 sop.read(1.0)
 check("onto a bad nick is 432", bool(sop.find(" 432 ", lines=sop.since(omark))), sop.since(omark)[-2:])
 make_account(f"held{RUN}")
+# make_account closes its client; the nick is not free again until the server
+# has seen that go, and "in use" is a different refusal from "reserved".
+for _ in range(20):
+    probe = sop.mark()
+    sop.send(f"WHOIS held{RUN}")
+    sop.wait_for(" 318 ", " 401 ", seconds=5)
+    if sop.find(" 401 ", lines=sop.since(probe)):
+        break
+    time.sleep(0.5)
 omark = sop.mark()
 sop.send(f"SANICK squat{RUN} held{RUN}")
 sop.read(1.0)

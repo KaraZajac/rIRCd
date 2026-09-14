@@ -917,6 +917,127 @@ if door.find(" 381 "):
     check("the operator is still connected afterwards", bool(door.wait_for(f"door{SUF}", seconds=5)), door.lines[-2:])
 door.close()
 
+section("a pattern the operators would rather never see again")
+
+# SPAMFILTER: a pattern, what it is looked for in, and what happens when it
+# is found. The sender is never told which pattern caught them.
+filt = Client(f"filt{SUF}")
+filt.send(f"OPER {OPER_NAME} {OPER_PASSWORD}")
+filt.wait_for(" 381 ", " 464 ", seconds=5)
+if filt.find(" 381 "):
+    PAT = f"*buynow{SUF}*"
+    fmark = filt.mark()
+    filt.send(f"SPAMFILTER ADD pz block :{PAT}")
+    filt.send(f"SPAMFILTER ADD pc nonsense :{PAT}")
+    filt.send("SPAMFILTER ADD pc block :***")
+    filt.send("SPAMFILTER ADD pc block :/(/")
+    filt.read(1.5)
+    refused = filt.since(fmark)
+    check("a filter that watches nothing real is refused", bool(filt.find("FAIL SPAMFILTER INVALID_TARGETS", lines=refused)), refused[-4:])
+    check("and so is an action that is not one", bool(filt.find("FAIL SPAMFILTER INVALID_ACTION", lines=refused)), refused[-4:])
+    check("a pattern of nothing but wildcards is refused", bool(filt.find("FAIL SPAMFILTER INVALID_PATTERN", "wildcards", lines=refused)), refused[-4:])
+    check("and so is one that is not a regular expression", len(filt.find("FAIL SPAMFILTER INVALID_PATTERN", lines=refused)) == 2, refused[-4:])
+
+    fmark = filt.mark()
+    filt.send(f"SPAMFILTER ADD pc warn :{PAT}")
+    filt.read(1.0)
+    added = [l for l in filt.since(fmark) if "NOTE SPAMFILTER ADDED" in l]
+    check("a filter is added", bool(added), filt.since(fmark)[-2:])
+    fid = added[0].split()[4] if added else ""
+
+    room = f"#spam{SUF}"
+    watcher = Client(f"watch{SUF}")
+    watcher.join(room)
+    talker = Client(f"talk{SUF}")
+    talker.join(room)
+    wmark = watcher.mark()
+    talker.send(f"PRIVMSG {room} :please buynow{SUF} friend")
+    talker.read(1.0)
+    watcher.read(1.0)
+    check("a warn filter lets the line through", bool(watcher.find(f"buynow{SUF}", lines=watcher.since(wmark))), watcher.since(wmark)[-2:])
+    filt.read(0.5)
+    check("and tells the operators what matched", bool(filt.find("Spam filter", PAT, "matched")), filt.lines[-3:])
+
+    fmark = filt.mark()
+    filt.send(f"SPAMFILTER ADD pc block :{PAT}")
+    filt.read(1.0)
+    check("the same pattern can be given a new action", bool(filt.find("NOTE SPAMFILTER ADDED", lines=filt.since(fmark))), filt.since(fmark)[-2:])
+    wmark, tmark = watcher.mark(), talker.mark()
+    talker.send(f"PRIVMSG {room} :buynow{SUF} now")
+    talker.read(1.0)
+    watcher.read(1.0)
+    check("a block filter refuses the line", bool(talker.find(" 404 ", "not delivered", lines=talker.since(tmark))), talker.since(tmark)[-2:])
+    check("and nobody in the channel sees it", not watcher.find(f"buynow{SUF}", lines=watcher.since(wmark)), watcher.since(wmark)[-2:])
+    check("and the sender is not told which pattern caught them",
+          not any(PAT in l for l in talker.since(tmark)), talker.since(tmark)[-2:])
+    tmark = talker.mark()
+    talker.send(f"PRIVMSG watch{SUF} :buynow{SUF} privately")
+    talker.read(1.0)
+    watcher.read(0.5)
+    check("a private message is filtered too", bool(talker.find(" 404 ", lines=talker.since(tmark))), talker.since(tmark)[-2:])
+
+    fmark = filt.mark()
+    filt.send(f"PRIVMSG {room} :buynow{SUF} from an operator")
+    filt.read(0.8)
+    check("an operator is never filtered", not filt.find(" 404 ", lines=filt.since(fmark)), filt.since(fmark)[-2:])
+
+    fmark = filt.mark()
+    filt.send(f"SPAMFILTER TEST :please buynow{SUF} friend")
+    filt.send("SPAMFILTER TEST :nothing like it")
+    filt.read(1.0)
+    tested = filt.since(fmark)
+    check("TEST says what a line would hit", bool(filt.find("NOTE SPAMFILTER TESTED", "Matched by", lines=tested)), tested[-3:])
+    check("and says so when nothing would", bool(filt.find("NOTE SPAMFILTER TESTED", "Nothing matches", lines=tested)), tested[-3:])
+    fmark = filt.mark()
+    filt.send("SPAMFILTER LIST")
+    filt.read(1.0)
+    listed = filt.since(fmark)
+    check("LIST shows the filter with its hits", bool(filt.find("NOTE SPAMFILTER FILTER", PAT, "hit(s)", lines=listed)), listed[-3:])
+
+    # A nick and a topic are lines too.
+    filt.send(f"SPAMFILTER ADD nt block :*nasty{SUF}*")
+    filt.read(0.8)
+    tmark = talker.mark()
+    talker.send(f"NICK nasty{SUF}")
+    talker.read(1.0)
+    check("a filtered nick is refused", bool(talker.find(" 432 ", lines=talker.since(tmark))), talker.since(tmark)[-2:])
+    watcher.send(f"MODE {room} +o watch{SUF}")
+    watcher.read(0.5)
+    wmark = watcher.mark()
+    watcher.send(f"TOPIC {room} :something nasty{SUF} here")
+    watcher.read(1.0)
+    check("a filtered topic is refused", bool(watcher.find(" 404 ", "not set", lines=watcher.since(wmark))), watcher.since(wmark)[-2:])
+
+    # A quit reason is shouted into every channel, so it is filtered too —
+    # there is nothing to refuse, so it is simply not carried.
+    filt.send(f"SPAMFILTER ADD q block :*leaving{SUF}*")
+    filt.read(0.8)
+    wmark = watcher.mark()
+    talker.send(f"QUIT :buy things at leaving{SUF}")
+    talker.read(0.5)
+    watcher.read(1.0)
+    parted = watcher.since(wmark)
+    check("a filtered quit reason is not carried", bool([l for l in parted if "QUIT" in l]) and not any(f"leaving{SUF}" in l for l in parted), parted[-2:])
+
+    if fid:
+        fmark = filt.mark()
+        filt.send(f"SPAMFILTER DEL {fid}")
+        filt.read(1.0)
+        check("DEL by id lifts it", bool(filt.find("NOTE SPAMFILTER REMOVED", lines=filt.since(fmark))), filt.since(fmark)[-2:])
+        again = Client(f"again{SUF}")
+        again.join(room)
+        wmark = watcher.mark()
+        again.send(f"PRIVMSG {room} :buynow{SUF} once more")
+        again.read(1.0)
+        watcher.read(1.0)
+        check("and the line goes through again", bool(watcher.find(f"buynow{SUF}", lines=watcher.since(wmark))), watcher.since(wmark)[-2:])
+        again.close()
+    for pattern in (f"*nasty{SUF}*", f"*leaving{SUF}*"):
+        filt.send(f"SPAMFILTER DEL {pattern}")
+    filt.read(1.0)
+    watcher.close()
+filt.close()
+
 section("still standing")
 check("the server is still accepting and serving clients", still_alive("everything", f"h12{RUN}"))
 

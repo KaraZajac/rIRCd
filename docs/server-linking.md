@@ -273,6 +273,18 @@ been an operator where they typed it; what the receiving server checks for
 itself is that the new nick is well-formed, not in use, and not somebody else's
 registered name.
 
+A spam filter is the network's rule rather than one server's, so it is
+announced when it is set and bursted to a server that links afterwards:
+
+    :<sid> SPAMFILTER <targets> <action> <duration> <set_at> <set_by> :<pattern>
+    :<sid> UNSPAMFILTER :<pattern>
+
+The pattern comes last because it is the one part that may hold spaces, and it
+is the filter's identity: two servers hold the same filter when they hold the
+same pattern. A receiving server compiles it for itself and refuses one it
+cannot — a pattern that does not compile here is not enforced here, and is said
+out loud rather than silently dropped.
+
 `WHOWAS` needs no asking. Every server keeps its own record of who was here,
 and somebody on another server was here as far as anyone who shared a channel
 with them could tell — so a user leaving, being killed, split away, or renamed

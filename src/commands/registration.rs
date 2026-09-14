@@ -1459,6 +1459,39 @@ pub async fn handle_nick(
         }
     };
 
+    // A nick an operator would rather never see again. Checked before the
+    // reservation rules, because a filtered nick is not one anybody gets,
+    // registered or not.
+    {
+        drop(state_guard);
+        let refused = crate::spamfilter::screen(
+            'n',
+            &nick,
+            client_id,
+            &state,
+            &senders,
+            cfg,
+        )
+        .await
+            == crate::spamfilter::Verdict::Refuse;
+        if refused {
+            let current = match state.read().await.clients.get(client_id) {
+                Some(c) => c.read().await.nick_or_id().to_string(),
+                None => "*".to_string(),
+            };
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new("432", vec![current, nick, "Erroneous nickname".into()])
+                    .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+        state_guard = state.write().await;
+    }
+
     // A registered nick belongs to its account: refuse it to anyone else, unless
     // the operator has turned that off.
     if cfg.server.nick_protection {
@@ -1476,17 +1509,16 @@ pub async fn handle_nick(
                 None => ("*".to_string(), None),
             },
         };
-        let owns_it = current_account
-            .as_deref()
-            .is_some_and(|a| a.eq_ignore_ascii_case(&nick));
+        let owns_it = state_guard.account_holds_nick(current_account.as_deref(), &nick);
 
         if !owns_it {
-            let registered = match cfg.db {
-                Some(ref pool) => {
-                    crate::persist::nick_is_registered(pool, &cfg.db_health, &nick).await
-                }
-                None => false,
-            };
+            let registered = state_guard.grouped_owner(&nick).is_some()
+                || match cfg.db {
+                    Some(ref pool) => {
+                        crate::persist::nick_is_registered(pool, &cfg.db_health, &nick).await
+                    }
+                    None => false,
+                };
             if registered {
                 drop(state_guard);
                 reply_to_client(
@@ -1781,7 +1813,7 @@ pub async fn handle_user(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut state_guard = state.write().await;
+    let state_guard = state.write().await;
 
     if state_guard.clients.contains_key(client_id) {
         reply_to_client(
@@ -1820,6 +1852,27 @@ pub async fn handle_user(
         return Ok(());
     }
 
+    drop(state_guard);
+    if crate::spamfilter::screen('r', &realname, client_id, &state, &senders, cfg).await
+        == crate::spamfilter::Verdict::Refuse
+    {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("ERROR", vec!["Closing link: filtered".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        if let Some(sink) = senders.write().await.remove(client_id) {
+            sink.close(
+                Message::new("ERROR", vec!["Closing link: filtered".into()])
+                    .with_prefix(&cfg.server.name),
+            );
+        }
+        return Ok(());
+    }
+    let mut state_guard = state.write().await;
     let conn = state_guard.get_or_create_pending(client_id, host);
     conn.user = Some(user);
     conn.realname = Some(realname);
@@ -1996,7 +2049,16 @@ pub async fn handle_quit(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
-    let reason = msg.trailing().unwrap_or("Client quit").to_string();
+    let mut reason = msg.trailing().unwrap_or("Client quit").to_string();
+    // A quit reason is shouted into every channel the person was in, which
+    // is what makes it worth filtering. There is nothing to refuse — they
+    // are leaving either way — so a filtered reason is simply not carried.
+    if crate::spamfilter::screen('q', &reason, client_id, &state, &senders, cfg).await
+        == crate::spamfilter::Verdict::Refuse
+    {
+        reason = "Quit".to_string();
+    }
+    let reason = reason;
 
     let user_id = state.read().await.user_id(client_id);
 
@@ -4143,6 +4205,33 @@ pub async fn handle_register(
             return Ok(());
         }
     };
+    // A nick grouped to somebody else's account is theirs: nick protection
+    // keeps anyone from wearing it, and this keeps anyone from making an
+    // account of it while protection is off.
+    let grouped_elsewhere = state
+        .read()
+        .await
+        .grouped_owner(&account)
+        .is_some_and(|owner| !owner.eq_ignore_ascii_case(&account));
+    if grouped_elsewhere {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "REGISTER".into(),
+                    "ACCOUNT_EXISTS".into(),
+                    account.clone(),
+                    "That name is reserved for another account".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
     let email = msg
         .params
         .get(1)

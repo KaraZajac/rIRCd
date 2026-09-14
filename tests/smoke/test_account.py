@@ -298,6 +298,36 @@ if CONFIG:
     taker = Client(idle)
     taker.read(0.5)
     check("the freed nick can be taken", bool(taker.find(" 001 ")) and not taker.find(" 433 "), taker.lines[-2:])
+    # An operator's NOEXPIRE keeps a name and a room whatever the clock says.
+    kept, kept_ch = f"kept{STAMP}", f"#kept{STAMP}"
+    verified_account(kept)
+    k = login(kept)
+    k.send(f"JOIN {kept_ch}")
+    k.read(1.0)
+    k.close()
+    db(f"UPDATE users SET last_seen = {long_ago} WHERE nick_lower = '{kept}'")
+    db(f"UPDATE channels SET last_used = {long_ago} WHERE LOWER(name) = '{kept_ch}'")
+    noop = Client(f"noexp{STAMP}")
+    noop.send(f"OPER {_os.environ.get('SMOKE_OPER_NAME', 'smokeoper')} {_os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+    noop.wait_for(" 381 ", " 464 ", seconds=5)
+    nmark = noop.mark()
+    noop.send(f"NOEXPIRE {kept} ON")
+    noop.send(f"NOEXPIRE {kept_ch} ON")
+    noop.send(f"NOEXPIRE nosuch{STAMP} ON")
+    noop.read(1.2)
+    check("NOEXPIRE marks an account and a channel",
+          len(noop.find("NOTE NOEXPIRE STATUS", "kept whatever", lines=noop.since(nmark))) == 2
+          and bool(noop.find("FAIL NOEXPIRE NO_SUCH_TARGET", lines=noop.since(nmark))), noop.since(nmark)[-3:])
+    rehash_with(("[limits]", "[expiry]\naccounts_days = 30\nchannels_days = 30\n\n[limits]"))
+    time.sleep(2.5)
+    check("and the sweep leaves them alone",
+          db(f"SELECT COUNT(*) FROM users WHERE nick_lower = '{kept}'") == "1"
+          and db(f"SELECT founder FROM channels WHERE LOWER(name) = '{kept_ch}'") == kept)
+    nmark = noop.mark()
+    noop.send(f"NOEXPIRE {kept}")
+    noop.read(0.8)
+    check("and says so when asked", bool(noop.find("NOTE NOEXPIRE STATUS", "kept whatever", lines=noop.since(nmark))), noop.since(nmark)[-2:])
+    noop.close()
     taker.close()
     newcomer = Client(f"newc{STAMP}")
     newcomer.send(f"JOIN {idle_ch}")
@@ -307,5 +337,69 @@ if CONFIG:
     newcomer.close()
     b.close()
     rehash_with()
+
+section("GROUP: the other names you go by")
+
+# An account's own name is reserved for it. GROUP reserves the nick you are
+# using as well; being logged in is then enough to use it, and nobody else
+# can. It goes when the account goes.
+if CONFIG:
+    grp = f"grp{STAMP}"
+    verified_account(grp)
+    g = login(grp)
+    # The login connects under another name, because a registered nick is
+    # reserved until its owner has logged in; now that they have, it is theirs.
+    g.send(f"NICK {grp}")
+    g.read(0.8)
+    gmark = g.mark()
+    g.send("GROUP")
+    g.read(0.8)
+    check("an account's own name is already its own",
+          bool(g.find("FAIL GROUP ALREADY_YOURS", lines=g.since(gmark))), g.since(gmark)[-2:])
+    g.send(f"NICK alt{STAMP}")
+    g.read(0.8)
+    gmark = g.mark()
+    g.send("GROUP")
+    g.read(0.8)
+    check("GROUP reserves the nick being used", bool(g.find("NOTE GROUP GROUPED", f"alt{STAMP}", lines=g.since(gmark))), g.since(gmark)[-2:])
+    gmark = g.mark()
+    g.send("GROUP *")
+    g.read(0.8)
+    check("and lists it beside the account", bool(g.find("NOTE GROUP NICKS", grp, f"alt{STAMP}", lines=g.since(gmark))), g.since(gmark)[-2:])
+    stranger = Client(f"str{STAMP}")
+    smark = stranger.mark()
+    stranger.send(f"NICK alt{STAMP}")
+    stranger.read(0.8)
+    check("nobody else can take a grouped nick", bool(stranger.find(" 433 ", "registered", lines=stranger.since(smark))), stranger.since(smark)[-2:])
+    smark = stranger.mark()
+    stranger.send(f"REGISTER alt{STAMP} str@example.org {PASSWORD}")
+    stranger.read(1.5)
+    check("nor register it as an account", bool(stranger.find("FAIL REGISTER", lines=stranger.since(smark))), stranger.since(smark)[-2:])
+    stranger.close()
+    # Away from the grouped nick and back again: it is still theirs to wear.
+    g.send(f"NICK {grp}")
+    g.read(0.8)
+    gmark = g.mark()
+    g.send(f"NICK alt{STAMP}")
+    g.read(0.8)
+    check("its owner can wear it again, being logged in to the account",
+          bool(g.find("NICK", f"alt{STAMP}", lines=g.since(gmark))), g.since(gmark)[-2:])
+    other = login(grp)
+    other.send(f"NICK two{STAMP}")
+    other.read(0.8)
+    omark = other.mark()
+    other.send("GROUP")
+    other.read(0.8)
+    check("and a second connection's nick can be grouped too",
+          bool(other.find("NOTE GROUP GROUPED", f"two{STAMP}", lines=other.since(omark))), other.since(omark)[-2:])
+    other.close()
+    gmark = g.mark()
+    g.send(f"GROUP -two{STAMP}")
+    g.read(0.8)
+    check("GROUP -<nick> gives one back", bool(g.find("NOTE GROUP RELEASED", f"two{STAMP}", lines=g.since(gmark))), g.since(gmark)[-2:])
+    freed = Client(f"two{STAMP}")
+    check("and it is anybody's again", bool(freed.find(" 001 ")) and not freed.find(" 433 "), freed.lines[-2:])
+    freed.close()
+    g.close()
 
 summary("account")

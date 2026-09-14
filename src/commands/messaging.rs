@@ -509,6 +509,40 @@ pub async fn handle_privmsg(
     drop(sender_data);
     drop(state_guard);
 
+    // Held against the spam filters before anything is done with it, and
+    // before any lock is taken: a line that is not going to be delivered
+    // should cost as little as possible. The sender is told it was refused
+    // and not which pattern refused it.
+    if crate::spamfilter::screen(
+        if target.starts_with('#') || target.starts_with('&') { 'c' } else { 'p' },
+        &text,
+        client_id,
+        &state,
+        &senders,
+        cfg,
+    )
+    .await
+        == crate::spamfilter::Verdict::Refuse
+    {
+        reply_to_sender(
+            &senders,
+            client_id,
+            Message::new(
+                "404",
+                vec![
+                    sender_nick.clone(),
+                    target.into(),
+                    "Your message was not delivered".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+            parent_batch,
+        )
+        .await;
+        return Ok(());
+    }
+
     // Update last_active for idle tracking (WHOIS 317)
     client.write().await.last_active = chrono::Utc::now().timestamp();
 
@@ -1158,6 +1192,22 @@ pub async fn handle_notice(
         .contains("echo-message");
     drop(sender_data);
     drop(state_guard);
+
+    // The same for a notice, refused the way every refused notice is:
+    // silently.
+    if crate::spamfilter::screen(
+        if raw_target.starts_with('#') || raw_target.starts_with('&') { 'c' } else { 'p' },
+        &text,
+        client_id,
+        &state,
+        &senders,
+        cfg,
+    )
+    .await
+        == crate::spamfilter::Verdict::Refuse
+    {
+        return Ok(());
+    }
 
     // STATUSMSG: @#channel (ops+halfops) or +#channel (voiced+ops+halfops)
     let (statusmsg_prefix, target) = if (raw_target.starts_with('@') || raw_target.starts_with('+'))

@@ -779,6 +779,17 @@ pub async fn handle_message(
         "OPER" => {
             registration::handle_oper(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
+        "GROUP" => {
+            account::handle_group(&client_id, msg, state, channels, senders, cfg, label.as_deref())
+                .await
+        }
+        "SPAMFILTER" => {
+            server_cmds::handle_spamfilter(&client_id, msg, state, senders, cfg, label.as_deref())
+                .await
+        }
+        "NOEXPIRE" => {
+            server_cmds::handle_noexpire(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
         "PASSWD" => {
             account::handle_passwd(
                 &client_id,

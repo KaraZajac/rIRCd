@@ -970,6 +970,38 @@ pub async fn handle_help(
                 "  The network as a tree, with how many people are on each server.",
             ],
         ),
+        Some("SPAMFILTER") => (
+            "SPAMFILTER",
+            &[
+                "SPAMFILTER ADD <targets> <action> [<seconds>] :<pattern>",
+                "SPAMFILTER DEL <id|pattern>   LIST   TEST :<text>",
+                "  targets: p private messages, c channel messages, n nicks,",
+                "  t topics, q quit reasons, r real names, or * for all of them.",
+                "  action: warn, block, kill, kline, dline. <seconds> is how long",
+                "  a ban lasts, 0 for no end.",
+                "  A pattern between slashes is a regular expression; anything else",
+                "  is a glob, so say *phrase* to match it anywhere in a line.",
+                "  Operators are never filtered. The sender is not told which",
+                "  pattern caught them; the operators are.",
+            ],
+        ),
+        Some("GROUP") => (
+            "GROUP",
+            &[
+                "GROUP            reserve the nick you are using for your account",
+                "GROUP -<nick>    give one back        GROUP *    list them",
+                "  Up to five besides the account's own name. Being logged in is",
+                "  enough to use any of them; nobody else can take them.",
+            ],
+        ),
+        Some("NOEXPIRE") => (
+            "NOEXPIRE",
+            &[
+                "NOEXPIRE <account|#channel> [ON|OFF]",
+                "  Keep a name or a room out of [expiry]'s reach, or put it back.",
+                "  Operators with channels. Without ON or OFF, shows which it is.",
+            ],
+        ),
         Some("MLOCK") => (
             "MLOCK",
             &[
@@ -1023,7 +1055,8 @@ pub async fn handle_help(
                 "  VERIFY PASSWD RESETPASS DROPACCOUNT GHOST",
                 "  CHANOWN CHANACCESS CHANDROP ACCEPT SILENCE",
                 "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS CONNECT SQUIT SANICK",
-                "  KLINE DLINE SNOMASK MLOCK SAJOIN SAPART SAMODE TESTMASK MAP",
+                "  KLINE DLINE SNOMASK MLOCK SAJOIN SAPART SAMODE TESTMASK MAP GROUP NOEXPIRE",
+                "  SPAMFILTER",
                 "  STATS LUSERS",
             ],
         ),
@@ -2833,15 +2866,21 @@ pub async fn handle_sanick(
     }
     // A registered nick belongs to its account, and an operator moving
     // somebody onto one they do not own would be handing it over.
-    if cfg.server.nick_protection
-        && !target_account
-            .as_deref()
-            .is_some_and(|a| a.eq_ignore_ascii_case(&new_nick))
-    {
-        let registered = match cfg.db {
-            Some(ref pool) => crate::persist::nick_is_registered(pool, &cfg.db_health, &new_nick).await,
-            None => false,
-        };
+    let (holds, grouped_to_other) = {
+        let state_r = state.read().await;
+        (
+            state_r.account_holds_nick(target_account.as_deref(), &new_nick),
+            state_r.grouped_owner(&new_nick).is_some(),
+        )
+    };
+    if cfg.server.nick_protection && !holds {
+        let registered = grouped_to_other
+            || match cfg.db {
+                Some(ref pool) => {
+                    crate::persist::nick_is_registered(pool, &cfg.db_health, &new_nick).await
+                }
+                None => false,
+            };
         if registered {
             reply_to_client(
                 &senders,
@@ -3382,5 +3421,436 @@ pub async fn handle_map(
     }
     // 017 RPL_MAPEND
     reply_to_client(&senders, client_id, Message::new("017", vec![nick, "End of /MAP".into()]).with_prefix(s), label).await;
+    Ok(())
+}
+
+/// `NOEXPIRE <account|#channel> [ON|OFF]` — keep a name or a room out of
+/// `[expiry]`'s reach, or put it back; without ON or OFF, say which it is.
+/// An operator's decision, kept with the row it is about.
+pub async fn handle_noexpire(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let s = &cfg.server.name;
+    let (nick, allowed) = {
+        let state_r = state.read().await;
+        let Some(c) = state_r.clients.get(client_id) else {
+            return Ok(());
+        };
+        let g = c.read().await;
+        (g.nick_or_id().to_string(), g.may(crate::config::OperPrivilege::Channels))
+    };
+    if !allowed {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("481", vec![nick, "Permission Denied- You're not an IRC operator".into()])
+                .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let Some(target) = msg.params.first().cloned() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![nick, "NOEXPIRE".into(), "Not enough parameters".into()]).with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let Some(pool) = cfg.db.as_ref().filter(|_| !cfg.db_health.is_down()) else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec!["NOEXPIRE".into(), "TEMPORARILY_UNAVAILABLE".into(), target, "Try again later".into()],
+            )
+            .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let (kind, name) = if target.starts_with('#') {
+        ('c', crate::channel::canonical_channel_key(&target))
+    } else {
+        ('a', target.clone())
+    };
+    let wanted = match msg.params.get(1).map(|p| p.to_ascii_uppercase()) {
+        None => None,
+        Some(p) if p == "ON" => Some(true),
+        Some(p) if p == "OFF" => Some(false),
+        Some(_) => {
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "FAIL",
+                    vec!["NOEXPIRE".into(), "INVALID_PARAMS".into(), target, "NOEXPIRE <target> [ON|OFF]".into()],
+                )
+                .with_prefix(s),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let known = match wanted {
+        Some(on) => crate::persist::set_noexpire(pool, kind, &name, on).await,
+        None => crate::persist::noexpire(pool, kind, &name).await.is_some(),
+    };
+    if !known {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "NOEXPIRE".into(),
+                    "NO_SUCH_TARGET".into(),
+                    target,
+                    if kind == 'c' { "No such registered channel" } else { "No such account" }.into(),
+                ],
+            )
+            .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let on = match wanted {
+        Some(on) => on,
+        None => crate::persist::noexpire(pool, kind, &name).await.unwrap_or(false),
+    };
+    if wanted.is_some() {
+        tracing::warn!(client_id, oper = %nick, %target, on, "NOEXPIRE");
+        crate::commands::registration::notify_opers(
+            &state,
+            &senders,
+            s,
+            's',
+            &format!("{nick} set NOEXPIRE {} on {target}", if on { "ON" } else { "OFF" }),
+        )
+        .await;
+    }
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTE",
+            vec![
+                "NOEXPIRE".into(),
+                "STATUS".into(),
+                target.clone(),
+                if on {
+                    format!("{target} is kept whatever the expiry clock says")
+                } else {
+                    format!("{target} expires like everything else")
+                },
+            ],
+        )
+        .with_prefix(s),
+        label,
+    )
+    .await;
+    Ok(())
+}
+
+/// `SPAMFILTER ADD|DEL|LIST|TEST` — patterns an operator would rather never
+/// see again.
+///
+/// ```text
+/// SPAMFILTER ADD <targets> <action> [<seconds>] :<pattern>
+/// SPAMFILTER DEL <id|pattern>
+/// SPAMFILTER LIST
+/// SPAMFILTER TEST :<text>
+/// ```
+///
+/// `targets` is letters from `pcntqr`, or `*`; `action` is warn, block,
+/// kill, kline or dline; `seconds` is how long a ban lasts. A pattern
+/// between slashes is a regular expression, anything else a glob.
+pub async fn handle_spamfilter(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    use crate::spamfilter::{self, SpamFilter};
+    let s = &cfg.server.name;
+    let (nick, allowed) = {
+        let state_r = state.read().await;
+        let Some(c) = state_r.clients.get(client_id) else {
+            return Ok(());
+        };
+        let g = c.read().await;
+        (g.nick_or_id().to_string(), g.may(crate::config::OperPrivilege::Ban))
+    };
+    if !allowed {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("481", vec![nick, "Permission Denied- You're not an IRC operator".into()])
+                .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let refuse = |code: &str, target: &str, text: &str| {
+        Message::new(
+            "FAIL",
+            vec!["SPAMFILTER".into(), code.into(), target.into(), text.into()],
+        )
+        .with_prefix(s)
+    };
+    let sub = msg
+        .params
+        .first()
+        .map(|p| p.to_ascii_uppercase())
+        .unwrap_or_default();
+    match sub.as_str() {
+        "LIST" => {
+            let filters = state.read().await.spam_filters.clone();
+            for f in &filters {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "NOTE",
+                        vec![
+                            "SPAMFILTER".into(),
+                            "FILTER".into(),
+                            f.id(),
+                            format!(
+                                "{} {} {} by {} — {} hit(s) — {}",
+                                f.targets,
+                                f.action.name(),
+                                if f.duration > 0 { format!("{}s", f.duration) } else { "-".into() },
+                                f.set_by,
+                                f.hits,
+                                f.pattern
+                            ),
+                        ],
+                    )
+                    .with_prefix(s),
+                    label,
+                )
+                .await;
+            }
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "NOTE",
+                    vec![
+                        "SPAMFILTER".into(),
+                        "END".into(),
+                        "*".into(),
+                        format!("{} filter(s) of {}", filters.len(), spamfilter::MAX_FILTERS),
+                    ],
+                )
+                .with_prefix(s),
+                label,
+            )
+            .await;
+        }
+        "TEST" => {
+            let text = msg.params.get(1).cloned().unwrap_or_default();
+            if text.is_empty() {
+                reply_to_client(&senders, client_id, refuse("NEED_PARAMS", "*", "SPAMFILTER TEST :<text>"), label).await;
+                return Ok(());
+            }
+            let hits: Vec<String> = state
+                .read()
+                .await
+                .spam_filters
+                .iter()
+                .filter(|f| f.matches(&text))
+                .map(|f| format!("[{}] {} ({})", f.id(), f.pattern, f.action.name()))
+                .collect();
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "NOTE",
+                    vec![
+                        "SPAMFILTER".into(),
+                        "TESTED".into(),
+                        "*".into(),
+                        if hits.is_empty() {
+                            "Nothing matches that".to_string()
+                        } else {
+                            format!("Matched by {}", hits.join(", "))
+                        },
+                    ],
+                )
+                .with_prefix(s),
+                label,
+            )
+            .await;
+        }
+        "DEL" => {
+            let Some(which) = msg.params.get(1).cloned() else {
+                reply_to_client(&senders, client_id, refuse("NEED_PARAMS", "*", "SPAMFILTER DEL <id|pattern>"), label).await;
+                return Ok(());
+            };
+            let gone = spamfilter::remove(&mut *state.write().await, &which);
+            let Some(pattern) = gone else {
+                reply_to_client(&senders, client_id, refuse("NO_SUCH_FILTER", &which, "No filter by that id or pattern"), label).await;
+                return Ok(());
+            };
+            if let Some(ref pool) = cfg.db {
+                crate::persist::delete_spamfilter(pool, &pattern).await;
+            }
+            crate::link::announce_unspamfilter(cfg, &pattern).await;
+            tracing::warn!(client_id, oper = %nick, %pattern, "Spam filter removed");
+            crate::commands::registration::notify_opers(
+                &state,
+                &senders,
+                s,
+                'f',
+                &format!("{nick} removed the spam filter {pattern}"),
+            )
+            .await;
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "NOTE",
+                    vec!["SPAMFILTER".into(), "REMOVED".into(), pattern.clone(), format!("{pattern} is no longer filtered")],
+                )
+                .with_prefix(s),
+                label,
+            )
+            .await;
+        }
+        "ADD" => {
+            let (Some(targets), Some(action)) = (msg.params.get(1).cloned(), msg.params.get(2).cloned())
+            else {
+                reply_to_client(&senders, client_id, refuse("NEED_PARAMS", "*", "SPAMFILTER ADD <targets> <action> [<seconds>] :<pattern>"), label).await;
+                return Ok(());
+            };
+            // The seconds are optional, so the pattern is whichever of the
+            // last two is not a number.
+            let (duration, pattern) = match msg.params.get(3).and_then(|d| d.parse::<i64>().ok()) {
+                Some(secs) => (secs, msg.params.get(4).cloned().unwrap_or_default()),
+                None => (0, msg.params.get(3).cloned().unwrap_or_default()),
+            };
+            let targets = match spamfilter::normalise_targets(&targets) {
+                Ok(t) => t,
+                Err(e) => {
+                    reply_to_client(&senders, client_id, refuse("INVALID_TARGETS", &targets, &e), label).await;
+                    return Ok(());
+                }
+            };
+            let Some(parsed_action) = spamfilter::Action::parse(&action) else {
+                reply_to_client(&senders, client_id, refuse("INVALID_ACTION", &action, "warn, block, kill, kline or dline"), label).await;
+                return Ok(());
+            };
+            let mut filter = match SpamFilter::compile(&pattern) {
+                Ok(f) => f,
+                Err(e) => {
+                    reply_to_client(&senders, client_id, refuse("INVALID_PATTERN", &pattern, &e), label).await;
+                    return Ok(());
+                }
+            };
+            // A filter is judged against the operator's own nick and real
+            // name before it is kept: one that would catch the person adding
+            // it is one they would rather find out about now.
+            let (own_nick, own_real) = {
+                let state_r = state.read().await;
+                match state_r.clients.get(client_id) {
+                    Some(c) => {
+                        let g = c.read().await;
+                        (g.nick_or_id().to_string(), g.realname.clone().unwrap_or_default())
+                    }
+                    None => (nick.clone(), String::new()),
+                }
+            };
+            if (targets.contains('n') && filter.matches(&own_nick))
+                || (targets.contains('r') && filter.matches(&own_real))
+            {
+                reply_to_client(&senders, client_id, refuse("MATCHES_YOURSELF", &pattern, "That pattern matches your own nick or real name"), label).await;
+                return Ok(());
+            }
+            filter.targets = targets.clone();
+            filter.action = parsed_action;
+            filter.duration = duration.clamp(0, 366 * 86_400);
+            filter.set_by = nick.clone();
+            filter.set_at = chrono::Utc::now().timestamp();
+            let id = filter.id();
+            let stored = filter.clone();
+            if !crate::spamfilter::install(&mut *state.write().await, filter) {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    refuse("TOO_MANY", &pattern, &format!("This server holds {} filters already", spamfilter::MAX_FILTERS)),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+            if let Some(ref pool) = cfg.db {
+                if let Err(e) = crate::persist::save_spamfilter(
+                    pool,
+                    &stored.pattern,
+                    &stored.targets,
+                    stored.action.name(),
+                    stored.duration,
+                    &stored.set_by,
+                    stored.set_at,
+                )
+                .await
+                {
+                    tracing::error!(client_id, pattern = %stored.pattern, "Could not store the spam filter: {e}");
+                }
+            }
+            crate::link::announce_spamfilter(cfg, &stored).await;
+            tracing::warn!(client_id, oper = %nick, pattern = %stored.pattern, %targets, action = %action, "Spam filter added");
+            crate::commands::registration::notify_opers(
+                &state,
+                &senders,
+                s,
+                'f',
+                &format!("{nick} added spam filter [{id}] {} ({targets}, {})", stored.pattern, stored.action.name()),
+            )
+            .await;
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "NOTE",
+                    vec![
+                        "SPAMFILTER".into(),
+                        "ADDED".into(),
+                        id.clone(),
+                        format!("[{id}] {} is filtered in {targets} ({})", stored.pattern, stored.action.name()),
+                    ],
+                )
+                .with_prefix(s),
+                label,
+            )
+            .await;
+        }
+        _ => {
+            reply_to_client(
+                &senders,
+                client_id,
+                refuse("INVALID_PARAMS", "*", "SPAMFILTER ADD|DEL|LIST|TEST"),
+                label,
+            )
+            .await;
+        }
+    }
     Ok(())
 }

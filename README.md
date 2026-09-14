@@ -547,8 +547,12 @@ channels_days = 90    # give up a registration nobody holding it has visited for
 
 | Key | Default | Meaning |
 |---|---|---|
-| `accounts_days` | `0` (never) | An account nobody has logged in to for this long is erased: its nick is free again, its profile and read markers go with it, and the channels it founded are left without a founder — the people in them are told, as with `DROPACCOUNT` |
+| `accounts_days` | `0` (never) | An account nobody has logged in to for this long is erased: its nick is free again, its grouped nicks with it, its profile and read markers go with it, and the channels it founded are left without a founder — the people in them are told, as with `DROPACCOUNT` |
 | `channels_days` | `0` (never) | A registration nobody who holds the channel — founder or standing operator — has been in for this long is given up. The channel keeps its topic and its modes; it is simply nobody's, and the next person in gets `@` the way they would in any fresh channel |
+
+An operator can keep a name or a room out of expiry's reach with
+`NOEXPIRE <account|#channel> ON` (`OFF` puts it back; without either it says
+which it is). What a services package calls the same thing.
 
 "Unseen" is measured the way a person would measure it. A login is use, and so
 is a holder standing in the room — including one who connected months ago and
@@ -629,6 +633,54 @@ SCRAM-SHA-256 uses PBKDF2 key derivation (4096 iterations) and provides mutual a
 Accounts are keyed by nick (lowercase). There is no separate admin interface for user management — use direct SQL queries on the `users` table if needed.
 
 ---
+
+### Spam filters
+
+`SPAMFILTER` is a pattern, what it is looked for in, and what happens when it
+is found — what other servers call the same thing. Operators with the `ban`
+privilege.
+
+```
+SPAMFILTER ADD <targets> <action> [<seconds>] :<pattern>
+SPAMFILTER DEL <id|pattern>
+SPAMFILTER LIST
+SPAMFILTER TEST :<text>
+```
+
+| Part | Meaning |
+|---|---|
+| `targets` | Letters: `p` private messages, `c` channel messages, `n` nicks, `t` topics, `q` quit reasons, `r` real names — or `*` for all of them |
+| `action` | `warn` (let it through and tell the operators), `block` (refuse the line), `kill` (refuse it and close the connection), `kline` / `dline` (refuse it and ban the address for `<seconds>`, 0 for no end) |
+| `<pattern>` | A glob, matched as a ban mask is — say `*phrase*` to catch it anywhere in a line. Between slashes (`/…/`) it is a regular expression instead |
+
+A pattern made only of wildcards is refused, and so is one that matches the
+nick or real name of the operator adding it. Operators are never filtered: a
+filter that killed the person who could lift it is a server nobody can get
+back into. The sender is never told which pattern caught them — that would be
+handing them the way around it — so a blocked message is simply "not
+delivered", a blocked topic "not set", and a filtered quit reason becomes
+"Quit". The operators are told, under snomask `f`, and so is the log.
+
+Filters are kept in the database, carried to every server when they are set,
+and bursted to a server that links afterwards, so the network agrees on them.
+`SPAMFILTER TEST` asks what a line would hit without anybody sending it, and
+`LIST` shows each filter's id, what it watches, and how many times it has
+matched since the server started. At most 64 filters, each pattern at most 512
+characters: every line a client sends is held against all of them on the one
+dispatch loop, so the cost is a budget rather than a preference. Regular
+expressions are matched in time linear in the line, so a pattern cannot be
+made to hang the server.
+
+### Grouped nicks
+
+An account's own name is reserved for it. `GROUP` reserves the nick you are
+using as well — the work nick, the phone nick — so nobody else can sit on it,
+and so that being logged in is enough to use any of them. Up to five besides
+the account's own name; `GROUP -<nick>` gives one back, `GROUP *` lists them.
+You have to be using a nick to group it: reserving names you have never been
+seen under is squatting, and the server does not help with that. A grouped
+nick goes when the account goes, whether by `DROPACCOUNT` or by expiry, and
+cannot be registered as an account by anybody else while it is held.
 
 ## Accounts, Channels and Moderation
 
@@ -877,6 +929,9 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `DLINE` | — | Oper-only: `DLINE [<seconds>] <address\|network> :<reason>` — turn an address away the moment it connects, before the handshake, the blocklist lookup or a connection slot has been spent on it. CIDR for a network; nothing wider than a /8 (IPv4) or /16 (IPv6). Crosses links like `KLINE`; `STATS d` lists them |
 | `UNDLINE` | — | Oper-only: lift a D-line |
 | `TESTMASK` | — | Oper-only: `TESTMASK <mask>` — how many people a K-line on this mask would hit, here and on the rest of the network (724), before anybody sets it |
+| `SPAMFILTER` | — | Oper-only (`ban`): patterns an operator would rather never see again; see **Spam filters** |
+| `GROUP` | — | Reserve the nick you are using for your account; `GROUP -<nick>` releases one, `GROUP *` lists them |
+| `NOEXPIRE` | — | Oper-only (`channels`): keep an account or a channel out of `[expiry]`'s reach |
 | `MAP` | — | The network as a tree with a user count per server (015/017) |
 | `SAJOIN` | — | Oper-only (`channels`): `SAJOIN <nick> <#channel>` — put somebody in a channel. The server invites them, so `+b`, `+i`, `+k`, `+l` and `+j` open; `+O`, `+Z` and `+R` still hold, because a forced join that broke a channel's promise would be the server lying on the operator's behalf. Somebody on another server is joined by that server at this one's request |
 | `SAPART` | — | Oper-only (`channels`): `SAPART <nick> <#channel> [:<reason>]` — take somebody out of a channel; an ordinary PART, with the reason given |

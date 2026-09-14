@@ -820,6 +820,13 @@ pub struct ServerState {
     /// Server bans, matched on connection. Kept in memory so a connection never
     /// waits on the database.
     pub server_bans: Vec<crate::persist::ServerBan>,
+    /// Nicks grouped to accounts (`GROUP`): nick, lower-cased, to the account
+    /// that holds it, lower-cased. Kept here so a NICK never waits on the
+    /// database to learn that a name is somebody's.
+    pub grouped_nicks: HashMap<String, String>,
+    /// Patterns an operator would rather never see again, in the order they
+    /// were added. See `crate::spamfilter`.
+    pub spam_filters: Vec<crate::spamfilter::SpamFilter>,
     /// The D-lines among them, as the listeners see them: judged the moment a
     /// connection arrives, with no lock on this state. `publish_dlines` keeps
     /// it current.
@@ -1201,6 +1208,25 @@ impl ServerState {
         self.server_bans
             .iter()
             .find(|ban| !ban.is_expired(now) && ban.matches(source, ip))
+    }
+
+    /// The account a grouped nick belongs to, lower-cased, if it is one.
+    pub fn grouped_owner(&self, nick: &str) -> Option<&str> {
+        self.grouped_nicks
+            .get(&crate::casefold::lower(nick))
+            .map(String::as_str)
+    }
+
+    /// Whether this account may use this nick: it is the account's own name,
+    /// or a nick grouped to it.
+    pub fn account_holds_nick(&self, account: Option<&str>, nick: &str) -> bool {
+        let Some(account) = account else {
+            return false;
+        };
+        account.eq_ignore_ascii_case(nick)
+            || self
+                .grouped_owner(nick)
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(account))
     }
 
     /// Copy the D-lines out to where a connection is judged the moment it

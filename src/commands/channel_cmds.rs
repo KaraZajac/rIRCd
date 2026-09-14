@@ -2982,6 +2982,29 @@ pub async fn handle_topic(
     // trailing() made it a request to set the topic to the channel's own name.
     let new_topic = msg.params.get(1).cloned();
 
+    if let Some(ref proposed) = new_topic {
+        if crate::spamfilter::screen('t', proposed, client_id, &state, &senders, cfg).await
+            == crate::spamfilter::Verdict::Refuse
+        {
+            let nick = match state.read().await.clients.get(client_id) {
+                Some(c) => c.read().await.nick_or_id().to_string(),
+                None => "*".to_string(),
+            };
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "404",
+                    vec![nick, ch_name.to_string(), "That topic was not set".into()],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
     let state = state.read().await;
     let client = match state.clients.get(client_id) {
         Some(c) => c.clone(),

@@ -186,15 +186,46 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
 
     // Expiry counts from when somebody was last seen. Rows from before the
     // clock existed start it now, so an upgrade never expires anybody on the
-    // day it lands.
+    // day it lands. `noexpire` is an operator's word that a name or a room
+    // is kept whatever the clock says.
     for sql in [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen BIGINT NULL",
         "ALTER TABLE channels ADD COLUMN IF NOT EXISTS last_used BIGINT NULL",
         "UPDATE users SET last_seen = UNIX_TIMESTAMP() WHERE last_seen IS NULL",
         "UPDATE channels SET last_used = UNIX_TIMESTAMP() WHERE last_used IS NULL",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS noexpire TINYINT NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS noexpire TINYINT NOT NULL DEFAULT 0",
     ] {
         let _ = sqlx::query(sql).execute(pool).await;
     }
+
+    // Patterns an operator would rather never see again. The pattern is the
+    // identity: two servers hold the same filter when they hold the same one.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS spamfilters (
+            pattern  VARCHAR(512) NOT NULL PRIMARY KEY,
+            targets  VARCHAR(16)  NOT NULL,
+            action   VARCHAR(16)  NOT NULL,
+            duration BIGINT       NOT NULL DEFAULT 0,
+            set_by   VARCHAR(64)  NOT NULL,
+            set_at   BIGINT       NOT NULL
+        ) CHARACTER SET utf8mb4",
+    )
+    .execute(pool)
+    .await?;
+
+    // Nicks grouped to an account: reserved for it the way its own name is.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS account_nicks (
+            nick_lower    VARCHAR(64) NOT NULL PRIMARY KEY,
+            nick          VARCHAR(64) NOT NULL,
+            account_lower VARCHAR(64) NOT NULL,
+            added_at      BIGINT      NOT NULL,
+            INDEX idx_account_nicks_account (account_lower)
+        ) CHARACTER SET utf8mb4",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS channel_operators (
@@ -1469,7 +1500,8 @@ pub async fn erase_account(pool: &sqlx::MySqlPool, account: &str) -> Result<Eras
         .map(|r| r.get::<String, _>("name"))
         .collect();
 
-    let steps: [(&str, &str); 8] = [
+    let steps: [(&str, &str); 9] = [
+        ("DELETE FROM account_nicks WHERE account_lower = ?", &lower),
         ("UPDATE channels SET founder = '' WHERE LOWER(founder) = ?", &lower),
         ("DELETE FROM channel_operators WHERE LOWER(nick_or_account) = ?", &lower),
         ("DELETE FROM channel_voice WHERE LOWER(nick_or_account) = ?", &lower),
@@ -1515,7 +1547,8 @@ pub async fn touch_channel_used(pool: &sqlx::MySqlPool, channel_name: &str) {
 pub async fn accounts_unseen_since(pool: &sqlx::MySqlPool, cutoff: i64) -> Vec<String> {
     sqlx::query_scalar::<_, String>(
         "SELECT nick FROM users
-         WHERE verified = 1 AND COALESCE(last_seen, UNIX_TIMESTAMP(created_at)) < ?
+         WHERE verified = 1 AND noexpire = 0
+           AND COALESCE(last_seen, UNIX_TIMESTAMP(created_at)) < ?
          ORDER BY nick_lower LIMIT 1000",
     )
     .bind(cutoff)
@@ -1529,12 +1562,165 @@ pub async fn accounts_unseen_since(pool: &sqlx::MySqlPool, cutoff: i64) -> Vec<S
 pub async fn channels_unused_since(pool: &sqlx::MySqlPool, cutoff: i64) -> Vec<String> {
     sqlx::query_scalar::<_, String>(
         "SELECT c.name FROM channels c
-         WHERE COALESCE(c.last_used, UNIX_TIMESTAMP(c.created_at)) < ?
+         WHERE c.noexpire = 0
+           AND COALESCE(c.last_used, UNIX_TIMESTAMP(c.created_at)) < ?
            AND (c.founder <> ''
                 OR EXISTS (SELECT 1 FROM channel_operators o WHERE o.channel_id = c.id))
          ORDER BY c.name LIMIT 1000",
     )
     .bind(cutoff)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// Keep an account or a channel out of expiry's reach, or put it back.
+/// Returns whether there was such a row. `kind` is 'a' or 'c'.
+pub async fn set_noexpire(pool: &sqlx::MySqlPool, kind: char, name: &str, on: bool) -> bool {
+    let result = if kind == 'a' {
+        sqlx::query("UPDATE users SET noexpire = ? WHERE nick_lower = ?")
+            .bind(on as i32)
+            .bind(name.to_lowercase())
+            .execute(pool)
+            .await
+    } else {
+        sqlx::query("UPDATE channels SET noexpire = ? WHERE name = ?")
+            .bind(on as i32)
+            .bind(name)
+            .execute(pool)
+            .await
+    };
+    result.map(|r| r.rows_affected() > 0).unwrap_or(false)
+}
+
+/// Whether an account or a channel is kept out of expiry's reach.
+pub async fn noexpire(pool: &sqlx::MySqlPool, kind: char, name: &str) -> Option<bool> {
+    let flag: Option<i32> = if kind == 'a' {
+        sqlx::query_scalar("SELECT noexpire FROM users WHERE nick_lower = ?")
+            .bind(name.to_lowercase())
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        sqlx::query_scalar("SELECT noexpire FROM channels WHERE name = ?")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+    };
+    flag.map(|f| f != 0)
+}
+
+// ─── Spam filters ─────────────────────────────────────────────────────────────
+
+/// Every stored filter, as (pattern, targets, action, duration, set_by, set_at).
+pub async fn load_spamfilters(
+    pool: &sqlx::MySqlPool,
+) -> Vec<(String, String, String, i64, String, i64)> {
+    use sqlx::Row;
+    sqlx::query("SELECT pattern, targets, action, duration, set_by, set_at FROM spamfilters ORDER BY set_at")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            (
+                r.get("pattern"),
+                r.get("targets"),
+                r.get("action"),
+                r.get("duration"),
+                r.get("set_by"),
+                r.get("set_at"),
+            )
+        })
+        .collect()
+}
+
+pub async fn save_spamfilter(
+    pool: &sqlx::MySqlPool,
+    pattern: &str,
+    targets: &str,
+    action: &str,
+    duration: i64,
+    set_by: &str,
+    set_at: i64,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO spamfilters (pattern, targets, action, duration, set_by, set_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE targets = VALUES(targets), action = VALUES(action),
+                                 duration = VALUES(duration), set_by = VALUES(set_by),
+                                 set_at = VALUES(set_at)",
+    )
+    .bind(pattern)
+    .bind(targets)
+    .bind(action)
+    .bind(duration)
+    .bind(set_by)
+    .bind(set_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+pub async fn delete_spamfilter(pool: &sqlx::MySqlPool, pattern: &str) -> bool {
+    sqlx::query("DELETE FROM spamfilters WHERE pattern = ?")
+        .bind(pattern)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false)
+}
+
+// ─── Grouped nicks ────────────────────────────────────────────────────────────
+
+/// Every grouped nick, as (nick_lower, account_lower).
+pub async fn load_grouped_nicks(pool: &sqlx::MySqlPool) -> std::collections::HashMap<String, String> {
+    use sqlx::Row;
+    sqlx::query("SELECT nick_lower, account_lower FROM account_nicks")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.get("nick_lower"), r.get("account_lower")))
+        .collect()
+}
+
+/// Reserve a nick for an account.
+pub async fn group_nick(pool: &sqlx::MySqlPool, nick: &str, account: &str) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO account_nicks (nick_lower, nick, account_lower, added_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(nick.to_lowercase())
+    .bind(nick)
+    .bind(account.to_lowercase())
+    .bind(chrono::Utc::now().timestamp())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// Release a grouped nick. Returns whether it was the account's to release.
+pub async fn ungroup_nick(pool: &sqlx::MySqlPool, nick: &str, account: &str) -> bool {
+    sqlx::query("DELETE FROM account_nicks WHERE nick_lower = ? AND account_lower = ?")
+        .bind(nick.to_lowercase())
+        .bind(account.to_lowercase())
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false)
+}
+
+/// The nicks grouped to an account, as they were spelled.
+pub async fn grouped_nicks_of(pool: &sqlx::MySqlPool, account: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT nick FROM account_nicks WHERE account_lower = ? ORDER BY added_at",
+    )
+    .bind(account.to_lowercase())
     .fetch_all(pool)
     .await
     .unwrap_or_default()

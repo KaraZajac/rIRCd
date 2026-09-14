@@ -342,6 +342,11 @@ pub async fn run(
         let meta = crate::persist::load_all_metadata(pool).await;
         let memberships = crate::persist::load_account_channels(pool).await;
         let bans = crate::persist::load_server_bans(pool).await;
+        let grouped = crate::persist::load_grouped_nicks(pool).await;
+        let filters = crate::persist::load_spamfilters(pool).await;
+        if !grouped.is_empty() {
+            info!("Loaded {} grouped nick(s)", grouped.len());
+        }
         if !bans.is_empty() {
             info!("Loaded {} server ban(s)", bans.len());
         }
@@ -350,6 +355,22 @@ pub async fn run(
         state_w.metadata = meta;
         state_w.server_bans = bans;
         state_w.publish_dlines();
+        state_w.grouped_nicks = grouped;
+        for (pattern, targets, action, duration, set_by, set_at) in filters {
+            match crate::spamfilter::rebuild(&pattern, &targets, &action, duration, &set_by, set_at)
+            {
+                Ok(filter) => {
+                    crate::spamfilter::install(&mut state_w, filter);
+                }
+                // A pattern that no longer compiles is one this build reads
+                // differently from the one that stored it. Better said out
+                // loud than quietly enforcing something else.
+                Err(e) => warn!(%pattern, "Ignoring a stored spam filter: {e}"),
+            }
+        }
+        if !state_w.spam_filters.is_empty() {
+            info!("Loaded {} spam filter(s)", state_w.spam_filters.len());
+        }
         for (channel, account) in memberships {
             state_w
                 .channel_accounts

@@ -1154,6 +1154,35 @@ async fn send_burst(
         }
     }
 
+    // The filters this server holds. A peer that was down when one was set
+    // would otherwise carry the network's traffic without the network's
+    // rule; every other announcement here is about something that exists
+    // now, and so is this.
+    let filters: Vec<Message> = {
+        let state = ctx.state.read().await;
+        state
+            .spam_filters
+            .iter()
+            .map(|f| {
+                Message::new(
+                    "SPAMFILTER",
+                    vec![
+                        f.targets.clone(),
+                        f.action.name().to_string(),
+                        f.duration.to_string(),
+                        f.set_at.to_string(),
+                        f.set_by.clone(),
+                        f.pattern.clone(),
+                    ],
+                )
+                .with_prefix(our_sid)
+            })
+            .collect()
+    };
+    for filter in filters {
+        let _ = tx.send(filter).await;
+    }
+
     let _ = tx
         .send(Message::new("EOB", vec![]).with_prefix(our_sid))
         .await;
@@ -1664,14 +1693,24 @@ async fn accept_remote_sanick(ctx: &LinkContext, msg: &Message) {
         warn!(%oper_nick, %target, %new_nick, "SANICK for a nick already in use, refused");
         return;
     }
-    if cfg.server.nick_protection
-        && !account.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&new_nick))
-    {
-        if let Some(ref pool) = cfg.db {
-            if crate::persist::nick_is_registered(pool, &cfg.db_health, &new_nick).await {
-                warn!(%oper_nick, %target, %new_nick, "SANICK onto a registered nick, refused");
-                return;
-            }
+    let (holds, grouped_to_other) = {
+        let state = ctx.state.read().await;
+        (
+            state.account_holds_nick(account.as_deref(), &new_nick),
+            state.grouped_owner(&new_nick).is_some(),
+        )
+    };
+    if cfg.server.nick_protection && !holds {
+        let registered = grouped_to_other
+            || match cfg.db {
+                Some(ref pool) => {
+                    crate::persist::nick_is_registered(pool, &cfg.db_health, &new_nick).await
+                }
+                None => false,
+            };
+        if registered {
+            warn!(%oper_nick, %target, %new_nick, "SANICK onto a registered nick, refused");
+            return;
         }
     }
     let _ = crate::commands::registration::apply_nick_change(
@@ -2989,6 +3028,122 @@ async fn accept_remote_kline(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
+/// `:<sid> SPAMFILTER <targets> <action> <duration> <set_at> <set_by> :<pattern>`
+/// — a filter added on another server. The pattern comes last because it is
+/// the one part that may hold spaces.
+async fn accept_remote_spamfilter(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(targets), Some(action), Some(duration), Some(set_at), Some(set_by), Some(pattern)) = (
+        msg.params.first().cloned(),
+        msg.params.get(1).cloned(),
+        msg.params.get(2).and_then(|d| d.parse::<i64>().ok()),
+        msg.params.get(3).and_then(|t| t.parse::<i64>().ok()),
+        msg.params.get(4).cloned(),
+        msg.params.get(5).cloned(),
+    ) else {
+        warn!(peer = %peer_sid, "Malformed SPAMFILTER from a linked server");
+        return;
+    };
+    let filter =
+        match crate::spamfilter::rebuild(&pattern, &targets, &action, duration, &set_by, set_at) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(peer = %peer_sid, %pattern, "Refusing a spam filter from a peer: {e}");
+                return;
+            }
+        };
+    let (id, room) = {
+        let mut state = ctx.state.write().await;
+        let id = filter.id();
+        (id, crate::spamfilter::install(&mut state, filter))
+    };
+    if !room {
+        warn!(peer = %peer_sid, %pattern, "No room for another spam filter");
+        return;
+    }
+    let (pool, server_name) = {
+        let cfg = ctx.cfg.read().await;
+        (cfg.db.clone(), cfg.server.name.clone())
+    };
+    if let Some(pool) = pool {
+        let _ = crate::persist::save_spamfilter(
+            &pool, &pattern, &targets, &action, duration, &set_by, set_at,
+        )
+        .await;
+    }
+    warn!(peer = %peer_sid, %pattern, %action, "Spam filter added from the network");
+    crate::commands::registration::notify_opers(
+        &ctx.state,
+        &ctx.senders,
+        &server_name,
+        'f',
+        &format!("{set_by} added spam filter [{id}] {pattern} ({targets}, {action}) elsewhere on the network"),
+    )
+    .await;
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// `:<sid> UNSPAMFILTER :<pattern>` — a filter lifted on another server.
+async fn accept_remote_unspamfilter(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let Some(pattern) = msg.params.first().cloned() else {
+        return;
+    };
+    let gone = crate::spamfilter::remove(&mut *ctx.state.write().await, &pattern);
+    let (pool, server_name) = {
+        let cfg = ctx.cfg.read().await;
+        (cfg.db.clone(), cfg.server.name.clone())
+    };
+    if let Some(pool) = pool {
+        crate::persist::delete_spamfilter(&pool, &pattern).await;
+    }
+    if gone.is_some() {
+        info!(peer = %peer_sid, %pattern, "Spam filter removed from the network");
+        crate::commands::registration::notify_opers(
+            &ctx.state,
+            &ctx.senders,
+            &server_name,
+            'f',
+            &format!("The spam filter {pattern} was removed elsewhere on the network"),
+        )
+        .await;
+    }
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// Tell the network about a filter added here.
+pub async fn announce_spamfilter(cfg: &Config, filter: &crate::spamfilter::SpamFilter) {
+    if cfg.links_runtime.is_none() {
+        return;
+    }
+    broadcast(
+        cfg,
+        Message::new(
+            "SPAMFILTER",
+            vec![
+                filter.targets.clone(),
+                filter.action.name().to_string(),
+                filter.duration.to_string(),
+                filter.set_at.to_string(),
+                filter.set_by.clone(),
+                filter.pattern.clone(),
+            ],
+        )
+        .with_prefix(our_sid(cfg)),
+    )
+    .await;
+}
+
+/// Tell the network a filter was lifted here.
+pub async fn announce_unspamfilter(cfg: &Config, pattern: &str) {
+    if cfg.links_runtime.is_none() {
+        return;
+    }
+    broadcast(
+        cfg,
+        Message::new("UNSPAMFILTER", vec![pattern.to_string()]).with_prefix(our_sid(cfg)),
+    )
+    .await;
+}
+
 /// A server ban lifted on another server.
 async fn accept_remote_unkline(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     let Some(mask) = msg.params.first().cloned() else {
@@ -3075,6 +3230,18 @@ async fn accept_remote_mode(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
                         } else {
                             list.retain(|m| m != mask);
                         }
+                    }
+                    // Who set it and when, as for a mask set here. Without
+                    // this the entry has no age, and anything that asks —
+                    // RPL_BANLIST, and a timed ban's clock — falls back to
+                    // the channel's own creation, which for `~t:` means a
+                    // ban that arrives already spent.
+                    let entry = format!("{c}{mask}");
+                    if adding {
+                        let setter = source.split('!').next().unwrap_or(&source).to_string();
+                        ch.list_meta.insert(entry, (setter, chrono::Utc::now().timestamp()));
+                    } else {
+                        ch.list_meta.remove(&entry);
                     }
                     shown.push(mask.clone());
                 }
@@ -3835,6 +4002,14 @@ async fn handle_link_message(
         }
         "ACCOUNT" => {
             accept_remote_account(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "SPAMFILTER" => {
+            accept_remote_spamfilter(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "UNSPAMFILTER" => {
+            accept_remote_unspamfilter(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }
         "KLINE" | "DLINE" => {
