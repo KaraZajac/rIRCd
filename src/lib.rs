@@ -7,6 +7,7 @@ pub mod commands;
 pub mod config;
 pub mod dnsbl;
 pub mod expiry;
+pub mod timed_bans;
 pub mod filehost;
 pub mod linereader;
 pub mod link;

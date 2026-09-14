@@ -750,7 +750,11 @@ pub async fn handle_help(
                 "  n (no external), m (moderated), k (key), l (limit), b (ban), o (op),",
                 "  v (voice), R (registered-only), M (registered speak), Z (TLS only),",
                 "  c (no colors), C (no CTCP), q (quiet mask), j (join throttle, <joins>:<seconds>),",
-                "  f (flood limit, <lines>:<seconds>: one line over it and the server kicks).",
+                "  f (flood limit, <lines>:<seconds>: one line over it and the server kicks),",
+                "  N (no nick changes), T (no notices), z (op-moderated: what the muted say",
+                "  goes to the ops), O (operators only), L #overflow (where a full channel",
+                "  sends people). A ban or quiet may be timed: +b ~t:30m:nick!*@* lifts itself",
+                "  after 30 minutes (s, m, h, d; a bare number is minutes).",
                 "MODE <nick> [+/-modes]",
                 "  User modes: B (bot).",
             ],
@@ -929,6 +933,15 @@ pub async fn handle_help(
                 "  UNDLINE lifts it; STATS d lists them.",
             ],
         ),
+        Some("MLOCK") => (
+            "MLOCK",
+            &[
+                "MLOCK <#channel> [<+modes-modes>|OFF]",
+                "  Lock modes so the operators the founder appointed cannot undo them:",
+                "  MLOCK #chan +nt-k keeps n and t on and k off. Founder only; a server",
+                "  operator may override. Without modes, shows the lock.",
+            ],
+        ),
         Some("SNOMASK") => (
             "SNOMASK",
             &[
@@ -973,7 +986,7 @@ pub async fn handle_help(
                 "  VERIFY PASSWD RESETPASS DROPACCOUNT GHOST",
                 "  CHANOWN CHANACCESS CHANDROP ACCEPT SILENCE",
                 "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS CONNECT SQUIT SANICK",
-                "  KLINE DLINE SNOMASK",
+                "  KLINE DLINE SNOMASK MLOCK",
                 "  STATS LUSERS",
             ],
         ),

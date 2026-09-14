@@ -901,7 +901,14 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+k` | Channel key (password) |
 | `+l` | User limit |
 | `+j` | Join throttle, `<joins>:<seconds>` — no more than that many joins in that many seconds (480 past it). Whoever holds the channel, whoever it invited, and operators are let past, so a join flood slows the crowd without locking the owner out |
+| `MLOCK` | Not a mode but a lock on them: `MLOCK #chan +nt-k` says `n` and `t` stay on and `k` stays off, and a MODE from anybody but the founder (or a server operator) that would change one is refused (742). Kept with the channel, carried to every server. `MLOCK #chan` shows it, `MLOCK #chan OFF` clears it |
 | `+f` | Flood limit, `<lines>:<seconds>` — one line over it from one person and the server kicks them (`Channel flood (limit is 5 lines in 10 seconds)`); the line itself is not delivered. Ops, half-ops and operators are not the crowd it is for, and the founder cannot be kicked by it any more than by anyone else |
+| `+N` | No nick changes while in the channel (447), unless you are an op or half-op there, or a server operator |
+| `+T` | No NOTICEs to the channel from anybody who is not an op or half-op; dropped silently, as a refused NOTICE always is |
+| `+z` | Op-moderated: what somebody who may not speak (`+m`, `+M`, `+q`, a mute) says is delivered to the ops and half-ops as a message to `@#channel` instead of being refused — moderation the moderators can see |
+| `+O` | Operators only: nobody else may join (520). Only a server operator may set it |
+| `+L` | Overflow channel: when the channel is full (`+l`), somebody joining is told where they are being sent (470) and joins `#overflow` instead. One hop only |
+| `+b ~t:…` | A timed ban: `+b ~t:30m:nick!*@*` lifts itself after 30 minutes — `s`, `m`, `h`, `d`, or a bare number of minutes, up to a year. The server removes it with a `MODE -b` everybody sees, on every server. The same on `+q`, and around another extban (`~t:1h:~a:account`) |
 | `+R` | Registered users only — unregistered users cannot join or speak |
 | `+M` | Only registered users may speak; anybody may join. Somebody given a voice or ops may speak regardless, as with `+m`. The anti-spam mode for a channel that wants to stay open to lurkers |
 | `+Z` | TLS only — a connection not over TLS cannot join, and the mode cannot be set while anybody in the channel is not on TLS (490). What is said in a `+Z` channel has never crossed a wire in the clear on any hop this server controls |

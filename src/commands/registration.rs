@@ -90,7 +90,7 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// only to clients that enabled the capability.
 fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES=beIq,k,fjl,imnstpRcCMZ USERMODES=,,s,BgiorRw MAXLIST=beIq:100 SILENCE=32 CALLERID=g PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current());
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES=beIq,k,fjlL,imnstpRcCMZNOTz USERMODES=,,s,BgiorRw MAXLIST=beIq:100 SILENCE=32 CALLERID=g PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current());
     let deny = cfg
         .server
         .client_tag_deny
@@ -1522,6 +1522,54 @@ pub async fn handle_nick(
         None => false,
     };
     if registered {
+        // +N: a channel that keeps its names still. Staff there, and
+        // operators, may still change theirs.
+        let (chans, is_oper) = match state_guard.clients.get(client_id) {
+            Some(c) => {
+                let g = c.read().await;
+                (g.channels.keys().cloned().collect::<Vec<_>>(), g.oper)
+            }
+            None => (Vec::new(), false),
+        };
+        if !is_oper && !chans.is_empty() {
+            let user_id = state_guard.user_id(client_id);
+            let store = channels.read().await;
+            for key in &chans {
+                let Some(ch) = store.channels.get(key) else {
+                    continue;
+                };
+                let ch = ch.read().await;
+                let staff = ch
+                    .members
+                    .get(&user_id)
+                    .map(|m| m.modes.op || m.modes.halfop)
+                    .unwrap_or(false);
+                if ch.modes.no_nick_change && !staff {
+                    let (shown, current) = (
+                        ch.name.clone(),
+                        match state_guard.clients.get(client_id) {
+                            Some(c) => c.read().await.nick_or_id().to_string(),
+                            None => "*".to_string(),
+                        },
+                    );
+                    drop(ch);
+                    drop(store);
+                    drop(state_guard);
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        Message::new(
+                            "447",
+                            vec![current, format!("Cannot change nickname while on {shown} (+N)")],
+                        )
+                        .with_prefix(&cfg.server.name),
+                        label,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
         drop(state_guard);
         apply_nick_change(client_id, &nick, state, channels, senders, cfg, label, None).await?;
         return Ok(());

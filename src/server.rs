@@ -300,9 +300,15 @@ pub async fn run(
                     'Z' => ch_guard.modes.tls_only = true,
                     'c' => ch_guard.modes.no_colors = true,
                     'C' => ch_guard.modes.no_ctcp = true,
+                    'N' => ch_guard.modes.no_nick_change = true,
+                    'T' => ch_guard.modes.no_notices = true,
+                    'z' => ch_guard.modes.op_moderated = true,
+                    'O' => ch_guard.modes.oper_only = true,
                     _ => {}
                 }
             }
+            ch_guard.modes.redirect = e.mode_redirect;
+            ch_guard.mode_lock = e.mode_lock;
             ch_guard.key = e.mode_key;
             ch_guard.modes.user_limit = e.mode_limit;
             ch_guard.modes.join_throttle = e
@@ -875,6 +881,7 @@ pub async fn run(
         }
     }
     crate::expiry::start(cfg_arc.clone(), state.clone(), channels.clone(), senders.clone());
+    crate::timed_bans::start(cfg_arc.clone(), state.clone(), channels.clone(), senders.clone());
 
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

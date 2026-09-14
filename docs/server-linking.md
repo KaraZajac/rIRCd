@@ -152,6 +152,11 @@ away; without it, given. For `f` a `-` name removes the founder, if it names
 the founder the channel has — `CHANDROP`, or an account that was dropped — and
 says nothing otherwise.
 
+A fourth letter, `m`, carries the founder's mode lock (`MLOCK`) whole —
+`CACCESS <ts> <channel> m :+nt-k` — and `-` on its own clears it. It is bursted
+with the founder and the operator list, and sent whenever the founder changes
+it, so an operator on any server is held to the same lock.
+
 It merges rather than replaces, so two servers that each learned part of a
 channel's access list end up holding all of it. The founder is the exception,
 because a channel has exactly one: the older channel keeps the founder it has,

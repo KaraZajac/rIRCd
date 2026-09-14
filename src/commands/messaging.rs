@@ -12,6 +12,32 @@ use tracing::debug;
 ///
 /// Channel members and message targets are users, and a user may be reading on
 /// more than one connection at a time.
+/// +z: what somebody who may not speak says is not thrown away — it goes to
+/// the channel's ops and half-ops, as a message to `@#channel`, so what the
+/// moderation is holding back is something the moderators can see.
+async fn op_moderated_delivery(
+    ch: &crate::channel::Channel,
+    state: &ServerState,
+    senders: &Senders,
+    client_id: &str,
+    source: &str,
+    target: &str,
+    text: &str,
+    msgid: &str,
+) {
+    let mut word = Message::new("PRIVMSG", vec![format!("@{target}"), text.to_string()])
+        .with_prefix(source);
+    word.tags
+        .insert("time".to_string(), Some(crate::protocol::server_time_now()));
+    word.tags.insert("msgid".to_string(), Some(msgid.to_string()));
+    let registry = senders.read().await;
+    for (mid, memb) in &ch.members {
+        if (memb.modes.op || memb.modes.halfop) && !state.is_self(mid, client_id) {
+            registry.deliver(mid, &word);
+        }
+    }
+}
+
 async fn send_to_client(senders: &Senders, user_id: &str, msg: Message) {
     senders.read().await.deliver(user_id, &msg);
 }
@@ -651,6 +677,10 @@ pub async fn handle_privmsg(
                 .unwrap_or(false)
                 && ch.is_muted(sender_account.as_deref(), &source)
             {
+                if ch.modes.op_moderated {
+                    op_moderated_delivery(&ch, &state_guard, &senders, client_id, &source, target, &text, &msgid).await;
+                    return Ok(());
+                }
                 reply_to_sender(
                     &senders,
                     client_id,
@@ -681,6 +711,10 @@ pub async fn handle_privmsg(
                     .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
                     .unwrap_or(false)
             {
+                if ch.modes.op_moderated {
+                    op_moderated_delivery(&ch, &state_guard, &senders, client_id, &source, target, &text, &msgid).await;
+                    return Ok(());
+                }
                 reply_to_sender(
                     &senders,
                     client_id,
@@ -727,6 +761,10 @@ pub async fn handle_privmsg(
                     .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
                     .unwrap_or(false)
             {
+                if ch.modes.op_moderated {
+                    op_moderated_delivery(&ch, &state_guard, &senders, client_id, &source, target, &text, &msgid).await;
+                    return Ok(());
+                }
                 reply_to_sender(
                     &senders,
                     client_id,
@@ -1159,6 +1197,18 @@ pub async fn handle_notice(
             let ch = ch.read().await;
             // +n: reject non-members when no-external-messages is set
             if !ch.is_member(&state_guard.user_id(client_id)) && ch.modes.no_external {
+                return Ok(());
+            }
+            // +T: no notices here from anybody who is not staff. Dropped the
+            // way every refused NOTICE is: silently.
+            if ch.modes.no_notices
+                && !ch
+                    .members
+                    .get(&state_guard.user_id(client_id))
+                    .map(|m| m.modes.halfop || m.modes.op)
+                    .unwrap_or(false)
+                && !sender_is_oper
+            {
                 return Ok(());
             }
             // +m: only voiced/op may send

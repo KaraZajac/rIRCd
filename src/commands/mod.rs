@@ -1085,6 +1085,10 @@ pub async fn handle_message(
         "SQUIT" => {
             server_cmds::handle_squit(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
+        "MLOCK" => {
+            channel_cmds::handle_mlock(&client_id, msg, state, channels, senders, cfg, label.as_deref())
+                .await
+        }
         "SANICK" => {
             server_cmds::handle_sanick(
                 &client_id,

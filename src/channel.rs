@@ -97,6 +97,9 @@ pub struct Channel {
     /// When each member last spoke, for `+f`. Behind its own small lock so
     /// the message path, which only reads the channel, can still count.
     pub spoke_at: std::sync::Mutex<HashMap<String, std::collections::VecDeque<i64>>>,
+    /// The founder's mode lock, `+nt-k` and the like: what the appointed
+    /// operators may not undo. Empty is no lock.
+    pub mode_lock: String,
 }
 
 /// Members whose speaking record is kept before the oldest are forgotten.
@@ -132,6 +135,17 @@ pub struct ChannelModeSet {
     /// many seconds, and the server shows them the door. Channel staff — ops
     /// and half-ops — and operators are not the crowd it is for.
     pub msg_flood: Option<(u32, u32)>,
+    /// +N: nobody changes their nick while in here, unless they are staff.
+    pub no_nick_change: bool,
+    /// +T: no NOTICEs to the channel from anybody who is not staff.
+    pub no_notices: bool,
+    /// +z: what somebody who may not speak says goes to the ops instead of
+    /// nowhere — moderation the moderators can see.
+    pub op_moderated: bool,
+    /// +O: operators only.
+    pub oper_only: bool,
+    /// +L `#overflow`: where somebody is sent when the channel is full.
+    pub redirect: Option<String>,
 }
 
 /// Read a `+j` argument. Both halves have to be there and be positive; a
@@ -186,6 +200,7 @@ impl Channel {
             recent_joins: std::collections::VecDeque::new(),
             use_noted_at: 0,
             spoke_at: std::sync::Mutex::new(HashMap::new()),
+            mode_lock: String::new(),
         }
     }
 
@@ -231,6 +246,8 @@ impl Channel {
     /// an exact-match check would silence nobody, since these are almost always
     /// written nick!*@*.
     fn mask_covers(mask: &str, account: Option<&str>, source: &str) -> bool {
+        // A timed mask is the mask under it, for as long as it lasts.
+        let mask = crate::timed_bans::peel_timed(mask);
         match mask.strip_prefix("~a:") {
             Some(account_mask) => account
                 .map(|a| a.eq_ignore_ascii_case(account_mask))
@@ -259,7 +276,7 @@ impl Channel {
             || self
                 .bans
                 .iter()
-                .filter_map(|b| b.strip_prefix("~m:"))
+                .filter_map(|b| crate::timed_bans::peel_timed(b).strip_prefix("~m:"))
                 .any(|m| Self::mask_covers(m, account, source))
     }
 
@@ -278,8 +295,23 @@ impl Channel {
         self.bans
             .iter()
             // A mute extban lives on the ban list but is not a ban on entry.
-            .filter(|b| !b.starts_with("~m:"))
+            .filter(|b| !crate::timed_bans::peel_timed(b).starts_with("~m:"))
             .any(|b| Self::mask_covers(b, account, source))
+    }
+
+    /// Whether the founder's mode lock says this change may not be made:
+    /// `+nt-k` locks `n` and `t` on and `k` off.
+    pub fn lock_forbids(&self, letter: char, plus: bool) -> bool {
+        let mut adding = true;
+        for c in self.mode_lock.chars() {
+            match c {
+                '+' => adding = true,
+                '-' => adding = false,
+                c if c == letter => return adding != plus,
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Check if source/account matches a ban exception (+e).
@@ -336,6 +368,10 @@ impl Channel {
             (self.modes.tls_only, 'Z'),
             (self.modes.no_colors, 'c'),
             (self.modes.no_ctcp, 'C'),
+            (self.modes.no_nick_change, 'N'),
+            (self.modes.no_notices, 'T'),
+            (self.modes.op_moderated, 'z'),
+            (self.modes.oper_only, 'O'),
         ] {
             if set {
                 letters.push(letter);
@@ -344,6 +380,10 @@ impl Channel {
         if let Some(ref key) = self.key {
             letters.push('k');
             args.push(key.clone());
+        }
+        if let Some(ref target) = self.modes.redirect {
+            letters.push('L');
+            args.push(target.clone());
         }
         if let Some(limit) = self.modes.user_limit {
             letters.push('l');
@@ -441,6 +481,11 @@ impl Channel {
                 'Z' => self.modes.tls_only = true,
                 'c' => self.modes.no_colors = true,
                 'C' => self.modes.no_ctcp = true,
+                'N' => self.modes.no_nick_change = true,
+                'T' => self.modes.no_notices = true,
+                'z' => self.modes.op_moderated = true,
+                'O' => self.modes.oper_only = true,
+                'L' => self.modes.redirect = arg.next().cloned(),
                 'k' => self.key = arg.next().cloned(),
                 'l' => self.modes.user_limit = arg.next().and_then(|v| v.parse().ok()),
                 'j' => self.modes.join_throttle = arg.next().and_then(|v| parse_throttle(v)),
@@ -472,6 +517,16 @@ impl Channel {
                 'Z' => self.modes.tls_only = true,
                 'c' => self.modes.no_colors = true,
                 'C' => self.modes.no_ctcp = true,
+                'N' => self.modes.no_nick_change = true,
+                'T' => self.modes.no_notices = true,
+                'z' => self.modes.op_moderated = true,
+                'O' => self.modes.oper_only = true,
+                'L' => {
+                    let v = arg.next().cloned();
+                    if self.modes.redirect.is_none() {
+                        self.modes.redirect = v;
+                    }
+                }
                 'k' => {
                     let v = arg.next().cloned();
                     if self.key.is_none() {

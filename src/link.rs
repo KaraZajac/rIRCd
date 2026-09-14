@@ -1293,6 +1293,9 @@ fn access_messages(ch: &crate::channel::Channel, our_sid: &str) -> Vec<Message> 
     }
     add('o', &ch.persisted_operators);
     add('v', &ch.persisted_voice);
+    if !ch.mode_lock.is_empty() {
+        add('m', std::slice::from_ref(&ch.mode_lock));
+    }
     out
 }
 
@@ -2700,7 +2703,7 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
         .take(MAX_ACCESS_NAMES_PER_MESSAGE + 1)
         .map(str::to_string)
         .collect();
-    if names.is_empty() || !matches!(letter, 'f' | 'o' | 'v') {
+    if names.is_empty() || !matches!(letter, 'f' | 'o' | 'v' | 'm') {
         return;
     }
     // A line is one line's worth of news. A peer that sends more than a channel
@@ -2737,6 +2740,7 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
     let mut founder_cleared = false;
     let mut newly_granted: Vec<String> = Vec::new();
     let mut newly_revoked: Vec<String> = Vec::new();
+    let mut new_lock: Option<String> = None;
     {
         let mut store = ctx.channels.write().await;
         let existed = store.channels.contains_key(&key);
@@ -2763,6 +2767,16 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
                 if !ch.founder.is_empty() && ch.founder.eq_ignore_ascii_case(gone) {
                     ch.founder.clear();
                     founder_cleared = true;
+                }
+            }
+            'm' => {
+                // The founder's mode lock, whole: `-` means none. What the
+                // founder set on their own server is what every server holds
+                // their operators to.
+                let lock = if names[0] == "-" { String::new() } else { names[0].clone() };
+                if lock != ch.mode_lock {
+                    ch.mode_lock = lock.clone();
+                    new_lock = Some(lock);
                 }
             }
             'f' => {
@@ -2823,6 +2837,12 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
         }
     }
 
+    if let Some(ref lock) = new_lock {
+        let pool = ctx.cfg.read().await.db.clone();
+        if let Some(pool) = pool {
+            crate::persist::set_channel_mode_lock(&pool, &key, lock).await;
+        }
+    }
     // Write down what was learned, or it is forgotten at the next restart and
     // this server starts disagreeing with the network all over again.
     if new_founder.is_some()
@@ -3050,6 +3070,21 @@ async fn accept_remote_mode(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
                 'R' => ch.modes.registered_only = adding,
                 'c' => ch.modes.no_colors = adding,
                 'C' => ch.modes.no_ctcp = adding,
+                'M' => ch.modes.registered_speak = adding,
+                'Z' => ch.modes.tls_only = adding,
+                'N' => ch.modes.no_nick_change = adding,
+                'T' => ch.modes.no_notices = adding,
+                'z' => ch.modes.op_moderated = adding,
+                'O' => ch.modes.oper_only = adding,
+                'L' => {
+                    if adding {
+                        let value = arg.next().cloned();
+                        shown.push(value.clone().unwrap_or_default());
+                        ch.modes.redirect = value;
+                    } else {
+                        ch.modes.redirect = None;
+                    }
+                }
                 _ => {}
             }
         }

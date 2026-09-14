@@ -177,8 +177,16 @@ async fn handle_join_inner(
         keys_str.split(',').collect()
     };
 
-    for (ch_idx, ch_name) in ch_names.split(',').enumerate() {
-        let ch_name = ch_name.trim();
+    // The channels asked for, and any a full channel sends somebody on to
+    // instead (+L). One hop only: an overflow channel that is itself full
+    // and points somewhere else is refused like any full channel.
+    let mut wanted: std::collections::VecDeque<(usize, String, bool)> = ch_names
+        .split(',')
+        .enumerate()
+        .map(|(i, n)| (i, n.trim().to_string(), false))
+        .collect();
+    while let Some((ch_idx, ch_name, forwarded)) = wanted.pop_front() {
+        let ch_name = ch_name.as_str();
         if ch_name.is_empty()
             || !ch_name.starts_with('#')
             || ch_name.len() > 64
@@ -427,6 +435,20 @@ async fn handle_join_inner(
             }
         }
 
+        // +O: a room for operators.
+        if ch.modes.oper_only && !is_oper {
+            reply_self!(Message::new(
+                "520",
+                vec![
+                    nick.clone(),
+                    ch_name.to_string(),
+                    "Cannot join channel (+O)".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name));
+            continue;
+        }
+
         // An invitation is permission to come in, so it outlasts a full
         // channel: refusing someone you just invited defeats the invite.
         if let Some(limit) = ch.modes.user_limit {
@@ -434,6 +456,23 @@ async fn handle_join_inner(
                 && !ch.invite_list.contains(&user_id)
                 && !holds_the_channel
             {
+                // +L: a full channel that knows where to send people.
+                if let Some(ref overflow) = ch.modes.redirect {
+                    if !forwarded {
+                        reply_self!(Message::new(
+                            "470",
+                            vec![
+                                nick.clone(),
+                                ch_name.to_string(),
+                                overflow.clone(),
+                                "Forwarding to another channel".into(),
+                            ],
+                        )
+                        .with_prefix(&cfg.server.name));
+                        wanted.push_back((usize::MAX, overflow.clone(), true));
+                        continue;
+                    }
+                }
                 reply_self!(Message::new(
                     "471",
                     vec![
@@ -1493,7 +1532,10 @@ pub async fn handle_mode(
         Some(c) => c.clone(),
         None => return Ok(()),
     };
-    let nick = client.read().await.nick_or_id().to_string();
+    let (nick, sender_account, sender_is_oper) = {
+        let g = client.read().await;
+        (g.nick_or_id().to_string(), g.account.clone(), g.oper)
+    };
 
     if target.starts_with('#') || target.starts_with('&') {
         let ch_key = canonical_channel_key(target);
@@ -1570,6 +1612,18 @@ pub async fn handle_mode(
                 if ch.modes.private {
                     modes.push('p');
                 }
+                if ch.modes.no_nick_change {
+                    modes.push('N');
+                }
+                if ch.modes.no_notices {
+                    modes.push('T');
+                }
+                if ch.modes.op_moderated {
+                    modes.push('z');
+                }
+                if ch.modes.oper_only {
+                    modes.push('O');
+                }
                 if ch.key.is_some() {
                     modes.push('k');
                 }
@@ -1581,6 +1635,9 @@ pub async fn handle_mode(
                 }
                 if ch.modes.msg_flood.is_some() {
                     modes.push('f');
+                }
+                if ch.modes.redirect.is_some() {
+                    modes.push('L');
                 }
                 let mut reply_params = vec![nick.clone(), target.into(), format!("+{}", modes)];
                 if let Some(ref key) = ch.key {
@@ -1599,6 +1656,9 @@ pub async fn handle_mode(
                 }
                 if let Some(t) = ch.modes.msg_flood {
                     reply_params.push(crate::channel::throttle_string(t));
+                }
+                if let Some(ref t) = ch.modes.redirect {
+                    reply_params.push(t.clone());
                 }
                 let created_at = ch.created_at;
                 let msg = Message::new("324", reply_params).with_prefix(&cfg.server.name);
@@ -1658,6 +1718,36 @@ pub async fn handle_mode(
             // param_idx starts at 2: params[0]=target, params[1]=mode_str, params[2+]=mode args
             let mut param_idx: usize = 2;
             for c in mode_str.chars() {
+                // MLOCK: what the founder locked, an appointed operator may
+                // not undo. The founder may, and so may a server operator.
+                if !matches!(c, '+' | '-')
+                    && ch.lock_forbids(c, plus)
+                    && !ch.is_founder(sender_account.as_deref())
+                    && !sender_is_oper
+                {
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        Message::new(
+                            "742",
+                            vec![
+                                nick.clone(),
+                                target.into(),
+                                c.to_string(),
+                                ch.mode_lock.clone(),
+                                "MODE cannot be set due to channel having an active MLOCK restriction policy".into(),
+                            ],
+                        )
+                        .with_prefix(&cfg.server.name),
+                        label,
+                    )
+                    .await;
+                    rejected_modes.push((c, plus));
+                    if mode_takes_param(c, plus) {
+                        param_idx += 1;
+                    }
+                    continue;
+                }
                 match c {
                     '+' => plus = true,
                     '-' => plus = false,
@@ -1669,6 +1759,63 @@ pub async fn handle_mode(
                     'm' => ch.modes.moderated = plus,
                     'R' => ch.modes.registered_only = plus,
                     'M' => ch.modes.registered_speak = plus,
+                    'N' => ch.modes.no_nick_change = plus,
+                    'T' => ch.modes.no_notices = plus,
+                    'z' => ch.modes.op_moderated = plus,
+                    'O' => {
+                        // A room for operators is an operator's to declare.
+                        if !sender_is_oper {
+                            reply_to_client(
+                                &senders,
+                                client_id,
+                                Message::new(
+                                    "481",
+                                    vec![nick.clone(), "Permission Denied- You're not an IRC operator".into()],
+                                )
+                                .with_prefix(&cfg.server.name),
+                                label,
+                            )
+                            .await;
+                            rejected_modes.push(('O', plus));
+                            continue;
+                        }
+                        ch.modes.oper_only = plus;
+                    }
+                    'L' => {
+                        if plus {
+                            let raw = msg.params.get(param_idx).cloned().unwrap_or_default();
+                            param_idx += 1;
+                            let sane = raw.starts_with('#')
+                                && raw.len() > 1
+                                && raw.len() <= 64
+                                && !raw.contains([' ', ',', '\x07'])
+                                && canonical_channel_key(&raw) != ch_key;
+                            if !sane {
+                                reply_to_client(
+                                    &senders,
+                                    client_id,
+                                    Message::new(
+                                        "696",
+                                        vec![
+                                            nick.clone(),
+                                            target.into(),
+                                            "L".into(),
+                                            if raw.is_empty() { "*".to_string() } else { raw },
+                                            "Invalid overflow channel".into(),
+                                        ],
+                                    )
+                                    .with_prefix(&cfg.server.name),
+                                    label,
+                                )
+                                .await;
+                                rejected_modes.push(('L', plus));
+                                continue;
+                            }
+                            ch.modes.redirect = Some(raw);
+                        } else {
+                            ch.modes.redirect = None;
+                        }
+                    }
                     'Z' => {
                         // +Z promises that everyone in the channel is on TLS.
                         // Setting it over somebody who is not would make the
@@ -1867,6 +2014,22 @@ pub async fn handle_mode(
                     'b' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
+                                if let Some(Err(why)) = crate::timed_bans::parse_timed(mask) {
+                                    reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "696",
+                                            vec![nick.clone(), target.into(), "b".into(), mask.clone(), why.into()],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
+                                    rejected_modes.push(('b', plus));
+                                    param_idx += 1;
+                                    continue;
+                                }
                                 if ch.bans.len() >= 100 {
                                     reply_to_client(
                                         &senders,
@@ -1941,6 +2104,22 @@ pub async fn handle_mode(
                     'q' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
+                                if let Some(Err(why)) = crate::timed_bans::parse_timed(mask) {
+                                    reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "696",
+                                            vec![nick.clone(), target.into(), "q".into(), mask.clone(), why.into()],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
+                                    rejected_modes.push(('q', plus));
+                                    param_idx += 1;
+                                    continue;
+                                }
                                 if ch.quiet_list.len() >= 100 {
                                     reply_to_client(
                                         &senders,
@@ -2386,12 +2565,25 @@ pub async fn handle_mode(
                 if ch.modes.no_ctcp {
                     flags.push('C');
                 }
+                if ch.modes.no_nick_change {
+                    flags.push('N');
+                }
+                if ch.modes.no_notices {
+                    flags.push('T');
+                }
+                if ch.modes.op_moderated {
+                    flags.push('z');
+                }
+                if ch.modes.oper_only {
+                    flags.push('O');
+                }
                 flags
             };
             let mode_key_val = ch.key.clone();
             let mode_limit_val = ch.modes.user_limit;
             let mode_throttle_val = ch.modes.join_throttle.map(crate::channel::throttle_string);
             let mode_flood_val = ch.modes.msg_flood.map(crate::channel::throttle_string);
+            let mode_redirect_val = ch.modes.redirect.clone();
             let channel_created_at = ch.created_at;
             let member_ids_mode: Vec<String> = ch.members.keys().cloned().collect();
             let echo_params = filter_mode_echo(&msg.params, &rejected_modes);
@@ -2424,6 +2616,7 @@ pub async fn handle_mode(
                     mode_limit_val,
                     mode_throttle_val.as_deref(),
                     mode_flood_val.as_deref(),
+                    mode_redirect_val.as_deref(),
                 )
                 .await;
                 // ... and the operator and voice lists, so status survives a part
@@ -2675,6 +2868,12 @@ fn snomask_after(current: &str, spec: &str) -> String {
     have.into_iter().collect()
 }
 
+/// Whether a channel mode letter carries a parameter: the list and status
+/// modes always, `k` always, and `l`, `j`, `f` and `L` only when set.
+pub fn mode_takes_param(c: char, plus: bool) -> bool {
+    "ovhbeIqk".contains(c) || (matches!(c, 'l' | 'j' | 'f' | 'L') && plus)
+}
+
 /// Rebuild a MODE echo without the changes the server refused.
 ///
 /// A rejected change must not be announced: a client told `+o nobody` succeeded
@@ -2686,7 +2885,6 @@ fn snomask_after(current: &str, spec: &str) -> String {
 /// nick change crossing in the other direction would otherwise be able to hand
 /// somebody else the op. Everything else goes as written.
 fn mode_params_for_link(params: &[String], state: &ServerState) -> Option<(String, Vec<String>)> {
-    const ALWAYS_PARAM: &str = "ovhbeIqk";
     let mode_str = params.get(1)?.clone();
     let mut rest = params[2..].iter();
     let mut plus = true;
@@ -2696,7 +2894,7 @@ fn mode_params_for_link(params: &[String], state: &ServerState) -> Option<(Strin
             '+' => plus = true,
             '-' => plus = false,
             _ => {
-                if !(ALWAYS_PARAM.contains(c) || (matches!(c, 'l' | 'j' | 'f') && plus)) {
+                if !mode_takes_param(c, plus) {
                     continue;
                 }
                 let Some(p) = rest.next() else { continue };
@@ -2715,9 +2913,6 @@ fn mode_params_for_link(params: &[String], state: &ServerState) -> Option<(Strin
 }
 
 fn filter_mode_echo(params: &[String], rejected: &[(char, bool)]) -> Option<Vec<String>> {
-    // Modes taking a parameter whichever way they are set, and `l`, `j` and
-    // `f`, which take one only when set.
-    const ALWAYS_PARAM: &str = "ovhbeIqk";
     let channel = params.first()?;
     let mode_str = params.get(1)?;
     let mut rest = params[2..].iter();
@@ -2732,7 +2927,7 @@ fn filter_mode_echo(params: &[String], rejected: &[(char, bool)]) -> Option<Vec<
             '+' => plus = true,
             '-' => plus = false,
             _ => {
-                let takes_param = ALWAYS_PARAM.contains(c) || (matches!(c, 'l' | 'j' | 'f') && plus);
+                let takes_param = mode_takes_param(c, plus);
                 let param = if takes_param { rest.next() } else { None };
                 if rejected.contains(&(c, plus)) {
                     continue;
@@ -3144,6 +3339,208 @@ pub async fn handle_kick(
         }
     }
 
+    Ok(())
+}
+
+/// `MLOCK <#channel> [<+modes-modes>|OFF]` — what the founder locks, the
+/// operators they appointed may not undo.
+///
+/// A founder who sets `+nt-k` and goes to bed comes back to `+nt-k`: a MODE
+/// from anybody who is not the founder — or a server operator — that would
+/// change a locked letter is refused with 742. The lock is a fact about the
+/// channel, so it is kept with it, and carried to every server the way the
+/// founder is. Without modes, shows the lock. `OFF` clears it. The lock does
+/// not change the channel's modes by itself; it says what may not be changed
+/// from here on.
+pub async fn handle_mlock(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    channels: Arc<RwLock<ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let s = &cfg.server.name;
+    let (nick, account, may_override) = {
+        let state_r = state.read().await;
+        let Some(client) = state_r.clients.get(client_id) else {
+            return Ok(());
+        };
+        let g = client.read().await;
+        (
+            g.nick_or_id().to_string(),
+            g.account.clone(),
+            g.may(crate::config::OperPrivilege::Channels),
+        )
+    };
+    let Some(target) = msg.params.first().cloned() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![nick, "MLOCK".into(), "Not enough parameters".into()])
+                .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let ch_key = canonical_channel_key(&target);
+    let (founder, current, created_at) = {
+        let store = channels.read().await;
+        match store.channels.get(&ch_key) {
+            Some(ch) => {
+                let ch = ch.read().await;
+                (ch.founder.clone(), ch.mode_lock.clone(), ch.created_at)
+            }
+            None => {
+                drop(store);
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("403", vec![nick, target, "No such channel".into()]).with_prefix(s),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    };
+    let Some(wanted) = msg.params.get(1).cloned() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "NOTE",
+                vec![
+                    "MLOCK".into(),
+                    "LOCK".into(),
+                    target.clone(),
+                    if current.is_empty() {
+                        format!("{target} has no mode lock")
+                    } else {
+                        format!("{target} is locked {current}")
+                    },
+                ],
+            )
+            .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let is_founder = account
+        .as_deref()
+        .is_some_and(|a| !founder.is_empty() && a.eq_ignore_ascii_case(&founder));
+    if !is_founder && !may_override {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "MLOCK".into(),
+                    "NOT_FOUNDER".into(),
+                    target.clone(),
+                    if founder.is_empty() {
+                        "Only a registered channel's founder can lock its modes; CHANOWN it first".into()
+                    } else {
+                        "Only the founder can lock the channel's modes".into()
+                    },
+                ],
+            )
+            .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    // A lock is `+letters-letters` over the modes that are a fact about the
+    // channel rather than about a person or a mask. Normalised so two
+    // servers, and two readings, agree on what it says.
+    let lock = if wanted.eq_ignore_ascii_case("OFF") {
+        String::new()
+    } else {
+        let mut on = std::collections::BTreeSet::new();
+        let mut off = std::collections::BTreeSet::new();
+        let mut adding = true;
+        for c in wanted.chars() {
+            match c {
+                '+' => adding = true,
+                '-' => adding = false,
+                c if "imnstpRMZcCNTzOkljfL".contains(c) => {
+                    if adding {
+                        on.insert(c);
+                        off.remove(&c);
+                    } else {
+                        off.insert(c);
+                        on.remove(&c);
+                    }
+                }
+                _ => {
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        Message::new(
+                            "FAIL",
+                            vec![
+                                "MLOCK".into(),
+                                "INVALID_LOCK".into(),
+                                wanted.clone(),
+                                format!("{c} is not a mode that can be locked"),
+                            ],
+                        )
+                        .with_prefix(s),
+                        label,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
+        let mut lock = String::new();
+        if !on.is_empty() {
+            lock.push('+');
+            lock.extend(on.iter());
+        }
+        if !off.is_empty() {
+            lock.push('-');
+            lock.extend(off.iter());
+        }
+        lock
+    };
+    {
+        let store = channels.read().await;
+        if let Some(ch) = store.channels.get(&ch_key) {
+            ch.write().await.mode_lock = lock.clone();
+        }
+    }
+    if let Some(ref pool) = cfg.db {
+        crate::persist::set_channel_mode_lock(pool, &ch_key, &lock).await;
+    }
+    let carried = if lock.is_empty() { "-".to_string() } else { lock.clone() };
+    crate::link::announce_channel_access(cfg, &ch_key, created_at, 'm', std::slice::from_ref(&carried)).await;
+    tracing::info!(client_id, %nick, channel = %ch_key, %lock, "MLOCK");
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTE",
+            vec![
+                "MLOCK".into(),
+                "LOCK".into(),
+                target.clone(),
+                if lock.is_empty() {
+                    format!("{target} has no mode lock now")
+                } else {
+                    format!("{target} is locked {lock}")
+                },
+            ],
+        )
+        .with_prefix(s),
+        label,
+    )
+    .await;
     Ok(())
 }
 

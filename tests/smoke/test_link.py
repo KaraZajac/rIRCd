@@ -582,6 +582,61 @@ if banner.find(" 381 "):
     target.close()
 banner.close()
 
+section("a mode lock and a timed ban are the same on both servers")
+# The founder's lock travels with the channel, so an operator on B is held
+# to it the same way; a timed ban set on A lifts on B when it lifts on A.
+lk = Client(f"lk{RUN}", port=A_PORT)
+lk.send(f"OPER linkoper {os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+lk.wait_for(" 381 ", " 464 ", seconds=5)
+lk.send(f"JOIN #lk{RUN}")
+lk.read(0.8)
+lk.send(f"MODE #lk{RUN} +nt")
+lk.read(0.5)
+lb = Client(f"lb2{RUN}", port=B_PORT)
+lb.send(f"JOIN #lk{RUN}")
+lb.read(0.8)
+lk.send(f"MODE #lk{RUN} +o lb2{RUN}")
+lk.read(0.8)
+lk.send(f"MLOCK #lk{RUN} +nt")
+lk.read(0.8)
+bmark = lb.mark()
+deadline = time.time() + 8
+locked = []
+while time.time() < deadline and not locked:
+    lb.send(f"MLOCK #lk{RUN}")
+    lb.read(0.6)
+    locked = [l for l in lb.since(bmark) if "is locked +nt" in l]
+check("the lock set on A is the lock on B", bool(locked), lb.lines[-2:])
+bmark = lb.mark()
+lb.send(f"MODE #lk{RUN} -t")
+lb.read(1.0)
+check("and an operator on B is held to it", bool(lb.find(" 742 ", lines=lb.since(bmark))), lb.since(bmark)[-2:])
+lk.send(f"MODE #lk{RUN} +b ~t:5s:gone{RUN}!*@*")
+lk.read(0.5)
+bmark = lb.mark()
+deadline = time.time() + 8
+seen = []
+while time.time() < deadline and not seen:
+    lb.send(f"MODE #lk{RUN} b")
+    lb.read(0.8)
+    seen = [l for l in lb.since(bmark) if " 367 " in l and f"~t:5s:gone{RUN}" in l]
+check("a timed ban set on A is on B's list", bool(seen), lb.lines[-3:])
+lifted = arrives(lb, f"-b ~t:5s:gone{RUN}", lb.mark(), seconds=25)
+check("and B lifts it when the time is up", bool(lifted), lb.lines[-2:])
+deadline = time.time() + 15
+gone_from_a = False
+while time.time() < deadline and not gone_from_a:
+    amark = lk.mark()
+    lk.send(f"MODE #lk{RUN} b")
+    lk.wait_for(" 368 ", seconds=5)
+    listed = lk.since(amark)
+    gone_from_a = any(" 368 " in l for l in listed) and not any(f"~t:5s:gone{RUN}" in l for l in listed)
+    if not gone_from_a:
+        time.sleep(1.0)
+check("and it is gone from A as well", gone_from_a, lk.lines[-3:])
+lb.close()
+lk.close()
+
 section("a D-line crosses the link too")
 gate = Client(f"gate{RUN}", port=A_PORT)
 gate.send(f"OPER linkoper {os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
