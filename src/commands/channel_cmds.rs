@@ -1,5 +1,6 @@
 use crate::channel::{
-    canonical_channel_key, Channel, ChannelMemberModeSet, ChannelMembership, ChannelStore,
+    canonical_channel_key, mode_takes_param, Channel, ChannelMemberModeSet, ChannelMembership,
+    ChannelStore,
 };
 use crate::commands::{
     end_labeled_batch, reply_in_batch, reply_to_client, session_caps, start_labeled_batch,
@@ -122,7 +123,16 @@ async fn handle_join_inner(
     let account = client_data.account.clone();
     let is_oper = client_data.oper;
     let is_tls = client_data.is_tls;
+    // What an extended ban may ask about besides the hostmask. The channels
+    // are the ones they were in when the command arrived: one JOIN is judged
+    // against where they already were, not against what it is doing.
+    let realname = client_data.realname.clone().unwrap_or_default();
+    let in_channels: Vec<String> = client_data.channels.keys().cloned().collect();
     drop(client_data);
+    let subject = crate::channel::Subject::from_source(&source)
+        .with_account(account.as_deref())
+        .with_realname(&realname)
+        .in_channels(&in_channels);
     // What this connection negotiated, not what the person behind it did on
     // some other client: a reply belongs to the one that asked.
     let client_caps = session_caps(&senders, client_id).await;
@@ -356,8 +366,8 @@ async fn handle_join_inner(
         // This is only safe because INVITE needs the op: if any member could
         // invite, a ban would be one message away from being lifted by anyone
         // it did not apply to.
-        if ch.is_banned(account.as_deref(), &source)
-            && !ch.is_ban_exempt(account.as_deref(), &source)
+        if ch.is_banned(&subject)
+            && !ch.is_ban_exempt(&subject)
             && !ch.invite_list.contains(&user_id)
             && !holds_the_channel
         {
@@ -401,7 +411,7 @@ async fn handle_join_inner(
 
         if ch.modes.invite_only
             && !ch.invite_list.contains(&user_id)
-            && !ch.is_invite_exempt(account.as_deref(), &source)
+            && !ch.is_invite_exempt(&subject)
             && !holds_the_channel
         {
             reply_self!(Message::new(
@@ -2882,12 +2892,6 @@ fn snomask_after(current: &str, spec: &str) -> String {
         }
     }
     have.into_iter().collect()
-}
-
-/// Whether a channel mode letter carries a parameter: the list and status
-/// modes always, `k` always, and `l`, `j`, `f` and `L` only when set.
-pub fn mode_takes_param(c: char, plus: bool) -> bool {
-    "ovhbeIqk".contains(c) || (matches!(c, 'l' | 'j' | 'f' | 'L') && plus)
 }
 
 /// Rebuild a MODE echo without the changes the server refused.

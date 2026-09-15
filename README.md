@@ -634,6 +634,25 @@ Accounts are keyed by nick (lowercase). There is no separate admin interface for
 
 ---
 
+### Shuns
+
+A K-line closes the connection, which tells whoever was behind it to come back
+from another address. `SHUN [<seconds>] <nick!user@host> :<reason>` leaves them
+connected and lets nothing they say reach anybody:
+
+- They may listen, answer a `PING`, and leave. Everything else they type quietly
+  does nothing — no error, no numeric, no hint. A shun that announced itself
+  would just be a slower kill.
+- `QUIT` and `PART` still work, without the parting words: a quit reason is
+  shouted into every channel they were in, so it is dropped with the rest.
+- They are never told, and neither is anybody else except the operators, under
+  snomask `b`.
+
+Shuns live beside K-lines and D-lines: stored in the database, carried to every
+server when set, listed by `STATS s`, lifted by `UNSHUN`, and expiring on their
+own when given a duration. A mask made only of wildcards is refused, and so is
+one covering the operator setting it.
+
 ### Spam filters
 
 `SPAMFILTER` is a pattern, what it is looked for in, and what happens when it
@@ -867,7 +886,7 @@ still accepted in `CAP REQ` so older clients keep working.
 | **typing** | Full | TAGMSG with `+typing=active/paused/done`; forwarded via client-only tag relay |
 | **reply** | Full | Messages with `+reply=<msgid>` tag forwarded as-is |
 | **ACCOUNTEXTBAN** | Full | ISUPPORT token (not a capability); MODE +b ~a:account, JOIN 474 when banned by account |
-| **EXTBAN mute** | Full | ISUPPORT `EXTBAN=~,am`; `MODE +b ~m:nick!*@*` keeps someone from talking without keeping them out. Voice lifts it, and `MODE +e ~m:mask` excepts from it. `MODE #chan +b` with no mask reads the list without needing op, and RPL_BANLIST/RPL_EXCEPTLIST/RPL_INVITELIST name who set each entry and when |
+| **EXTBAN mute** | Full | ISUPPORT `EXTBAN=~,ajmrt`; `MODE +b ~m:nick!*@*` keeps someone from talking without keeping them out. Voice lifts it, and `MODE +e ~m:mask` excepts from it. `MODE #chan +b` with no mask reads the list without needing op, and RPL_BANLIST/RPL_EXCEPTLIST/RPL_INVITELIST name who set each entry and when |
 | **sasl** | Full | AUTHENTICATE PLAIN, SCRAM-SHA-256, and EXTERNAL (TLS client cert); 903/904; certfp auto-associated on PLAIN/SCRAM login |
 | **monitor** | Full | MONITOR +/−/C/L/S; 730/731/732/733/734; on join/quit/nick |
 | **extended-monitor** | Full | AWAY/ACCOUNT/CHGHOST/SETNAME forwarded for monitored nicks; `nick!user@host` masks (`*`/`?`) may be monitored as well as plain nicks |
@@ -930,6 +949,8 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `UNDLINE` | — | Oper-only: lift a D-line |
 | `TESTMASK` | — | Oper-only: `TESTMASK <mask>` — how many people a K-line on this mask would hit, here and on the rest of the network (724), before anybody sets it |
 | `SPAMFILTER` | — | Oper-only (`ban`): patterns an operator would rather never see again; see **Spam filters** |
+| `SHUN` | — | Oper-only (`ban`): `SHUN [<seconds>] <mask> :<reason>` — leave somebody connected and let nothing they say reach anybody. See **Shuns** |
+| `UNSHUN` | — | Oper-only (`ban`): lift a shun |
 | `GROUP` | — | Reserve the nick you are using for your account; `GROUP -<nick>` releases one, `GROUP *` lists them |
 | `NOEXPIRE` | — | Oper-only (`channels`): keep an account or a channel out of `[expiry]`'s reach |
 | `MAP` | — | The network as a tree with a user count per server (015/017) |
@@ -967,7 +988,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+o` | Channel operator |
 | `+v` | Voice (+) |
 | `+h` | Half-op (%) |
-| `+b` | Ban list (supports `~a:account` extban and glob masks) |
+| `+b` | Ban list — glob masks and the extended bans `~a:` (account), `~r:` (real name), `~j:` (in another channel), `~m:` (mute rather than ban) and `~t:` (lifts itself). The prefixes peel one at a time, so they stack: `~m:~r:*spam*` mutes by real name, `~t:1h:~j:#raiders` expires |
 | `+e` | Ban exception list — exempt users bypass `+b` bans |
 | `+I` | Invite exception list — matching users bypass `+i` without explicit INVITE |
 | `+q` | Quiet list — silences matching users without kicking |
@@ -987,6 +1008,8 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+O` | Operators only: nobody else may join (520). Only a server operator may set it |
 | `+L` | Overflow channel: when the channel is full (`+l`), somebody joining is told where they are being sent (470) and joins `#overflow` instead. One hop only |
 | `+b ~t:…` | A timed ban: `+b ~t:30m:nick!*@*` lifts itself after 30 minutes — `s`, `m`, `h`, `d`, or a bare number of minutes, up to a year. The server removes it with a `MODE -b` everybody sees, on every server. The same on `+q`, and around another extban (`~t:1h:~a:account`) |
+| `+b ~r:…` | A ban on the real name rather than the hostmask: `+b ~r:*seedy_marketing*`. A glob, because a real name is a sentence — and since a mode parameter cannot hold a space, `_` stands for one on both sides. Somebody who gave no real name is matched only by a pattern that matches nothing in particular |
+| `+b ~j:#chan` | A ban on being somewhere else: `+b ~j:#raiders` keeps out whoever is in `#raiders` at the moment they try to come in |
 | `+R` | Registered users only — unregistered users cannot join or speak |
 | `+M` | Only registered users may speak; anybody may join. Somebody given a voice or ops may speak regardless, as with `+m`. The anti-spam mode for a channel that wants to stay open to lurkers |
 | `+Z` | TLS only — a connection not over TLS cannot join, and the mode cannot be set while anybody in the channel is not on TLS (490). What is said in a `+Z` channel has never crossed a wire in the clear on any hop this server controls |

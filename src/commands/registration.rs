@@ -90,7 +90,11 @@ const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 /// only to clients that enabled the capability.
 fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES=beIq,k,fjlL,imnstpRcCMZNOTz USERMODES=,,s,BgiorRw MAXLIST=beIq:100 SILENCE=32 CALLERID=g PREFIX=(ohv)@%+ STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,am ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current());
+    use crate::channel::{
+        CHANMODES_FLAG, CHANMODES_LIST, CHANMODES_PARAM_ALWAYS, CHANMODES_PARAM_SET, EXTBAN_TYPES,
+        PREFIX_CHARS, PREFIX_MODES, USERMODES_FLAG, USERMODES_PARAM_SET,
+    };
+    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES={a},{b},{c},{d} USERMODES=,,{uc},{ud} MAXLIST={a}:100 SILENCE=32 CALLERID=g PREFIX=({pm}){pc} STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,{ext} ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current(), a = CHANMODES_LIST, b = CHANMODES_PARAM_ALWAYS, c = CHANMODES_PARAM_SET, d = CHANMODES_FLAG, uc = USERMODES_PARAM_SET, ud = USERMODES_FLAG, pm = PREFIX_MODES, pc = PREFIX_CHARS, ext = EXTBAN_TYPES);
     let deny = cfg
         .server
         .client_tag_deny
@@ -297,6 +301,18 @@ pub async fn complete_registration(
         return Ok(());
     }
 
+    // A shun in force covers whoever it names, including somebody who has
+    // only just walked in. Worked out here rather than by the dispatch loop,
+    // which asks the answer rather than the question.
+    if state_guard
+        .shuns_in_force()
+        .iter()
+        .any(|b| b.matches(&real_source, &client.host))
+    {
+        tracing::info!(client_id, nick = %nick, "A shun covers this connection");
+        state_guard.shunned.insert(uid.clone());
+    }
+
     // The capabilities are this connection's. A user's set is the union of its
     // connections', so a message is built for the superset and trimmed back per
     // connection as it goes out.
@@ -429,8 +445,9 @@ pub async fn complete_registration(
                 nick_str.clone(),
                 server.clone(),
                 concat!("rIRCd-", env!("CARGO_PKG_VERSION")).into(),
-                "BioRrw".into(),
-                "bceIklmnopqRstvC".into(),
+                crate::channel::all_user_modes(),
+                crate::channel::all_channel_modes(),
+                crate::channel::parameterised_channel_modes(),
             ],
         )
         .with_prefix(server),

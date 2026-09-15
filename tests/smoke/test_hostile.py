@@ -1038,6 +1038,71 @@ if filt.find(" 381 "):
     watcher.close()
 filt.close()
 
+section("somebody who should stop, rather than go")
+
+# A shun leaves them connected and lets nothing they say reach anybody. They
+# are not told, because a shun that announced itself would be a slower kill.
+sh = Client(f"sh{SUF}")
+sh.send(f"OPER {OPER_NAME} {OPER_PASSWORD}")
+sh.wait_for(" 381 ", " 464 ", seconds=5)
+if sh.find(" 381 "):
+    ROOM = f"#shun{SUF}"
+    sh.join(ROOM)
+    victim = Client(f"vic{SUF}")
+    victim.join(ROOM)
+
+    smark = sh.mark()
+    sh.send("SHUN *!*@* :everybody")
+    sh.send(f"SHUN sh{SUF}!*@* :myself")
+    sh.read(1.2)
+    refused = sh.since(smark)
+    check("a shun on everybody is refused", bool(sh.find("FAIL SHUN MASK_TOO_BROAD", lines=refused)), refused[-3:])
+    check("and so is one that covers the operator setting it",
+          bool(sh.find("FAIL SHUN MATCHES_YOURSELF", lines=refused)), refused[-3:])
+
+    smark = sh.mark()
+    sh.send(f"SHUN vic{SUF}!*@* :quiet please")
+    sh.read(1.2)
+    check("a shun is placed, and says how many it silenced",
+          bool(sh.find("shun on", "silenced", lines=sh.since(smark))), sh.since(smark)[-2:])
+
+    smark, vmark = sh.mark(), victim.mark()
+    victim.send(f"PRIVMSG {ROOM} :can anybody hear me")
+    victim.send(f"NOTICE {ROOM} :or this")
+    victim.read(1.2)
+    sh.read(1.0)
+    check("nothing the shunned person says reaches the room",
+          not sh.find("hear me", lines=sh.since(smark)) and not sh.find("or this", lines=sh.since(smark)),
+          sh.since(smark)[-3:])
+    check("and they are told nothing at all", not victim.since(vmark), victim.since(vmark)[-3:])
+
+    victim.send(f"PING alive{SUF}")
+    check("they are still connected", bool(victim.wait_for(f"alive{SUF}", seconds=5)), victim.lines[-2:])
+
+    smark = sh.mark()
+    sh.send("STATS s")
+    sh.wait_for(" 219 ", seconds=5)
+    check("STATS s lists the shun", bool(sh.find(" 216 ", "S", f"vic{SUF}", lines=sh.since(smark))), sh.since(smark)[-3:])
+
+    smark = sh.mark()
+    victim.send(f"PART {ROOM} :goodbye cruel world")
+    victim.read(1.0)
+    sh.read(1.0)
+    parted = sh.since(smark)
+    check("they may leave, without the parting words",
+          bool(sh.find("PART", f"vic{SUF}", lines=parted)) and not sh.find("cruel world", lines=parted), parted[-2:])
+
+    sh.send(f"UNSHUN vic{SUF}!*@*")
+    sh.read(1.2)
+    victim.join(ROOM)
+    smark = sh.mark()
+    victim.send(f"PRIVMSG {ROOM} :hello again")
+    victim.read(1.0)
+    sh.read(1.0)
+    check("UNSHUN gives them their voice back", bool(sh.find("hello again", lines=sh.since(smark))), sh.since(smark)[-2:])
+    victim.close()
+sh.close()
+
 section("still standing")
 check("the server is still accepting and serving clients", still_alive("everything", f"h12{RUN}"))
 

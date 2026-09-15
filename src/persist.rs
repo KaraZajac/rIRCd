@@ -1941,6 +1941,11 @@ pub enum BanKind {
     #[default]
     Kline,
     Dline,
+    /// Neither refuses the connection: it stays, and nothing it says reaches
+    /// anybody. A shun is for somebody who should stop rather than go — and
+    /// for somebody who would come straight back under another address if
+    /// they knew they had been dealt with.
+    Shun,
 }
 
 impl BanKind {
@@ -1948,15 +1953,24 @@ impl BanKind {
         match self {
             BanKind::Kline => "K",
             BanKind::Dline => "D",
+            BanKind::Shun => "S",
         }
     }
 
     pub fn from_letter(s: &str) -> Self {
         if s.eq_ignore_ascii_case("D") {
             BanKind::Dline
+        } else if s.eq_ignore_ascii_case("S") {
+            BanKind::Shun
         } else {
             BanKind::Kline
         }
+    }
+
+    /// Whether a ban of this kind turns a connection away. A shun does not:
+    /// that is the whole of what makes it one.
+    pub fn closes_the_connection(self) -> bool {
+        !matches!(self, BanKind::Shun)
     }
 }
 
@@ -1971,7 +1985,9 @@ impl ServerBan {
     pub fn matches(&self, source: &str, ip: &str) -> bool {
         match self.kind {
             BanKind::Dline => address_in(&self.mask, ip).unwrap_or(false),
-            BanKind::Kline => {
+            // A shun names somebody the way a K-line does; what differs is
+            // what happens to them, not how they are found.
+            BanKind::Kline | BanKind::Shun => {
                 let mask = crate::casefold::lower(&self.mask);
                 let source = crate::casefold::lower(source);
                 // `nick!user@1.2.3.0/24`: the mask up to the host is a glob and
@@ -3141,6 +3157,25 @@ mod ban_tests {
         assert!(!network_too_broad("2001:db8::/32"));
         assert!(!network_too_broad("203.0.113.5"), "a single address is never too broad");
         assert!(network_too_broad("203.0.113.0/x"));
+    }
+
+    /// A shun is found the way a K-line is; what differs is what happens to
+    /// whoever it finds.
+    #[test]
+    fn a_shun_is_named_like_a_kline_and_does_not_close_anything() {
+        assert_eq!(BanKind::from_letter("S"), BanKind::Shun);
+        assert_eq!(BanKind::from_letter("s"), BanKind::Shun);
+        assert_eq!(BanKind::Shun.letter(), "S");
+        assert!(BanKind::Kline.closes_the_connection());
+        assert!(BanKind::Dline.closes_the_connection());
+        assert!(!BanKind::Shun.closes_the_connection());
+
+        let s = ban("*!*@203.0.113.0/24", BanKind::Shun);
+        assert!(s.matches("bob!user@cloaked.host", "203.0.113.4"));
+        assert!(!s.matches("bob!user@cloaked.host", "198.51.100.1"));
+        let s = ban("loud!*@*", BanKind::Shun);
+        assert!(s.matches("Loud!user@host", "203.0.113.4"));
+        assert!(!s.matches("quiet!user@host", "203.0.113.4"));
     }
 
     /// A D-line looks only at the address; a K-line at the whole source, and

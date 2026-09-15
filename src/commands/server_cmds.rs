@@ -537,6 +537,11 @@ pub async fn handle_stats(
                 reply_to_client(&senders, client_id, m, label).await;
             }
         }
+        "s" | "S" => {
+            for m in stats_bans(&state, &nick, &cfg.server.name, crate::persist::BanKind::Shun).await {
+                reply_to_client(&senders, client_id, m, label).await;
+            }
+        }
         "m" | "M" => {
             for m in stats_commands(&state, &nick, &cfg.server.name).await {
                 reply_to_client(&senders, client_id, m, label).await;
@@ -970,6 +975,16 @@ pub async fn handle_help(
                 "  The network as a tree, with how many people are on each server.",
             ],
         ),
+        Some("SHUN") => (
+            "SHUN",
+            &[
+                "SHUN [<seconds>] <nick!user@host> :<reason>",
+                "  Leave somebody connected and let nothing they say reach anybody.",
+                "  They may listen, answer a PING, and leave; everything else they",
+                "  type quietly does nothing, and they are not told. UNSHUN lifts it,",
+                "  STATS s lists them. Operators with the ban privilege.",
+            ],
+        ),
         Some("SPAMFILTER") => (
             "SPAMFILTER",
             &[
@@ -1056,7 +1071,7 @@ pub async fn handle_help(
                 "  CHANOWN CHANACCESS CHANDROP ACCEPT SILENCE",
                 "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS CONNECT SQUIT SANICK",
                 "  KLINE DLINE SNOMASK MLOCK SAJOIN SAPART SAMODE TESTMASK MAP GROUP NOEXPIRE",
-                "  SPAMFILTER",
+                "  SPAMFILTER SHUN",
                 "  STATS LUSERS",
             ],
         ),
@@ -1126,13 +1141,15 @@ pub async fn handle_knock(
         .unwrap_or_else(|| "knock knock".to_string());
 
     let state = state.read().await;
-    let (nick, source, account) = match state.clients.get(client_id) {
+    let (nick, source, account, realname, in_channels) = match state.clients.get(client_id) {
         Some(c) => {
             let g = c.read().await;
             (
                 g.nick_or_id().to_string(),
                 g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
                 g.account.clone(),
+                g.realname.clone().unwrap_or_default(),
+                g.channels.keys().cloned().collect::<Vec<String>>(),
             )
         }
         None => return Ok(()),
@@ -1213,7 +1230,12 @@ pub async fn handle_knock(
     }
 
     // Check banned
-    if ch.is_banned(account.as_deref(), &source) {
+    if ch.is_banned(
+        &crate::channel::Subject::from_source(&source)
+            .with_account(account.as_deref())
+            .with_realname(&realname)
+            .in_channels(&in_channels),
+    ) {
         reply_to_client(
             &senders,
             client_id,
@@ -1989,7 +2011,9 @@ pub fn mask_too_broad(normalized: &str) -> bool {
 /// address or a network at all, and not one wider than an operator's call.
 pub fn ban_too_broad(mask: &str, kind: crate::persist::BanKind) -> bool {
     match kind {
-        crate::persist::BanKind::Kline => mask_too_broad(mask),
+        // A shun names somebody the way a K-line does, so it is held to the
+        // same rule: a mask made of wildcards would silence the network.
+        crate::persist::BanKind::Kline | crate::persist::BanKind::Shun => mask_too_broad(mask),
         crate::persist::BanKind::Dline => {
             let parses = crate::persist::address_in(mask, "0.0.0.0").is_some()
                 || crate::persist::address_in(mask, "::").is_some();
@@ -2039,6 +2063,16 @@ pub async fn enforce_ban(
             }
         }
     }
+    if !ban.kind.closes_the_connection() {
+        // Nobody is closed and nobody is told. Their connection carries the
+        // answer from here on, so the dispatch loop does not match masks on
+        // every line they send.
+        apply_shuns(state).await;
+        for (_, hit_nick) in &hits {
+            tracing::info!(nick = %hit_nick, mask = %ban.mask, "Shunning user");
+        }
+        return hits;
+    }
     for (id, hit_nick) in &hits {
         senders.write().await.close_user(
             id,
@@ -2051,6 +2085,38 @@ pub async fn enforce_ban(
         tracing::info!(nick = %hit_nick, mask = %ban.mask, "Disconnecting banned user");
     }
     hits
+}
+
+/// Work out again who the shuns in force cover.
+///
+/// Read once per message from the dispatch loop, so it is worked out here —
+/// when a shun is set, lifted or expires — rather than by matching every
+/// mask against every line. Only this server's own users: somebody on
+/// another server is shunned there, by the same shun, which crossed the link.
+pub async fn apply_shuns(state: &Arc<RwLock<ServerState>>) {
+    let (shuns, people) = {
+        let state_r = state.read().await;
+        let shuns = state_r.shuns_in_force();
+        let mut people = Vec::new();
+        for (id, client) in state_r.users() {
+            let g = client.read().await;
+            if g.server.is_some() {
+                continue;
+            }
+            people.push((
+                id.clone(),
+                g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
+                g.host.clone(),
+            ));
+        }
+        (shuns, people)
+    };
+    let covered: std::collections::HashSet<String> = people
+        .into_iter()
+        .filter(|(_, source, host)| shuns.iter().any(|b| b.matches(source, host)))
+        .map(|(id, _, _)| id)
+        .collect();
+    state.write().await.shunned = covered;
 }
 
 /// `KLINE [<duration>] <mask> :<reason>` — refuse connections matching a mask.
@@ -2196,6 +2262,15 @@ async fn ban_arguments(
     Some((duration, mask.to_string(), reason))
 }
 
+/// What to call a ban of this kind when telling somebody about it.
+fn ban_noun(kind: crate::persist::BanKind) -> &'static str {
+    match kind {
+        crate::persist::BanKind::Kline => "K-line",
+        crate::persist::BanKind::Dline => "D-line",
+        crate::persist::BanKind::Shun => "shun",
+    }
+}
+
 fn new_ban(
     mask: String,
     reason: String,
@@ -2250,9 +2325,9 @@ async fn place_ban(
         &cfg.server.name,
         'b',
         &format!(
-            "{} added a {}-line on {}{} ({})",
+            "{} added a {} on {}{} ({})",
             nick,
-            ban.kind.letter(),
+            ban_noun(ban.kind),
             ban.mask,
             match ban.expires_at {
                 Some(at) => format!(" until {}", clock_time(at)),
@@ -2271,10 +2346,11 @@ async fn place_ban(
             vec![
                 nick.to_string(),
                 format!(
-                    "{}-line on {} added ({} connection(s) closed)",
-                    ban.kind.letter(),
+                    "{} on {} added ({} connection(s) {})",
+                    ban_noun(ban.kind),
                     ban.mask,
-                    hits.len()
+                    hits.len(),
+                    if ban.kind.closes_the_connection() { "closed" } else { "silenced" }
                 ),
             ],
         )
@@ -3852,5 +3928,146 @@ pub async fn handle_spamfilter(
             .await;
         }
     }
+    Ok(())
+}
+
+/// `SHUN [<duration>] <mask> :<reason>` — somebody who should stop, rather
+/// than go.
+///
+/// A K-line closes the connection, which tells whoever was behind it to come
+/// back from another address. A shun leaves them connected and lets nothing
+/// they say reach anybody: they may listen, keep the connection alive, and
+/// leave, and everything else they type quietly does nothing. They are not
+/// told, because a shun that announced itself would just be a slower kill.
+pub async fn handle_shun(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    const KIND: crate::persist::BanKind = crate::persist::BanKind::Shun;
+    let Some((nick, own_source, own_ip)) = may_ban(&state, &senders, client_id, cfg, label).await
+    else {
+        return Ok(());
+    };
+    let Some((duration, mask, reason)) =
+        ban_arguments(&msg, "SHUN", &senders, client_id, cfg, label).await
+    else {
+        return Ok(());
+    };
+    let normalized = normalize_ban_mask(&mask);
+    if ban_too_broad(&normalized, KIND) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "SHUN".into(),
+                    "MASK_TOO_BROAD".into(),
+                    normalized,
+                    "A shun needs a mask that names somebody: at least four characters that are not wildcards".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    if ban_covers(&normalized, KIND, &own_source, &own_ip) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "SHUN".into(),
+                    "MATCHES_YOURSELF".into(),
+                    normalized,
+                    "That mask matches your own connection".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let ban = new_ban(normalized, reason, &nick, duration, KIND);
+    place_ban(client_id, &nick, ban, &state, &senders, cfg, label).await;
+    Ok(())
+}
+
+/// `UNSHUN <mask>` — let somebody speak again.
+pub async fn handle_unshun(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((nick, _, _)) = may_ban(&state, &senders, client_id, cfg, label).await else {
+        return Ok(());
+    };
+    let Some(given) = msg.params.first() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![nick, "UNSHUN".into(), "Not enough parameters".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let mask = normalize_ban_mask(given);
+    let removed = match cfg.db {
+        Some(ref pool) => crate::persist::delete_server_ban(pool, &mask).await,
+        None => false,
+    };
+    let known = {
+        let mut state_w = state.write().await;
+        let before = state_w.server_bans.len();
+        state_w
+            .server_bans
+            .retain(|b| !(b.kind == crate::persist::BanKind::Shun && b.mask == mask));
+        state_w.server_bans.len() != before
+    };
+    // Whoever it covered is covered by it no longer — unless another shun
+    // still names them, which is why this is worked out again rather than
+    // simply cleared.
+    apply_shuns(&state).await;
+    tracing::warn!(oper = %nick, %mask, removed, "Shun removed");
+    crate::link::announce_unkline(cfg, &mask, crate::persist::BanKind::Shun).await;
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        'b',
+        &format!("{nick} removed the shun on {mask}"),
+    )
+    .await;
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTICE",
+            vec![
+                nick,
+                if known || removed {
+                    format!("Shun on {mask} removed")
+                } else {
+                    format!("No shun on {mask}")
+                },
+            ],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
     Ok(())
 }

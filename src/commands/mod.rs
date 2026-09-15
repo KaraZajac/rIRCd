@@ -159,6 +159,24 @@ pub async fn handle_message(
             .await;
     }
 
+    // A shunned connection may listen, and may leave. What it says reaches
+    // nobody, and it is not told so — a shun that announced itself would be a
+    // slower kill, and the whole point of one is that the person does not
+    // know to come back from somewhere else. The handshake and the keepalive
+    // are never held against anybody, so they are not even looked up.
+    let shunned = !matches!(msg.command.as_str(), "CAP" | "AUTHENTICATE" | "PING" | "PONG")
+        && state.read().await.is_shunned(&client_id);
+    let mut msg = msg;
+    if shunned {
+        match msg.command.as_str() {
+            // Going is allowed. The parting words are not: a quit reason is
+            // shouted into every channel they were in.
+            "QUIT" => msg.params.clear(),
+            "PART" => msg.params.truncate(1),
+            _ => return Ok(()),
+        }
+    }
+
     // CONNECT hands the shared config to a link task that outlives this call.
     let cfg_shared = cfg.clone();
     let cfg_guard = cfg.read().await;
@@ -1075,6 +1093,12 @@ pub async fn handle_message(
         }
         "DLINE" => {
             server_cmds::handle_dline(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "SHUN" => {
+            server_cmds::handle_shun(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "UNSHUN" => {
+            server_cmds::handle_unshun(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
         "UNDLINE" => {
             server_cmds::handle_undline(&client_id, msg, state, senders, cfg, label.as_deref())

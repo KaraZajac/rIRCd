@@ -2969,10 +2969,10 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
 /// one line. Remembered, written down, and put into effect on this server's
 /// own users; the peer's users are the peer's to close.
 async fn accept_remote_kline(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
-    let kind = if msg.command == "DLINE" {
-        crate::persist::BanKind::Dline
-    } else {
-        crate::persist::BanKind::Kline
+    let kind = match msg.command.as_str() {
+        "DLINE" => crate::persist::BanKind::Dline,
+        "SHUN" => crate::persist::BanKind::Shun,
+        _ => crate::persist::BanKind::Kline,
     };
     let (Some(mask), Some(set_at), Some(expires), Some(set_by)) = (
         msg.params.first().cloned(),
@@ -3158,6 +3158,7 @@ async fn accept_remote_unkline(ctx: &LinkContext, msg: &Message, peer_sid: &str)
         state.server_bans.retain(|b| b.mask != mask);
         state.publish_dlines();
     }
+    crate::commands::server_cmds::apply_shuns(&ctx.state).await;
     info!(peer = %peer_sid, %mask, "Server ban removed from the network");
     let server_name = ctx.cfg.read().await.server.name.clone();
     crate::commands::registration::notify_opers(
@@ -3738,6 +3739,7 @@ pub async fn announce_kline(cfg: &Config, ban: &crate::persist::ServerBan) {
             match ban.kind {
                 crate::persist::BanKind::Kline => "KLINE",
                 crate::persist::BanKind::Dline => "DLINE",
+                crate::persist::BanKind::Shun => "SHUN",
             },
             vec![
                 ban.mask.clone(),
@@ -3763,6 +3765,7 @@ pub async fn announce_unkline(cfg: &Config, mask: &str, kind: crate::persist::Ba
             match kind {
                 crate::persist::BanKind::Kline => "UNKLINE",
                 crate::persist::BanKind::Dline => "UNDLINE",
+                crate::persist::BanKind::Shun => "UNSHUN",
             },
             vec![mask.to_string()],
         )
@@ -4012,11 +4015,11 @@ async fn handle_link_message(
             accept_remote_unspamfilter(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }
-        "KLINE" | "DLINE" => {
+        "KLINE" | "DLINE" | "SHUN" => {
             accept_remote_kline(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }
-        "UNKLINE" | "UNDLINE" => {
+        "UNKLINE" | "UNDLINE" | "UNSHUN" => {
             accept_remote_unkline(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }

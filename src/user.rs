@@ -827,6 +827,10 @@ pub struct ServerState {
     /// Patterns an operator would rather never see again, in the order they
     /// were added. See `crate::spamfilter`.
     pub spam_filters: Vec<crate::spamfilter::SpamFilter>,
+    /// The users a shun covers, by user id. Worked out when a shun is set or
+    /// lifted rather than matched again on every line: the dispatch loop asks
+    /// this once per message, and the usual answer is that the set is empty.
+    pub shunned: HashSet<String>,
     /// The D-lines among them, as the listeners see them: judged the moment a
     /// connection arrives, with no lock on this state. `publish_dlines` keeps
     /// it current.
@@ -1121,6 +1125,7 @@ impl ServerState {
         self.clients.remove(&user_id);
         self.session_to_user.remove(&user_id);
         self.forget_session(&user_id);
+        self.shunned.remove(&user_id);
         let (nick, account, remote) = {
             let g = client.read().await;
             (g.nick.clone(), g.account.clone(), g.server.is_some())
@@ -1205,9 +1210,27 @@ impl ServerState {
     /// The ban matching this user, if any. Expired entries are ignored.
     pub fn matching_ban(&self, source: &str, ip: &str) -> Option<&crate::persist::ServerBan> {
         let now = Utc::now().timestamp();
+        self.server_bans.iter().find(|ban| {
+            // A shun is not a reason to turn somebody away — it is the reason
+            // they were not turned away.
+            ban.kind.closes_the_connection() && !ban.is_expired(now) && ban.matches(source, ip)
+        })
+    }
+
+    /// Whether this user is shunned: they stay connected, and nothing they
+    /// say reaches anybody.
+    pub fn is_shunned(&self, session_id: &str) -> bool {
+        !self.shunned.is_empty() && self.shunned.contains(&self.user_id(session_id))
+    }
+
+    /// The shuns in force, for working out who they cover.
+    pub fn shuns_in_force(&self) -> Vec<crate::persist::ServerBan> {
+        let now = Utc::now().timestamp();
         self.server_bans
             .iter()
-            .find(|ban| !ban.is_expired(now) && ban.matches(source, ip))
+            .filter(|b| b.kind == crate::persist::BanKind::Shun && !b.is_expired(now))
+            .cloned()
+            .collect()
     }
 
     /// The account a grouped nick belongs to, lower-cased, if it is one.

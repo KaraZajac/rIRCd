@@ -51,6 +51,124 @@ impl ChannelMemberModeSet {
     }
 }
 
+// ─── What this server says it has ─────────────────────────────────────────────
+//
+// Every answer that names a mode reads these: `ISUPPORT`'s `CHANMODES`,
+// `USERMODES` and `PREFIX`, `RPL_MYINFO`, and the MODE parser deciding which
+// letters carry a parameter. A mode added in one place and forgotten in
+// another is a server that says it cannot do something it does, which is how
+// `RPL_MYINFO` came to be describing a version several releases old.
+
+/// Channel modes that hold a list of masks. `CHANMODES` group A.
+pub const CHANMODES_LIST: &str = "beIq";
+/// Channel modes that carry a parameter whichever way they are set. Group B.
+pub const CHANMODES_PARAM_ALWAYS: &str = "k";
+/// Channel modes that carry a parameter only when set. Group C.
+pub const CHANMODES_PARAM_SET: &str = "fjlL";
+/// Channel modes that never carry one. Group D.
+pub const CHANMODES_FLAG: &str = "imnstpRcCMZNOTz";
+/// The modes that give a member a prefix, strongest first.
+pub const PREFIX_MODES: &str = "ohv";
+/// The prefixes they give, in the same order.
+pub const PREFIX_CHARS: &str = "@%+";
+/// User modes that carry a parameter when set: the server notice mask.
+pub const USERMODES_PARAM_SET: &str = "s";
+/// User modes that never carry one.
+pub const USERMODES_FLAG: &str = "BgiorRw";
+/// The extended ban types this server understands, the letters after `~`.
+pub const EXTBAN_TYPES: &str = "ajmrt";
+
+/// The same letters in one sorted string, which is how `RPL_MYINFO` wants
+/// them: a set rather than a grammar.
+fn sorted(parts: &[&str]) -> String {
+    let mut letters: Vec<char> = parts.iter().flat_map(|p| p.chars()).collect();
+    letters.sort_unstable();
+    letters.dedup();
+    letters.into_iter().collect()
+}
+
+/// Every channel mode there is: `RPL_MYINFO`'s fifth parameter.
+pub fn all_channel_modes() -> String {
+    sorted(&[
+        CHANMODES_LIST,
+        CHANMODES_PARAM_ALWAYS,
+        CHANMODES_PARAM_SET,
+        CHANMODES_FLAG,
+        PREFIX_MODES,
+    ])
+}
+
+/// The channel modes that carry a parameter: `RPL_MYINFO`'s sixth.
+pub fn parameterised_channel_modes() -> String {
+    sorted(&[
+        CHANMODES_LIST,
+        CHANMODES_PARAM_ALWAYS,
+        CHANMODES_PARAM_SET,
+        PREFIX_MODES,
+    ])
+}
+
+/// Every user mode there is: `RPL_MYINFO`'s fourth parameter.
+pub fn all_user_modes() -> String {
+    sorted(&[USERMODES_PARAM_SET, USERMODES_FLAG])
+}
+
+/// Whether a channel mode letter carries a parameter. A list mode, a group B
+/// mode and a prefix mode always do; a group C mode does only when set.
+pub fn mode_takes_param(letter: char, plus: bool) -> bool {
+    PREFIX_MODES.contains(letter)
+        || CHANMODES_LIST.contains(letter)
+        || CHANMODES_PARAM_ALWAYS.contains(letter)
+        || (CHANMODES_PARAM_SET.contains(letter) && plus)
+}
+
+/// Everything a channel's masks can be asked about.
+///
+/// A mask used to be matched against a `nick!user@host` and, for `~a:`, an
+/// account. Each new extended ban wanted one more thing, and threading one
+/// more argument through every caller each time is how a server ends up with
+/// a ban type that quietly works in one place and not another. This carries
+/// the whole person instead.
+#[derive(Debug, Clone, Copy)]
+pub struct Subject<'a> {
+    /// `nick!user@host`, as everybody else sees it — the cloak, not the
+    /// address behind it.
+    pub source: &'a str,
+    /// The account they are logged in to, if any.
+    pub account: Option<&'a str>,
+    /// Their real name, for `~r:`.
+    pub realname: &'a str,
+    /// The channels they are in, keyed as channels are, for `~j:`.
+    pub channels: &'a [String],
+}
+
+impl<'a> Subject<'a> {
+    /// Somebody named only by their `nick!user@host`.
+    pub fn from_source(source: &'a str) -> Self {
+        Self {
+            source,
+            account: None,
+            realname: "",
+            channels: &[],
+        }
+    }
+
+    pub fn with_account(mut self, account: Option<&'a str>) -> Self {
+        self.account = account;
+        self
+    }
+
+    pub fn with_realname(mut self, realname: &'a str) -> Self {
+        self.realname = realname;
+        self
+    }
+
+    pub fn in_channels(mut self, channels: &'a [String]) -> Self {
+        self.channels = channels;
+        self
+    }
+}
+
 /// A channel on the server
 #[derive(Debug)]
 pub struct Channel {
@@ -241,43 +359,69 @@ impl Channel {
         }
     }
 
-    /// Whether one mask covers this source. `~a:` matches the account rather
-    /// than the hostmask; everything else is a glob, exactly like the ban list —
-    /// an exact-match check would silence nobody, since these are almost always
-    /// written nick!*@*.
-    fn mask_covers(mask: &str, account: Option<&str>, source: &str) -> bool {
+    /// Whether one mask covers this person.
+    ///
+    /// A plain mask is a glob over `nick!user@host`, which is what almost
+    /// every mask is. An extended ban — the `~` types named in `EXTBAN` —
+    /// asks about something else instead: the account behind the connection,
+    /// the real name, another channel they are in. They compose, because the
+    /// prefixes peel one at a time: `~t:1h:~r:*viagra*` is a real-name ban
+    /// that lifts itself in an hour, and `~m:~r:*viagra*` mutes rather than
+    /// bans.
+    fn mask_covers(mask: &str, subject: &Subject) -> bool {
         // A timed mask is the mask under it, for as long as it lasts.
         let mask = crate::timed_bans::peel_timed(mask);
-        match mask.strip_prefix("~a:") {
-            Some(account_mask) => account
+        if let Some(account_mask) = mask.strip_prefix("~a:") {
+            return subject
+                .account
                 .map(|a| a.eq_ignore_ascii_case(account_mask))
-                .unwrap_or(false),
-            None => crate::user::glob_match(mask, source),
+                .unwrap_or(false);
         }
+        if let Some(realname_mask) = mask.strip_prefix("~r:") {
+            // A glob, because a real name is a sentence and nobody bans one
+            // exactly. Somebody who gave none matches only `*`.
+            //
+            // A mode parameter cannot hold a space, and a real name is mostly
+            // spaces, so `_` stands for one — the spelling every other server
+            // uses. Both sides are read that way, so `~r:*seedy_marketing*`
+            // and a mask sent as the trailing parameter with real spaces in
+            // it mean the same thing.
+            let pattern = realname_mask.replace(' ', "_");
+            let realname = subject.realname.replace(' ', "_");
+            return crate::user::glob_match(&pattern, &realname);
+        }
+        if let Some(channel) = mask.strip_prefix("~j:") {
+            let wanted = canonical_channel_key(channel);
+            return subject
+                .channels
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&wanted));
+        }
+        crate::user::glob_match(mask, subject.source)
     }
 
     /// Whether this source is kept from speaking: the quiet list (+q), or a
     /// mute extban (+b ~m:mask), which is a ban on talking rather than on
     /// coming in. A ban exception lifts either.
-    pub fn is_muted(&self, account: Option<&str>, source: &str) -> bool {
+    pub fn is_muted(&self, subject: &Subject) -> bool {
         // Only a mute exception lifts a mute. A plain +e is an exception to a
         // ban on coming in, and says nothing about who may talk.
         let exempt = self
             .ban_exceptions
             .iter()
             .filter_map(|e| e.strip_prefix("~m:"))
-            .any(|e| Self::mask_covers(e, account, source));
+            .any(|e| Self::mask_covers(e, subject));
         if exempt {
             return false;
         }
         self.quiet_list
             .iter()
-            .any(|m| Self::mask_covers(m, account, source))
+            .any(|m| Self::mask_covers(m, subject))
             || self
                 .bans
                 .iter()
                 .filter_map(|b| crate::timed_bans::peel_timed(b).strip_prefix("~m:"))
-                .any(|m| Self::mask_covers(m, account, source))
+                .any(|m| Self::mask_covers(m, subject))
     }
 
     /// Returns (op, voice) for a joining user based on nick/account and persisted lists.
@@ -291,12 +435,12 @@ impl Channel {
     }
 
     /// Check if the client is banned (account-extban ~a: or hostmask glob match).
-    pub fn is_banned(&self, account: Option<&str>, source: &str) -> bool {
+    pub fn is_banned(&self, subject: &Subject) -> bool {
         self.bans
             .iter()
             // A mute extban lives on the ban list but is not a ban on entry.
             .filter(|b| !crate::timed_bans::peel_timed(b).starts_with("~m:"))
-            .any(|b| Self::mask_covers(b, account, source))
+            .any(|b| Self::mask_covers(b, subject))
     }
 
     /// Whether the founder's mode lock says this change may not be made:
@@ -315,19 +459,19 @@ impl Channel {
     }
 
     /// Check if source/account matches a ban exception (+e).
-    pub fn is_ban_exempt(&self, account: Option<&str>, source: &str) -> bool {
+    pub fn is_ban_exempt(&self, subject: &Subject) -> bool {
         self.ban_exceptions
             .iter()
             // A mute exception lifts a mute, not a ban on coming in.
             .filter(|e| !e.starts_with("~m:"))
-            .any(|e| Self::mask_covers(e, account, source))
+            .any(|e| Self::mask_covers(e, subject))
     }
 
     /// Check if source/account matches an invite exception (+I).
-    pub fn is_invite_exempt(&self, account: Option<&str>, source: &str) -> bool {
+    pub fn is_invite_exempt(&self, subject: &Subject) -> bool {
         self.invite_exceptions
             .iter()
-            .any(|e| Self::mask_covers(e, account, source))
+            .any(|e| Self::mask_covers(e, subject))
     }
 
     /// Who set a list entry and when, for RPL_BANLIST and its kin. An entry
@@ -643,6 +787,151 @@ use std::sync::Arc;
 mod tests {
     use super::*;
 
+    /// Somebody named only by their `nick!user@host`, which is what most of
+    /// these masks are about.
+    fn sub(source: &str) -> Subject<'_> {
+        Subject::from_source(source)
+    }
+
+    /// `~r:` asks about the real name, which a hostmask never sees.
+    #[test]
+    fn a_realname_extban_matches_the_gecos_rather_than_the_source() {
+        let mut ch = Channel::new("#r".into());
+        ch.bans.push("~r:*seedy marketing*".into());
+        assert!(ch.is_banned(&sub("bob!u@host").with_realname("A Seedy Marketing Firm")));
+        // A mode parameter holds no spaces, so `_` stands for one — and a
+        // mask that did manage to carry spaces means the same thing.
+        let mut underscored = Channel::new("#r".into());
+        underscored.bans.push("~r:*seedy_marketing*".into());
+        assert!(underscored.is_banned(&sub("bob!u@host").with_realname("A Seedy Marketing Firm")));
+        assert!(underscored.is_banned(&sub("bob!u@host").with_realname("seedy_marketing_ltd")));
+        assert!(!ch.is_banned(&sub("bob!u@host").with_realname("Bob")));
+        assert!(
+            !ch.is_banned(&sub("seedy marketing!u@host")),
+            "the source is not the real name"
+        );
+        assert!(!ch.is_banned(&sub("bob!u@host")), "nobody gave a real name to match");
+    }
+
+    /// `~j:` asks which other rooms somebody is in.
+    #[test]
+    fn a_channel_extban_matches_being_somewhere_else() {
+        let mut ch = Channel::new("#a".into());
+        ch.bans.push("~j:#Raiders".into());
+        let raiding = vec![canonical_channel_key("#raiders")];
+        let elsewhere = vec![canonical_channel_key("#books")];
+        assert!(ch.is_banned(&sub("eve!u@host").in_channels(&raiding)));
+        assert!(!ch.is_banned(&sub("eve!u@host").in_channels(&elsewhere)));
+        assert!(!ch.is_banned(&sub("eve!u@host")), "in no channel at all");
+    }
+
+    /// The prefixes peel one at a time, so they stack: a mute by real name,
+    /// and a channel ban that lifts itself.
+    #[test]
+    fn extended_bans_compose_with_a_mute_and_with_a_clock() {
+        let mut ch = Channel::new("#c".into());
+        ch.bans.push("~m:~r:*spam*".into());
+        let seller = sub("bob!u@host").with_realname("I sell spam");
+        assert!(ch.is_muted(&seller), "muted by what their real name says");
+        assert!(!ch.is_banned(&seller), "a mute is not a ban on coming in");
+
+        let raiding = vec![canonical_channel_key("#raiders")];
+        ch.bans.push("~t:1h:~j:#raiders".into());
+        assert!(ch.is_banned(&sub("eve!u@host").in_channels(&raiding)));
+        assert!(!ch.is_banned(&sub("eve!u@host")));
+    }
+
+    /// An exception lifts an extended ban the same way it lifts a plain one.
+    #[test]
+    fn an_exception_lifts_an_extended_ban() {
+        let mut ch = Channel::new("#e".into());
+        ch.bans.push("~r:*bot*".into());
+        let bot = sub("helper!u@host").with_realname("a helpful bot");
+        assert!(ch.is_banned(&bot));
+        ch.ban_exceptions.push("~r:*helpful*".into());
+        assert!(ch.is_ban_exempt(&bot));
+    }
+
+    /// What the server shows and what it says it has are the same list.
+    ///
+    /// `RPL_MYINFO` used to be a string somebody typed once, and by the time
+    /// anybody looked it was describing a server several releases old. The
+    /// literal below is written out in full on purpose: adding a mode to
+    /// `ChannelModeSet` stops this compiling until somebody decides whether
+    /// it is advertised.
+    #[test]
+    fn every_mode_the_server_can_show_is_one_it_advertises() {
+        let mut ch = Channel::new("#m".into());
+        ch.modes = ChannelModeSet {
+            secret: true,
+            private: true,
+            invite_only: true,
+            topic_protect: true,
+            no_external: true,
+            moderated: true,
+            registered_only: true,
+            registered_speak: true,
+            tls_only: true,
+            no_colors: true,
+            no_ctcp: true,
+            user_limit: Some(5),
+            join_throttle: Some((2, 60)),
+            msg_flood: Some((3, 10)),
+            no_nick_change: true,
+            no_notices: true,
+            op_moderated: true,
+            oper_only: true,
+            redirect: Some("#overflow".into()),
+        };
+        ch.key = Some("key".into());
+        let (letters, args) = ch.mode_string();
+        let advertised = all_channel_modes();
+        for c in letters.chars().filter(|c| *c != '+') {
+            assert!(
+                advertised.contains(c),
+                "a channel can show +{c} but ISUPPORT does not name it"
+            );
+        }
+        // Every letter shown with an argument is one that says it takes one.
+        let with_args: usize = letters
+            .chars()
+            .filter(|c| *c != '+' && mode_takes_param(*c, true))
+            .count();
+        assert_eq!(with_args, args.len(), "a shown mode's arguments and its letters disagree");
+    }
+
+    #[test]
+    fn the_mode_classes_agree_with_each_other() {
+        assert_eq!(PREFIX_MODES.len(), PREFIX_CHARS.len());
+        // No letter is in two classes: CHANMODES would then be ambiguous.
+        let all: Vec<char> = [
+            CHANMODES_LIST,
+            CHANMODES_PARAM_ALWAYS,
+            CHANMODES_PARAM_SET,
+            CHANMODES_FLAG,
+            PREFIX_MODES,
+        ]
+        .iter()
+        .flat_map(|p| p.chars())
+        .collect();
+        let mut seen = all.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), all.len(), "a mode letter is in two classes");
+        assert_eq!(all_channel_modes().len(), all.len());
+
+        for c in CHANMODES_LIST.chars().chain(CHANMODES_PARAM_ALWAYS.chars()).chain(PREFIX_MODES.chars()) {
+            assert!(mode_takes_param(c, true) && mode_takes_param(c, false), "+{c} carries one either way");
+        }
+        for c in CHANMODES_PARAM_SET.chars() {
+            assert!(mode_takes_param(c, true) && !mode_takes_param(c, false), "+{c} carries one only when set");
+        }
+        for c in CHANMODES_FLAG.chars() {
+            assert!(!mode_takes_param(c, true) && !mode_takes_param(c, false), "+{c} never carries one");
+        }
+        assert_eq!(all_user_modes(), "BRgiorsw", "the user modes MODE implements");
+    }
+
     /// `+j` is `<joins>:<seconds>`, both positive, and nothing else.
     #[test]
     fn a_join_throttle_is_joins_and_seconds() {
@@ -732,18 +1021,18 @@ mod tests {
     fn a_mute_extban_does_not_keep_anyone_out() {
         let mut ch = chan();
         ch.bans.push("~m:bar!*@*".to_string());
-        assert!(!ch.is_banned(None, "bar!user@host"));
-        assert!(ch.is_muted(None, "bar!user@host"));
-        assert!(!ch.is_muted(None, "someoneelse!user@host"));
+        assert!(!ch.is_banned(&sub("bar!user@host")));
+        assert!(ch.is_muted(&sub("bar!user@host")));
+        assert!(!ch.is_muted(&sub("someoneelse!user@host")));
     }
 
     #[test]
     fn a_plain_ban_still_keeps_someone_out() {
         let mut ch = chan();
         ch.bans.push("bar!*@*".to_string());
-        assert!(ch.is_banned(None, "bar!user@host"));
+        assert!(ch.is_banned(&sub("bar!user@host")));
         // ...and is not, by itself, a mute.
-        assert!(!ch.is_muted(None, "bar!user@host"));
+        assert!(!ch.is_muted(&sub("bar!user@host")));
     }
 
     #[test]
@@ -751,8 +1040,8 @@ mod tests {
         let mut ch = chan();
         ch.bans.push("~m:qux!*@*".to_string());
         ch.ban_exceptions.push("~m:*!*evan@*".to_string());
-        assert!(!ch.is_muted(None, "qux!evan@host"));
-        assert!(ch.is_muted(None, "qux!other@host"));
+        assert!(!ch.is_muted(&sub("qux!evan@host")));
+        assert!(ch.is_muted(&sub("qux!other@host")));
     }
 
     /// A plain +e excepts from a ban on coming in, and says nothing about who
@@ -762,7 +1051,7 @@ mod tests {
         let mut ch = chan();
         ch.quiet_list.push("bar!*@*".to_string());
         ch.ban_exceptions.push("bar!*@*".to_string());
-        assert!(ch.is_muted(None, "bar!user@host"));
+        assert!(ch.is_muted(&sub("bar!user@host")));
     }
 
     /// A mute exception is not a ban exception: it says who may talk, not who
@@ -772,24 +1061,24 @@ mod tests {
         let mut ch = chan();
         ch.bans.push("qux!*@*".to_string());
         ch.ban_exceptions.push("~m:*!*evan@*".to_string());
-        assert!(ch.is_banned(None, "qux!evan@host"));
+        assert!(ch.is_banned(&sub("qux!evan@host")));
     }
 
     #[test]
     fn the_quiet_list_mutes_too() {
         let mut ch = chan();
         ch.quiet_list.push("bar!*@*".to_string());
-        assert!(ch.is_muted(None, "bar!user@host"));
-        assert!(!ch.is_banned(None, "bar!user@host"));
+        assert!(ch.is_muted(&sub("bar!user@host")));
+        assert!(!ch.is_banned(&sub("bar!user@host")));
     }
 
     #[test]
     fn account_extbans_match_the_account_not_the_host() {
         let mut ch = chan();
         ch.bans.push("~a:evan".to_string());
-        assert!(ch.is_banned(Some("Evan"), "someone!user@host"));
-        assert!(!ch.is_banned(Some("other"), "someone!user@host"));
-        assert!(!ch.is_banned(None, "someone!user@host"));
+        assert!(ch.is_banned(&sub("someone!user@host").with_account(Some("Evan"))));
+        assert!(!ch.is_banned(&sub("someone!user@host").with_account(Some("other"))));
+        assert!(!ch.is_banned(&sub("someone!user@host")));
     }
 
     /// Nicks and hosts are case-insensitive in IRC, so a ban has to hold when
@@ -798,7 +1087,7 @@ mod tests {
     fn masks_hold_regardless_of_case() {
         let mut ch = chan();
         ch.bans.push("bar!*@example.com".to_string());
-        assert!(ch.is_banned(None, "BAR!user@EXAMPLE.COM"));
+        assert!(ch.is_banned(&sub("BAR!user@EXAMPLE.COM")));
     }
 
     #[test]

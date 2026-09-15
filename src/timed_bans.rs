@@ -1,7 +1,14 @@
-//! Bans that lift themselves: `+b ~t:<duration>:<mask>`, and the same on
-//! `+q`. The duration is minutes, or a number with a unit — `30s`, `10m`,
-//! `2h`, `1d`. When it is up the server takes the mask off the list itself,
-//! and everybody hears it the way they would hear an operator do it.
+//! Bans that lift themselves.
+//!
+//! `+b ~t:<duration>:<mask>` on a channel, and the same on `+q`: the duration
+//! is minutes, or a number with a unit — `30s`, `10m`, `2h`, `1d`. When it is
+//! up the server takes the mask off the list itself, and everybody hears it
+//! the way they would hear an operator do it.
+//!
+//! A timed shun is here too, for a different reason. Every other server ban
+//! is judged when it is matched, so an expired one simply stops matching; a
+//! shun is remembered on the connection it covers, so when one runs out
+//! somebody has to go and forget it.
 //!
 //! Every server on the network runs this over its own copy of the lists, so
 //! a ban set on one server lifts everywhere at about the same moment; the
@@ -81,6 +88,33 @@ pub async fn sweep(
     senders: &Senders,
 ) -> Vec<(String, char, String)> {
     let now = chrono::Utc::now().timestamp();
+
+    // A shun that has run out stops covering anybody.
+    let stale = {
+        let state_r = state.read().await;
+        state_r
+            .server_bans
+            .iter()
+            .any(|b| b.kind == crate::persist::BanKind::Shun && b.is_expired(now))
+    };
+    if stale {
+        let gone: Vec<String> = {
+            let mut state_w = state.write().await;
+            let (expired, kept): (Vec<_>, Vec<_>) = state_w
+                .server_bans
+                .drain(..)
+                .partition(|b| b.kind == crate::persist::BanKind::Shun && b.is_expired(now));
+            state_w.server_bans = kept;
+            expired.into_iter().map(|b| b.mask).collect()
+        };
+        crate::commands::server_cmds::apply_shuns(state).await;
+        for mask in gone {
+            tracing::info!(%mask, "Shun expired");
+            if let Some(ref pool) = cfg.read().await.db {
+                crate::persist::delete_server_ban(pool, &mask).await;
+            }
+        }
+    }
     // Look first, under read locks, and only then touch what is due.
     let due: Vec<(String, char, String)> = {
         let store = channels.read().await;

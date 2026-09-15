@@ -499,6 +499,9 @@ pub async fn handle_privmsg(
         .unwrap_or_else(|| client_id.to_string());
     let sender_nick = sender_data.nick_or_id().to_string();
     let sender_account = sender_data.account.clone();
+    // What an extended ban may ask about besides the hostmask.
+    let sender_realname = sender_data.realname.clone().unwrap_or_default();
+    let sender_channels: Vec<String> = sender_data.channels.keys().cloned().collect();
     let sender_is_oper = sender_data.oper;
     let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
     let echo_message = senders
@@ -709,7 +712,12 @@ pub async fn handle_privmsg(
                 .get(&state_guard.user_id(client_id))
                 .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
                 .unwrap_or(false)
-                && ch.is_muted(sender_account.as_deref(), &source)
+                && ch.is_muted(
+                    &crate::channel::Subject::from_source(&source)
+                        .with_account(sender_account.as_deref())
+                        .with_realname(&sender_realname)
+                        .in_channels(&sender_channels),
+                )
             {
                 if ch.modes.op_moderated {
                     op_moderated_delivery(&ch, &state_guard, &senders, client_id, &source, target, &text, &msgid).await;
@@ -1183,6 +1191,9 @@ pub async fn handle_notice(
         .source()
         .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
+    // What an extended ban may ask about besides the hostmask.
+    let sender_realname = sender_data.realname.clone().unwrap_or_default();
+    let sender_channels: Vec<String> = sender_data.channels.keys().cloned().collect();
     let sender_is_oper = sender_data.oper;
     let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
     let echo_message = senders
@@ -1294,7 +1305,12 @@ pub async fn handle_notice(
                 .get(&state_guard.user_id(client_id))
                 .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
                 .unwrap_or(false)
-                && ch.is_muted(sender_account.as_deref(), &source)
+                && ch.is_muted(
+                    &crate::channel::Subject::from_source(&source)
+                        .with_account(sender_account.as_deref())
+                        .with_realname(&sender_realname)
+                        .in_channels(&sender_channels),
+                )
             {
                 return Ok(());
             }
@@ -1943,6 +1959,9 @@ pub async fn handle_tagmsg(
         .source()
         .unwrap_or_else(|| client_id.to_string());
     let sender_account = sender_data.account.clone();
+    // What an extended ban may ask about besides the hostmask.
+    let sender_realname = sender_data.realname.clone().unwrap_or_default();
+    let sender_channels: Vec<String> = sender_data.channels.keys().cloned().collect();
     let sender_nick = sender_data.nick_or_id().to_string();
     let sender_tags = SenderTags::new(sender_data.bot, sender_data.oper_name.clone());
     let echo_message = senders
@@ -2002,7 +2021,12 @@ pub async fn handle_tagmsg(
                 .get(&state_guard.user_id(client_id))
                 .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
                 .unwrap_or(false)
-                && ch.is_muted(sender_account.as_deref(), &source)
+                && ch.is_muted(
+                    &crate::channel::Subject::from_source(&source)
+                        .with_account(sender_account.as_deref())
+                        .with_realname(&sender_realname)
+                        .in_channels(&sender_channels),
+                )
             {
                 reply_to_sender(
                     &senders,

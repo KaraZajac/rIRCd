@@ -273,6 +273,11 @@ been an operator where they typed it; what the receiving server checks for
 itself is that the new nick is well-formed, not in use, and not somebody else's
 registered name.
 
+A shun crosses a link the way a K-line does — `SHUN` and `UNSHUN`, with the
+same parameters as `KLINE` — because somebody who should stop talking should
+stop talking everywhere. The receiving server applies it to its own users; the
+connections it covers stay up, there and here.
+
 A spam filter is the network's rule rather than one server's, so it is
 announced when it is set and bursted to a server that links afterwards:
 
