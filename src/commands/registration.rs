@@ -96,7 +96,11 @@ fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
         CHANMODES_FLAG, CHANMODES_LIST, CHANMODES_PARAM_ALWAYS, CHANMODES_PARAM_SET, EXTBAN_TYPES,
         PREFIX_CHARS, PREFIX_MODES, USERMODES_FLAG, USERMODES_PARAM_SET,
     };
-    let base = format!("CHANTYPES=# CHANLIMIT=#:50 CHANNELLEN=64 NICKLEN=32 NAMELEN=128 TOPICLEN=307 KICKLEN=307 AWAYLEN=307 HOSTLEN=64 USERLEN=32 KEYLEN=64 LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES={a},{b},{c},{d} USERMODES=,,{uc},{ud} MAXLIST={a}:100 SILENCE=32 CALLERID=g PREFIX=({pm}){pc} STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,{ext} ACCOUNTEXTBAN=a MONITOR=100 CHATHISTORY=200 MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA=50{}", network, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current(), a = CHANMODES_LIST, b = CHANMODES_PARAM_ALWAYS, c = CHANMODES_PARAM_SET, d = CHANMODES_FLAG, uc = USERMODES_PARAM_SET, ud = USERMODES_FLAG, pm = PREFIX_MODES, pc = PREFIX_CHARS, ext = EXTBAN_TYPES);
+    use crate::config::{
+        AWAYLEN, CHANNELLEN, CHATHISTORY_MAX, HOSTLEN, KEYLEN, KICKLEN, MAXLIST, METADATA_KEYS,
+        MONITOR, NAMELEN, NICKLEN, SILENCE, TOPICLEN, USERLEN,
+    };
+    let base = format!("CHANTYPES=# CHANLIMIT=#:{chanlimit} CHANNELLEN={CHANNELLEN} NICKLEN={NICKLEN} NAMELEN={NAMELEN} TOPICLEN={TOPICLEN} KICKLEN={KICKLEN} AWAYLEN={AWAYLEN} HOSTLEN={HOSTLEN} USERLEN={USERLEN} KEYLEN={KEYLEN} LINELEN={linelen} MODES=4 CASEMAPPING={casemapping} CHANMODES={a},{b},{c},{d} USERMODES=,,{uc},{ud} MAXLIST={a}:{MAXLIST} SILENCE={SILENCE} CALLERID=g PREFIX=({pm}){pc} STATUSMSG=@+ SAFELIST ELIST=CMNTU EXCEPTS INVEX KNOCK UTF8ONLY WHOX BOT=B EXTBAN=~,{ext} ACCOUNTEXTBAN=a MONITOR={MONITOR} CHATHISTORY={CHATHISTORY_MAX} MSGREFTYPES=msgid,timestamp TARGMAX=PRIVMSG:{targmax},NOTICE:{targmax},KICK:{targmax},NAMES: METADATA={METADATA_KEYS}{}", network, chanlimit = cfg.limits.max_channels_per_client, linelen = cfg.limits.max_line_length, targmax = cfg.limits.max_targets, casemapping = crate::casefold::current(), a = CHANMODES_LIST, b = CHANMODES_PARAM_ALWAYS, c = CHANMODES_PARAM_SET, d = CHANMODES_FLAG, uc = USERMODES_PARAM_SET, ud = USERMODES_FLAG, pm = PREFIX_MODES, pc = PREFIX_CHARS, ext = EXTBAN_TYPES);
     let deny = cfg
         .server
         .client_tag_deny
@@ -1833,7 +1837,7 @@ fn usable_username(given: &str) -> String {
         .chars()
         .filter(|c| !c.is_whitespace() && !c.is_control() && !matches!(c, '!' | '@' | ':'))
         .collect();
-    let kept = crate::protocol::truncate_bytes(&kept, 32).to_string();
+    let kept = crate::protocol::truncate_bytes(&kept, crate::config::USERLEN).to_string();
     if kept.is_empty() {
         "user".to_string()
     } else {
@@ -1842,7 +1846,7 @@ fn usable_username(given: &str) -> String {
 }
 
 pub fn is_valid_nick(n: &str) -> bool {
-    if n.is_empty() || n.len() > 32 {
+    if n.is_empty() || n.len() > crate::config::NICKLEN {
         return false;
     }
     let bad_start = [
@@ -1891,7 +1895,7 @@ pub async fn handle_user(
     let realname = msg
         .params
         .get(3)
-        .map(|r| crate::protocol::truncate_bytes(r, 128).to_string())
+        .map(|r| crate::protocol::truncate_bytes(r, crate::config::NAMELEN).to_string())
         .unwrap_or_default();
     if msg.params.len() < 4 || realname.is_empty() {
         drop(state_guard);
@@ -5088,7 +5092,7 @@ pub async fn handle_away(
     // the parameter, the user is no longer away" — Modern §away-message.
     let away_msg = msg
         .trailing()
-        .map(|s| crate::protocol::truncate_bytes(s, 307))
+        .map(|s| crate::protocol::truncate_bytes(s, crate::config::AWAYLEN))
         .filter(|s| !s.is_empty())
         .map(String::from);
     let (source, nick, channel_list) = {
@@ -5326,7 +5330,7 @@ pub async fn handle_sethost(
         .await;
         return Ok(());
     }
-    if !fits_in_a_prefix(&new_host, 64) {
+    if !fits_in_a_prefix(&new_host, crate::config::HOSTLEN) {
         reply_to_client(
             &senders,
             client_id,

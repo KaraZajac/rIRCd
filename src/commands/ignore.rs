@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 /// Names one person may accept. A list, not a set of everybody they know.
 pub const MAX_ACCEPT: usize = 64;
 /// Masks one person may silence. Advertised as `SILENCE=`.
-pub const MAX_SILENCE: usize = 32;
+pub const MAX_SILENCE: usize = crate::config::SILENCE;
 /// How often the owner of a `+g` inbox is told about the same knocker.
 const KNOCK_REMINDER: Duration = Duration::from_secs(60);
 

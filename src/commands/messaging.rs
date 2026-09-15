@@ -2639,7 +2639,7 @@ pub async fn handle_redact(
     Ok(())
 }
 
-const CHATHISTORY_LIMIT: usize = 200;
+const CHATHISTORY_LIMIT: usize = crate::config::CHATHISTORY_MAX;
 
 /// CHATHISTORY: legacy "CHATHISTORY #channel [count]" or spec "CHATHISTORY LATEST #channel * limit".
 /// When client has batch+message-tags, wraps reply in BATCH chathistory.

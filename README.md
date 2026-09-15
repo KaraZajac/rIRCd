@@ -1127,6 +1127,23 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 
 ---
 
+## What it says it does
+
+`ISUPPORT` is a promise. A client that reads `NICKLEN=32` will not offer a
+longer one; one that reads `TOPICLEN=307` will not warn somebody their topic is
+about to be cut. Each of those numbers lives in exactly one place now — the
+token the server sends and the code that enforces it read the same constant —
+because they used to be written twice, which is how `CHANLIMIT` came to
+advertise fifty while the configuration said something else.
+
+`tests/smoke/test_isupport.py` holds the server to it. Every expectation in
+that suite is read out of the server's own `ISUPPORT` rather than written down,
+so it does not check that the numbers are any particular value: it checks that
+the numbers the server gives out are the numbers it keeps. A nick one character
+over the advertised length is refused, a topic fifty over is cut to exactly it,
+a list takes the number it promises and refuses the next, and changing a
+configured limit changes both the token and the behaviour.
+
 ## Performance
 
 Measured rather than claimed. `tests/smoke/throughput.py <receivers> <senders>`

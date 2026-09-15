@@ -236,6 +236,45 @@ fn default_code_expiry() -> i64 {
 /// same ones that do it to everybody else, and somebody has already written
 /// them down. Asked once per address and cached; a lookup that times out
 /// counts as not listed, so a resolver outage never locks everybody out.
+// ─── What the protocol promises ───────────────────────────────────────────────
+//
+// `ISUPPORT` is a promise. A client that reads `NICKLEN=32` will not offer a
+// longer one; one that reads `TOPICLEN=307` will not warn somebody their
+// topic is about to be cut. Every one of these numbers used to be written
+// twice — once in the token the server sends and once in the code that
+// enforces it — which is how `CHANLIMIT` came to advertise fifty while the
+// configuration said something else. They are written once now, and the
+// token is built from the same constant the check reads.
+
+/// Longest nick.
+pub const NICKLEN: usize = 32;
+/// Longest channel name, including the `#`.
+pub const CHANNELLEN: usize = 64;
+/// Longest real name.
+pub const NAMELEN: usize = 128;
+/// Longest topic; anything longer is cut rather than refused.
+pub const TOPICLEN: usize = 307;
+/// Longest kick comment.
+pub const KICKLEN: usize = 307;
+/// Longest away message.
+pub const AWAYLEN: usize = 307;
+/// Longest host, which bounds what `SETHOST` will take.
+pub const HOSTLEN: usize = 64;
+/// Longest username.
+pub const USERLEN: usize = 32;
+/// Longest channel key.
+pub const KEYLEN: usize = 64;
+/// How many masks one of a channel's lists holds.
+pub const MAXLIST: usize = 100;
+/// How many masks somebody may be ignoring at once.
+pub const SILENCE: usize = 32;
+/// How many nicks somebody may watch at once.
+pub const MONITOR: usize = 100;
+/// How many metadata keys one target may have.
+pub const METADATA_KEYS: usize = 50;
+/// The most history one `CHATHISTORY` may ask for.
+pub const CHATHISTORY_MAX: usize = 200;
+
 /// One kind of client, and what that kind is allowed.
 ///
 /// `[limits]` says what *a* client may do, which is the right answer only

@@ -654,7 +654,7 @@ pub async fn handle_whois(
     Ok(())
 }
 
-const MONITOR_LIMIT: usize = 100;
+const MONITOR_LIMIT: usize = crate::config::MONITOR;
 
 /// MONITOR +nicks / -nicks / C / L / S per IRCv3 monitor spec. Sends 730 RPL_MONONLINE, 731 RPL_MONOFFLINE, 732 RPL_MONLIST, 733 RPL_ENDOFMONLIST, 734 ERR_MONLISTFULL.
 pub async fn handle_monitor(

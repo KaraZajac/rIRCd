@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Max metadata keys allowed per target
-const MAX_METADATA_KEYS: usize = 50;
+const MAX_METADATA_KEYS: usize = crate::config::METADATA_KEYS;
 /// A value has to come back out in RPL_KEYVALUE, which shares one 512-byte
 /// line with the nick, the target and the key. Storing more than fits would
 /// mean handing back something the client never sent.

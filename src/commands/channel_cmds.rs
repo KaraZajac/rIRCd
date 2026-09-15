@@ -202,7 +202,7 @@ async fn handle_join_inner(
         let ch_name = ch_name.as_str();
         if ch_name.is_empty()
             || !ch_name.starts_with('#')
-            || ch_name.len() > 64
+            || ch_name.len() > crate::config::CHANNELLEN
             || ch_name.contains(' ')
             || ch_name.contains(',')
             || ch_name.contains('\x07')
@@ -1911,7 +1911,7 @@ pub async fn handle_mode_as(
                             // A key with a space in it cannot be used in a JOIN,
                             // and an empty or over-long one is not a key at all.
                             // Refusing it beats setting one nobody can use.
-                            if key.is_empty() || key.contains(' ') || key.len() > 64 {
+                            if key.is_empty() || key.contains(' ') || key.len() > crate::config::KEYLEN {
                                 reply_to_client(
                                     &senders,
                                     client_id,
@@ -2076,7 +2076,7 @@ pub async fn handle_mode_as(
                                     param_idx += 1;
                                     continue;
                                 }
-                                if ch.bans.len() >= 100 {
+                                if ch.bans.len() >= crate::config::MAXLIST {
                                     reply_to_client(
                                         &senders,
                                         client_id,
@@ -2166,7 +2166,7 @@ pub async fn handle_mode_as(
                                     param_idx += 1;
                                     continue;
                                 }
-                                if ch.quiet_list.len() >= 100 {
+                                if ch.quiet_list.len() >= crate::config::MAXLIST {
                                     reply_to_client(
                                         &senders,
                                         client_id,
@@ -2417,7 +2417,7 @@ pub async fn handle_mode_as(
                     'e' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
-                                if ch.ban_exceptions.len() >= 100 {
+                                if ch.ban_exceptions.len() >= crate::config::MAXLIST {
                                     reply_to_client(
                                         &senders,
                                         client_id,
@@ -2498,7 +2498,7 @@ pub async fn handle_mode_as(
                     'I' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
-                                if ch.invite_exceptions.len() >= 100 {
+                                if ch.invite_exceptions.len() >= crate::config::MAXLIST {
                                     reply_to_client(
                                         &senders,
                                         client_id,
@@ -3135,7 +3135,7 @@ pub async fn handle_topic(
         }
 
         // Enforce TOPICLEN=307
-        let new_topic = new_topic.map(|t| crate::protocol::truncate_bytes(&t, 307).to_string());
+        let new_topic = new_topic.map(|t| crate::protocol::truncate_bytes(&t, crate::config::TOPICLEN).to_string());
 
         let topic_time_ts = chrono::Utc::now().timestamp();
         ch.topic = new_topic.clone();
@@ -3232,7 +3232,7 @@ pub async fn handle_kick(
         .map(|s| s.as_str())
         .unwrap_or(kicker_nick.as_str())
         .chars()
-        .take(307)
+        .take(crate::config::KICKLEN)
         .collect::<String>();
 
     if ch_name.is_empty() || target_nick.is_empty() {

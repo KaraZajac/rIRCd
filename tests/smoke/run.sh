@@ -201,6 +201,15 @@ max_clients = 2
 ping_secs = 300
 sendq = 64
 
+# Room to fill a list without being throttled. Flood control drops what it
+# will not carry, so a suite that checks a hundred-entry limit has to be
+# allowed to send a hundred entries; 127.0.0.8 is nobody else's address here.
+[[classes]]
+name = "smoke-bulk"
+hosts = ["127.0.0.8"]
+flood_burst = 400
+flood_rate = 200
+
 [network]
 name = "SmokeNet"
 
@@ -310,7 +319,7 @@ export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 status=0
 if [ "$SERVE_ONLY" = 0 ]; then
   if [ ${#SUITES[@]} -eq 0 ]; then
-    SUITES=(test_core.py test_ircv3.py test_features.py test_websocket.py test_account.py test_ownership.py test_management.py test_webpush.py test_multiclient.py test_hostile.py)
+    SUITES=(test_core.py test_isupport.py test_ircv3.py test_features.py test_websocket.py test_account.py test_ownership.py test_management.py test_webpush.py test_multiclient.py test_hostile.py)
   fi
   for suite in "${SUITES[@]}"; do
     say "Running $suite"
