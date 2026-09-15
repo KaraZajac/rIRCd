@@ -1154,6 +1154,41 @@ async fn send_burst(
         }
     }
 
+    // What the network has decided is off-limits. A peer that was down when
+    // a ban, a reservation or a filter was set would otherwise carry the
+    // network's traffic without the network's rules — it has its own copy of
+    // whatever it was here for, and this is the rest.
+    //
+    // Capped, because a server that has been running for years has a ban
+    // list that is not a greeting.
+    const MOST_RULES_BURSTED: usize = 512;
+    let (bans, reservations) = {
+        let state = ctx.state.read().await;
+        let now = chrono::Utc::now().timestamp();
+        (
+            state
+                .server_bans
+                .iter()
+                .filter(|b| !b.is_expired(now))
+                .take(MOST_RULES_BURSTED)
+                .cloned()
+                .collect::<Vec<_>>(),
+            state
+                .reservations
+                .iter()
+                .filter(|r| !r.is_expired(now))
+                .take(MOST_RULES_BURSTED)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    for ban in &bans {
+        let _ = tx.send(kline_message(ban, our_sid)).await;
+    }
+    for reservation in &reservations {
+        let _ = tx.send(resv_message(reservation, our_sid)).await;
+    }
+
     // The filters this server holds. A peer that was down when one was set
     // would otherwise carry the network's traffic without the network's
     // rule; every other announcement here is about something that exists
@@ -3109,6 +3144,108 @@ async fn accept_remote_unspamfilter(ctx: &LinkContext, msg: &Message, peer_sid: 
     ctx.links.read().await.relay(msg, Some(peer_sid));
 }
 
+/// `:<sid> RESV <set_at> <expires> <set_by> <pattern> :<reason>` — a name
+/// reserved on another server. The reason comes last because it is the one
+/// part that holds spaces.
+async fn accept_remote_resv(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let (Some(set_at), Some(expires), Some(set_by), Some(pattern)) = (
+        msg.params.first().and_then(|t| t.parse::<i64>().ok()),
+        msg.params.get(1).and_then(|t| t.parse::<i64>().ok()),
+        msg.params.get(2).cloned(),
+        msg.params.get(3).cloned(),
+    ) else {
+        warn!(peer = %peer_sid, "Malformed RESV from a linked server");
+        return;
+    };
+    if crate::commands::server_cmds::reservation_says_nothing(&pattern) {
+        warn!(peer = %peer_sid, %pattern, "Refusing a reservation that names nothing");
+        return;
+    }
+    let reservation = crate::persist::Reservation {
+        pattern: pattern.clone(),
+        reason: msg
+            .params
+            .get(4)
+            .cloned()
+            .unwrap_or_else(|| "No reason given".into()),
+        set_by,
+        set_at,
+        expires_at: (expires > 0).then_some(expires),
+    };
+    crate::commands::server_cmds::install_reservation(&ctx.state, reservation.clone()).await;
+    let (pool, server_name) = {
+        let cfg = ctx.cfg.read().await;
+        (cfg.db.clone(), cfg.server.name.clone())
+    };
+    if let Some(pool) = pool {
+        let _ = crate::persist::save_reservation(&pool, &reservation).await;
+    }
+    info!(peer = %peer_sid, %pattern, "Reservation added from the network");
+    crate::commands::registration::notify_opers(
+        &ctx.state,
+        &ctx.senders,
+        &server_name,
+        'b',
+        &format!(
+            "{} reserved {pattern} elsewhere on the network ({})",
+            reservation.set_by, reservation.reason
+        ),
+    )
+    .await;
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// `:<sid> UNRESV <pattern>` — a name given back on another server.
+async fn accept_remote_unresv(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
+    let Some(pattern) = msg.params.first().cloned() else {
+        return;
+    };
+    {
+        let mut state = ctx.state.write().await;
+        state.reservations.retain(|r| r.pattern != pattern);
+    }
+    let pool = ctx.cfg.read().await.db.clone();
+    if let Some(pool) = pool {
+        crate::persist::delete_reservation(&pool, &pattern).await;
+    }
+    info!(peer = %peer_sid, %pattern, "Reservation removed from the network");
+    ctx.links.read().await.relay(msg, Some(peer_sid));
+}
+
+/// Tell the network about a name reserved here.
+pub async fn announce_resv(cfg: &Config, r: &crate::persist::Reservation) {
+    if cfg.links_runtime.is_none() {
+        return;
+    }
+    broadcast(cfg, resv_message(r, &our_sid(cfg))).await;
+}
+
+fn resv_message(r: &crate::persist::Reservation, sid: &str) -> Message {
+    Message::new(
+        "RESV",
+        vec![
+            r.set_at.to_string(),
+            r.expires_at.unwrap_or(0).to_string(),
+            r.set_by.clone(),
+            r.pattern.clone(),
+            r.reason.clone(),
+        ],
+    )
+    .with_prefix(sid)
+}
+
+/// Tell the network a name was given back here.
+pub async fn announce_unresv(cfg: &Config, pattern: &str) {
+    if cfg.links_runtime.is_none() {
+        return;
+    }
+    broadcast(
+        cfg,
+        Message::new("UNRESV", vec![pattern.to_string()]).with_prefix(our_sid(cfg)),
+    )
+    .await;
+}
+
 /// Tell the network about a filter added here.
 pub async fn announce_spamfilter(cfg: &Config, filter: &crate::spamfilter::SpamFilter) {
     if cfg.links_runtime.is_none() {
@@ -3733,25 +3870,25 @@ pub async fn announce_kline(cfg: &Config, ban: &crate::persist::ServerBan) {
     if cfg.links_runtime.is_none() {
         return;
     }
-    broadcast(
-        cfg,
-        Message::new(
-            match ban.kind {
-                crate::persist::BanKind::Kline => "KLINE",
-                crate::persist::BanKind::Dline => "DLINE",
-                crate::persist::BanKind::Shun => "SHUN",
-            },
-            vec![
-                ban.mask.clone(),
-                ban.set_at.to_string(),
-                ban.expires_at.unwrap_or(0).to_string(),
-                ban.set_by.clone(),
-                ban.reason.clone(),
-            ],
-        )
-        .with_prefix(our_sid(cfg)),
+    broadcast(cfg, kline_message(ban, &our_sid(cfg))).await;
+}
+
+fn kline_message(ban: &crate::persist::ServerBan, sid: &str) -> Message {
+    Message::new(
+        match ban.kind {
+            crate::persist::BanKind::Kline => "KLINE",
+            crate::persist::BanKind::Dline => "DLINE",
+            crate::persist::BanKind::Shun => "SHUN",
+        },
+        vec![
+            ban.mask.clone(),
+            ban.set_at.to_string(),
+            ban.expires_at.unwrap_or(0).to_string(),
+            ban.set_by.clone(),
+            ban.reason.clone(),
+        ],
     )
-    .await;
+    .with_prefix(sid)
 }
 
 /// Tell the network a server ban was lifted here.
@@ -4005,6 +4142,14 @@ async fn handle_link_message(
         }
         "ACCOUNT" => {
             accept_remote_account(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "RESV" => {
+            accept_remote_resv(ctx, msg, peer_sid).await;
+            std::ops::ControlFlow::Continue(())
+        }
+        "UNRESV" => {
+            accept_remote_unresv(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }
         "SPAMFILTER" => {

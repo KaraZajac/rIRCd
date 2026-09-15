@@ -47,7 +47,7 @@ def make_account(name, password=PW):
     clear_mail()
     c = Client(name)
     c.send(f"REGISTER * {name}@example.org {password}")
-    c.read(2.5)
+    c.wait_for("REGISTER", seconds=20)
     mail = wait_for_mail(1, seconds=15)
     found = re.search(rf"VERIFY {name} ([A-Z0-9]{{8}})", mail[0])
     if not found:
@@ -350,7 +350,7 @@ stayer.close()
 fresh = Client(bob)
 mark = fresh.mark()
 fresh.send(f"REGISTER * {bob}@example.org {PW}")
-fresh.read(2.5)
+fresh.wait_for("REGISTER", seconds=20)
 check("the name is free to register again", bool(fresh.find("REGISTER", lines=fresh.since(mark)))
       and not fresh.find("ACCOUNT_EXISTS", lines=fresh.since(mark)), fresh.since(mark)[-2:])
 fresh.close()
@@ -880,5 +880,72 @@ check("and is told plainly when there is no such account",
       bool(snoop.find("FAIL ACCOUNTINFO NO_SUCH_ACCOUNT", lines=snoop.since(smark))), snoop.since(smark)[-2:])
 snoop.close()
 mv.close()
+
+section("RESV: names this network keeps")
+
+rs = Client(f"rs{RUN}")
+rs.send(f"OPER smokeoper {OPER_PW}")
+rs.wait_for(" 381 ", " 464 ", seconds=5)
+civ2 = Client(f"cv{RUN}")
+cmark = civ2.mark()
+civ2.send(f"RESV #anything{RUN} :mine now")
+civ2.read(1.0)
+check("a user reserves nothing", bool(civ2.find(" 481 ", lines=cmark and civ2.since(cmark))), civ2.since(cmark)[-2:])
+
+rmark = rs.mark()
+rs.send("RESV #* :everything")
+rs.send(f"RESV rs{RUN} :my own nick")
+rs.read(1.2)
+refused = rs.since(rmark)
+check("a pattern that names nothing is refused",
+      bool(rs.find("FAIL RESV MASK_TOO_BROAD", lines=refused)), refused[-3:])
+check("and so is one covering the operator's own nick",
+      bool(rs.find("FAIL RESV MATCHES_YOURSELF", lines=refused)), refused[-3:])
+
+rmark = rs.mark()
+rs.send(f"RESV #staff{RUN} :for the people who run this place")
+rs.send(f"RESV serv{RUN}* :nobody here speaks for services")
+rs.read(1.2)
+check("a channel and a nick can both be kept",
+      len(rs.find("NOTE RESV RESERVED", lines=rs.since(rmark))) == 2, rs.since(rmark)[-3:])
+
+cmark = civ2.mark()
+civ2.send(f"JOIN #staff{RUN}")
+civ2.read(1.2)
+check("a reserved channel is refused, with the reason",
+      bool(civ2.find(" 479 ", "run this place", lines=civ2.since(cmark))), civ2.since(cmark)[-2:])
+cmark = civ2.mark()
+civ2.send(f"NICK serv{RUN}bot")
+civ2.read(1.2)
+check("and a reserved nick likewise",
+      bool(civ2.find(" 432 ", "speaks for services", lines=civ2.since(cmark))), civ2.since(cmark)[-2:])
+cmark = civ2.mark()
+civ2.send(f"JOIN #staffroom{RUN}")
+civ2.read(1.2)
+check("a name the pattern does not cover is nobody's business",
+      bool(civ2.find("JOIN", f"#staffroom{RUN}", lines=civ2.since(cmark))), civ2.since(cmark)[-2:])
+
+rmark = rs.mark()
+rs.send(f"JOIN #staff{RUN}")
+rs.read(1.2)
+check("an operator is not held to it", bool(rs.find("JOIN", f"#staff{RUN}", lines=rs.since(rmark))), rs.since(rmark)[-2:])
+
+rs.send(f"UNRESV #staff{RUN}")
+rs.send(f"UNRESV serv{RUN}*")
+rs.read(1.2)
+cmark = civ2.mark()
+civ2.send(f"JOIN #staff{RUN}")
+civ2.send(f"NICK serv{RUN}bot")
+civ2.read(1.5)
+back = civ2.since(cmark)
+check("UNRESV gives both back",
+      bool(civ2.find("JOIN", f"#staff{RUN}", lines=back)) and bool(civ2.find("NICK", f"serv{RUN}bot", lines=back)), back[-3:])
+rmark = rs.mark()
+rs.send(f"UNRESV #never{RUN}")
+rs.read(1.0)
+check("and says so when there was nothing to give back",
+      bool(rs.find("NOTE UNRESV NO_SUCH_RESV", lines=rs.since(rmark))), rs.since(rmark)[-2:])
+civ2.close()
+rs.close()
 
 summary("management")

@@ -362,7 +362,7 @@ GHOST_PASSWORD = "hunter2hunter2"
 owner = Client(GHOST_NICK, port=B_PORT)
 mark = owner.mark()
 owner.send(f"REGISTER * {GHOST_NICK}@example.invalid {GHOST_PASSWORD}")
-owner.read(2.5)
+owner.wait_for("REGISTER", seconds=20)
 registered = bool(owner.find(" 900 ", lines=owner.since(mark))) or bool(
     owner.find("REGISTER SUCCESS", lines=owner.since(mark)))
 check("an account can be registered on B", registered, owner.since(mark)[-3:])
@@ -686,6 +686,30 @@ if sf.find(" 381 "):
     b_talk.close()
 sf.close()
 
+section("a reserved name is the network's, not one server's")
+rv = Client(f"rv{RUN}", port=A_PORT)
+rv.send(f"OPER linkoper {os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+rv.wait_for(" 381 ", " 464 ", seconds=5)
+if rv.find(" 381 "):
+    rv.send(f"RESV #keep{RUN} :ours everywhere")
+    rv.read(1.2)
+    stored = eventually(lambda: side_db("b", f"SELECT COUNT(*) FROM reservations WHERE pattern = '#keep{RUN}'") == "1", seconds=8)
+    check("a reservation set on A is written down on B", bool(stored), side_db("b", "SELECT pattern FROM reservations"))
+    seeker = Client(f"seek{RUN}", port=B_PORT)
+    seeker.send(f"JOIN #keep{RUN}")
+    seeker.read(1.5)
+    check("and B keeps the name too, with the reason",
+          bool(seeker.find(" 479 ", "ours everywhere")), seeker.lines[-2:])
+    rv.send(f"UNRESV #keep{RUN}")
+    rv.read(1.2)
+    gone = eventually(lambda: side_db("b", f"SELECT COUNT(*) FROM reservations WHERE pattern = '#keep{RUN}'") == "0", seconds=8)
+    check("and giving it back on A gives it back on B", bool(gone), side_db("b", "SELECT pattern FROM reservations"))
+    seeker.send(f"JOIN #keep{RUN}")
+    seeker.read(1.5)
+    check("so the name is anybody's again", bool(seeker.find("JOIN", f"#keep{RUN}")), seeker.lines[-2:])
+    seeker.close()
+rv.close()
+
 section("a shun set on A silences its man on B")
 sn = Client(f"sn{RUN}", port=A_PORT)
 sn.send(f"OPER linkoper {os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
@@ -792,6 +816,10 @@ if shaper.find(" 381 "):
     check("dropping a server that is not attached is refused",
           bool(shaper.find("FAIL SQUIT NO_SUCH_LINK", lines=shaper.since(mark))), shaper.since(mark)[-2:])
 
+    # Decided while B was away — whether B learns it from the burst or from
+    # the announcement when it returns, it must end up holding it.
+    shaper.send(f"RESV #whileaway{RUN} :decided without B")
+    shaper.read(0.8)
     mark = shaper.mark()
     shaper.send(f"CONNECT {B_NAME}")
     shaper.read(2.0)
@@ -803,6 +831,10 @@ if shaper.find(" 381 "):
     shaper.read(0.5)
     # Autoconnect may well have brought B back before CONNECT was even sent,
     # so the notice is looked for from the SQUIT onward.
+    learned = eventually(lambda: side_db("b", f"SELECT COUNT(*) FROM reservations WHERE pattern = '#whileaway{RUN}'") == "1", seconds=20)
+    check("and B holds what was decided while it was away", bool(learned), side_db("b", "SELECT pattern FROM reservations"))
+    shaper.send(f"UNRESV #whileaway{RUN}")
+    shaper.read(0.8)
     check("and every operator hears that it is back",
           bool(shaper.find("NOTICE", "Link with", B_NAME, "established", lines=shaper.since(squit_mark))),
           [l for l in shaper.since(squit_mark) if "NOTICE" in l][-3:])

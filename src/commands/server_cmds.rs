@@ -1041,6 +1041,17 @@ pub async fn handle_help(
                 "  operators.",
             ],
         ),
+        Some("RESV") => (
+            "RESV",
+            &[
+                "RESV [<seconds>] <pattern> :<reason>",
+                "  A name this network keeps for itself. A pattern beginning with #",
+                "  is about channels and anything else about nicks, so #help* never",
+                "  stops anybody being called helpdesk. Whoever asks for one is told",
+                "  why. Operators are not held to it, and a channel that already has",
+                "  people in it keeps them. UNRESV gives the name back.",
+            ],
+        ),
         Some("SHUN") => (
             "SHUN",
             &[
@@ -1157,7 +1168,7 @@ pub async fn handle_help(
                 "  CHANOWN CHANACCESS CHANDROP ACCEPT SILENCE",
                 "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS CONNECT SQUIT SANICK",
                 "  KLINE DLINE SNOMASK MLOCK SAJOIN SAPART SAMODE TESTMASK MAP GROUP NOEXPIRE",
-                "  SPAMFILTER SHUN TRACE SETEMAIL ACCOUNTINFO",
+                "  SPAMFILTER SHUN TRACE SETEMAIL ACCOUNTINFO RESV",
                 "  STATS LUSERS",
             ],
         ),
@@ -4465,4 +4476,227 @@ async fn stats_classes(
         );
     }
     rows
+}
+
+/// Whether a reservation pattern says anything. One made of wildcards keeps
+/// the whole network out of its own channels.
+pub fn reservation_says_nothing(pattern: &str) -> bool {
+    reservation_too_broad(pattern)
+}
+
+fn reservation_too_broad(pattern: &str) -> bool {
+    pattern
+        .chars()
+        .filter(|c| !matches!(c, '*' | '?' | '#' | '&'))
+        .count()
+        < 2
+}
+
+/// `RESV [<seconds>] <pattern> :<reason>` — a name this network keeps.
+///
+/// A pattern beginning with `#` is about channels and anything else about
+/// nicks, so `#help*` never stops anybody being called `helpdesk`. Whoever
+/// asks for a reserved name is told why, which is the difference between
+/// this and a spam filter: a filter is quiet on purpose, and a reservation
+/// is a rule people are meant to be able to read.
+///
+/// Operators are not held to it — reserving the staff channel and then
+/// being unable to enter it would be a strange way to run a network — and a
+/// channel that already has people in it keeps them; the reservation stops
+/// anybody else coming in.
+pub async fn handle_resv(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((nick, own_source, _own_ip)) = may_ban(&state, &senders, client_id, cfg, label).await
+    else {
+        return Ok(());
+    };
+    let Some((duration, pattern, reason)) =
+        ban_arguments(&msg, "RESV", &senders, client_id, cfg, label).await
+    else {
+        return Ok(());
+    };
+    if reservation_too_broad(&pattern) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "RESV".into(),
+                    "MASK_TOO_BROAD".into(),
+                    pattern,
+                    "A reservation needs at least two characters that are not wildcards".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    // Reserving your own name is how an operator locks themselves out of
+    // their own nick at the next reconnection.
+    let own_nick = own_source.split('!').next().unwrap_or(&nick).to_string();
+    if !pattern.starts_with('#')
+        && !pattern.starts_with('&')
+        && crate::user::glob_match(&pattern.to_lowercase(), &own_nick.to_lowercase())
+    {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "RESV".into(),
+                    "MATCHES_YOURSELF".into(),
+                    pattern,
+                    "That pattern covers the nick you are using".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    let reservation = crate::persist::Reservation {
+        pattern: pattern.clone(),
+        reason,
+        set_by: nick.clone(),
+        set_at: now,
+        expires_at: (duration > 0).then(|| now.saturating_add(duration)),
+    };
+    install_reservation(&state, reservation.clone()).await;
+    if let Some(ref pool) = cfg.db {
+        if let Err(e) = crate::persist::save_reservation(pool, &reservation).await {
+            tracing::error!(client_id, %pattern, "RESV: could not store: {e}");
+        }
+    }
+    crate::link::announce_resv(cfg, &reservation).await;
+    tracing::warn!(oper = %nick, %pattern, "Reservation added");
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        'b',
+        &format!(
+            "{nick} reserved {pattern} ({}){}",
+            reservation.reason,
+            match reservation.expires_at {
+                Some(at) => format!(" until {}", clock_time(at)),
+                None => String::new(),
+            }
+        ),
+    )
+    .await;
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTE",
+            vec![
+                "RESV".into(),
+                "RESERVED".into(),
+                pattern.clone(),
+                format!(
+                    "{pattern} is reserved for this network{}",
+                    if reservation.is_channel() {
+                        "; anybody already in such a channel stays"
+                    } else {
+                        ""
+                    }
+                ),
+            ],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    Ok(())
+}
+
+/// Put a reservation into this server's list, replacing one on the same
+/// pattern.
+pub async fn install_reservation(
+    state: &Arc<RwLock<ServerState>>,
+    reservation: crate::persist::Reservation,
+) {
+    let mut state_w = state.write().await;
+    state_w
+        .reservations
+        .retain(|r| r.pattern != reservation.pattern);
+    state_w.reservations.push(reservation);
+}
+
+/// `UNRESV <pattern>` — give a name back.
+pub async fn handle_unresv(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((nick, _, _)) = may_ban(&state, &senders, client_id, cfg, label).await else {
+        return Ok(());
+    };
+    let Some(pattern) = msg.params.first().cloned() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("461", vec![nick, "UNRESV".into(), "Not enough parameters".into()])
+                .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let removed = match cfg.db {
+        Some(ref pool) => crate::persist::delete_reservation(pool, &pattern).await,
+        None => false,
+    };
+    let known = {
+        let mut state_w = state.write().await;
+        let before = state_w.reservations.len();
+        state_w.reservations.retain(|r| r.pattern != pattern);
+        state_w.reservations.len() != before
+    };
+    crate::link::announce_unresv(cfg, &pattern).await;
+    tracing::warn!(oper = %nick, %pattern, removed, "Reservation removed");
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        'b',
+        &format!("{nick} gave {pattern} back"),
+    )
+    .await;
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTE",
+            vec![
+                "UNRESV".into(),
+                if known || removed { "RELEASED" } else { "NO_SUCH_RESV" }.into(),
+                pattern.clone(),
+                if known || removed {
+                    format!("{pattern} is anybody's again")
+                } else {
+                    format!("{pattern} was not reserved")
+                },
+            ],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    Ok(())
 }

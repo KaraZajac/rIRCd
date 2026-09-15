@@ -29,7 +29,7 @@ def make_account(name):
     clear_mail()
     c = Client(name)
     c.send(f"REGISTER * {name}@example.org {PW}")
-    c.read(2.5)
+    c.wait_for("REGISTER", seconds=20)
     mail = wait_for_mail(1, seconds=15)
     found = re.search(rf"VERIFY {name} ([A-Z0-9]{{8}})", mail[0])
     if not found:

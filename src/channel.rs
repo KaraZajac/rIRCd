@@ -76,7 +76,7 @@ pub const USERMODES_PARAM_SET: &str = "s";
 /// User modes that never carry one.
 pub const USERMODES_FLAG: &str = "BgiorRw";
 /// The extended ban types this server understands, the letters after `~`.
-pub const EXTBAN_TYPES: &str = "OSajmrt";
+pub const EXTBAN_TYPES: &str = "OSajmnrt";
 
 /// The same letters in one sorted string, which is how `RPL_MYINFO` wants
 /// them: a set rather than a grammar.
@@ -467,9 +467,31 @@ impl Channel {
     pub fn is_banned(&self, subject: &Subject) -> bool {
         self.bans
             .iter()
-            // A mute extban lives on the ban list but is not a ban on entry.
-            .filter(|b| !crate::timed_bans::peel_timed(b).starts_with("~m:"))
+            // A mute or a nick lock lives on the ban list but is not a ban on
+            // coming in: they are about what somebody may do once they are
+            // here.
+            .filter(|b| {
+                let peeled = crate::timed_bans::peel_timed(b);
+                !peeled.starts_with("~m:") && !peeled.starts_with("~n:")
+            })
             .any(|b| Self::mask_covers(b, subject))
+    }
+
+    /// Whether this channel keeps this person's name still: `+b ~n:mask`,
+    /// the one-person version of `+N`. Lifted by `+e ~n:mask`, as a mute is.
+    pub fn forbids_nick_change(&self, subject: &Subject) -> bool {
+        let exempt = self
+            .ban_exceptions
+            .iter()
+            .filter_map(|e| crate::timed_bans::peel_timed(e).strip_prefix("~n:"))
+            .any(|m| Self::mask_covers(m, subject));
+        if exempt {
+            return false;
+        }
+        self.bans
+            .iter()
+            .filter_map(|b| crate::timed_bans::peel_timed(b).strip_prefix("~n:"))
+            .any(|m| Self::mask_covers(m, subject))
     }
 
     /// Whether the founder's mode lock says this change may not be made:
@@ -868,6 +890,19 @@ mod tests {
         ch.bans.push("~t:1h:~j:#raiders".into());
         assert!(ch.is_banned(&sub("eve!u@host").in_channels(&raiding)));
         assert!(!ch.is_banned(&sub("eve!u@host")));
+    }
+
+    /// `~n:` keeps one person's name still without keeping the room's still.
+    #[test]
+    fn a_nick_extban_locks_a_name_without_being_a_ban() {
+        let mut ch = Channel::new("#n".into());
+        ch.bans.push("~n:fidget!*@*".into());
+        let fidget = sub("fidget!u@host");
+        assert!(ch.forbids_nick_change(&fidget));
+        assert!(!ch.is_banned(&fidget), "a nick lock is not a ban on coming in");
+        assert!(!ch.forbids_nick_change(&sub("steady!u@host")));
+        ch.ban_exceptions.push("~n:fidget!*@*".into());
+        assert!(!ch.forbids_nick_change(&fidget), "an exception lifts it");
     }
 
     /// `~S:` asks for the certificate, `~O` for the badge.

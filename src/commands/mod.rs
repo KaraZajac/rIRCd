@@ -1113,6 +1113,12 @@ pub async fn handle_message(
         "TRACE" => {
             server_cmds::handle_trace(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
+        "RESV" => {
+            server_cmds::handle_resv(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "UNRESV" => {
+            server_cmds::handle_unresv(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
         "SHUN" => {
             server_cmds::handle_shun(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }

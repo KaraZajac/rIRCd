@@ -46,7 +46,7 @@ isupport = " ".join(alice.find(" 005 "))
 # offer, so the tokens are worth pinning alongside the behaviour.
 for token in ["CHANTYPES=#", "PREFIX=(ohv)@%+", "NETWORK=", "CASEMAPPING=", "CHATHISTORY=",
               "STATUSMSG=@+", "KNOCK", "EXCEPTS", "INVEX", "SAFELIST", "ELIST=CMNTU",
-              "EXTBAN=~,OSajmrt", "MONITOR=", "TARGMAX=", "METADATA=", "UTF8ONLY", "WHOX"]:
+              "EXTBAN=~,OSajmnrt", "MONITOR=", "TARGMAX=", "METADATA=", "UTF8ONLY", "WHOX"]:
     check(f"ISUPPORT has {token}", token in isupport, isupport[:300])
 check("VAPID advertised to a draft/webpush client", "VAPID=" in isupport, isupport[:300])
 

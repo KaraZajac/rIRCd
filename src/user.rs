@@ -917,6 +917,8 @@ pub struct ServerState {
     /// that holds it, lower-cased. Kept here so a NICK never waits on the
     /// database to learn that a name is somebody's.
     pub grouped_nicks: HashMap<String, String>,
+    /// Names this network keeps for itself: see `RESV`.
+    pub reservations: Vec<crate::persist::Reservation>,
     /// The kinds of client this server is telling apart, as they were when
     /// it started. The accept path took its copy then and is not given a new
     /// one, so this is what is actually in force — a `REHASH` can change the
@@ -1314,6 +1316,17 @@ impl ServerState {
             // they were not turned away.
             ban.kind.closes_the_connection() && !ban.is_expired(now) && ban.matches(source, ip)
         })
+    }
+
+    /// The reservation covering a name, if one does. A channel name is only
+    /// matched by a channel reservation and a nick by a nick one, so `#help*`
+    /// never keeps somebody from being called `helpdesk`.
+    pub fn reservation_for(&self, name: &str) -> Option<&crate::persist::Reservation> {
+        let now = Utc::now().timestamp();
+        let channel = name.starts_with('#') || name.starts_with('&');
+        self.reservations
+            .iter()
+            .find(|r| r.is_channel() == channel && !r.is_expired(now) && r.covers(name))
     }
 
     /// Whether this user is shunned: they stay connected, and nothing they

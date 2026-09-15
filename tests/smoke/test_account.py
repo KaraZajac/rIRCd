@@ -50,7 +50,7 @@ section("REGISTER with a valid address")
 carol = Client("carol")
 mark = carol.mark()
 carol.send(f"REGISTER * carol@example.org {PASSWORD}")
-carol.read(2.5)
+carol.wait_for("REGISTER", seconds=20)
 new = carol.since(mark)
 check("REGISTER VERIFICATION_REQUIRED", bool(carol.find("REGISTER VERIFICATION_REQUIRED carol", lines=new)), new)
 check("client is not logged in yet", not carol.find(" 900 ", lines=new), new)
@@ -129,7 +129,7 @@ db(
 stale = Client("stale")
 mark = stale.mark()
 stale.send(f"REGISTER * fresh@example.org {PASSWORD}")
-stale.read(2.5)
+stale.wait_for("REGISTER", seconds=20)
 check("re-registration allowed once the code expired",
       bool(stale.find("REGISTER VERIFICATION_REQUIRED stale", lines=stale.since(mark))), stale.since(mark))
 check("exactly one row for the name", db("SELECT COUNT(*) FROM users WHERE nick_lower='stale'") == "1")
@@ -139,12 +139,12 @@ section("an unexpired pending registration holds the name")
 held = Client("stale2")
 mark = held.mark()
 held.send(f"REGISTER * held@example.org {PASSWORD}")
-held.read(2.5)
+held.wait_for("REGISTER", seconds=20)
 held.close()
 again = Client("stale2b")
 mark = again.mark()
 again.send(f"REGISTER stale2 other@example.org {PASSWORD}")
-again.read(2.0)
+again.wait_for("REGISTER", seconds=20)
 check("second registration is refused",
       bool(again.find("FAIL REGISTER", lines=again.since(mark))), again.since(mark))
 again.close()
@@ -153,7 +153,7 @@ section("before-connect")
 early = connect_negotiating("earlybird")
 mark = early.mark()
 early.send(f"REGISTER * early@example.org {PASSWORD}")
-early.read(2.5)
+early.wait_for("REGISTER", seconds=20)
 check("REGISTER works before CAP END",
       bool(early.find("REGISTER VERIFICATION_REQUIRED earlybird", lines=early.since(mark))), early.since(mark))
 early.send("CAP END")
@@ -202,7 +202,9 @@ if CONFIG:
             c = Client(f"burst{STAMP}{n}")
             mark = c.mark()
             c.send(f"REGISTER * burst{STAMP}{n}@example.org {PASSWORD}")
-            c.read(1.2)
+            # Either answer is an answer; waiting for one beats napping for
+            # long enough that a busy machine usually manages it.
+            c.wait_for("REGISTER", seconds=20)
             answers.append(" ".join(c.since(mark)))
             c.close()
         refused = [a for a in answers if "Too many registrations" in a]
@@ -222,12 +224,12 @@ if CONFIG:
         clear_mail()
         twice = Client(f"same{STAMP}")
         twice.send(f"REGISTER * shared{STAMP}@example.org {PASSWORD}")
-        twice.read(1.2)
+        twice.wait_for("REGISTER", seconds=20)
         first_mail = len(wait_for_mail(1, seconds=8))
         again = Client(f"same{STAMP}b")
         mark = again.mark()
         again.send(f"REGISTER * shared{STAMP}@example.org {PASSWORD}")
-        again.read(1.2)
+        again.wait_for("REGISTER", seconds=20)
         check("a second registration to the same address within the gap is refused",
               bool(again.find("TEMPORARILY_UNAVAILABLE", lines=again.since(mark))) and first_mail == 1,
               (first_mail, again.since(mark)[-2:]))
@@ -249,7 +251,8 @@ if CONFIG:
     def verified_account(nick):
         c = Client(nick)
         c.send(f"REGISTER * {nick}@example.org {PASSWORD}")
-        c.read(2.0)
+        # The row has to exist before the next line marks it verified.
+        c.wait_for("REGISTER", seconds=20)
         c.close()
         db(f"UPDATE users SET verified = 1 WHERE nick_lower = '{nick.lower()}'")
 
@@ -373,7 +376,7 @@ if CONFIG:
     check("nobody else can take a grouped nick", bool(stranger.find(" 433 ", "registered", lines=stranger.since(smark))), stranger.since(smark)[-2:])
     smark = stranger.mark()
     stranger.send(f"REGISTER alt{STAMP} str@example.org {PASSWORD}")
-    stranger.read(1.5)
+    stranger.wait_for("REGISTER", seconds=20)
     check("nor register it as an account", bool(stranger.find("FAIL REGISTER", lines=stranger.since(smark))), stranger.since(smark)[-2:])
     stranger.close()
     # Away from the grouped nick and back again: it is still theirs to wear.

@@ -677,6 +677,29 @@ Accounts are keyed by nick (lowercase). There is no separate admin interface for
 
 ---
 
+### Reserved names
+
+`RESV [<seconds>] <pattern> :<reason>` keeps a name for the network.
+A pattern beginning with `#` is about channels and anything else about nicks,
+so `#help*` never stops anybody being called `helpdesk`.
+
+```
+RESV #staff :for the people who run this place
+RESV *serv :nobody here speaks for services
+```
+
+Somebody who asks for a reserved channel is told why (479), and somebody who
+asks for a reserved nick likewise (432). That is the difference between this
+and a spam filter: a filter is quiet on purpose, because telling a spammer
+what caught them hands them the way around it, while a reservation is a rule
+people are meant to be able to read.
+
+Operators are not held to it — reserving the staff channel and then being
+unable to enter it would be a strange way to run a network — and a channel
+that already has people in it keeps them; the reservation stops anybody else
+coming in. Reservations are stored, cross links, and expire on their own when
+given a duration. `UNRESV <pattern>` gives the name back.
+
 ### Shuns
 
 A K-line closes the connection, which tells whoever was behind it to come back
@@ -725,6 +748,8 @@ delivered", a blocked topic "not set", and a filtered quit reason becomes
 
 Filters are kept in the database, carried to every server when they are set,
 and bursted to a server that links afterwards, so the network agrees on them.
+Server bans and reservations are bursted the same way, capped at 512 of each:
+a server that has been running for years has a ban list that is not a greeting.
 `SPAMFILTER TEST` asks what a line would hit without anybody sending it, and
 `LIST` shows each filter's id, what it watches, and how many times it has
 matched since the server started. At most 64 filters, each pattern at most 512
@@ -961,7 +986,7 @@ still accepted in `CAP REQ` so older clients keep working.
 | **typing** | Full | TAGMSG with `+typing=active/paused/done`; forwarded via client-only tag relay |
 | **reply** | Full | Messages with `+reply=<msgid>` tag forwarded as-is |
 | **ACCOUNTEXTBAN** | Full | ISUPPORT token (not a capability); MODE +b ~a:account, JOIN 474 when banned by account |
-| **EXTBAN mute** | Full | ISUPPORT `EXTBAN=~,OSajmrt`; `MODE +b ~m:nick!*@*` keeps someone from talking without keeping them out. Voice lifts it, and `MODE +e ~m:mask` excepts from it. `MODE #chan +b` with no mask reads the list without needing op, and RPL_BANLIST/RPL_EXCEPTLIST/RPL_INVITELIST name who set each entry and when |
+| **EXTBAN mute** | Full | ISUPPORT `EXTBAN=~,OSajmnrt`; `MODE +b ~m:nick!*@*` keeps someone from talking without keeping them out. Voice lifts it, and `MODE +e ~m:mask` excepts from it. `MODE #chan +b` with no mask reads the list without needing op, and RPL_BANLIST/RPL_EXCEPTLIST/RPL_INVITELIST name who set each entry and when |
 | **sasl** | Full | AUTHENTICATE PLAIN, SCRAM-SHA-256, and EXTERNAL (TLS client cert); 903/904; certfp auto-associated on PLAIN/SCRAM login |
 | **monitor** | Full | MONITOR +/−/C/L/S; 730/731/732/733/734; on join/quit/nick |
 | **extended-monitor** | Full | AWAY/ACCOUNT/CHGHOST/SETNAME forwarded for monitored nicks; `nick!user@host` masks (`*`/`?`) may be monitored as well as plain nicks |
@@ -1025,6 +1050,8 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `TESTMASK` | — | Oper-only: `TESTMASK <mask>` — how many people a K-line on this mask would hit, here and on the rest of the network (724), before anybody sets it |
 | `SPAMFILTER` | — | Oper-only (`ban`): patterns an operator would rather never see again; see **Spam filters** |
 | `SHUN` | — | Oper-only (`ban`): `SHUN [<seconds>] <mask> :<reason>` — leave somebody connected and let nothing they say reach anybody. See **Shuns** |
+| `RESV` | — | Oper-only (`ban`): `RESV [<seconds>] <pattern> :<reason>` — a name this network keeps for itself. `#`-patterns are channels, anything else nicks |
+| `UNRESV` | — | Oper-only (`ban`): give a reserved name back |
 | `UNSHUN` | — | Oper-only (`ban`): lift a shun |
 | `GROUP` | — | Reserve the nick you are using for your account; `GROUP -<nick>` releases one, `GROUP *` lists them |
 | `SETEMAIL` | — | `SETEMAIL <current password> <new address>` then `SETEMAIL <code>` — move your account to another address. See **Looking after your own account** |
@@ -1067,7 +1094,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+o` | Channel operator |
 | `+v` | Voice (+) |
 | `+h` | Half-op (%) |
-| `+b` | Ban list — glob masks and the extended bans `~a:` (account), `~r:` (real name), `~j:` (in another channel), `~S:` (client certificate), `~O` (operators), `~m:` (mute rather than ban) and `~t:` (lifts itself). The prefixes peel one at a time, so they stack: `~m:~r:*spam*` mutes by real name, `~t:1h:~j:#raiders` expires |
+| `+b` | Ban list — glob masks and the extended bans `~a:` (account), `~r:` (real name), `~j:` (in another channel), `~S:` (client certificate), `~O` (operators), `~m:` (mute rather than ban), `~n:` (no nick change) and `~t:` (lifts itself). The prefixes peel one at a time, so they stack: `~m:~r:*spam*` mutes by real name, `~t:1h:~j:#raiders` expires |
 | `+e` | Ban exception list — exempt users bypass `+b` bans |
 | `+I` | Invite exception list — matching users bypass `+i` without explicit INVITE |
 | `+q` | Quiet list — silences matching users without kicking |
@@ -1090,6 +1117,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+b ~r:…` | A ban on the real name rather than the hostmask: `+b ~r:*seedy_marketing*`. A glob, because a real name is a sentence — and since a mode parameter cannot hold a space, `_` stands for one on both sides. Somebody who gave no real name is matched only by a pattern that matches nothing in particular |
 | `+b ~j:#chan` | A ban on being somewhere else: `+b ~j:#raiders` keeps out whoever is in `#raiders` at the moment they try to come in |
 | `+b ~S:…` | A ban on the TLS client certificate: `~S:*` is everybody who brought one, `~S:3b8f*` a particular one. Mostly useful as `+e ~S:*` — anybody who can prove who they are is excepted |
+| `+b ~n:…` | Keeps one person's name still: they may talk, but not change nick while in the channel (447). The one-person version of `+N`, lifted by `+e ~n:mask`. Not a ban on coming in |
 | `+b ~O` | Matches the server's operators. Written as a ban it is legal and does nothing useful; written as `+e ~O` it excepts them from what the room bans |
 | `+R` | Registered users only — unregistered users cannot join or speak |
 | `+M` | Only registered users may speak; anybody may join. Somebody given a voice or ops may speak regardless, as with `+m`. The anti-spam mode for a channel that wants to stay open to lurkers |

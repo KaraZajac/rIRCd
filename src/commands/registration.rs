@@ -1571,17 +1571,55 @@ pub async fn handle_nick(
         None => false,
     };
     if registered {
-        // +N: a channel that keeps its names still. Staff there, and
-        // operators, may still change theirs.
-        let (chans, is_oper) = match state_guard.clients.get(client_id) {
+        // A name this network keeps for itself.
+        let is_oper = match state_guard.clients.get(client_id) {
+            Some(c) => c.read().await.oper,
+            None => false,
+        };
+        if !is_oper {
+            if let Some(reserved) = state_guard.reservation_for(&nick) {
+                let (current, why) = (
+                    match state_guard.clients.get(client_id) {
+                        Some(c) => c.read().await.nick_or_id().to_string(),
+                        None => "*".to_string(),
+                    },
+                    reserved.reason.clone(),
+                );
+                drop(state_guard);
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new("432", vec![current, nick, why]).with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
+        // +N: a channel that keeps its names still, and `+b ~n:` which keeps
+        // one person's still. Staff there, and operators, may change theirs.
+        let (chans, source, account, realname, certfp) = match state_guard.clients.get(client_id) {
             Some(c) => {
                 let g = c.read().await;
-                (g.channels.keys().cloned().collect::<Vec<_>>(), g.oper)
+                (
+                    g.channels.keys().cloned().collect::<Vec<_>>(),
+                    g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
+                    g.account.clone(),
+                    g.realname.clone().unwrap_or_default(),
+                    state_guard.certfps.get(client_id).cloned(),
+                )
             }
-            None => (Vec::new(), false),
+            None => (Vec::new(), String::new(), None, String::new(), None),
         };
         if !is_oper && !chans.is_empty() {
             let user_id = state_guard.user_id(client_id);
+            let subject = crate::channel::Subject::from_source(&source)
+                .with_account(account.as_deref())
+                .with_realname(&realname)
+                .in_channels(&chans)
+                .with_certfp(certfp.as_deref())
+                .oper(is_oper);
             let store = channels.read().await;
             for key in &chans {
                 let Some(ch) = store.channels.get(key) else {
@@ -1593,7 +1631,7 @@ pub async fn handle_nick(
                     .get(&user_id)
                     .map(|m| m.modes.op || m.modes.halfop)
                     .unwrap_or(false);
-                if ch.modes.no_nick_change && !staff {
+                if (ch.modes.no_nick_change || ch.forbids_nick_change(&subject)) && !staff {
                     let (shown, current) = (
                         ch.name.clone(),
                         match state_guard.clients.get(client_id) {
@@ -1609,7 +1647,7 @@ pub async fn handle_nick(
                         client_id,
                         Message::new(
                             "447",
-                            vec![current, format!("Cannot change nickname while on {shown} (+N)")],
+                            vec![current, format!("Cannot change nickname while on {shown}")],
                         )
                         .with_prefix(&cfg.server.name),
                         label,

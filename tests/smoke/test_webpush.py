@@ -65,7 +65,7 @@ section("register an account to push to")
 erin = Client(ACCOUNT)
 mark = erin.mark()
 erin.send(f"REGISTER * {ACCOUNT}@example.org {PASSWORD}")
-erin.read(2.5)
+erin.wait_for("REGISTER", seconds=20)
 registered = bool(erin.find("REGISTER SUCCESS", lines=erin.since(mark)))
 if not registered and not erin.find("ACCOUNT_EXISTS", lines=erin.since(mark)):
     # Email verification is on in the full run: confirm the code from the sink.

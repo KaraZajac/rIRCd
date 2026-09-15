@@ -199,6 +199,19 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
         let _ = sqlx::query(sql).execute(pool).await;
     }
 
+    // Names this network keeps for itself.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS reservations (
+            pattern    VARCHAR(160) NOT NULL PRIMARY KEY,
+            reason     TEXT         NOT NULL,
+            set_by     VARCHAR(64)  NOT NULL,
+            set_at     BIGINT       NOT NULL,
+            expires_at BIGINT       NULL
+        ) CHARACTER SET utf8mb4",
+    )
+    .execute(pool)
+    .await?;
+
     // Patterns an operator would rather never see again. The pattern is the
     // identity: two servers hold the same filter when they hold the same one.
     sqlx::query(
@@ -1614,6 +1627,85 @@ pub async fn noexpire(pool: &sqlx::MySqlPool, kind: char, name: &str) -> Option<
             .flatten()
     };
     flag.map(|f| f != 0)
+}
+
+// ─── Names nobody may take ────────────────────────────────────────────────────
+
+/// A name, or a pattern of names, that this network keeps for itself.
+#[derive(Debug, Clone)]
+pub struct Reservation {
+    /// A glob. One starting with `#` is about channels, anything else about
+    /// nicks.
+    pub pattern: String,
+    pub reason: String,
+    pub set_by: String,
+    pub set_at: i64,
+    pub expires_at: Option<i64>,
+}
+
+impl Reservation {
+    pub fn is_expired(&self, now: i64) -> bool {
+        self.expires_at.is_some_and(|e| e <= now)
+    }
+
+    /// Whether this reservation is about channel names.
+    pub fn is_channel(&self) -> bool {
+        self.pattern.starts_with('#') || self.pattern.starts_with('&')
+    }
+
+    pub fn covers(&self, name: &str) -> bool {
+        crate::user::glob_match(&self.pattern.to_lowercase(), &name.to_lowercase())
+    }
+}
+
+pub async fn save_reservation(pool: &sqlx::MySqlPool, r: &Reservation) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO reservations (pattern, reason, set_by, set_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE reason = VALUES(reason), set_by = VALUES(set_by),
+                                 set_at = VALUES(set_at), expires_at = VALUES(expires_at)",
+    )
+    .bind(&r.pattern)
+    .bind(&r.reason)
+    .bind(&r.set_by)
+    .bind(r.set_at)
+    .bind(r.expires_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+pub async fn delete_reservation(pool: &sqlx::MySqlPool, pattern: &str) -> bool {
+    sqlx::query("DELETE FROM reservations WHERE pattern = ?")
+        .bind(pattern)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false)
+}
+
+/// Every reservation still in force, the expired ones dropped on the way.
+pub async fn load_reservations(pool: &sqlx::MySqlPool) -> Vec<Reservation> {
+    use sqlx::Row;
+    let now = chrono::Utc::now().timestamp();
+    let _ = sqlx::query("DELETE FROM reservations WHERE expires_at IS NOT NULL AND expires_at <= ?")
+        .bind(now)
+        .execute(pool)
+        .await;
+    sqlx::query("SELECT pattern, reason, set_by, set_at, expires_at FROM reservations")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| Reservation {
+            pattern: r.get("pattern"),
+            reason: r.get("reason"),
+            set_by: r.get("set_by"),
+            set_at: r.get("set_at"),
+            expires_at: r.get("expires_at"),
+        })
+        .collect()
 }
 
 // ─── Changing the address on an account ───────────────────────────────────────

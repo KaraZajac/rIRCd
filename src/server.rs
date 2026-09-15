@@ -347,6 +347,10 @@ pub async fn run(
         let bans = crate::persist::load_server_bans(pool).await;
         let grouped = crate::persist::load_grouped_nicks(pool).await;
         let filters = crate::persist::load_spamfilters(pool).await;
+        let reservations = crate::persist::load_reservations(pool).await;
+        if !reservations.is_empty() {
+            info!("Loaded {} reservation(s)", reservations.len());
+        }
         if !grouped.is_empty() {
             info!("Loaded {} grouped nick(s)", grouped.len());
         }
@@ -359,6 +363,7 @@ pub async fn run(
         state_w.server_bans = bans;
         state_w.publish_dlines();
         state_w.grouped_nicks = grouped;
+        state_w.reservations = reservations;
         for (pattern, targets, action, duration, set_by, set_at) in filters {
             match crate::spamfilter::rebuild(&pattern, &targets, &action, duration, &set_by, set_at)
             {

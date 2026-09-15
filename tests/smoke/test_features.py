@@ -104,7 +104,7 @@ section("account for the authentication tests")
 setup = Client(ACCOUNT)
 mark = setup.mark()
 setup.send(f"REGISTER * {ACCOUNT}@example.org {PASSWORD}")
-setup.read(2.5)
+setup.wait_for("REGISTER", seconds=20)
 if setup.find("VERIFICATION_REQUIRED", lines=setup.since(mark)):
     import re
 
@@ -230,7 +230,7 @@ section("a conversation follows the account, not the nick")
 mover = Client(f"mover{RUN_ID}", caps=TAGS + ["draft/chathistory"])
 mark = mover.mark()
 mover.send(f"REGISTER * mover{RUN_ID}@example.org {PASSWORD}")
-mover.read(2.5)
+mover.wait_for("REGISTER", seconds=20)
 if mover.find("VERIFICATION_REQUIRED", lines=mover.since(mark)):
     import re as _re
 
@@ -602,7 +602,7 @@ owner_chan = f"#owned{RUN_ID}"
 founder = Client(f"founder{RUN_ID}", caps=TAGS)
 mark = founder.mark()
 founder.send(f"REGISTER * founder{RUN_ID}@example.org {PASSWORD}")
-founder.read(2.5)
+founder.wait_for("REGISTER", seconds=20)
 if founder.find("VERIFICATION_REQUIRED", lines=founder.since(mark)):
     import re as _re2
 
@@ -769,7 +769,7 @@ ghost_acct = f"ghost{RUN_ID}"
 first = Client(ghost_acct, caps=TAGS)
 mark = first.mark()
 first.send(f"REGISTER * {ghost_acct}@example.org {PASSWORD}")
-first.read(2.5)
+first.wait_for("REGISTER", seconds=20)
 if first.find("VERIFICATION_REQUIRED", lines=first.since(mark)):
     import re as _re3
 
@@ -1476,5 +1476,32 @@ check("and stops them talking", bool(loud.find(" 404 ", lines=loud.since(lmark))
       and not xb.find("loudhailer", lines=xb.since(xmark)), loud.since(lmark)[-2:])
 loud.close()
 xb.close()
+
+section("~n: one person's name held still")
+
+nk = Client(f"nk{RUN_ID}")
+nk.join(f"#nk{RUN_ID}")
+fidget = Client(f"fidget{RUN_ID}")
+fidget.join(f"#nk{RUN_ID}")
+nk.send(f"MODE #nk{RUN_ID} +b ~n:fidget{RUN_ID}!*@*")
+nk.read(0.8)
+fmark = fidget.mark()
+fidget.send(f"NICK settled{RUN_ID}")
+fidget.read(1.0)
+check("a ~n: ban keeps their name still", bool(fidget.find(" 447 ", lines=fidget.since(fmark))), fidget.since(fmark)[-2:])
+fmark = fidget.mark()
+fidget.send(f"PRIVMSG #nk{RUN_ID} :but I can still talk")
+fidget.read(0.8)
+nk.read(0.8)
+check("and is not a ban on talking or on coming in",
+      bool(nk.find("but I can still talk")) and not fidget.find(" 404 ", lines=fidget.since(fmark)), nk.lines[-2:])
+nk.send(f"MODE #nk{RUN_ID} +e ~n:fidget{RUN_ID}!*@*")
+nk.read(0.8)
+fmark = fidget.mark()
+fidget.send(f"NICK settled{RUN_ID}")
+fidget.read(1.0)
+check("an exception lifts it", bool(fidget.find("NICK", f"settled{RUN_ID}", lines=fidget.since(fmark))), fidget.since(fmark)[-2:])
+fidget.close()
+nk.close()
 
 summary("features")

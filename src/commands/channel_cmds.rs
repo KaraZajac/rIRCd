@@ -215,6 +215,23 @@ async fn handle_join_inner(
             .with_prefix(&cfg.server.name));
             continue;
         }
+        // A name this network keeps for itself. Operators are not held to
+        // it: reserving the staff channel and then being unable to enter it
+        // would be a strange way to run a network.
+        if !is_oper {
+            if let Some(reserved) = state.reservation_for(ch_name) {
+                reply_self!(Message::new(
+                    "479",
+                    vec![
+                        nick.clone(),
+                        ch_name.to_string(),
+                        format!("Cannot join channel: {}", reserved.reason),
+                    ],
+                )
+                .with_prefix(&cfg.server.name));
+                continue;
+            }
+        }
         let provided_key = keys.get(ch_idx).copied().unwrap_or("");
 
         // Check per-channel so joining multiple channels in one command can't bypass the limit
