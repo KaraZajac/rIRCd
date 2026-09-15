@@ -461,9 +461,9 @@ pub struct ConnStats {
     pub messages_out: std::sync::atomic::AtomicU64,
     /// When the connection was accepted, which is before it had a nick.
     pub since: i64,
-    /// How it arrived: `plain`, `tls` or `websocket`. What `TRACE` calls the
-    /// class, until there are classes to call it.
-    pub kind: &'static str,
+    /// The kind of client this is: the name of its `[[classes]]` block, or
+    /// how it arrived — `plain`, `tls`, `websocket` — when no class named it.
+    pub class: Arc<str>,
 }
 
 impl Default for ConnStats {
@@ -474,17 +474,17 @@ impl Default for ConnStats {
 
 impl ConnStats {
     pub fn new() -> Self {
-        Self::of_kind("plain")
+        Self::in_class("plain")
     }
 
-    pub fn of_kind(kind: &'static str) -> Self {
+    pub fn in_class(class: impl Into<Arc<str>>) -> Self {
         Self {
             bytes_in: std::sync::atomic::AtomicU64::new(0),
             bytes_out: std::sync::atomic::AtomicU64::new(0),
             messages_in: std::sync::atomic::AtomicU64::new(0),
             messages_out: std::sync::atomic::AtomicU64::new(0),
             since: Utc::now().timestamp(),
-            kind,
+            class: class.into(),
         }
     }
 
@@ -549,7 +549,7 @@ impl ClientSink {
     /// How much is queued for this connection and not yet written. A client
     /// that has stopped reading shows here before it shows anywhere else.
     pub fn sendq(&self) -> usize {
-        crate::client::SEND_QUEUE.saturating_sub(self.tx.capacity())
+        self.tx.max_capacity().saturating_sub(self.tx.capacity())
     }
 
     /// Send a last message and close the connection — how a server drops a client
@@ -917,6 +917,12 @@ pub struct ServerState {
     /// that holds it, lower-cased. Kept here so a NICK never waits on the
     /// database to learn that a name is somebody's.
     pub grouped_nicks: HashMap<String, String>,
+    /// The kinds of client this server is telling apart, as they were when
+    /// it started. The accept path took its copy then and is not given a new
+    /// one, so this is what is actually in force — a `REHASH` can change the
+    /// file without changing this, and `STATS y` had better say what is true
+    /// rather than what was most recently typed.
+    pub classes: Vec<crate::config::ClassConfig>,
     /// Patterns an operator would rather never see again, in the order they
     /// were added. See `crate::spamfilter`.
     pub spam_filters: Vec<crate::spamfilter::SpamFilter>,

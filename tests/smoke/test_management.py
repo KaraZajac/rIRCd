@@ -698,4 +698,98 @@ check("and how much has crossed the connections open now",
 bystander.close()
 look.close()
 
+section("connection classes: not every client is the same client")
+
+# The harness gives 127.0.0.7 a class of its own, holding two connections.
+# Everybody else falls into no class and is named by how they arrived.
+klass = Client(f"cls{RUN}")
+klass.send(f"OPER smokeoper {OPER_PW}")
+klass.wait_for(" 381 ", " 464 ", seconds=5)
+gw1 = Client(f"gw1{RUN}", source="127.0.0.7")
+gw2 = Client(f"gw2{RUN}", source="127.0.0.7")
+check("a class holds what it says it holds", bool(gw1.find(" 001 ")) and bool(gw2.find(" 001 ")),
+      (gw1.lines[-1:], gw2.lines[-1:]))
+third = Client(source="127.0.0.7")
+third.read(1.5)
+check("and refuses the one over it",
+      bool(third.find("ERROR", "class")) and not third.find(" 001 "), third.lines[-2:])
+third.close()
+
+kmark = klass.mark()
+klass.send("STATS y")
+klass.wait_for(" 219 ", seconds=5)
+classes = klass.since(kmark)
+check("STATS y names the class and how many are in it",
+      bool(klass.find(" 218 ", "smoke-gateway", "2 here", lines=classes)), classes[-4:])
+check("and says where everybody else ended up",
+      bool(klass.find(" 218 ", "in no class", lines=classes)), classes[-4:])
+check("with the class's own ping time and send queue",
+      bool(klass.find(" 218 ", "smoke-gateway", "300", "64", lines=classes)), classes[-4:])
+
+kmark = klass.mark()
+klass.send(f"TRACE gw1{RUN}")
+klass.wait_for(" 262 ", seconds=5)
+check("TRACE calls them by their class",
+      bool(klass.find(" 205 ", "smoke-gateway", f"gw1{RUN}", lines=klass.since(kmark))), klass.since(kmark)[-3:])
+kmark = klass.mark()
+klass.send(f"TRACE cls{RUN}")
+klass.wait_for(" 262 ", seconds=5)
+check("and calls the unclassed by how they arrived",
+      bool(klass.find(" 204 ", "plain", f"cls{RUN}", lines=klass.since(kmark))), klass.since(kmark)[-3:])
+
+gw1.close()
+gw2.close()
+time.sleep(1.0)
+again = Client(f"gw3{RUN}", source="127.0.0.7")
+check("and a place opens up when one leaves", bool(again.find(" 001 ")), again.lines[-2:])
+again.close()
+klass.close()
+
+section("extended bans: the certificate and the badge")
+
+# ~S: asks for a TLS client certificate, ~O for an operator's badge. The
+# useful one is +e ~O: the operators are exempt from what the room bans.
+xo = Client(f"xo{RUN}")
+xo.send(f"OPER smokeoper {OPER_PW}")
+xo.wait_for(" 381 ", " 464 ", seconds=5)
+XCH = f"#xo{RUN}"
+holder = Client(f"hold{RUN}")
+holder.join(XCH)
+holder.send(f"MODE {XCH} +b *!*@*.IP")
+holder.read(0.8)
+xmark = xo.mark()
+xo.send(f"JOIN {XCH}")
+xo.read(1.0)
+check("a wide ban keeps even an operator out", bool(xo.find(" 474 ", lines=xo.since(xmark))), xo.since(xmark)[-2:])
+holder.send(f"MODE {XCH} +e ~O")
+holder.read(0.8)
+xmark = xo.mark()
+xo.send(f"JOIN {XCH}")
+xo.read(1.0)
+check("+e ~O lets the operators past it", bool(xo.find("JOIN", XCH, lines=xo.since(xmark))), xo.since(xmark)[-2:])
+plainer = Client(f"pln{RUN}")
+plainer.send(f"JOIN {XCH}")
+plainer.read(1.0)
+check("and nobody else", bool(plainer.find(" 474 ")), plainer.lines[-2:])
+plainer.close()
+holder.send(f"MODE {XCH} -e ~O")
+holder.send(f"MODE {XCH} -b *!*@*.IP")
+holder.send(f"MODE {XCH} +b ~S:*")
+holder.read(0.8)
+withcert = Client(f"crt{RUN}", tls=True, certfile=pem) if CONFIG else None
+if withcert:
+    cmark = withcert.mark()
+    withcert.send(f"JOIN {XCH}")
+    withcert.read(1.2)
+    check("a ~S: ban keeps out whoever brought a certificate",
+          bool(withcert.find(" 474 ", lines=withcert.since(cmark))), withcert.since(cmark)[-2:])
+    withcert.close()
+    nocert = Client(f"ncr{RUN}", tls=True)
+    nocert.send(f"JOIN {XCH}")
+    nocert.read(1.2)
+    check("and lets in whoever did not", bool(nocert.find("JOIN", XCH)), nocert.lines[-2:])
+    nocert.close()
+holder.close()
+xo.close()
+
 summary("management")

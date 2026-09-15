@@ -542,6 +542,28 @@ pub async fn handle_stats(
                 reply_to_client(&senders, client_id, m, label).await;
             }
         }
+        // The kinds of client this server tells apart. No hosts of anybody's
+        // in it, but it describes the shape of the server, so it keeps the
+        // company the rest of STATS keeps.
+        "y" | "Y" => {
+            if !is_oper {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "481",
+                        vec![nick.clone(), "Permission Denied- You're not an IRC operator".into()],
+                    )
+                    .with_prefix(s),
+                    label,
+                )
+                .await;
+            } else {
+                for m in stats_classes(cfg, &state, &senders, &nick, s).await {
+                    reply_to_client(&senders, client_id, m, label).await;
+                }
+            }
+        }
         // What this server is carrying, and what it has been doing. Both name
         // hosts and count traffic, so both are the operators' to see.
         "l" | "L" | "t" | "T" => {
@@ -1014,8 +1036,9 @@ pub async fn handle_help(
             &[
                 "STATS <letter>",
                 "  u uptime, m command counts, o operator blocks, k K-lines, d D-lines,",
-                "  s shuns, l what each connection has carried, t what this server has",
-                "  been doing. Everything but u and m is for operators.",
+                "  s shuns, y connection classes, l what each connection has carried,",
+                "  t what this server has been doing. Everything but u and m is for",
+                "  operators.",
             ],
         ),
         Some("SHUN") => (
@@ -1184,7 +1207,7 @@ pub async fn handle_knock(
         .unwrap_or_else(|| "knock knock".to_string());
 
     let state = state.read().await;
-    let (nick, source, account, realname, in_channels) = match state.clients.get(client_id) {
+    let (nick, source, account, realname, in_channels, is_oper) = match state.clients.get(client_id) {
         Some(c) => {
             let g = c.read().await;
             (
@@ -1193,10 +1216,12 @@ pub async fn handle_knock(
                 g.account.clone(),
                 g.realname.clone().unwrap_or_default(),
                 g.channels.keys().cloned().collect::<Vec<String>>(),
+                g.oper,
             )
         }
         None => return Ok(()),
     };
+    let certfp = state.certfps.get(client_id).cloned();
 
     if ch_name.is_empty() {
         reply_to_client(
@@ -1277,7 +1302,9 @@ pub async fn handle_knock(
         &crate::channel::Subject::from_source(&source)
             .with_account(account.as_deref())
             .with_realname(&realname)
-            .in_channels(&in_channels),
+            .in_channels(&in_channels)
+            .with_certfp(certfp.as_deref())
+            .oper(is_oper),
     ) {
         reply_to_client(
             &senders,
@@ -4284,8 +4311,8 @@ pub async fn handle_trace(
             let class = registry
                 .sessions_of(id)
                 .into_iter()
-                .find_map(|session| registry.get(&session).map(|sink| sink.stats().kind))
-                .unwrap_or("plain");
+                .find_map(|session| registry.get(&session).map(|sink| sink.stats().class.clone()))
+                .unwrap_or_else(|| std::sync::Arc::from("plain"));
             let source = format!("{}[{}@{}]", their_nick, g.display_user(), g.display_host());
             rows.push(
                 Message::new(
@@ -4341,4 +4368,81 @@ pub async fn handle_trace(
     )
     .await;
     Ok(())
+}
+
+/// The kinds of client this server tells apart, for `STATS y`.
+///
+/// Counted from the connections themselves rather than from the accept
+/// path's own tally: what is actually here is a better answer than what was
+/// once let in, and it shows where the unclassed connections ended up too.
+async fn stats_classes(
+    cfg: &Config,
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    nick: &str,
+    server: &str,
+) -> Vec<Message> {
+    let mut here: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for stats in senders.read().await.all_stats() {
+        *here.entry(stats.class.to_string()).or_insert(0) += 1;
+    }
+    let classes = state.read().await.classes.clone();
+    let mut rows = Vec::new();
+    let mut row = |name: &str, ping: String, max: String, sendq: String, note: String| {
+        // 218 RPL_STATSYLINE
+        rows.push(
+            Message::new(
+                "218",
+                vec![
+                    nick.to_string(),
+                    "Y".into(),
+                    name.to_string(),
+                    ping,
+                    max,
+                    sendq,
+                    note,
+                ],
+            )
+            .with_prefix(server),
+        );
+    };
+    for class in &classes {
+        let n = here.remove(&class.name).unwrap_or(0);
+        row(
+            &class.name,
+            class
+                .ping_secs
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| cfg.server.ping_timeout_secs.to_string()),
+            class
+                .max_clients
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "-".into()),
+            class
+                .sendq
+                .map(|q| q.to_string())
+                .unwrap_or_else(|| crate::client::SEND_QUEUE.to_string()),
+            format!(
+                "{n} here; {}",
+                if class.hosts.is_empty() {
+                    "everybody else".to_string()
+                } else {
+                    class.hosts.join(" ")
+                }
+            ),
+        );
+    }
+    // Whatever is left is in no class at all, and is named by how it arrived.
+    let mut loose: Vec<(String, usize)> = here.into_iter().collect();
+    loose.sort();
+    for (name, n) in loose {
+        row(
+            &name,
+            cfg.server.ping_timeout_secs.to_string(),
+            "-".into(),
+            crate::client::SEND_QUEUE.to_string(),
+            format!("{n} here; in no class"),
+        );
+    }
+    rows
 }

@@ -48,6 +48,10 @@ pub struct ConnectionLimits {
     /// before a nick, a handshake, or a database has cost anything. Shared
     /// with the server state that keeps them current.
     dlines: Option<Arc<std::sync::RwLock<Vec<crate::persist::ServerBan>>>>,
+    /// Kinds of client, in the order they are tried. See `ClassConfig`.
+    classes: Arc<Vec<Arc<crate::config::ClassConfig>>>,
+    /// How many connections each class is holding.
+    class_counts: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
 }
 
 /// A listener where counting by address cannot mean anything.
@@ -72,10 +76,46 @@ struct SharedListener {
 pub struct ConnectionSlot {
     limits: ConnectionLimits,
     host: String,
+    /// The kind of client this connection was taken as, if any class named
+    /// it. What it is allowed, and what `TRACE` and `STATS y` call it.
+    class: Option<Arc<crate::config::ClassConfig>>,
+}
+
+impl ConnectionSlot {
+    /// What this connection is called: its class, or how it arrived when no
+    /// class named it.
+    pub fn class_name(&self, transport: &'static str) -> Arc<str> {
+        match self.class {
+            Some(ref c) => Arc::from(c.name.as_str()),
+            None => Arc::from(transport),
+        }
+    }
+
+    /// The pacing for this connection: the server's, with whatever its class
+    /// had an opinion about.
+    pub fn paced(&self, base: KeepaliveConfig) -> KeepaliveConfig {
+        let Some(ref class) = self.class else {
+            return base;
+        };
+        KeepaliveConfig {
+            ping_secs: class.ping_secs.unwrap_or(base.ping_secs),
+            flood_burst: class.flood_burst.unwrap_or(base.flood_burst),
+            flood_rate: class.flood_rate.unwrap_or(base.flood_rate),
+            sendq: class.sendq.unwrap_or(base.sendq).clamp(16, 1 << 20),
+            ..base
+        }
+    }
 }
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
+        if let Some(ref class) = self.class {
+            if let Ok(mut counts) = self.limits.class_counts.lock() {
+                if let Some(n) = counts.get_mut(&class.name) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+        }
         match self.limits.shared {
             Some(ref shared) => {
                 shared
@@ -156,6 +196,29 @@ impl ConnectionLimits {
     pub fn with_dnsbl(mut self, dnsbl: Option<Arc<crate::dnsbl::Dnsbl>>) -> Self {
         self.dnsbl = dnsbl;
         self
+    }
+
+    /// The same limits, with kinds of client told apart.
+    pub fn with_classes(mut self, classes: &[crate::config::ClassConfig]) -> Self {
+        self.classes = Arc::new(classes.iter().cloned().map(Arc::new).collect());
+        self
+    }
+
+    /// The class a connecting address belongs to, if any is configured for it.
+    pub fn class_for(&self, host: &str) -> Option<Arc<crate::config::ClassConfig>> {
+        let key = limit_key_for(host);
+        self.classes
+            .iter()
+            .find(|c| c.covers(host) || c.covers(&key))
+            .cloned()
+    }
+
+    /// How many connections each class is holding, for `STATS y`.
+    pub fn class_counts(&self) -> std::collections::HashMap<String, usize> {
+        self.class_counts
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default()
     }
 
     /// The same limits, turning D-lined addresses away on arrival.
@@ -268,8 +331,34 @@ impl ConnectionLimits {
     /// under is `limit_key_for(host)`, so an IPv6 client is one client however
     /// many of its /64 it uses.
     pub fn claim(&self, host: &str) -> Result<ConnectionSlot, &'static str> {
+        let class = self.class_for(host);
         let host = limit_key_for(host);
         let host = host.as_str();
+        // A class holds what it says it holds, whatever the server's own
+        // ceiling is — that is the whole point of having one.
+        if let Some(ref class) = class {
+            let mut counts = match self.class_counts.lock() {
+                Ok(c) => c,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let taken = counts.entry(class.name.clone()).or_insert(0);
+            match class.max_clients {
+                Some(max) if max > 0 && *taken >= max => {
+                    tracing::warn!(class = %class.name, max, "A class is full");
+                    return Err("This class of connection is full");
+                }
+                _ => *taken += 1,
+            }
+        }
+        let undo_class = || {
+            if let Some(ref class) = class {
+                if let Ok(mut counts) = self.class_counts.lock() {
+                    if let Some(n) = counts.get_mut(&class.name) {
+                        *n = n.saturating_sub(1);
+                    }
+                }
+            }
+        };
         let total = self
             .total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -277,11 +366,13 @@ impl ConnectionLimits {
         if self.max_total > 0 && total > self.max_total {
             self.total
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            undo_class();
             return Err("Server is full");
         }
         if self.shared.is_none() && self.arriving_too_fast(host) {
             self.total
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            undo_class();
             return Err("Connecting too often; try again in a minute");
         }
         if let Some(ref shared) = self.shared {
@@ -295,6 +386,7 @@ impl ConnectionLimits {
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 self.total
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                undo_class();
                 tracing::warn!(
                     listener = %shared.addr,
                     max = shared.max,
@@ -305,6 +397,7 @@ impl ConnectionLimits {
             return Ok(ConnectionSlot {
                 limits: self.clone(),
                 host: host.to_string(),
+                class,
             });
         }
         {
@@ -313,9 +406,18 @@ impl ConnectionLimits {
                 Err(poisoned) => poisoned.into_inner(),
             };
             let entry = counts.entry(host.to_string()).or_insert(0);
-            if self.max_per_ip > 0 && *entry >= self.max_per_ip {
+            // The class has the say when it has an opinion; a class that sets
+            // 0 means this kind of client is not counted by address at all,
+            // which is what a gateway needs.
+            let per_ip = match class.as_ref().and_then(|c| c.max_per_ip) {
+                Some(max) => max,
+                None => self.max_per_ip,
+            };
+            if per_ip > 0 && *entry >= per_ip {
                 self.total
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                drop(counts);
+                undo_class();
                 return Err("Too many connections from your address");
             }
             *entry += 1;
@@ -323,6 +425,7 @@ impl ConnectionLimits {
         Ok(ConnectionSlot {
             limits: self.clone(),
             host: host.to_string(),
+            class,
         })
     }
 }
@@ -349,6 +452,9 @@ pub struct KeepaliveConfig {
     pub flood_burst: f64,
     /// Commands per second the allowance refills at.
     pub flood_rate: f64,
+    /// Messages that may be queued for this connection before it is dropped
+    /// for not reading them.
+    pub sendq: usize,
 }
 
 pub async fn handle_client_tls(
@@ -393,7 +499,8 @@ pub async fn handle_client_tls(
         server_name,
         certfp,
         true,
-        keepalive,
+        _slot.paced(keepalive),
+        _slot.class_name("tls"),
     )
     .await;
 }
@@ -441,7 +548,8 @@ pub async fn handle_client(
         server_name,
         None,
         false,
-        keepalive,
+        _slot.paced(keepalive),
+        _slot.class_name("plain"),
     )
     .await;
 }
@@ -555,6 +663,7 @@ async fn write_loop<W>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_stream<S>(
     stream: S,
     client_id: String,
@@ -564,13 +673,14 @@ async fn handle_client_stream<S>(
     certfp: Option<String>,
     is_tls: bool,
     keepalive: KeepaliveConfig,
+    class: Arc<str>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::with_capacity(BUF_SIZE, reader);
 
-    let (send_tx, mut send_rx) = mpsc::channel::<Message>(SEND_QUEUE);
+    let (send_tx, mut send_rx) = mpsc::channel::<Message>(keepalive.sendq);
 
     let client_id_clone = client_id.clone();
     // Two bytes of the limit belong to the CRLF.
@@ -584,11 +694,7 @@ async fn handle_client_stream<S>(
     let mut lines =
         crate::linereader::BoundedLines::new(crate::protocol::MAX_TOTAL_TAGGED.max(in_line_limit));
     // What crosses this connection, counted where the bytes are.
-    let stats = std::sync::Arc::new(crate::user::ConnStats::of_kind(if is_tls {
-        "tls"
-    } else {
-        "plain"
-    }));
+    let stats = std::sync::Arc::new(crate::user::ConnStats::in_class(class));
     let writer_stats = stats.clone();
     let mut writer_task = tokio::spawn(async move {
         write_loop(
@@ -902,11 +1008,15 @@ pub async fn handle_client_ws(
         tracing::warn!(%host, %zone, "Connection from a listed address, allowed by configuration");
     }
 
-    let (send_tx, mut send_rx) = mpsc::channel::<Message>(SEND_QUEUE);
+    // The class has its say before anything is sized by it.
+    let keepalive = _slot.paced(keepalive);
+    let (send_tx, mut send_rx) = mpsc::channel::<Message>(keepalive.sendq);
     let kill = Arc::new(tokio::sync::Notify::new());
     // What crosses this connection. A frame is a message, which is the one
     // place a WebSocket client counts differently from a socket one.
-    let stats = std::sync::Arc::new(crate::user::ConnStats::of_kind("websocket"));
+    let stats = std::sync::Arc::new(crate::user::ConnStats::in_class(
+        _slot.class_name("websocket"),
+    ));
 
     // Flood control
     let flood_capacity = keepalive.flood_burst;

@@ -129,10 +129,13 @@ async fn handle_join_inner(
     let realname = client_data.realname.clone().unwrap_or_default();
     let in_channels: Vec<String> = client_data.channels.keys().cloned().collect();
     drop(client_data);
+    let certfp = state.certfps.get(client_id).cloned();
     let subject = crate::channel::Subject::from_source(&source)
         .with_account(account.as_deref())
         .with_realname(&realname)
-        .in_channels(&in_channels);
+        .in_channels(&in_channels)
+        .with_certfp(certfp.as_deref())
+        .oper(is_oper);
     // What this connection negotiated, not what the person behind it did on
     // some other client: a reply belongs to the one that asked.
     let client_caps = session_caps(&senders, client_id).await;

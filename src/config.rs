@@ -35,6 +35,9 @@ pub struct Config {
     /// Ask a DNS blocklist about every public address that connects.
     #[serde(default)]
     pub dnsbl: Option<DnsblConfig>,
+    /// Kinds of client, and what each kind is allowed. See `ClassConfig`.
+    #[serde(default)]
+    pub classes: Vec<ClassConfig>,
     /// Let go of accounts and channel registrations nobody has used in a
     /// long time. Off unless set: this is a policy, and a server with real
     /// people on it should choose it rather than be handed one.
@@ -233,6 +236,64 @@ fn default_code_expiry() -> i64 {
 /// same ones that do it to everybody else, and somebody has already written
 /// them down. Asked once per address and cached; a lookup that times out
 /// counts as not listed, so a resolver outage never locks everybody out.
+/// One kind of client, and what that kind is allowed.
+///
+/// `[limits]` says what *a* client may do, which is the right answer only
+/// when every client is the same. A gateway carrying two hundred people from
+/// one address, a bot that must not be pinged out while it thinks, and
+/// somebody on a phone are not the same thing, and a server with one set of
+/// numbers is a server tuned for whichever of them it would rather lose.
+///
+/// A connection lands in the first class whose `hosts` it matches; a class
+/// with no `hosts` matches everybody, so it is the one to put last. Anything
+/// left unset falls through to `[limits]` and `[server]`, which means adding
+/// a class changes nothing except what it says.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClassConfig {
+    pub name: String,
+    /// Addresses in this class: globs (`10.0.0.*`, `*.example.org`) or
+    /// networks in CIDR form (`10.0.0.0/8`). Empty matches everybody.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// How many connections this class may hold at once. 0 or unset for as
+    /// many as the server will take.
+    #[serde(default)]
+    pub max_clients: Option<usize>,
+    /// How many one address may hold, within this class.
+    #[serde(default)]
+    pub max_per_ip: Option<usize>,
+    /// How long a connection here may be quiet before it is pinged.
+    #[serde(default)]
+    pub ping_secs: Option<u64>,
+    /// Commands it may send back to back before being throttled.
+    #[serde(default)]
+    pub flood_burst: Option<f64>,
+    /// Commands per second its allowance refills at.
+    #[serde(default)]
+    pub flood_rate: Option<f64>,
+    /// Messages that may be queued for it before it is dropped for not
+    /// reading. A gateway needs a deeper queue than a phone.
+    #[serde(default)]
+    pub sendq: Option<usize>,
+}
+
+impl ClassConfig {
+    /// Whether a connecting address belongs to this class. A class with no
+    /// addresses named is the one everybody falls into.
+    pub fn covers(&self, host: &str) -> bool {
+        if self.hosts.is_empty() {
+            return true;
+        }
+        self.hosts.iter().any(|pattern| {
+            if pattern.contains('/') {
+                crate::persist::address_in(pattern, host).unwrap_or(false)
+            } else {
+                crate::user::glob_match(&pattern.to_lowercase(), &host.to_lowercase())
+            }
+        })
+    }
+}
+
 /// What a services package would call nick and channel expiry.
 ///
 /// An account nobody has logged in to for `accounts_days` is erased, and the

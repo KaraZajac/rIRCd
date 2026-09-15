@@ -533,6 +533,49 @@ rotating that last one would invalidate every push subscription registered
 under it. A configuration that will not load leaves the running one alone and
 says why in the log.
 
+### `[[classes]]`
+
+`[limits]` says what *a* client may do, which is the right answer only when
+every client is the same one. A gateway carrying two hundred people from one
+address, a bot that must not be pinged out while it thinks, and somebody on a
+phone are not the same thing, and a server with one set of numbers is a server
+tuned for whichever of them it would rather lose.
+
+```toml
+[[classes]]
+name = "gateway"
+hosts = ["10.0.0.5", "192.168.0.0/16"]
+max_per_ip = 0          # this address may bring as many as it likes
+max_clients = 500       # but no more than this many at once, all told
+ping_secs = 300
+sendq = 8192
+
+[[classes]]
+name = "everybody"      # no hosts: the one everybody else falls into
+max_per_ip = 5
+```
+
+| Key | Meaning |
+|---|---|
+| `hosts` | Addresses in this class: globs (`10.0.0.*`, `*.example.org`) or networks in CIDR form. **Empty matches everybody**, so that class goes last |
+| `max_clients` | How many connections this class may hold at once. The one over it is turned away with `This class of connection is full` |
+| `max_per_ip` | How many one address may hold within this class; `0` for as many as it likes |
+| `ping_secs` | How long a connection here may be quiet before it is pinged |
+| `flood_burst`, `flood_rate` | Commands it may send back to back, and how fast the allowance refills |
+| `sendq` | Messages that may be queued for it before it is dropped for not reading. A gateway needs a deeper queue than a phone |
+
+A connection lands in the first class whose `hosts` it matches. Anything a class
+leaves unset falls through to `[limits]` and `[server]`, so adding a class
+changes nothing except what it says. `STATS y` lists the classes with how many
+connections are in each, and `TRACE` calls each connection by its class —
+falling back to how it arrived (`plain`, `tls`, `websocket`) when no class
+named it.
+
+Classes are read when the server starts, not on `REHASH`: the part of the
+server that accepts connections took its copy at startup. `STATS y` reports
+that copy rather than the file, so it never claims a class that is not in
+force.
+
 ### `[expiry]`
 
 What a services package would call nick and channel expiry. Off unless set:
@@ -886,7 +929,7 @@ still accepted in `CAP REQ` so older clients keep working.
 | **typing** | Full | TAGMSG with `+typing=active/paused/done`; forwarded via client-only tag relay |
 | **reply** | Full | Messages with `+reply=<msgid>` tag forwarded as-is |
 | **ACCOUNTEXTBAN** | Full | ISUPPORT token (not a capability); MODE +b ~a:account, JOIN 474 when banned by account |
-| **EXTBAN mute** | Full | ISUPPORT `EXTBAN=~,ajmrt`; `MODE +b ~m:nick!*@*` keeps someone from talking without keeping them out. Voice lifts it, and `MODE +e ~m:mask` excepts from it. `MODE #chan +b` with no mask reads the list without needing op, and RPL_BANLIST/RPL_EXCEPTLIST/RPL_INVITELIST name who set each entry and when |
+| **EXTBAN mute** | Full | ISUPPORT `EXTBAN=~,OSajmrt`; `MODE +b ~m:nick!*@*` keeps someone from talking without keeping them out. Voice lifts it, and `MODE +e ~m:mask` excepts from it. `MODE #chan +b` with no mask reads the list without needing op, and RPL_BANLIST/RPL_EXCEPTLIST/RPL_INVITELIST name who set each entry and when |
 | **sasl** | Full | AUTHENTICATE PLAIN, SCRAM-SHA-256, and EXTERNAL (TLS client cert); 903/904; certfp auto-associated on PLAIN/SCRAM login |
 | **monitor** | Full | MONITOR +/−/C/L/S; 730/731/732/733/734; on join/quit/nick |
 | **extended-monitor** | Full | AWAY/ACCOUNT/CHGHOST/SETNAME forwarded for monitored nicks; `nick!user@host` masks (`*`/`?`) may be monitored as well as plain nicks |
@@ -954,7 +997,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `GROUP` | — | Reserve the nick you are using for your account; `GROUP -<nick>` releases one, `GROUP *` lists them |
 | `NOEXPIRE` | — | Oper-only (`channels`): keep an account or a channel out of `[expiry]`'s reach |
 | `MAP` | — | The network as a tree with a user count per server (015/017) |
-| `STATS` | — | `STATS u` uptime and `STATS m` command counts are for anybody; `o` (operator blocks), `k` (K-lines), `d` (D-lines), `s` (shuns), `l` (what each connection has carried: send queue, messages and bytes each way, how long it has been open — 211) and `t` (what this server has been doing — 249) are for operators |
+| `STATS` | — | `STATS u` uptime and `STATS m` command counts are for anybody; `o` (operator blocks), `k` (K-lines), `d` (D-lines), `s` (shuns), `y` (connection classes — 218), `l` (what each connection has carried: send queue, messages and bytes each way, how long it has been open — 211) and `t` (what this server has been doing — 249) are for operators |
 | `TRACE` | — | Oper-only: `TRACE [<nick>]` — the connections this server is holding (204/205) and the servers it is linked to (206), ending with 262. The class is how each one arrived: `plain`, `tls` or `websocket` |
 | `SAJOIN` | — | Oper-only (`channels`): `SAJOIN <nick> <#channel>` — put somebody in a channel. The server invites them, so `+b`, `+i`, `+k`, `+l` and `+j` open; `+O`, `+Z` and `+R` still hold, because a forced join that broke a channel's promise would be the server lying on the operator's behalf. Somebody on another server is joined by that server at this one's request |
 | `SAPART` | — | Oper-only (`channels`): `SAPART <nick> <#channel> [:<reason>]` — take somebody out of a channel; an ordinary PART, with the reason given |
@@ -990,7 +1033,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+o` | Channel operator |
 | `+v` | Voice (+) |
 | `+h` | Half-op (%) |
-| `+b` | Ban list — glob masks and the extended bans `~a:` (account), `~r:` (real name), `~j:` (in another channel), `~m:` (mute rather than ban) and `~t:` (lifts itself). The prefixes peel one at a time, so they stack: `~m:~r:*spam*` mutes by real name, `~t:1h:~j:#raiders` expires |
+| `+b` | Ban list — glob masks and the extended bans `~a:` (account), `~r:` (real name), `~j:` (in another channel), `~S:` (client certificate), `~O` (operators), `~m:` (mute rather than ban) and `~t:` (lifts itself). The prefixes peel one at a time, so they stack: `~m:~r:*spam*` mutes by real name, `~t:1h:~j:#raiders` expires |
 | `+e` | Ban exception list — exempt users bypass `+b` bans |
 | `+I` | Invite exception list — matching users bypass `+i` without explicit INVITE |
 | `+q` | Quiet list — silences matching users without kicking |
@@ -1012,6 +1055,8 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+b ~t:…` | A timed ban: `+b ~t:30m:nick!*@*` lifts itself after 30 minutes — `s`, `m`, `h`, `d`, or a bare number of minutes, up to a year. The server removes it with a `MODE -b` everybody sees, on every server. The same on `+q`, and around another extban (`~t:1h:~a:account`) |
 | `+b ~r:…` | A ban on the real name rather than the hostmask: `+b ~r:*seedy_marketing*`. A glob, because a real name is a sentence — and since a mode parameter cannot hold a space, `_` stands for one on both sides. Somebody who gave no real name is matched only by a pattern that matches nothing in particular |
 | `+b ~j:#chan` | A ban on being somewhere else: `+b ~j:#raiders` keeps out whoever is in `#raiders` at the moment they try to come in |
+| `+b ~S:…` | A ban on the TLS client certificate: `~S:*` is everybody who brought one, `~S:3b8f*` a particular one. Mostly useful as `+e ~S:*` — anybody who can prove who they are is excepted |
+| `+b ~O` | Matches the server's operators. Written as a ban it is legal and does nothing useful; written as `+e ~O` it excepts them from what the room bans |
 | `+R` | Registered users only — unregistered users cannot join or speak |
 | `+M` | Only registered users may speak; anybody may join. Somebody given a voice or ops may speak regardless, as with `+m`. The anti-spam mode for a channel that wants to stay open to lurkers |
 | `+Z` | TLS only — a connection not over TLS cannot join, and the mode cannot be set while anybody in the channel is not on TLS (490). What is said in a `+Z` channel has never crossed a wire in the clear on any hop this server controls |

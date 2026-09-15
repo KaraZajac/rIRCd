@@ -188,6 +188,15 @@ cert = "$ETC_DIR/tls.cert.pem"
 key = "$ETC_DIR/tls.key.pem"
 client_certs = true
 
+# A kind of client, so the class machinery is exercised by something.
+# 127.0.0.7 is nobody else's address in these suites.
+[[classes]]
+name = "smoke-gateway"
+hosts = ["127.0.0.7"]
+max_clients = 2
+ping_secs = 300
+sendq = 64
+
 [network]
 name = "SmokeNet"
 

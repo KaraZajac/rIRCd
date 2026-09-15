@@ -505,7 +505,20 @@ pub async fn run(
                     .as_ref()
                     .map(|d| Arc::new(crate::dnsbl::Dnsbl::from_config(d))),
             )
-            .with_dlines(state.read().await.dlines.clone());
+            .with_dlines(state.read().await.dlines.clone())
+            .with_classes(&cfg.classes);
+    state.write().await.classes = cfg.classes.clone();
+    for class in &cfg.classes {
+        info!(
+            "Connection class {}: {}",
+            class.name,
+            if class.hosts.is_empty() {
+                "everybody else".to_string()
+            } else {
+                class.hosts.join(", ")
+            }
+        );
+    }
     if let Some(ref d) = cfg.dnsbl {
         info!("DNS blocklists: {} ({})", d.zones.join(", "), d.action);
     }
@@ -540,6 +553,7 @@ pub async fn run(
         registration_secs: cfg.server.registration_timeout_secs,
         flood_burst: cfg.limits.flood_burst,
         flood_rate: cfg.limits.flood_rate,
+        sendq: client::SEND_QUEUE,
     };
 
     for listen_addr in &cfg.server.listen {

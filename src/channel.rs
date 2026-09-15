@@ -76,7 +76,7 @@ pub const USERMODES_PARAM_SET: &str = "s";
 /// User modes that never carry one.
 pub const USERMODES_FLAG: &str = "BgiorRw";
 /// The extended ban types this server understands, the letters after `~`.
-pub const EXTBAN_TYPES: &str = "ajmrt";
+pub const EXTBAN_TYPES: &str = "OSajmrt";
 
 /// The same letters in one sorted string, which is how `RPL_MYINFO` wants
 /// them: a set rather than a grammar.
@@ -140,6 +140,10 @@ pub struct Subject<'a> {
     pub realname: &'a str,
     /// The channels they are in, keyed as channels are, for `~j:`.
     pub channels: &'a [String],
+    /// The TLS client certificate they presented, for `~S:`.
+    pub certfp: Option<&'a str>,
+    /// Whether they are a server operator, for `~O`.
+    pub is_oper: bool,
 }
 
 impl<'a> Subject<'a> {
@@ -150,6 +154,8 @@ impl<'a> Subject<'a> {
             account: None,
             realname: "",
             channels: &[],
+            certfp: None,
+            is_oper: false,
         }
     }
 
@@ -165,6 +171,16 @@ impl<'a> Subject<'a> {
 
     pub fn in_channels(mut self, channels: &'a [String]) -> Self {
         self.channels = channels;
+        self
+    }
+
+    pub fn with_certfp(mut self, certfp: Option<&'a str>) -> Self {
+        self.certfp = certfp;
+        self
+    }
+
+    pub fn oper(mut self, is_oper: bool) -> Self {
+        self.is_oper = is_oper;
         self
     }
 }
@@ -389,6 +405,19 @@ impl Channel {
             let pattern = realname_mask.replace(' ', "_");
             let realname = subject.realname.replace(' ', "_");
             return crate::user::glob_match(&pattern, &realname);
+        }
+        if let Some(fingerprint) = mask.strip_prefix("~S:") {
+            // A glob, so `~S:*` is everybody who brought a certificate and
+            // `+e ~S:*` is "anybody who can prove who they are is exempt".
+            return subject
+                .certfp
+                .is_some_and(|have| crate::user::glob_match(fingerprint, have));
+        }
+        if mask.eq_ignore_ascii_case("~O") {
+            // Mostly written as `+e ~O`: the operators are exempt. As a ban
+            // it is legal and does nothing useful, which is the operator's
+            // business rather than the server's.
+            return subject.is_oper;
         }
         if let Some(channel) = mask.strip_prefix("~j:") {
             let wanted = canonical_channel_key(channel);
@@ -839,6 +868,27 @@ mod tests {
         ch.bans.push("~t:1h:~j:#raiders".into());
         assert!(ch.is_banned(&sub("eve!u@host").in_channels(&raiding)));
         assert!(!ch.is_banned(&sub("eve!u@host")));
+    }
+
+    /// `~S:` asks for the certificate, `~O` for the badge.
+    #[test]
+    fn a_certificate_and_a_badge_are_things_a_mask_can_ask_about() {
+        let mut ch = Channel::new("#s".into());
+        ch.bans.push("~S:*".into());
+        assert!(ch.is_banned(&sub("bob!u@host").with_certfp(Some("beef"))));
+        assert!(!ch.is_banned(&sub("bob!u@host")), "brought no certificate");
+        let mut exact = Channel::new("#s".into());
+        exact.bans.push("~S:beef*".into());
+        assert!(exact.is_banned(&sub("bob!u@host").with_certfp(Some("beefcafe"))));
+        assert!(!exact.is_banned(&sub("bob!u@host").with_certfp(Some("cafe"))));
+
+        let mut opers = Channel::new("#o".into());
+        opers.bans.push("*!*@host".into());
+        opers.ban_exceptions.push("~O".into());
+        let staff = sub("bob!u@host").oper(true);
+        assert!(opers.is_banned(&staff));
+        assert!(opers.is_ban_exempt(&staff), "an operator is excepted by ~O");
+        assert!(!opers.is_ban_exempt(&sub("bob!u@host")));
     }
 
     /// An exception lifts an extended ban the same way it lifts a plain one.
