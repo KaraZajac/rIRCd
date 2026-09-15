@@ -110,6 +110,9 @@ impl Drop for PidfileGuard {
 }
 
 pub struct ClientMessage {
+    /// What has crossed this connection, counted as it goes. The same handle
+    /// the reader and the writer hold, so `STATS l` reads live numbers.
+    pub stats: Arc<crate::user::ConnStats>,
     pub client_id: String,
     pub host: String,
     pub msg: Message,
@@ -932,7 +935,11 @@ pub async fn run(
                         senders_w.insert_session(
                             &client_id,
                             &client_id,
-                            crate::user::ClientSink::new(cm.send_tx.clone(), cm.kill.clone()),
+                            crate::user::ClientSink::with_stats(
+                                cm.send_tx.clone(),
+                                cm.kill.clone(),
+                                cm.stats.clone(),
+                            ),
                         );
                     }
                 }

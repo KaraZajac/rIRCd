@@ -954,6 +954,8 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `GROUP` | — | Reserve the nick you are using for your account; `GROUP -<nick>` releases one, `GROUP *` lists them |
 | `NOEXPIRE` | — | Oper-only (`channels`): keep an account or a channel out of `[expiry]`'s reach |
 | `MAP` | — | The network as a tree with a user count per server (015/017) |
+| `STATS` | — | `STATS u` uptime and `STATS m` command counts are for anybody; `o` (operator blocks), `k` (K-lines), `d` (D-lines), `s` (shuns), `l` (what each connection has carried: send queue, messages and bytes each way, how long it has been open — 211) and `t` (what this server has been doing — 249) are for operators |
+| `TRACE` | — | Oper-only: `TRACE [<nick>]` — the connections this server is holding (204/205) and the servers it is linked to (206), ending with 262. The class is how each one arrived: `plain`, `tls` or `websocket` |
 | `SAJOIN` | — | Oper-only (`channels`): `SAJOIN <nick> <#channel>` — put somebody in a channel. The server invites them, so `+b`, `+i`, `+k`, `+l` and `+j` open; `+O`, `+Z` and `+R` still hold, because a forced join that broke a channel's promise would be the server lying on the operator's behalf. Somebody on another server is joined by that server at this one's request |
 | `SAPART` | — | Oper-only (`channels`): `SAPART <nick> <#channel> [:<reason>]` — take somebody out of a channel; an ordinary PART, with the reason given |
 | `SAMODE` | — | Oper-only (`channels`): `SAMODE <#channel> <modes> [<args>]` — set channel modes without holding ops there. Shown as the operator's own MODE; the operators are told it was done this way |

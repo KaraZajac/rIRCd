@@ -644,4 +644,58 @@ if CONFIG:
     far.close()
     rehash_with()
 
+section("TRACE and STATS: an operator can see the server")
+
+look = Client(f"look{RUN}")
+look.send(f"OPER smokeoper {OPER_PW}")
+look.wait_for(" 381 ", " 464 ", seconds=5)
+bystander = Client(f"byst{RUN}")
+bmark = bystander.mark()
+bystander.send("TRACE")
+bystander.send("STATS l")
+bystander.send("STATS t")
+bystander.read(1.5)
+refused = bystander.since(bmark)
+check("none of it is a bystander's business", len(bystander.find(" 481 ", lines=refused)) == 3, refused[-4:])
+
+lmark = look.mark()
+look.send("TRACE")
+look.wait_for(" 262 ", seconds=5)
+traced = look.since(lmark)
+check("TRACE names the operator asking", bool(look.find(" 204 ", "Oper", f"look{RUN}", lines=traced)), traced[-4:])
+check("and everybody else on the server", bool(look.find(" 205 ", "User", f"byst{RUN}", lines=traced)), traced[-4:])
+check("saying how each of them arrived", bool(look.find(" 205 ", "plain", lines=traced)), traced[-4:])
+check("and ends where it says it does", bool(look.find(" 262 ", "End of TRACE", lines=traced)), traced[-2:])
+
+lmark = look.mark()
+look.send(f"TRACE byst{RUN}")
+look.wait_for(" 262 ", seconds=5)
+one = look.since(lmark)
+check("TRACE with a name is about that one person",
+      bool(look.find(" 205 ", f"byst{RUN}", lines=one)) and not look.find(" 204 ", lines=one), one[-3:])
+
+lmark = look.mark()
+look.send("STATS l")
+look.wait_for(" 219 ", seconds=5)
+rows = [l for l in look.since(lmark) if " 211 " in l]
+check("STATS l has a row for every connection", len(rows) >= 2, rows[:3])
+mine = next((l for l in rows if f"look{RUN}[" in l), "")
+fields = mine.split()
+# :server 211 nick name sendq sentmsgs sentbytes rcvdmsgs rcvdbytes :open
+check("with counts that have counted something",
+      bool(mine) and int(fields[5]) > 0 and int(fields[6]) > 0 and int(fields[7]) > 0, mine)
+check("and a send queue that is not backed up", bool(mine) and int(fields[4]) < 100, mine)
+
+lmark = look.mark()
+look.send("STATS t")
+look.wait_for(" 219 ", seconds=5)
+totals = look.since(lmark)
+check("STATS t says how long it has been up and what it has done",
+      bool(look.find(" 249 ", "Up ", "seconds", lines=totals))
+      and bool(look.find(" 249 ", "command(s) handled", lines=totals)), totals[-4:])
+check("and how much has crossed the connections open now",
+      bool(look.find(" 249 ", "byte(s) out", lines=totals)), totals[-4:])
+bystander.close()
+look.close()
+
 summary("management")

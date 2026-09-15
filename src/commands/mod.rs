@@ -1094,6 +1094,9 @@ pub async fn handle_message(
         "DLINE" => {
             server_cmds::handle_dline(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
+        "TRACE" => {
+            server_cmds::handle_trace(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
         "SHUN" => {
             server_cmds::handle_shun(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }

@@ -542,6 +542,31 @@ pub async fn handle_stats(
                 reply_to_client(&senders, client_id, m, label).await;
             }
         }
+        // What this server is carrying, and what it has been doing. Both name
+        // hosts and count traffic, so both are the operators' to see.
+        "l" | "L" | "t" | "T" => {
+            if !is_oper {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "481",
+                        vec![nick.clone(), "Permission Denied- You're not an IRC operator".into()],
+                    )
+                    .with_prefix(s),
+                    label,
+                )
+                .await;
+            } else if query.eq_ignore_ascii_case("l") {
+                for m in stats_links(&state, &senders, &nick, s).await {
+                    reply_to_client(&senders, client_id, m, label).await;
+                }
+            } else {
+                for m in stats_totals(&state, &senders, &nick, s).await {
+                    reply_to_client(&senders, client_id, m, label).await;
+                }
+            }
+        }
         "m" | "M" => {
             for m in stats_commands(&state, &nick, &cfg.server.name).await {
                 reply_to_client(&senders, client_id, m, label).await;
@@ -975,6 +1000,24 @@ pub async fn handle_help(
                 "  The network as a tree, with how many people are on each server.",
             ],
         ),
+        Some("TRACE") => (
+            "TRACE",
+            &[
+                "TRACE [<nick>]",
+                "  The connections this server is holding and the servers it is linked",
+                "  to; one person when named. The class is how they arrived: plain,",
+                "  tls or websocket. Operators only.",
+            ],
+        ),
+        Some("STATS") => (
+            "STATS",
+            &[
+                "STATS <letter>",
+                "  u uptime, m command counts, o operator blocks, k K-lines, d D-lines,",
+                "  s shuns, l what each connection has carried, t what this server has",
+                "  been doing. Everything but u and m is for operators.",
+            ],
+        ),
         Some("SHUN") => (
             "SHUN",
             &[
@@ -1071,7 +1114,7 @@ pub async fn handle_help(
                 "  CHANOWN CHANACCESS CHANDROP ACCEPT SILENCE",
                 "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS CONNECT SQUIT SANICK",
                 "  KLINE DLINE SNOMASK MLOCK SAJOIN SAPART SAMODE TESTMASK MAP GROUP NOEXPIRE",
-                "  SPAMFILTER SHUN",
+                "  SPAMFILTER SHUN TRACE",
                 "  STATS LUSERS",
             ],
         ),
@@ -4066,6 +4109,234 @@ pub async fn handle_unshun(
             ],
         )
         .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    Ok(())
+}
+
+/// Whether this client may look at other people's connections. `STATS l`,
+/// `STATS t` and `TRACE` all name hosts and count traffic, which is nobody
+/// else's business.
+async fn may_look(
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    client_id: &str,
+    cfg: &Config,
+    label: Option<&str>,
+) -> Option<String> {
+    let (nick, is_oper) = {
+        let state_r = state.read().await;
+        let c = state_r.clients.get(client_id)?;
+        let g = c.read().await;
+        (g.nick_or_id().to_string(), g.oper)
+    };
+    if !is_oper {
+        reply_to_client(
+            senders,
+            client_id,
+            Message::new(
+                "481",
+                vec![nick, "Permission Denied- You're not an IRC operator".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return None;
+    }
+    Some(nick)
+}
+
+/// One row per connection this server is holding, for `STATS l`.
+///
+/// `RPL_STATSLINKINFO` is the oldest answer to "what is this server actually
+/// carrying": how much is queued for somebody, how much has crossed, and how
+/// long they have been here. A client that has stopped reading shows up in
+/// the send queue before it shows up anywhere else.
+async fn stats_links(
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    nick: &str,
+    server: &str,
+) -> Vec<Message> {
+    let now = chrono::Utc::now().timestamp();
+    let mut rows = Vec::new();
+    let state_r = state.read().await;
+    let registry = senders.read().await;
+    for (id, client) in state_r.users() {
+        let g = client.read().await;
+        // Somebody on another server has no connection here to describe.
+        if g.server.is_some() {
+            continue;
+        }
+        let who = format!(
+            "{}[{}@{}]",
+            g.nick_or_id(),
+            g.display_user(),
+            g.display_host()
+        );
+        for session in registry.sessions_of(id) {
+            let Some(sink) = registry.get(&session) else {
+                continue;
+            };
+            let stats = sink.stats();
+            let (sent_msgs, sent_bytes, got_msgs, got_bytes) = stats.counts();
+            rows.push(
+                Message::new(
+                    "211",
+                    vec![
+                        nick.to_string(),
+                        who.clone(),
+                        sink.sendq().to_string(),
+                        sent_msgs.to_string(),
+                        sent_bytes.to_string(),
+                        got_msgs.to_string(),
+                        got_bytes.to_string(),
+                        format!("{}", now.saturating_sub(stats.since)),
+                    ],
+                )
+                .with_prefix(server),
+            );
+        }
+    }
+    rows
+}
+
+/// What this server has been doing, for `STATS t`.
+async fn stats_totals(
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    nick: &str,
+    server: &str,
+) -> Vec<Message> {
+    let (users, peak, uptime, commands) = {
+        let state_r = state.read().await;
+        (
+            state_r.user_count(),
+            state_r.max_clients,
+            chrono::Utc::now()
+                .timestamp()
+                .saturating_sub(state_r.started_at),
+            state_r.command_counts.values().sum::<u64>(),
+        )
+    };
+    // Summed over the connections open now: a server that kept a running
+    // total would have to be told when each one ended, and a number that is
+    // only true if nothing was missed is worse than one that says what it is.
+    let (sent_msgs, sent_bytes, got_msgs, got_bytes) = {
+        let registry = senders.read().await;
+        registry.all_stats().into_iter().fold(
+            (0u64, 0u64, 0u64, 0u64),
+            |(a, b, c, d), stats| {
+                let (sm, sb, gm, gb) = stats.counts();
+                (a + sm, b + sb, c + gm, d + gb)
+            },
+        )
+    };
+    [
+        format!("Up {uptime} seconds"),
+        format!("{users} user(s) now, {peak} at once at the most"),
+        format!("{commands} command(s) handled"),
+        format!(
+            "On the connections open now: {sent_msgs} message(s) and {sent_bytes} byte(s) out, \
+             {got_msgs} and {got_bytes} in"
+        ),
+    ]
+    .into_iter()
+    .map(|line| Message::new("249", vec![nick.to_string(), line]).with_prefix(server))
+    .collect()
+}
+
+/// `TRACE [<nick>]` — the connections this server is holding, and the
+/// servers it is linked to.
+///
+/// The class is how the connection arrived, because that is the only class
+/// this server has: `plain`, `tls` or `websocket`.
+pub async fn handle_trace(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let s = &cfg.server.name;
+    let Some(nick) = may_look(&state, &senders, client_id, cfg, label).await else {
+        return Ok(());
+    };
+    let wanted = msg.params.first().cloned();
+    let mut rows: Vec<Message> = Vec::new();
+    {
+        let state_r = state.read().await;
+        let registry = senders.read().await;
+        for (id, client) in state_r.users() {
+            let g = client.read().await;
+            if g.server.is_some() {
+                continue;
+            }
+            let their_nick = g.nick_or_id().to_string();
+            if let Some(ref only) = wanted {
+                if !their_nick.eq_ignore_ascii_case(only) {
+                    continue;
+                }
+            }
+            let class = registry
+                .sessions_of(id)
+                .into_iter()
+                .find_map(|session| registry.get(&session).map(|sink| sink.stats().kind))
+                .unwrap_or("plain");
+            let source = format!("{}[{}@{}]", their_nick, g.display_user(), g.display_host());
+            rows.push(
+                Message::new(
+                    if g.oper { "204" } else { "205" },
+                    vec![
+                        nick.clone(),
+                        if g.oper { "Oper".into() } else { "User".into() },
+                        class.to_string(),
+                        source,
+                    ],
+                )
+                .with_prefix(s),
+            );
+        }
+    }
+    // The servers, when nobody asked about one person in particular.
+    if wanted.is_none() {
+        if let Some(ref links) = cfg.links_runtime {
+            for server in links.read().await.all() {
+                rows.push(
+                    Message::new(
+                        "206",
+                        vec![
+                            nick.clone(),
+                            "Serv".into(),
+                            if server.behind.is_none() { "link".into() } else { "behind".into() },
+                            server.name.clone(),
+                            format!("{} hop(s)", server.hops),
+                        ],
+                    )
+                    .with_prefix(s),
+                );
+            }
+        }
+    }
+    for row in rows {
+        reply_to_client(&senders, client_id, row, label).await;
+    }
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "262",
+            vec![
+                nick,
+                s.clone(),
+                concat!("rIRCd-", env!("CARGO_PKG_VERSION")).into(),
+                "End of TRACE".into(),
+            ],
+        )
+        .with_prefix(s),
         label,
     )
     .await;

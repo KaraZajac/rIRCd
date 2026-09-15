@@ -329,7 +329,7 @@ impl ConnectionLimits {
 
 /// Outbound queue depth per client. Large enough for legitimate bursts such as a
 /// NAMES reply on a busy channel; a client that lets it fill is not reading.
-const SEND_QUEUE: usize = 1024;
+pub const SEND_QUEUE: usize = 1024;
 
 /// Bytes the writer will hold for a client that is behind. Past this it stops
 /// taking from the queue, the queue fills, and the connection is dropped —
@@ -498,25 +498,32 @@ async fn write_loop<W>(
     send_rx: &mut mpsc::Receiver<Message>,
     out_line_limit: usize,
     client_id: &str,
+    stats: &crate::user::ConnStats,
 ) where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut backlog: Vec<u8> = Vec::with_capacity(BUF_SIZE);
     let mut sent = 0usize;
+    let mut queued = 0u64;
     loop {
         if sent == backlog.len() {
             backlog.clear();
             sent = 0;
+            queued = 0;
             let Some(first) = send_rx.recv().await else {
                 return;
             };
             backlog.extend_from_slice(format_message_within(&first, out_line_limit).as_bytes());
+            queued += 1;
         }
         // Whatever else is already queued goes in the same write.
         while backlog.len() < SEND_BACKLOG_BYTES {
             match send_rx.try_recv() {
-                Ok(msg) => backlog
-                    .extend_from_slice(format_message_within(&msg, out_line_limit).as_bytes()),
+                Ok(msg) => {
+                    backlog
+                        .extend_from_slice(format_message_within(&msg, out_line_limit).as_bytes());
+                    queued += 1;
+                }
                 Err(_) => break,
             }
         }
@@ -525,7 +532,17 @@ async fn write_loop<W>(
                 error!("Write error for {}: peer closed", client_id);
                 return;
             }
-            Ok(n) => sent += n,
+            Ok(n) => {
+                sent += n;
+                // The messages are counted once the last of their bytes is
+                // away, so a half-written batch is not reported as sent.
+                let done = if sent == backlog.len() {
+                    std::mem::take(&mut queued)
+                } else {
+                    0
+                };
+                stats.wrote(n, done);
+            }
             Err(e) => {
                 error!("Write error for {}: {}", client_id, e);
                 return;
@@ -566,8 +583,22 @@ async fn handle_client_stream<S>(
     // line — this is.
     let mut lines =
         crate::linereader::BoundedLines::new(crate::protocol::MAX_TOTAL_TAGGED.max(in_line_limit));
+    // What crosses this connection, counted where the bytes are.
+    let stats = std::sync::Arc::new(crate::user::ConnStats::of_kind(if is_tls {
+        "tls"
+    } else {
+        "plain"
+    }));
+    let writer_stats = stats.clone();
     let mut writer_task = tokio::spawn(async move {
-        write_loop(&mut writer, &mut send_rx, out_line_limit, &client_id_clone).await;
+        write_loop(
+            &mut writer,
+            &mut send_rx,
+            out_line_limit,
+            &client_id_clone,
+            &writer_stats,
+        )
+        .await;
     });
 
     // Raised when the outbound queue overflows: the peer is not reading, and the
@@ -632,6 +663,9 @@ async fn handle_client_stream<S>(
                         if buf.is_empty() {
                             continue;
                         }
+                        // The line as it came off the wire, with the ending
+                        // the reader stripped.
+                        stats.read(buf.len() + 2);
                         let line = match std::str::from_utf8(buf) {
                             Ok(s) => s,
                             Err(_) => {
@@ -709,6 +743,7 @@ async fn handle_client_stream<S>(
 
                                 if tx_clone
                                     .send(ClientMessage {
+                                        stats: stats.clone(),
                                         client_id: client_id.clone(),
                                         host: host.clone(),
                                         msg,
@@ -797,6 +832,7 @@ async fn handle_client_stream<S>(
     }
     let _ = tx
         .send(ClientMessage {
+            stats: stats.clone(),
             client_id: client_id.clone(),
             host,
             msg: Message::new("QUIT", vec![quit_reason.into()]),
@@ -868,6 +904,9 @@ pub async fn handle_client_ws(
 
     let (send_tx, mut send_rx) = mpsc::channel::<Message>(SEND_QUEUE);
     let kill = Arc::new(tokio::sync::Notify::new());
+    // What crosses this connection. A frame is a message, which is the one
+    // place a WebSocket client counts differently from a socket one.
+    let stats = std::sync::Arc::new(crate::user::ConnStats::of_kind("websocket"));
 
     // Flood control
     let flood_capacity = keepalive.flood_burst;
@@ -921,10 +960,16 @@ pub async fn handle_client_ws(
                 } else {
                     ws::Message::Text(line.into())
                 };
+                let bytes = match &frame {
+                    ws::Message::Binary(b) => b.len(),
+                    ws::Message::Text(t) => t.len(),
+                    _ => 0,
+                };
                 if socket.send(frame).await.is_err() {
                     error!("WebSocket write error for {}", client_id);
                     break;
                 }
+                stats.wrote(bytes, 1);
             }
             // Read incoming WS frames as IRC messages (text or binary per IRCv3 WS spec)
             ws_msg = socket.recv() => {
@@ -934,6 +979,7 @@ pub async fn handle_client_ws(
                         if line.is_empty() {
                             continue;
                         }
+                        stats.read(text.len());
                         match parse_message_with_limit(line, ws_line_limit) {
                             Ok(msg) => {
                                 debug!(client = %client_id, command = %msg.command, "received (ws)");
@@ -977,6 +1023,7 @@ pub async fn handle_client_ws(
                                 }
 
                                 if tx_clone.send(ClientMessage {
+                                    stats: stats.clone(),
                                     client_id: client_id.clone(),
                                     host: host.clone(),
                                     msg,
@@ -1003,6 +1050,7 @@ pub async fn handle_client_ws(
                         }
                     }
                     Some(Ok(ws::Message::Binary(data))) => {
+                        stats.read(data.len());
                         // binary.ircv3.net: binary frames contain IRC messages as raw bytes
                         let line = match std::str::from_utf8(&data) {
                             Ok(s) => s.trim(),
@@ -1075,6 +1123,7 @@ pub async fn handle_client_ws(
                                 }
 
                                 if tx_clone.send(ClientMessage {
+                                    stats: stats.clone(),
                                     client_id: client_id.clone(),
                                     host: host.clone(),
                                     msg,
@@ -1130,6 +1179,7 @@ pub async fn handle_client_ws(
     info!("Client disconnected (WebSocket): {}", client_id);
     let _ = tx
         .send(ClientMessage {
+            stats: stats.clone(),
             client_id: client_id.clone(),
             host,
             msg: Message::new("QUIT", vec![quit_reason.into()]),
@@ -1165,7 +1215,7 @@ mod writer_tests {
 
         let writer = tokio::spawn(async move {
             let mut server = server;
-            write_loop(&mut server, &mut rx, 510, "test").await;
+            write_loop(&mut server, &mut rx, 510, "test", &crate::user::ConnStats::new()).await;
         });
 
         // The reader drains slowly enough that the socket buffer fills, which
@@ -1234,7 +1284,7 @@ mod writer_tests {
         let (tx, mut rx) = mpsc::channel::<Message>(SEND_QUEUE);
         let writer = tokio::spawn(async move {
             let mut server = server;
-            write_loop(&mut server, &mut rx, 510, "test").await;
+            write_loop(&mut server, &mut rx, 510, "test", &crate::user::ConnStats::new()).await;
         });
 
         let mut queued = 0usize;

@@ -447,6 +447,74 @@ impl MonitorWatchers {
     }
 }
 
+/// What has crossed one connection, counted as it goes.
+///
+/// A server that cannot say how much it is carrying is a server nobody can
+/// tell is in trouble. These are the numbers `STATS l` and `TRACE` report:
+/// kept on the connection itself, where the bytes actually are, and read
+/// from the command side through the sink.
+#[derive(Debug)]
+pub struct ConnStats {
+    pub bytes_in: std::sync::atomic::AtomicU64,
+    pub bytes_out: std::sync::atomic::AtomicU64,
+    pub messages_in: std::sync::atomic::AtomicU64,
+    pub messages_out: std::sync::atomic::AtomicU64,
+    /// When the connection was accepted, which is before it had a nick.
+    pub since: i64,
+    /// How it arrived: `plain`, `tls` or `websocket`. What `TRACE` calls the
+    /// class, until there are classes to call it.
+    pub kind: &'static str,
+}
+
+impl Default for ConnStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConnStats {
+    pub fn new() -> Self {
+        Self::of_kind("plain")
+    }
+
+    pub fn of_kind(kind: &'static str) -> Self {
+        Self {
+            bytes_in: std::sync::atomic::AtomicU64::new(0),
+            bytes_out: std::sync::atomic::AtomicU64::new(0),
+            messages_in: std::sync::atomic::AtomicU64::new(0),
+            messages_out: std::sync::atomic::AtomicU64::new(0),
+            since: Utc::now().timestamp(),
+            kind,
+        }
+    }
+
+    /// One line arrived.
+    pub fn read(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.bytes_in.fetch_add(bytes as u64, Relaxed);
+        self.messages_in.fetch_add(1, Relaxed);
+    }
+
+    /// A write went out, carrying that many messages.
+    pub fn wrote(&self, bytes: usize, messages: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.bytes_out.fetch_add(bytes as u64, Relaxed);
+        self.messages_out.fetch_add(messages, Relaxed);
+    }
+
+    /// Sent messages, sent bytes, received messages, received bytes — the
+    /// order `RPL_STATSLINKINFO` asks for them in.
+    pub fn counts(&self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.messages_out.load(Relaxed),
+            self.bytes_out.load(Relaxed),
+            self.messages_in.load(Relaxed),
+            self.bytes_in.load(Relaxed),
+        )
+    }
+}
+
 /// The outbound side of one client connection.
 ///
 /// Sends never wait. Every command in the server is handled by a single loop, so
@@ -457,11 +525,31 @@ impl MonitorWatchers {
 pub struct ClientSink {
     tx: mpsc::Sender<Message>,
     kill: Arc<tokio::sync::Notify>,
+    stats: Arc<ConnStats>,
 }
 
 impl ClientSink {
     pub fn new(tx: mpsc::Sender<Message>, kill: Arc<tokio::sync::Notify>) -> Self {
-        Self { tx, kill }
+        Self::with_stats(tx, kill, Arc::new(ConnStats::new()))
+    }
+
+    pub fn with_stats(
+        tx: mpsc::Sender<Message>,
+        kill: Arc<tokio::sync::Notify>,
+        stats: Arc<ConnStats>,
+    ) -> Self {
+        Self { tx, kill, stats }
+    }
+
+    /// What has crossed this connection.
+    pub fn stats(&self) -> &Arc<ConnStats> {
+        &self.stats
+    }
+
+    /// How much is queued for this connection and not yet written. A client
+    /// that has stopped reading shows here before it shows anywhere else.
+    pub fn sendq(&self) -> usize {
+        crate::client::SEND_QUEUE.saturating_sub(self.tx.capacity())
     }
 
     /// Send a last message and close the connection — how a server drops a client
@@ -514,6 +602,11 @@ impl SessionRegistry {
     /// connection that asked and not to the user's other ones.
     pub fn get(&self, session_id: &str) -> Option<&ClientSink> {
         self.sinks.get(session_id)
+    }
+
+    /// What has crossed every connection this server is holding.
+    pub fn all_stats(&self) -> Vec<&Arc<ConnStats>> {
+        self.sinks.values().map(|sink| sink.stats()).collect()
     }
 
     /// Add a connection, as a user's first session or an additional one.
