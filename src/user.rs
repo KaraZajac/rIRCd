@@ -947,6 +947,10 @@ pub struct ServerState {
     pub mail_cooldown: crate::authcost::Cooldown,
     /// Registrations per address, so many per window.
     pub register_rate: crate::authcost::RateWindow,
+    /// How many files each account has uploaded lately. Uploads cost disk
+    /// that nothing else reclaims, so an account that keeps uploading is
+    /// asked to stop for a while.
+    pub upload_rate: crate::authcost::RateWindow,
     /// Users held on behalf of other servers, kept as a count so the ceiling
     /// on them is a comparison rather than a walk through every user on every
     /// line of a burst.

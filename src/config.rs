@@ -154,6 +154,11 @@ pub struct FilehostConfig {
     /// Directory on disk where uploaded files are stored.
     #[serde(default = "default_filehost_dir")]
     pub upload_dir: String,
+    /// How many files one account may upload in an hour. 0 for as many as
+    /// they like — which on a server anybody can register on means as much
+    /// disk as they like.
+    #[serde(default = "default_max_uploads_per_hour")]
+    pub max_uploads_per_hour: usize,
     /// Maximum upload size in bytes (default 50 MiB).
     #[serde(default = "default_filehost_max_size")]
     pub max_size: usize,
@@ -797,6 +802,9 @@ fn default_max_targets() -> usize {
     4
 }
 
+fn default_max_uploads_per_hour() -> usize {
+    60
+}
 fn default_max_channels() -> usize {
     50
 }

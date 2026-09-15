@@ -16,13 +16,45 @@ use tokio::fs;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+/// The address a request came from, put there by whichever accept loop took
+/// it. The plain listener carries it as `ConnectInfo`; the TLS one runs its
+/// own accept loop, so it puts it here instead.
+#[derive(Clone, Debug)]
+pub struct PeerAddr(pub String);
+
+/// The account a request proved it holds, put there by the auth middleware
+/// so the upload handler knows whose file it is.
+#[derive(Clone, Debug)]
+pub struct Uploader(pub String);
+
 /// Shared state for the filehost HTTP handlers.
 #[derive(Clone)]
 pub struct FilehostState {
     pub upload_dir: PathBuf,
     pub public_url: String,
     pub max_size: usize,
+    pub max_uploads_per_hour: usize,
     pub db_pool: sqlx::MySqlPool,
+    /// The same state the IRC side uses, for the same reason: these are the
+    /// same passwords, so guessing at them here has to cost what guessing at
+    /// them there costs.
+    pub state: Arc<tokio::sync::RwLock<crate::user::ServerState>>,
+}
+
+/// Where a request came from, however its listener recorded it.
+fn peer_of(req: &Request<Body>) -> String {
+    if let Some(PeerAddr(ip)) = req.extensions().get::<PeerAddr>() {
+        return ip.clone();
+    }
+    if let Some(info) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        return info.0.ip().to_string();
+    }
+    // Nothing recorded it, so everything shares one allowance rather than
+    // none: an unknown address must not be the way around the budget.
+    "unknown".to_string()
 }
 
 /// Build the axum router for the filehost.
@@ -95,6 +127,30 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // These are the same passwords the IRC side takes such care over, and
+    // checking one costs the same bcrypt. An address that keeps getting it
+    // wrong is told to wait rather than having another check run for it —
+    // otherwise every bit of that care is one HTTP request away from being
+    // beside the point.
+    let peer = peer_of(&req);
+    let wait = {
+        let mut state = fh_state.state.write().await;
+        state.auth_cost.spend(&peer)
+    };
+    if !wait.is_zero() {
+        warn!(peer = %peer, "Filehost upload rejected: too many failed credentials from this address");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&wait.as_secs().max(1).to_string())
+                    .unwrap_or(HeaderValue::from_static("5")),
+            )],
+            "Too many credential checks from your address just now; try again in a moment",
+        )
+            .into_response();
+    }
+
     let Some(auth_str) = auth_header else {
         warn!("Filehost upload rejected: no Authorization header");
         return (
@@ -133,21 +189,49 @@ async fn auth_middleware(
     };
 
     if !crate::persist::verify_user(&fh_state.db_pool, user, pass).await {
-        warn!(user = %user, "Filehost upload rejected: bad credentials");
+        warn!(user = %user, peer = %peer, "Filehost upload rejected: bad credentials");
         return (StatusCode::FORBIDDEN, "Invalid username or password").into_response();
     }
+    // Right first time is not guessing, so it is given back.
+    fh_state.state.write().await.auth_cost.refund(&peer);
 
     info!(user = %user, "Filehost auth OK");
+    let mut req = req;
+    req.extensions_mut().insert(Uploader(user.to_string()));
     next.run(req).await
 }
 
 /// POST / — upload a file, return the download URL in Location header.
 async fn upload_file(
     State(fh_state): State<Arc<FilehostState>>,
+    axum::Extension(Uploader(account)): axum::Extension<Uploader>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    info!(size = body.len(), "Filehost upload body received");
+    info!(size = body.len(), account = %account, "Filehost upload body received");
+
+    // Disk is the one thing here nothing reclaims, so an account that keeps
+    // uploading is asked to stop for a while. Counted per account rather than
+    // per address: the account is what was proved.
+    if fh_state.max_uploads_per_hour > 0 {
+        let allowed = fh_state.state.write().await.upload_rate.allow(
+            &account.to_lowercase(),
+            fh_state.max_uploads_per_hour,
+            std::time::Duration::from_secs(3600),
+        );
+        if !allowed {
+            warn!(account = %account, "Filehost upload rejected: too many lately");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, HeaderValue::from_static("3600"))],
+                format!(
+                    "That account has uploaded {} files in the last hour, which is all it may",
+                    fh_state.max_uploads_per_hour
+                ),
+            )
+                .into_response();
+        }
+    }
 
     if body.len() > fh_state.max_size {
         warn!(
@@ -218,6 +302,7 @@ async fn upload_file(
     info!(
         file = %stored_name,
         size = body.len(),
+        account = %account,
         "File uploaded successfully"
     );
 

@@ -26,6 +26,10 @@ WS_PORT="${SMOKE_WS_PORT:-16668}"
 # TLS connection can exercise — +Z, SASL EXTERNAL, an operator's certificate
 # — is exercised.
 TLS_PORT="${SMOKE_TLS_PORT:-16670}"
+# The file host, over HTTPS as a real one would be, so the accept loop that
+# serves it is the one under test.
+FH_PORT="${SMOKE_FILEHOST_PORT:-16671}"
+export SMOKE_FILEHOST_PORT="$FH_PORT"
 export SMOKE_TLS_PORT="$TLS_PORT"
 DB_PORT="${SMOKE_DB_PORT:-3399}"
 # Which binary to run. The debug build is the right one for the suites, which
@@ -210,6 +214,15 @@ hosts = ["127.0.0.8"]
 flood_burst = 400
 flood_rate = 200
 
+[filehost]
+listen = "$BIND:$FH_PORT"
+public_url = "https://$BIND:$FH_PORT/uploads"
+upload_dir = "$RUN_DIR/uploads"
+# Small on purpose: the suite checks what happens at the edges, and the
+# edges should be reachable in a test rather than in a gigabyte.
+max_size = 65536
+max_uploads_per_hour = 5
+
 [network]
 name = "SmokeNet"
 
@@ -319,7 +332,7 @@ export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 status=0
 if [ "$SERVE_ONLY" = 0 ]; then
   if [ ${#SUITES[@]} -eq 0 ]; then
-    SUITES=(test_core.py test_isupport.py test_ircv3.py test_features.py test_websocket.py test_account.py test_ownership.py test_management.py test_webpush.py test_multiclient.py test_hostile.py)
+    SUITES=(test_core.py test_isupport.py test_filehost.py test_ircv3.py test_features.py test_websocket.py test_account.py test_ownership.py test_management.py test_webpush.py test_multiclient.py test_hostile.py)
   fi
   for suite in "${SUITES[@]}"; do
     say "Running $suite"

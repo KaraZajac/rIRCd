@@ -329,14 +329,33 @@ narrowed, and `channels` has to be listed for them to move a channel.
 
 ### `[filehost]`
 
-Optional. Enables the `draft/filehost` HTTP file upload endpoint. When configured, rIRCd embeds an HTTP server that accepts authenticated file uploads and serves them back. Authenticated IRC users upload via HTTP Basic auth (same credentials as SASL PLAIN). The `draft/FILEHOST=<url>` ISUPPORT token is advertised to clients.
+Optional, and how somebody shares a picture here. There is no upload bot and
+no third-party host: the server keeps the file itself. A client reads the
+`FILEHOST` token out of ISUPPORT, `POST`s the file there over HTTPS with the
+same account credentials it uses for SASL — HTTP Basic, because that is what
+the extension says — and is handed back a URL in the `Location` header to
+paste into the channel. Anybody with the link can fetch it; only somebody with
+an account can put one there.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `listen` | `0.0.0.0:8080` | HTTP listen address for the filehost |
-| `public_url` | _(required)_ | Public base URL clients use to reach uploads (e.g. `https://irc.example.com/uploads`) |
-| `upload_dir` | `/var/lib/rircd/uploads` | Local directory where uploaded files are stored |
-| `max_size` | `52428800` (50 MiB) | Maximum upload size in bytes |
+| `listen` | `0.0.0.0:8080` | Where the file host listens |
+| `public_url` | _(required)_ | The base URL people will actually reach it on (e.g. `https://irc.example.com/uploads`). Its path is where the routes are mounted, so a reverse proxy in front needs no special case, and an `https://` one makes the server serve it with the certificate from `[tls]` |
+| `upload_dir` | `/var/lib/rircd/uploads` | Where the files go |
+| `max_size` | `52428800` (50 MiB) | The largest file it will take; anything over gets 413 |
+| `max_uploads_per_hour` | `60` | How many files one account may put there in an hour; `0` for as many as it likes, which on a server anybody can register on means as much disk as it likes. Over it is 429 with a `Retry-After` |
+
+The credentials are the account's, so guessing at them here costs what guessing
+at them over IRC costs: the same allowance is spent per address, and an address
+that keeps getting it wrong is answered `429` with a `Retry-After` **without a
+password being checked at all**. Otherwise every bit of the care the IRC side
+takes over passwords would be one HTTP request away from being beside the
+point.
+
+A file is stored under a name of the server's choosing — a UUID, keeping only
+a sanitised extension — so nothing an uploader writes becomes a path, and
+nothing they upload can overwrite anything. `tests/smoke/test_filehost.py`
+covers the lot, including the links that try to leave the directory.
 
 Example:
 

@@ -425,7 +425,9 @@ pub async fn run(
             upload_dir,
             public_url: fh_cfg.public_url.clone(),
             max_size: fh_cfg.max_size,
+            max_uploads_per_hour: fh_cfg.max_uploads_per_hour,
             db_pool,
+            state: state.clone(),
         });
 
         let app = crate::filehost::router(fh_state);
@@ -439,9 +441,14 @@ pub async fn run(
                 tokio::spawn(async move {
                     loop {
                         match listener.accept().await {
-                            Ok((stream, _addr)) => {
+                            Ok((stream, addr)) => {
                                 let acceptor = acceptor.clone();
-                                let app = app.clone();
+                                // This loop is the server's own, so nothing
+                                // has recorded where the request came from
+                                // yet. The budget needs to know.
+                                let app = app.clone().layer(axum::Extension(
+                                    crate::filehost::PeerAddr(addr.ip().to_string()),
+                                ));
                                 tokio::spawn(async move {
                                     let acceptor = acceptor.read().await.clone();
                                     match tokio::time::timeout(
@@ -484,7 +491,9 @@ pub async fn run(
                 );
                 info!("Filehost HTTP listening on {}", listen_addr);
                 tokio::spawn(async move {
-                    if let Err(e) = axum::serve(listener, app).await {
+                    let service =
+                        app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+                    if let Err(e) = axum::serve(listener, service).await {
                         error!("Filehost server error: {}", e);
                     }
                 });
@@ -492,7 +501,8 @@ pub async fn run(
         } else {
             info!("Filehost HTTP listening on {}", listen_addr);
             tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, app).await {
+                let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+                if let Err(e) = axum::serve(listener, service).await {
                     error!("Filehost server error: {}", e);
                 }
             });
