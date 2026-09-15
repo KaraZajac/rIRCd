@@ -352,6 +352,11 @@ pub struct ExpiryConfig {
     pub accounts_days: u32,
     #[serde(default)]
     pub channels_days: u32,
+    /// How long a shared file is kept. Disk is the one thing here nothing
+    /// else reclaims: an account that stops uploading stops costing more,
+    /// but what it uploaded stays until somebody says otherwise.
+    #[serde(default)]
+    pub uploads_days: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

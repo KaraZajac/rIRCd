@@ -161,4 +161,57 @@ for i in range(8):
 check("an account may upload up to its allowance", allowed > 0, allowed)
 check("and is asked to stop after it", refused == 1, (allowed, refused))
 
+section("how long a shared file is kept")
+
+# Disk is the one thing here nothing else reclaims. [expiry] uploads_days
+# says how long a link is good for, which is a thing people can be told in
+# advance — unlike "until the disk fills", which is what no setting means.
+CONFIG = os.environ.get("SMOKE_CONFIG", "")
+UPLOAD_DIR = os.environ.get("SMOKE_UPLOAD_DIR", "")
+# Said out loud rather than skipped past: a section that quietly disappears
+# when the harness stops exporting something is a section nobody notices is
+# gone.
+check("the harness says where the config and the uploads are",
+      bool(CONFIG and UPLOAD_DIR), (CONFIG, UPLOAD_DIR))
+if CONFIG and UPLOAD_DIR:
+    original = open(CONFIG).read()
+
+    def rehash_to(text):
+        open(CONFIG, "w").write(text)
+        op = Client(f"cfg{RUN}")
+        op.send(f"OPER {os.environ.get('SMOKE_OPER_NAME', 'smokeoper')} "
+                f"{os.environ.get('SMOKE_OPER_PASSWORD', 'smoke-oper-password')}")
+        op.wait_for(" 381 ", " 464 ", seconds=5)
+        op.send("REHASH")
+        op.wait_for(" 382 ", seconds=5)
+        op.close()
+        time.sleep(1.5)
+
+    _, headers, _ = request("POST", PREFIX, body=b"yesterday's news", auth=(owner, PASSWORD))
+    stale_url = headers.get("location", "")
+    stale_on_disk = os.path.join(UPLOAD_DIR, stale_url.rsplit("/", 1)[1])
+    _, headers, _ = request("POST", PREFIX, body=b"today's news", auth=(owner, PASSWORD))
+    fresh_url = headers.get("location", "")
+    fresh_on_disk = os.path.join(UPLOAD_DIR, fresh_url.rsplit("/", 1)[1])
+    check("both files are on disk to begin with",
+          os.path.exists(stale_on_disk) and os.path.exists(fresh_on_disk),
+          (stale_on_disk, fresh_on_disk))
+
+    # Two days back, so a one-day setting is past it and the other is not.
+    old_enough = time.time() - 2 * 86400
+    os.utime(stale_on_disk, (old_enough, old_enough))
+
+    try:
+        assert "[limits]" in original
+        rehash_to(original.replace("[limits]", "[expiry]\nuploads_days = 1\n\n[limits]", 1))
+        check("a file older than the setting is let go", not os.path.exists(stale_on_disk),
+              stale_on_disk)
+        check("and the one that is not stays", os.path.exists(fresh_on_disk), fresh_on_disk)
+        status, _, _ = request("GET", "/" + stale_url.split("/", 3)[3])
+        check("the link to it is a plain 404 now", status == 404, status)
+        status, _, _ = request("GET", "/" + fresh_url.split("/", 3)[3])
+        check("and the other link still works", status == 200, status)
+    finally:
+        rehash_to(original)
+
 summary("filehost")

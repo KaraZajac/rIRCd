@@ -96,6 +96,70 @@ pub fn router(fh_state: Arc<FilehostState>) -> Router {
         .with_state(fh_state)
 }
 
+/// Let go of uploads older than `cutoff`, and say how many went.
+///
+/// Kept by age rather than by whether anybody still wants them: nothing here
+/// knows who has a link. An operator who sets `uploads_days` is saying how
+/// long a link is good for, which is a thing people can be told in advance —
+/// unlike "until the disk fills", which is what no setting at all means.
+///
+/// Only regular files directly in the directory are touched: not a symbolic
+/// link, not a directory, and not a dotfile, so nothing here reaches outside
+/// the place the operator named.
+pub async fn sweep_uploads(dir: &std::path::Path, cutoff: i64) -> usize {
+    let mut entries = match fs::read_dir(dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(dir = %dir.display(), "Cannot look over the uploads: {e}");
+            return 0;
+        }
+    };
+    let mut gone = 0usize;
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(dir = %dir.display(), "Stopped looking over the uploads: {e}");
+                break;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        // `file_type` does not follow a symbolic link, so a link is simply
+        // not a regular file and is left alone.
+        match entry.file_type().await {
+            Ok(kind) if kind.is_file() => {}
+            _ => continue,
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        // A clock that says a file predates the epoch is a clock to disbelieve,
+        // so such a file is treated as new and left alone.
+        let modified_at = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(i64::MAX);
+        if modified_at >= cutoff {
+            continue;
+        }
+        match fs::remove_file(entry.path()).await {
+            Ok(()) => {
+                info!(file = %name, "Upload expired");
+                gone += 1;
+            }
+            Err(e) => warn!(file = %name, "Could not let go of an expired upload: {e}"),
+        }
+    }
+    gone
+}
+
 /// Log every incoming request.
 async fn request_logging(req: Request<Body>, next: Next) -> Response {
     let method = req.method().clone();
@@ -210,29 +274,6 @@ async fn upload_file(
 ) -> Response {
     info!(size = body.len(), account = %account, "Filehost upload body received");
 
-    // Disk is the one thing here nothing reclaims, so an account that keeps
-    // uploading is asked to stop for a while. Counted per account rather than
-    // per address: the account is what was proved.
-    if fh_state.max_uploads_per_hour > 0 {
-        let allowed = fh_state.state.write().await.upload_rate.allow(
-            &account.to_lowercase(),
-            fh_state.max_uploads_per_hour,
-            std::time::Duration::from_secs(3600),
-        );
-        if !allowed {
-            warn!(account = %account, "Filehost upload rejected: too many lately");
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(header::RETRY_AFTER, HeaderValue::from_static("3600"))],
-                format!(
-                    "That account has uploaded {} files in the last hour, which is all it may",
-                    fh_state.max_uploads_per_hour
-                ),
-            )
-                .into_response();
-        }
-    }
-
     if body.len() > fh_state.max_size {
         warn!(
             size = body.len(),
@@ -284,6 +325,29 @@ async fn upload_file(
             })
             .unwrap_or_default(),
     };
+
+    // Disk is the one thing here nothing reclaims, so an account that keeps
+    // uploading is asked to stop for a while. Counted per account rather than
+    // per address: the account is what was proved.
+    if fh_state.max_uploads_per_hour > 0 {
+        let allowed = fh_state.state.write().await.upload_rate.allow(
+            &account.to_lowercase(),
+            fh_state.max_uploads_per_hour,
+            std::time::Duration::from_secs(3600),
+        );
+        if !allowed {
+            warn!(account = %account, "Filehost upload rejected: too many lately");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, HeaderValue::from_static("3600"))],
+                format!(
+                    "That account has uploaded {} files in the last hour, which is all it may",
+                    fh_state.max_uploads_per_hour
+                ),
+            )
+                .into_response();
+        }
+    }
 
     let unique_id = uuid::Uuid::new_v4();
     let stored_name = format!("{}{}", unique_id, ext);

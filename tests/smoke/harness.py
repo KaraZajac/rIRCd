@@ -54,6 +54,7 @@ class Client:
             self.sock = ctx.wrap_socket(self.sock, server_hostname=IRC_HOST)
         self.buf = ""
         self.lines = []
+        self.closed = False
         self.nick = nick
         if nick:
             self.register(nick, user, realname, caps)
@@ -100,8 +101,10 @@ class Client:
             except socket.timeout:
                 break
             except OSError:
+                self.closed = True
                 break
             if not data:
+                self.closed = True
                 break
             self.buf += data.decode("utf-8", "replace")
             while "\r\n" in self.buf:
@@ -123,6 +126,10 @@ class Client:
             for line in self.lines[start:]:
                 if any(n in line for n in needles):
                     return line
+            if self.closed:
+                # Nothing more is coming. Waiting out the deadline on a socket
+                # the server has hung up would be a spin, not a wait.
+                break
             self.read(0.3)
         for line in self.lines[start:]:
             if any(n in line for n in needles):
@@ -149,13 +156,20 @@ class Client:
         pool = self.lines if lines is None else lines
         return [l for l in pool if all(n in l for n in needles)]
 
-    def sasl_plain(self, account, password):
-        """Authenticate mid-handshake. Call before CAP END."""
+    def sasl_plain(self, account, password, seconds=25.0):
+        """Authenticate mid-handshake. Call before CAP END.
+
+        Waits for the server's answer rather than napping for it. An address
+        that has been failing to log in is made to *wait* before its next
+        check — never refused, since this password may be the right one — so
+        a correct login can land well after any fixed nap would have given up,
+        and a test that peeked would call it a wrong password.
+        """
         self.send("AUTHENTICATE PLAIN")
         self.read(0.7)
         payload = base64.b64encode(f"\0{account}\0{password}".encode()).decode()
         self.send("AUTHENTICATE " + payload)
-        self.read(1.5)
+        self.wait_for(" 903 ", " 904 ", " 905 ", " 906 ", seconds=seconds)
         return self
 
 

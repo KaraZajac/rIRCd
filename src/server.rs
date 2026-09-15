@@ -507,6 +507,12 @@ pub async fn run(
                 }
             });
         }
+        match cfg.expiry.as_ref().map(|e| e.uploads_days) {
+            Some(days) if days > 0 => info!("Shared files are kept for {days} day(s)"),
+            _ => info!(
+                "Shared files are kept forever: set [expiry] uploads_days to let go of old ones"
+            ),
+        }
     } else {
         debug!("Filehost not configured (no [filehost] section in config)");
     }

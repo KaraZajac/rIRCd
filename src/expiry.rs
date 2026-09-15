@@ -30,6 +30,7 @@ const DAY: i64 = 86_400;
 pub struct Swept {
     pub accounts: Vec<String>,
     pub channels: Vec<String>,
+    pub files: usize,
 }
 
 /// Sweep on a timer for as long as the server runs.
@@ -59,17 +60,37 @@ pub async fn sweep(
     let mut swept = Swept::default();
     // The configuration is read once and let go of: a read lock held across
     // a sweep would stand between a REHASH and every command behind it.
-    let (policy, pool, server_name) = {
+    let (policy, pool, server_name, uploads) = {
         let guard = cfg.read().await;
-        let (Some(policy), Some(pool)) = (guard.expiry.clone(), guard.db.clone()) else {
+        let Some(policy) = guard.expiry.clone() else {
             return swept;
         };
-        if guard.db_health.is_down() {
-            return swept;
-        }
-        (policy, pool, guard.server.name.clone())
+        (
+            policy,
+            guard.db.clone().filter(|_| !guard.db_health.is_down()),
+            guard.server.name.clone(),
+            guard
+                .filehost
+                .as_ref()
+                .map(|f| std::path::PathBuf::from(&f.upload_dir)),
+        )
     };
     let now = chrono::Utc::now().timestamp();
+
+    // Shared files first, because they are the one thing here that is not in
+    // the database — a database that is down is no reason to let the disk
+    // keep filling.
+    if policy.uploads_days > 0 {
+        if let Some(ref dir) = uploads {
+            let cutoff = now.saturating_sub(i64::from(policy.uploads_days) * DAY);
+            swept.files = crate::filehost::sweep_uploads(dir, cutoff).await;
+        }
+    }
+
+    let Some(pool) = pool else {
+        report(state, senders, &server_name, &swept).await;
+        return swept;
+    };
 
     if policy.accounts_days > 0 {
         let cutoff = now.saturating_sub(i64::from(policy.accounts_days) * DAY);
@@ -141,21 +162,33 @@ pub async fn sweep(
         }
     }
 
-    if !swept.accounts.is_empty() || !swept.channels.is_empty() {
-        crate::commands::registration::notify_opers(
-            state,
-            senders,
-            &server_name,
-            's',
-            &format!(
-                "Expiry: {} account(s) erased, {} channel registration(s) given up",
-                swept.accounts.len(),
-                swept.channels.len()
-            ),
-        )
-        .await;
-    }
+    report(state, senders, &server_name, &swept).await;
     swept
+}
+
+/// Tell the operators what a sweep let go of, when it let go of anything.
+async fn report(
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    server_name: &str,
+    swept: &Swept,
+) {
+    if swept.accounts.is_empty() && swept.channels.is_empty() && swept.files == 0 {
+        return;
+    }
+    crate::commands::registration::notify_opers(
+        state,
+        senders,
+        server_name,
+        's',
+        &format!(
+            "Expiry: {} account(s) erased, {} channel registration(s) given up, {} shared file(s) let go",
+            swept.accounts.len(),
+            swept.channels.len(),
+            swept.files
+        ),
+    )
+    .await;
 }
 
 /// Whether anybody connected right now is logged in to the account.

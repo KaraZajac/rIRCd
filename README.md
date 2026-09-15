@@ -357,6 +357,12 @@ a sanitised extension — so nothing an uploader writes becomes a path, and
 nothing they upload can overwrite anything. `tests/smoke/test_filehost.py`
 covers the lot, including the links that try to leave the directory.
 
+Nothing reclaims that disk on its own. `[expiry] uploads_days` is how you say
+how long a file is kept; without it the server says so at startup, because a
+directory that only ever grows is worth knowing about before it matters. The
+sweep touches regular files in the upload directory and nothing else — not a
+symbolic link, not a subdirectory, not a dotfile.
+
 Example:
 
 ```toml
@@ -605,12 +611,14 @@ people on it should choose it rather than be handed one.
 [expiry]
 accounts_days = 365   # erase an account nobody has logged in to for a year
 channels_days = 90    # give up a registration nobody holding it has visited for 90 days
+uploads_days = 30     # let go of a shared file after a month
 ```
 
 | Key | Default | Meaning |
 |---|---|---|
 | `accounts_days` | `0` (never) | An account nobody has logged in to for this long is erased: its nick is free again, its grouped nicks with it, its profile and read markers go with it, and the channels it founded are left without a founder — the people in them are told, as with `DROPACCOUNT` |
 | `channels_days` | `0` (never) | A registration nobody who holds the channel — founder or standing operator — has been in for this long is given up. The channel keeps its topic and its modes; it is simply nobody's, and the next person in gets `@` the way they would in any fresh channel |
+| `uploads_days` | `0` (never) | A file shared through `[filehost]` is let go of this long after it was uploaded, and its link becomes a 404. Kept by age rather than by whether anybody still wants it, because nothing here knows who has a link — so this is really a statement of how long a link is good for, which is a thing people can be told in advance. Unlike "until the disk fills", which is what leaving it unset means |
 
 An operator can keep a name or a room out of expiry's reach with
 `NOEXPIRE <account|#channel> ON` (`OFF` puts it back; without either it says
