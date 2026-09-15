@@ -402,6 +402,9 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
         // Password resets keep their own code. Sharing the verification column
         // would let a reset code verify an account, or a verification code
         // reset a password, and the two prove different things.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_email VARCHAR(255) DEFAULT NULL",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_code VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_expires BIGINT DEFAULT NULL",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires BIGINT DEFAULT NULL",
     ] {
@@ -1611,6 +1614,189 @@ pub async fn noexpire(pool: &sqlx::MySqlPool, kind: char, name: &str) -> Option<
             .flatten()
     };
     flag.map(|f| f != 0)
+}
+
+// ─── Changing the address on an account ───────────────────────────────────────
+
+/// How long a code sent to a new address is good for.
+pub const EMAIL_CODE_LIFETIME_SECS: i64 = 3600;
+
+#[derive(Debug)]
+pub enum EmailChangeStart {
+    /// A code was stored; this is where to send it.
+    Started,
+    /// A code is already out for this account and has not expired.
+    TooSoon,
+    NoSuchAccount,
+    Io(String),
+}
+
+#[derive(Debug)]
+pub enum EmailChangeOutcome {
+    /// The address on the account is this one now.
+    Changed(String),
+    /// Wrong code, expired, or nothing was waiting.
+    InvalidCode,
+    Io(String),
+}
+
+/// Remember an address somebody wants to move to, and the code that proves
+/// they can read it.
+///
+/// The address on the account does not change here. Until the code comes
+/// back the old one is still the one that password resets go to, which is
+/// what stops a borrowed session from quietly taking an account away from
+/// the person who owns it.
+pub async fn begin_email_change(
+    pool: &sqlx::MySqlPool,
+    account: &str,
+    new_email: &str,
+    code: &str,
+    now: i64,
+) -> EmailChangeStart {
+    use sqlx::Row;
+    let row = sqlx::query("SELECT email_expires FROM users WHERE nick_lower = ?")
+        .bind(account.to_lowercase())
+        .fetch_optional(pool)
+        .await;
+    let row = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => return EmailChangeStart::NoSuchAccount,
+        Err(e) => return EmailChangeStart::Io(e.to_string()),
+    };
+    let outstanding: Option<i64> = row.get("email_expires");
+    if outstanding.is_some_and(|e| e > now) {
+        return EmailChangeStart::TooSoon;
+    }
+    match sqlx::query(
+        "UPDATE users SET pending_email = ?, email_code = ?, email_expires = ? \
+         WHERE nick_lower = ?",
+    )
+    .bind(new_email)
+    .bind(code)
+    .bind(now + EMAIL_CODE_LIFETIME_SECS)
+    .bind(account.to_lowercase())
+    .execute(pool)
+    .await
+    {
+        Ok(_) => EmailChangeStart::Started,
+        Err(e) => EmailChangeStart::Io(e.to_string()),
+    }
+}
+
+/// Forget a change that was asked for and never confirmed.
+pub async fn cancel_email_change(pool: &sqlx::MySqlPool, account: &str) {
+    let _ = sqlx::query(
+        "UPDATE users SET pending_email = NULL, email_code = NULL, email_expires = NULL \
+         WHERE nick_lower = ?",
+    )
+    .bind(account.to_lowercase())
+    .execute(pool)
+    .await;
+}
+
+/// Use the code to move the account to the address it was sent to.
+pub async fn finish_email_change(
+    pool: &sqlx::MySqlPool,
+    account: &str,
+    code: &str,
+) -> EmailChangeOutcome {
+    use sqlx::Row;
+    use subtle::ConstantTimeEq;
+    let row = sqlx::query(
+        "SELECT pending_email, email_code, email_expires FROM users WHERE nick_lower = ?",
+    )
+    .bind(account.to_lowercase())
+    .fetch_optional(pool)
+    .await;
+    let row = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => return EmailChangeOutcome::InvalidCode,
+        Err(e) => return EmailChangeOutcome::Io(e.to_string()),
+    };
+    let (Some(pending), Some(stored)) = (
+        row.get::<Option<String>, _>("pending_email"),
+        row.get::<Option<String>, _>("email_code"),
+    ) else {
+        return EmailChangeOutcome::InvalidCode;
+    };
+    let expires: Option<i64> = row.get("email_expires");
+    if expires.is_none_or(|e| chrono::Utc::now().timestamp() > e) {
+        return EmailChangeOutcome::InvalidCode;
+    }
+    // Compared the way every other code here is: a comparison that stops at
+    // the first wrong byte tells a patient guesser how many were right.
+    let matches: bool = code
+        .trim()
+        .to_uppercase()
+        .as_bytes()
+        .ct_eq(stored.to_uppercase().as_bytes())
+        .into();
+    if !matches {
+        return EmailChangeOutcome::InvalidCode;
+    }
+    // Reading the new address proves as much as reading the first one did,
+    // so an account that was never verified is verified by this.
+    match sqlx::query(
+        "UPDATE users SET email = ?, verified = 1, pending_email = NULL, email_code = NULL, \
+         email_expires = NULL WHERE nick_lower = ?",
+    )
+    .bind(&pending)
+    .bind(account.to_lowercase())
+    .execute(pool)
+    .await
+    {
+        Ok(_) => EmailChangeOutcome::Changed(pending),
+        Err(e) => EmailChangeOutcome::Io(e.to_string()),
+    }
+}
+
+// ─── What the server knows about an account ───────────────────────────────────
+
+#[derive(Debug)]
+pub struct AccountSummary {
+    pub nick: String,
+    pub email: String,
+    pub verified: bool,
+    pub created_at: i64,
+    pub last_seen: Option<i64>,
+    pub noexpire: bool,
+    /// An address asked for and not yet confirmed.
+    pub pending_email: Option<String>,
+    pub certfp: Option<String>,
+}
+
+/// Everything this server is holding about one account.
+pub async fn account_summary(pool: &sqlx::MySqlPool, account: &str) -> Option<AccountSummary> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT nick, email, verified, noexpire, last_seen, pending_email, certfp, \
+         UNIX_TIMESTAMP(created_at) AS created_ts FROM users WHERE nick_lower = ?",
+    )
+    .bind(account.to_lowercase())
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+    Some(AccountSummary {
+        nick: row.get("nick"),
+        email: row.get("email"),
+        verified: row.get::<i8, _>("verified") != 0,
+        created_at: row.try_get("created_ts").unwrap_or(0),
+        last_seen: row.try_get("last_seen").unwrap_or(None),
+        noexpire: row.try_get::<i8, _>("noexpire").unwrap_or(0) != 0,
+        pending_email: row.try_get("pending_email").unwrap_or(None),
+        certfp: row.try_get("certfp").unwrap_or(None),
+    })
+}
+
+/// The channels an account is the founder of.
+pub async fn channels_founded_by(pool: &sqlx::MySqlPool, account: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, String>("SELECT name FROM channels WHERE LOWER(founder) = ? ORDER BY name")
+        .bind(account.to_lowercase())
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
 }
 
 // ─── Spam filters ─────────────────────────────────────────────────────────────

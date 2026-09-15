@@ -956,3 +956,406 @@ pub async fn handle_group(
     .await;
     Ok(())
 }
+
+/// `SETEMAIL <current password> <new address>` to ask, `SETEMAIL <code>` to
+/// confirm.
+///
+/// The address on an account is what a forgotten password goes to, so moving
+/// it is the one change that can quietly take an account away from the person
+/// who owns it. Two things have to be true: the password, which says it is
+/// them, and a code read at the new address, which says they can receive
+/// there. Until the code comes back the account keeps the address it had, so
+/// a borrowed session cannot point it somewhere else and wait.
+pub async fn handle_setemail(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    _channels: Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((_nick, account, host, _user_id)) = asker(&state, client_id).await else {
+        return Ok(());
+    };
+    let Some(account) = account else {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(cfg, "SETEMAIL", "NOT_LOGGED_IN", "*", "Log in to an account first"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let Some(pool) = cfg.db.as_ref().filter(|_| !cfg.db_health.is_down()) else {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(cfg, "SETEMAIL", "TEMPORARILY_UNAVAILABLE", &account, "Try again later"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let Some(email_cfg) = cfg.email.clone() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(
+                cfg,
+                "SETEMAIL",
+                "NO_EMAIL",
+                &account,
+                "This server does not send mail, so an address cannot be proved",
+            ),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+
+    match (msg.params.first(), msg.params.get(1)) {
+        // ── Confirm one ──────────────────────────────────────────────────────
+        (Some(code), None) => {
+            let over_budget = !state.write().await.auth_cost.spend(&host).is_zero();
+            if over_budget {
+                tracing::warn!(client_id, %account, "SETEMAIL: over budget, not checking");
+                reply_to_client(&senders, client_id, slow_down(cfg, "SETEMAIL", &account), label)
+                    .await;
+                return Ok(());
+            }
+            match persist::finish_email_change(pool, &account, code).await {
+                persist::EmailChangeOutcome::Changed(now_at) => {
+                    state.write().await.auth_cost.refund(&host);
+                    tracing::info!(client_id, %account, "SETEMAIL: address changed");
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        note(
+                            cfg,
+                            "SETEMAIL",
+                            "CHANGED",
+                            &account,
+                            &format!("{account} is now at {now_at}"),
+                        ),
+                        label,
+                    )
+                    .await;
+                }
+                persist::EmailChangeOutcome::InvalidCode => {
+                    tracing::warn!(client_id, %account, "SETEMAIL: code refused");
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        fail(
+                            cfg,
+                            "SETEMAIL",
+                            "INVALID_CODE",
+                            &account,
+                            "Wrong or expired code, or no change was asked for",
+                        ),
+                        label,
+                    )
+                    .await;
+                }
+                persist::EmailChangeOutcome::Io(e) => {
+                    tracing::error!(client_id, %account, "SETEMAIL: {e}");
+                    cfg.db_health.note(false);
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        fail(cfg, "SETEMAIL", "TEMPORARILY_UNAVAILABLE", &account, "Try again later"),
+                        label,
+                    )
+                    .await;
+                }
+            }
+        }
+        // ── Ask to move ──────────────────────────────────────────────────────
+        (Some(password), Some(wanted)) => {
+            if !crate::mail::is_valid_email(wanted) {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    fail(cfg, "SETEMAIL", "INVALID_EMAIL", wanted, "That is not an address this server can write to"),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+            let over_budget = !state.write().await.auth_cost.spend(&host).is_zero();
+            if over_budget {
+                reply_to_client(&senders, client_id, slow_down(cfg, "SETEMAIL", &account), label)
+                    .await;
+                return Ok(());
+            }
+            if !persist::verify_user(pool, &account, password).await {
+                tracing::warn!(client_id, %account, "SETEMAIL: password refused");
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    fail(cfg, "SETEMAIL", "INCORRECT_PASSWORD", &account, "Password is wrong"),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+            state.write().await.auth_cost.refund(&host);
+            let code = crate::mail::generate_code();
+            let now = chrono::Utc::now().timestamp();
+            match persist::begin_email_change(pool, &account, wanted, &code, now).await {
+                persist::EmailChangeStart::TooSoon => {
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        fail(
+                            cfg,
+                            "SETEMAIL",
+                            "RATE_LIMITED",
+                            &account,
+                            "A code is already out for this account; use it or wait for it to expire",
+                        ),
+                        label,
+                    )
+                    .await;
+                }
+                persist::EmailChangeStart::NoSuchAccount => {
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        fail(cfg, "SETEMAIL", "NOT_LOGGED_IN", &account, "That account is gone"),
+                        label,
+                    )
+                    .await;
+                }
+                persist::EmailChangeStart::Io(e) => {
+                    tracing::error!(client_id, %account, "SETEMAIL: {e}");
+                    cfg.db_health.note(false);
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        fail(cfg, "SETEMAIL", "TEMPORARILY_UNAVAILABLE", &account, "Try again later"),
+                        label,
+                    )
+                    .await;
+                }
+                persist::EmailChangeStart::Started => {
+                    // The address has its own say, shared with REGISTER and
+                    // RESETPASS: one message per gap, however it is asked for.
+                    let gap = std::time::Duration::from_secs(email_cfg.mail_gap_secs);
+                    let wanted = wanted.to_string();
+                    if !state.read().await.mail_cooldown.would_allow(&wanted, gap) {
+                        tracing::info!(client_id, %account, "SETEMAIL: that address was mailed lately, not sending");
+                        persist::cancel_email_change(pool, &account).await;
+                        reply_to_client(
+                            &senders,
+                            client_id,
+                            fail(
+                                cfg,
+                                "SETEMAIL",
+                                "RATE_LIMITED",
+                                &wanted,
+                                "That address was written to lately; try again in a while",
+                            ),
+                            label,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    state.write().await.mail_cooldown.record(&wanted, gap);
+                    let (network, account_bg, client_bg) = (
+                        cfg.network.name.clone(),
+                        account.clone(),
+                        client_id.to_string(),
+                    );
+                    let to = wanted.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::mail::send_email_change(
+                            &email_cfg, &network, &to, &account_bg, &code,
+                        )
+                        .await
+                        {
+                            tracing::warn!(client_id = %client_bg, account = %account_bg, "SETEMAIL: could not send: {e}");
+                        }
+                    });
+                    reply_to_client(
+                        &senders,
+                        client_id,
+                        note(
+                            cfg,
+                            "SETEMAIL",
+                            "SENT",
+                            &wanted,
+                            &format!("A code is on its way to {wanted}; {account} keeps the address it has until you send it back"),
+                        ),
+                        label,
+                    )
+                    .await;
+                }
+            }
+        }
+        _ => {
+            reply_to_client(
+                &senders,
+                client_id,
+                fail(
+                    cfg,
+                    "SETEMAIL",
+                    "NEED_PARAMS",
+                    &account,
+                    "SETEMAIL <current password> <new address>, then SETEMAIL <code>",
+                ),
+                label,
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// `ACCOUNTINFO [<account>]` — what this server is holding about an account.
+///
+/// Yours without asking; somebody else's needs the `ban` privilege, which is
+/// the one an operator has when they are working out who is doing what.
+pub async fn handle_accountinfo(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    _channels: Arc<RwLock<crate::channel::ChannelStore>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((_nick, own_account, _host, _user_id)) = asker(&state, client_id).await else {
+        return Ok(());
+    };
+    let asked_about = msg.params.first().cloned();
+    let may_look_elsewhere = {
+        let state_r = state.read().await;
+        match state_r.clients.get(client_id) {
+            Some(c) => c.read().await.may(crate::config::OperPrivilege::Ban),
+            None => false,
+        }
+    };
+    let account = match asked_about {
+        Some(other)
+            if !own_account
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(&other)) =>
+        {
+            if !may_look_elsewhere {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    fail(
+                        cfg,
+                        "ACCOUNTINFO",
+                        "NOT_YOURS",
+                        &other,
+                        "Only an operator can look at somebody else's account",
+                    ),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+            other
+        }
+        Some(mine) => mine,
+        None => match own_account {
+            Some(a) => a,
+            None => {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    fail(cfg, "ACCOUNTINFO", "NOT_LOGGED_IN", "*", "Log in to an account first"),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
+        },
+    };
+    let Some(pool) = cfg.db.as_ref().filter(|_| !cfg.db_health.is_down()) else {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(cfg, "ACCOUNTINFO", "TEMPORARILY_UNAVAILABLE", &account, "Try again later"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let Some(summary) = persist::account_summary(pool, &account).await else {
+        reply_to_client(
+            &senders,
+            client_id,
+            fail(cfg, "ACCOUNTINFO", "NO_SUCH_ACCOUNT", &account, "No account by that name"),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let when = |at: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(at, 0)
+            .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "an unknown time".into())
+    };
+    let mut lines: Vec<(&str, String)> = vec![(
+        "ACCOUNT",
+        format!(
+            "{} — registered {}, last seen {}",
+            summary.nick,
+            when(summary.created_at),
+            match summary.last_seen {
+                Some(at) => when(at),
+                None => "never".to_string(),
+            }
+        ),
+    )];
+    lines.push((
+        "EMAIL",
+        match (summary.email.is_empty(), summary.pending_email.as_deref()) {
+            (true, None) => "no address on this account".to_string(),
+            (true, Some(waiting)) => format!("none yet; a code is out for {waiting}"),
+            (false, None) => format!(
+                "{}{}",
+                summary.email,
+                if summary.verified { "" } else { " (never proved)" }
+            ),
+            (false, Some(waiting)) => format!(
+                "{} — a move to {waiting} is waiting for its code",
+                summary.email
+            ),
+        },
+    ));
+    if let Some(ref fp) = summary.certfp {
+        lines.push(("CERTFP", fp.clone()));
+    }
+    let mut nicks = vec![summary.nick.clone()];
+    nicks.extend(persist::grouped_nicks_of(pool, &account).await);
+    lines.push(("NICKS", nicks.join(" ")));
+    let founded = persist::channels_founded_by(pool, &account).await;
+    lines.push((
+        "CHANNELS",
+        if founded.is_empty() {
+            "none".to_string()
+        } else {
+            founded.join(" ")
+        },
+    ));
+    if summary.noexpire {
+        lines.push(("EXPIRY", "kept whatever the expiry clock says".to_string()));
+    }
+    for (kind, text) in lines {
+        reply_to_client(
+            &senders,
+            client_id,
+            note(cfg, "ACCOUNTINFO", kind, &account, &text),
+            label,
+        )
+        .await;
+    }
+    Ok(())
+}

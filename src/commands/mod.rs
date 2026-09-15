@@ -797,6 +797,22 @@ pub async fn handle_message(
         "OPER" => {
             registration::handle_oper(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
+        "SETEMAIL" => {
+            account::handle_setemail(&client_id, msg, state, channels, senders, cfg, label.as_deref())
+                .await
+        }
+        "ACCOUNTINFO" | "ACCINFO" => {
+            account::handle_accountinfo(
+                &client_id,
+                msg,
+                state,
+                channels,
+                senders,
+                cfg,
+                label.as_deref(),
+            )
+            .await
+        }
         "GROUP" => {
             account::handle_group(&client_id, msg, state, channels, senders, cfg, label.as_deref())
                 .await

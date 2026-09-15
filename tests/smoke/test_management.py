@@ -792,4 +792,93 @@ if withcert:
 holder.close()
 xo.close()
 
+section("SETEMAIL: moving an account to another address")
+
+# The address is what a forgotten password goes to, so moving it asks for the
+# password and for a code read at the new address. Until the code comes back
+# the account keeps the address it had.
+mover = f"move{RUN}"
+make_account(mover)
+mv = logged_in(f"{mover}c", mover)
+mmark = mv.mark()
+mv.send(f"SETEMAIL wrong-password somewhere@example.org")
+mv.wait_for("SETEMAIL", seconds=20)
+check("a wrong password moves nothing",
+      bool(mv.find("FAIL SETEMAIL INCORRECT_PASSWORD", lines=mv.since(mmark))), mv.since(mmark)[-2:])
+mmark = mv.mark()
+mv.send(f"SETEMAIL {PW} not-an-address")
+mv.wait_for("SETEMAIL", seconds=20)
+check("and neither does an address the server cannot write to",
+      bool(mv.find("FAIL SETEMAIL INVALID_EMAIL", lines=mv.since(mmark))), mv.since(mmark)[-2:])
+
+clear_mail()
+mmark = mv.mark()
+mv.send(f"SETEMAIL {PW} {mover}-new@example.org")
+mv.wait_for("SETEMAIL", seconds=20)
+check("the right password sends a code to the new address",
+      bool(mv.find("NOTE SETEMAIL SENT", f"{mover}-new@example.org", lines=mv.since(mmark))), mv.since(mmark)[-2:])
+check("and the account keeps the address it had for now",
+      db(f"SELECT email FROM users WHERE nick_lower='{mover}'") == f"{mover}@example.org")
+mail = wait_for_mail(1, seconds=20)
+found = re.search(r"SETEMAIL ([A-Z0-9]{8})", mail[0]) if mail else None
+check("the mail went to the new address and says what to type",
+      bool(found) and f"To: {mover}-new@example.org" in mail[0], (mail or [""])[0][:200])
+if found:
+    mmark = mv.mark()
+    mv.send("SETEMAIL WRONGCOD")
+    mv.wait_for("SETEMAIL", seconds=20)
+    check("a wrong code moves nothing",
+          bool(mv.find("FAIL SETEMAIL INVALID_CODE", lines=mv.since(mmark))), mv.since(mmark)[-2:])
+    seen = patiently(mv, f"SETEMAIL {found.group(1)}", "NOTE SETEMAIL CHANGED")
+    check("the right one moves it", bool(mv.find("NOTE SETEMAIL CHANGED", lines=seen)), seen[-2:])
+    check("and the account is at the new address", 
+          db(f"SELECT email FROM users WHERE nick_lower='{mover}'") == f"{mover}-new@example.org")
+    check("with nothing left waiting",
+          db(f"SELECT COUNT(*) FROM users WHERE nick_lower='{mover}' AND pending_email IS NOT NULL") == "0")
+
+section("ACCOUNTINFO: what the server is holding about you")
+
+mv.send(f"JOIN #owned{RUN}")
+mv.read(1.0)
+mmark = mv.mark()
+mv.send("ACCOUNTINFO")
+mv.read(1.5)
+info = mv.since(mmark)
+check("it says when the account was registered and last seen",
+      bool(mv.find("NOTE ACCOUNTINFO ACCOUNT", "registered", "last seen", lines=info)), info[-5:])
+check("and the address it is at now",
+      bool(mv.find("NOTE ACCOUNTINFO EMAIL", f"{mover}-new@example.org", lines=info)), info[-5:])
+check("and the nicks it holds", bool(mv.find("NOTE ACCOUNTINFO NICKS", mover, lines=info)), info[-5:])
+check("and the channels it founded",
+      bool(mv.find("NOTE ACCOUNTINFO CHANNELS", f"#owned{RUN}", lines=info)), info[-5:])
+
+nosy = Client(f"nosy{RUN}")
+nmark = nosy.mark()
+nosy.send(f"ACCOUNTINFO {mover}")
+nosy.read(1.2)
+check("somebody else's account is not a bystander's business",
+      bool(nosy.find("FAIL ACCOUNTINFO NOT_YOURS", lines=nosy.since(nmark))), nosy.since(nmark)[-2:])
+nmark = nosy.mark()
+nosy.send("ACCOUNTINFO")
+nosy.read(1.2)
+check("and somebody with no account has none to show",
+      bool(nosy.find("FAIL ACCOUNTINFO NOT_LOGGED_IN", lines=nosy.since(nmark))), nosy.since(nmark)[-2:])
+nosy.close()
+
+snoop = Client(f"snoop{RUN}")
+snoop.send(f"OPER smokeoper {OPER_PW}")
+snoop.wait_for(" 381 ", " 464 ", seconds=5)
+smark = snoop.mark()
+snoop.send(f"ACCOUNTINFO {mover}")
+snoop.read(1.5)
+check("an operator working out who is who may look",
+      bool(snoop.find("NOTE ACCOUNTINFO ACCOUNT", mover, lines=snoop.since(smark))), snoop.since(smark)[-3:])
+smark = snoop.mark()
+snoop.send(f"ACCOUNTINFO nobody{RUN}")
+snoop.read(1.2)
+check("and is told plainly when there is no such account",
+      bool(snoop.find("FAIL ACCOUNTINFO NO_SUCH_ACCOUNT", lines=snoop.since(smark))), snoop.since(smark)[-2:])
+snoop.close()
+mv.close()
+
 summary("management")

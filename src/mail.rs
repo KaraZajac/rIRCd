@@ -60,6 +60,43 @@ fn verification_body(network: &str, account: &str, code: &str, expiry_secs: i64)
 /// The command is given with a placeholder for the password, never with one
 /// filled in: a mail is read by whoever holds the inbox, and the password is
 /// the one thing in this exchange that should exist only in the reader's head.
+/// Send the code that moves an account to a new address.
+pub async fn send_email_change(
+    cfg: &EmailConfig,
+    network: &str,
+    to: &str,
+    account: &str,
+    code: &str,
+) -> anyhow::Result<()> {
+    send(
+        cfg,
+        to,
+        &cfg.subject,
+        email_change_body(
+            network,
+            account,
+            code,
+            crate::persist::EMAIL_CODE_LIFETIME_SECS,
+        ),
+    )
+    .await
+}
+
+fn email_change_body(network: &str, account: &str, code: &str, expiry_secs: i64) -> String {
+    let minutes = (expiry_secs / 60).max(1);
+    format!(
+        "Somebody asked to move the account \"{account}\" on {network} to this\n\
+         address. If it was you, send this from your IRC client:\n\
+         \n\
+         \x20   SETEMAIL {code}\n\
+         \n\
+         The code is valid for {minutes} minute{}. Until it is used the account\n\
+         keeps the address it had, so if you did not ask for this, ignore this\n\
+         message: nothing has changed and nothing will.\n",
+        if minutes == 1 { "" } else { "s" }
+    )
+}
+
 fn reset_body(network: &str, account: &str, code: &str, expiry_secs: i64) -> String {
     let minutes = (expiry_secs / 60).max(1);
     format!(
@@ -160,6 +197,14 @@ mod tests {
         assert!(body.contains("VERIFY alice K7M2QJ4T"), "body was:\n{body}");
         assert!(body.contains("ExampleNet"));
         assert!(body.contains("valid for 24 hours"));
+    }
+
+    #[test]
+    fn a_change_of_address_says_what_to_type_and_that_nothing_has_moved_yet() {
+        let body = email_change_body("ExampleNet", "alice", "K7M2QJ4T", 3600);
+        assert!(body.contains("SETEMAIL K7M2QJ4T"), "body was:\n{body}");
+        assert!(body.contains("keeps the address it had"));
+        assert!(body.contains("valid for 60 minutes"));
     }
 
     #[test]

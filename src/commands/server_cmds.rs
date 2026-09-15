@@ -1066,6 +1066,26 @@ pub async fn handle_help(
                 "  pattern caught them; the operators are.",
             ],
         ),
+        Some("SETEMAIL") => (
+            "SETEMAIL",
+            &[
+                "SETEMAIL <current password> <new address>",
+                "SETEMAIL <code>",
+                "  Move your account to another address. A code goes to the new one;",
+                "  until you send it back the account keeps the address it has, so",
+                "  a borrowed session cannot point it somewhere else and wait.",
+            ],
+        ),
+        Some("ACCOUNTINFO") => (
+            "ACCOUNTINFO",
+            &[
+                "ACCOUNTINFO [<account>]",
+                "  What this server is holding about an account: when it was",
+                "  registered and last seen, its address, its nicks, the channels it",
+                "  founded. Yours without asking; somebody else's needs the ban",
+                "  privilege. ACCINFO is the same command.",
+            ],
+        ),
         Some("GROUP") => (
             "GROUP",
             &[
@@ -1137,7 +1157,7 @@ pub async fn handle_help(
                 "  CHANOWN CHANACCESS CHANDROP ACCEPT SILENCE",
                 "  WEBPUSH MONITOR CHATHISTORY VERSION TIME INFO LINKS CONNECT SQUIT SANICK",
                 "  KLINE DLINE SNOMASK MLOCK SAJOIN SAPART SAMODE TESTMASK MAP GROUP NOEXPIRE",
-                "  SPAMFILTER SHUN TRACE",
+                "  SPAMFILTER SHUN TRACE SETEMAIL ACCOUNTINFO",
                 "  STATS LUSERS",
             ],
         ),

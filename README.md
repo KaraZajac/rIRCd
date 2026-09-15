@@ -733,6 +733,38 @@ dispatch loop, so the cost is a budget rather than a preference. Regular
 expressions are matched in time linear in the line, so a pattern cannot be
 made to hang the server.
 
+### Looking after your own account
+
+There is no NickServ to message, so the account commands are commands.
+`REGISTER` and `VERIFY` make one, `PASSWD` changes its password, `RESETPASS`
+recovers it, `GROUP` reserves the other nicks you go by, and `DROPACCOUNT`
+ends it. Two more fill the gaps:
+
+`ACCOUNTINFO` says what the server is holding about you — when the account was
+registered and last seen, the address on it, every nick grouped to it, the
+channels it founded, whether an operator has kept it out of the expiry sweep.
+An operator with the `ban` privilege can ask about somebody else's;
+nobody else can.
+
+`SETEMAIL <current password> <new address>` moves the account to another
+address. The address is what a forgotten password goes to, so this is the one
+change that could quietly take an account away from the person who owns it,
+and it asks for two things: the password, which says it is you, and a code
+read at the new address, which says you can receive there.
+
+```
+SETEMAIL hunter2 me@newhost.example
+-> NOTE SETEMAIL SENT me@newhost.example :A code is on its way…
+SETEMAIL K7M2QJ4T
+-> NOTE SETEMAIL CHANGED alice :alice is now at me@newhost.example
+```
+
+Until the code comes back the account keeps the address it had, so a borrowed
+session cannot point it somewhere else and wait for a reset. Reading the new
+address proves as much as reading the first one did, so an account that never
+verified is verified by this. One code at a time per account, and the address
+itself is held to the same `mail_gap_secs` as `REGISTER` and `RESETPASS`.
+
 ### Grouped nicks
 
 An account's own name is reserved for it. `GROUP` reserves the nick you are
@@ -995,6 +1027,8 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `SHUN` | — | Oper-only (`ban`): `SHUN [<seconds>] <mask> :<reason>` — leave somebody connected and let nothing they say reach anybody. See **Shuns** |
 | `UNSHUN` | — | Oper-only (`ban`): lift a shun |
 | `GROUP` | — | Reserve the nick you are using for your account; `GROUP -<nick>` releases one, `GROUP *` lists them |
+| `SETEMAIL` | — | `SETEMAIL <current password> <new address>` then `SETEMAIL <code>` — move your account to another address. See **Looking after your own account** |
+| `ACCOUNTINFO` | — | `ACCOUNTINFO [<account>]` — what the server is holding about an account. Yours without asking; somebody else's needs the `ban` privilege. `ACCINFO` is the same command |
 | `NOEXPIRE` | — | Oper-only (`channels`): keep an account or a channel out of `[expiry]`'s reach |
 | `MAP` | — | The network as a tree with a user count per server (015/017) |
 | `STATS` | — | `STATS u` uptime and `STATS m` command counts are for anybody; `o` (operator blocks), `k` (K-lines), `d` (D-lines), `s` (shuns), `y` (connection classes — 218), `l` (what each connection has carried: send queue, messages and bytes each way, how long it has been open — 211) and `t` (what this server has been doing — 249) are for operators |
