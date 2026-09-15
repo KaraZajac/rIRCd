@@ -38,8 +38,12 @@ async fn op_moderated_delivery(
     }
 }
 
-async fn send_to_client(senders: &Senders, user_id: &str, msg: Message) {
-    senders.read().await.deliver(user_id, &msg);
+/// Takes the message by reference on purpose: the registry gives each of a
+/// user's connections its own copy, so an owned argument here is one whole
+/// clone per recipient that nothing ever reads. On a channel of five hundred
+/// that is five hundred clones a message.
+async fn send_to_client(senders: &Senders, user_id: &str, msg: &Message) {
+    senders.read().await.deliver(user_id, msg);
 }
 
 /// One line to a recipient, skipping a connection when it is named.
@@ -211,7 +215,7 @@ async fn send_to_client_with_caps(
         client_tag_deny,
         sender,
     );
-    send_to_client(senders, to_id, tagged).await;
+    send_to_client(senders, to_id, &tagged).await;
 }
 
 /// Identity used for a direct conversation: the account when the user has one,
@@ -385,12 +389,15 @@ async fn push_notify(
     let Some(client) = state.clients.get(recipient_id) else {
         return;
     };
+    // Subscriptions are per account, so somebody with none is nobody to wake
+    // — and asking first saves cloning a nick for everybody in a channel who
+    // is not logged in.
     let (account, nick) = {
         let g = client.read().await;
-        (g.account.clone(), g.nick.clone().unwrap_or_default())
-    };
-    let Some(account) = account else {
-        return; // Subscriptions are per account; anonymous clients have none.
+        let Some(account) = g.account.clone() else {
+            return;
+        };
+        (account, g.nick.clone().unwrap_or_default())
     };
     if let Some(text) = channel_text {
         if !mentions_nick(text, &nick) {
@@ -937,9 +944,12 @@ pub async fn handle_privmsg(
                 // The copy this person is owed depends only on what they
                 // negotiated, so it is built once for everybody who negotiated
                 // the same things rather than once for each of them.
+                // Borrowed, not cloned: the copy for this set of capabilities
+                // was built once, and the registry makes each connection its
+                // own from it.
                 let tagged = match state_guard.clients.get(mid) {
-                    Some(c) => copies.for_caps(&c.read().await.capabilities).clone(),
-                    None => copies.for_caps(&Default::default()).clone(),
+                    Some(c) => copies.for_caps(&c.read().await.capabilities),
+                    None => copies.for_caps(&Default::default()),
                 };
                 send_to_client(&senders, mid, tagged).await;
                 push_notify(
@@ -1396,9 +1406,12 @@ pub async fn handle_notice(
                 // The copy this person is owed depends only on what they
                 // negotiated, so it is built once for everybody who negotiated
                 // the same things rather than once for each of them.
+                // Borrowed, not cloned: the copy for this set of capabilities
+                // was built once, and the registry makes each connection its
+                // own from it.
                 let tagged = match state_guard.clients.get(mid) {
-                    Some(c) => copies.for_caps(&c.read().await.capabilities).clone(),
-                    None => copies.for_caps(&Default::default()).clone(),
+                    Some(c) => copies.for_caps(&c.read().await.capabilities),
+                    None => copies.for_caps(&Default::default()),
                 };
                 send_to_client(&senders, mid, tagged).await;
                 push_notify(
@@ -1849,11 +1862,11 @@ pub async fn deliver_multiline_batch(
                         .tags
                         .insert("draft/multiline-concat".to_string(), None);
                 }
-                send_to_client(&senders, client_id, line_msg).await;
+                send_to_client(&senders, client_id, &line_msg).await;
             }
             let batch_end = Message::new("BATCH", vec![format!("-{}", batch.ref_tag)])
                 .with_prefix(&cfg.server.name);
-            send_to_client(&senders, client_id, batch_end).await;
+            send_to_client(&senders, client_id, &batch_end).await;
         } else {
             for (i, text) in flatten_multiline(&batch.lines).iter().enumerate() {
                 let mut line_msg = Message::new(
@@ -2729,7 +2742,7 @@ pub async fn handle_chathistory(
                 vec![format!("+{}", ref_id), "draft/chathistory-targets".into()],
             )
             .with_prefix(&cfg.server.name);
-            send_to_client(&senders, client_id, batch_start).await;
+            send_to_client(&senders, client_id, &batch_start).await;
         }
         for (chan, latest_ts) in &targets {
             let mut m = Message::new(
@@ -2740,12 +2753,12 @@ pub async fn handle_chathistory(
             if let Some(ref ref_id) = batch_ref {
                 m.tags.insert("batch".to_string(), Some(ref_id.clone()));
             }
-            send_to_client(&senders, client_id, m).await;
+            send_to_client(&senders, client_id, &m).await;
         }
         if let Some(ref ref_id) = batch_ref {
             let batch_end =
                 Message::new("BATCH", vec![format!("-{}", ref_id)]).with_prefix(&cfg.server.name);
-            send_to_client(&senders, client_id, batch_end).await;
+            send_to_client(&senders, client_id, &batch_end).await;
         }
         return Ok(());
     }
@@ -2974,7 +2987,7 @@ pub async fn handle_chathistory(
                 vec![format!("+{}", ref_id), "chathistory".into(), target.into()],
             )
             .with_prefix(&cfg.server.name);
-            send_to_client(&senders, client_id, batch_start).await;
+            send_to_client(&senders, client_id, &batch_start).await;
         }
     }
 
@@ -3042,7 +3055,7 @@ pub async fn handle_chathistory(
             cfg.server.client_tag_deny.as_deref(),
             &SenderTags::default(), // replayed history carries no live sender state
         );
-        send_to_client(&senders, client_id, tagged).await;
+        send_to_client(&senders, client_id, &tagged).await;
     }
 
     // If the client supports message-redaction, include REDACT events for any messages
@@ -3062,7 +3075,7 @@ pub async fn handle_chathistory(
                     .tags
                     .insert("batch".to_string(), Some(ref_id.clone()));
             }
-            send_to_client(&senders, client_id, redact_msg).await;
+            send_to_client(&senders, client_id, &redact_msg).await;
         }
     }
 
@@ -3070,7 +3083,7 @@ pub async fn handle_chathistory(
         if let Some(ref ref_id) = batch_ref {
             let batch_end =
                 Message::new("BATCH", vec![format!("-{}", ref_id)]).with_prefix(&cfg.server.name);
-            send_to_client(&senders, client_id, batch_end).await;
+            send_to_client(&senders, client_id, &batch_end).await;
         }
     }
 
@@ -3215,7 +3228,7 @@ pub async fn handle_markread(
         if let Some(l) = label {
             m_labelled.add_tag("label", Some(l.to_string()));
         }
-        send_to_client(&senders, &user_id, m_labelled).await;
+        send_to_client(&senders, &user_id, &m_labelled).await;
     } else {
         let state_r = state.read().await;
         let ts = state_r

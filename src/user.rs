@@ -661,7 +661,7 @@ impl SessionRegistry {
     /// The delivering loops below walk this once per recipient per message, so
     /// handing back a `Vec` means an allocation for every person a message
     /// reaches — a hundred thousand of them a second on a busy channel.
-    fn each_session<'a>(&'a self, user_id: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    pub(crate) fn each_session<'a>(&'a self, user_id: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         let listed = self.sessions.get(user_id);
         let alone = if listed.is_none() {
             Some(user_id)

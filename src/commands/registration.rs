@@ -37,10 +37,12 @@ fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// Returns whether they had any.
 async fn send_to_client(senders: &Senders, user_id: &str, msg: Message) -> bool {
     let registry = senders.read().await;
-    let sessions = registry.sessions_of(user_id);
     let mut delivered = false;
-    for session in sessions {
-        if let Some(sink) = registry.get(&session) {
+    // Walked rather than collected: this runs once per person in every
+    // channel somebody is in, and the list of their connections is not worth
+    // building a vector of each time.
+    for session in registry.each_session(user_id) {
+        if let Some(sink) = registry.get(session) {
             sink.send(msg.clone());
             delivered = true;
         }

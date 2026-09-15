@@ -28,6 +28,10 @@ WS_PORT="${SMOKE_WS_PORT:-16668}"
 TLS_PORT="${SMOKE_TLS_PORT:-16670}"
 export SMOKE_TLS_PORT="$TLS_PORT"
 DB_PORT="${SMOKE_DB_PORT:-3399}"
+# Which binary to run. The debug build is the right one for the suites, which
+# are about behaviour; a measurement wants the release build, because a debug
+# one spends most of its time somewhere production never goes.
+BIN="${SMOKE_BIN:-$REPO/target/debug/rircd}"
 SMTP_PORT="${SMOKE_SMTP_PORT:-12525}"
 BIND="${SMOKE_BIND:-127.0.0.1}"
 OPER_PASSWORD="${SMOKE_OPER_PASSWORD:-smoke-oper-password}"
@@ -152,7 +156,7 @@ if [ "$BUILD" = 1 ]; then
 fi
 
 # Oper credentials for the suites that need privileges.
-OPER_HASH="$(printf '%s\n%s\n' "$OPER_PASSWORD" "$OPER_PASSWORD" | "$REPO/target/debug/rircd" genpasswd 2>/dev/null | grep -o '\$2[aby]\$[^ ]*')"
+OPER_HASH="$(printf '%s\n%s\n' "$OPER_PASSWORD" "$OPER_PASSWORD" | "$BIN" genpasswd 2>/dev/null | grep -o '\$2[aby]\$[^ ]*')"
 [ -n "$OPER_HASH" ] || { echo "could not hash the oper password" >&2; exit 1; }
 
 if [ ! -f "$ETC_DIR/tls.cert.pem" ]; then
@@ -255,7 +259,7 @@ max_failures = 1000
 EOF
 
 say "Starting rircd on $BIND:$IRC_PORT (WebSocket $BIND:$WS_PORT)"
-RUST_LOG="${RUST_LOG:-rircd=info}" "$REPO/target/debug/rircd" --config "$ETC_DIR/config.toml" run \
+RUST_LOG="${RUST_LOG:-rircd=info}" "$BIN" --config "$ETC_DIR/config.toml" run \
   >"$SERVER_LOG" 2>&1 &
 echo $! >"$RUN_DIR/rircd.pid"
 
@@ -299,7 +303,7 @@ export SMOKE_OPER_NAME="smokeoper"
 export SMOKE_OPER_PASSWORD="$OPER_PASSWORD"
 export SMOKE_OPER_HASH="$OPER_HASH"
 export SMOKE_CONFIG="$ETC_DIR/config.toml"
-export SMOKE_RIRCD_BIN="$REPO/target/debug/rircd"
+export SMOKE_RIRCD_BIN="$BIN"
 export SMOKE_RIRCD_PID="$RUN_DIR/rircd.pid"
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 

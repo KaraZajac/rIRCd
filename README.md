@@ -1127,6 +1127,39 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 
 ---
 
+## Performance
+
+Measured rather than claimed. `tests/smoke/throughput.py <receivers> <senders>`
+puts every client in one channel, so each message a sender posts is delivered
+to every receiver, and reads the server's own CPU out of `/proc` around the
+burst alone — so the figures are steady-state delivery, not the cost of
+setting the connections up.
+
+```
+tests/smoke/run.sh --stop
+SMOKE_BIN=$PWD/target/release/rircd tests/smoke/run.sh --serve-only
+SMOKE_SERVER_PID=$(pgrep -x rircd) python3 tests/smoke/throughput.py 500 5
+```
+
+`SMOKE_BIN` matters: the suites run the debug build because they are about
+behaviour, and a debug build spends most of its time somewhere production
+never goes. On a quiet sixteen-core machine over loopback, 500 receivers in
+one channel and 5 senders:
+
+| | |
+|---|---|
+| Deliveries | ~126,000 a second |
+| One message to all 500 | p50 9.7 ms, p99 19.2 ms |
+| Server CPU per delivery | ~21 µs — about 9 µs its own work, about 12 µs asking the kernel |
+
+The second half of that is the interesting one. Every message is written to
+every recipient as it arrives rather than being held back to fill a buffer, so
+a delivery costs roughly one task wakeup and one `write` on the recipient's
+socket. That is the price of a chat server that answers immediately, and it is
+where the time goes: the server's own work — matching, tagging, copying — is
+the smaller half, and the fan-out loop builds one copy per set of negotiated
+capabilities rather than one per person so that it stays that way.
+
 ## Testing
 
 `cargo test` runs the unit and integration tests: message formatting, RFC 8291
