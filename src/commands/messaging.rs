@@ -670,8 +670,30 @@ pub async fn handle_privmsg(
         let ch_store = channels.read().await;
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
+            let outsider = !ch.is_member(&state_guard.user_id(client_id));
+            // A channel that keeps itself to itself is not there as far as a
+            // stranger is concerned, and answers the way one that is not there
+            // answers. Any other reply — a refusal included — says there is a
+            // channel by that name, which is the one thing `+s` is for. It also
+            // stops the message being delivered into a room the sender cannot
+            // see, which without `+n` it was.
+            if outsider && (ch.modes.secret || ch.modes.private) {
+                reply_to_sender(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "403",
+                        vec![sender_nick.clone(), target.into(), "No such channel".into()],
+                    )
+                    .with_prefix(&cfg.server.name),
+                    label,
+                    parent_batch,
+                )
+                .await;
+                return Ok(());
+            }
             // +n: reject non-members when no-external-messages is set
-            if !ch.is_member(&state_guard.user_id(client_id)) && ch.modes.no_external {
+            if outsider && ch.modes.no_external {
                 reply_to_sender(
                     &senders,
                     client_id,
@@ -994,7 +1016,10 @@ pub async fn handle_privmsg(
             reply_to_sender(
                 &senders,
                 client_id,
-                Message::new("403", vec![target.into(), "No such channel".into()])
+                Message::new(
+                    "403",
+                    vec![sender_nick.clone(), target.into(), "No such channel".into()],
+                )
                     .with_prefix(&cfg.server.name),
                 label,
                 parent_batch,
@@ -1268,8 +1293,15 @@ pub async fn handle_notice(
         let ch_store = channels.read().await;
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
+            let outsider = !ch.is_member(&state_guard.user_id(client_id));
+            // Not delivered, and not answered either: a refused NOTICE is
+            // always silent, and saying anything here would say the channel
+            // is there.
+            if outsider && (ch.modes.secret || ch.modes.private) {
+                return Ok(());
+            }
             // +n: reject non-members when no-external-messages is set
-            if !ch.is_member(&state_guard.user_id(client_id)) && ch.modes.no_external {
+            if outsider && ch.modes.no_external {
                 return Ok(());
             }
             // +T: no notices here from anybody who is not staff. Dropped the
@@ -1562,6 +1594,13 @@ pub async fn deliver_multiline_batch(
     cfg: &Config,
     label: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Every numeric begins with the nick it is addressed to. Two replies below
+    // left it out, so a client read each parameter one place to the left of
+    // where it was.
+    let sender_nick = match state.read().await.clients.get(client_id) {
+        Some(c) => c.read().await.nick_or_id().to_string(),
+        None => "*".to_string(),
+    };
     if batch.lines.is_empty() {
         reply_to_client(
             &senders,
@@ -1667,7 +1706,7 @@ pub async fn deliver_multiline_batch(
                             client_id,
                             Message::new(
                                 "404",
-                                vec![batch.target.clone(), "Cannot send to channel".into()],
+                                vec![sender_nick.clone(), batch.target.clone(), "Cannot send to channel".into()],
                             )
                             .with_prefix(&cfg.server.name),
                             label,
@@ -1681,7 +1720,10 @@ pub async fn deliver_multiline_batch(
                     reply_to_client(
                         &senders,
                         client_id,
-                        Message::new("403", vec![batch.target.clone(), "No such channel".into()])
+                        Message::new(
+                            "403",
+                            vec![sender_nick.clone(), batch.target.clone(), "No such channel".into()],
+                        )
                             .with_prefix(&cfg.server.name),
                         label,
                     )
@@ -1957,7 +1999,7 @@ pub async fn handle_tagmsg(
         reply_to_sender(
             &senders,
             client_id,
-            Message::new("411", vec!["No recipient given (TAGMSG)".into()])
+            Message::new("411", vec![crate::commands::numeric_nick(&state, client_id).await, "No recipient given (TAGMSG)".into()])
                 .with_prefix(&cfg.server.name),
             label,
             parent_batch,
@@ -2011,8 +2053,21 @@ pub async fn handle_tagmsg(
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
 
+            let outsider = !ch.is_member(&state_guard.user_id(client_id));
+            // A channel that keeps itself to itself is not there as far as a
+            // stranger is concerned, and answers the way one that is not there
+            // answers. Any other reply — a refusal included — says there is a
+            // channel by that name, which is the one thing `+s` is for. It also
+            // stops the message being delivered into a room the sender cannot
+            // see, which without `+n` it was.
+            if outsider && (ch.modes.secret || ch.modes.private) {
+                // TAGMSG says nothing about a channel it does not know, so it
+                // says nothing about one the sender may not see either: a reply
+                // of any kind would be the difference that gives it away.
+                return Ok(());
+            }
             // +n: reject non-members when no-external-messages is set
-            if !ch.is_member(&state_guard.user_id(client_id)) && ch.modes.no_external {
+            if outsider && ch.modes.no_external {
                 reply_to_sender(
                     &senders,
                     client_id,

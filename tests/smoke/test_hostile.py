@@ -976,6 +976,11 @@ if filt.find(" 381 "):
     watcher.read(0.5)
     check("a private message is filtered too", bool(talker.find(" 404 ", lines=talker.since(tmark))), talker.since(tmark)[-2:])
 
+    # In the room to say it: a channel is created +n now, so a message from
+    # outside is refused by the channel before any filter has an opinion, and
+    # this check is about the filter.
+    filt.join(room)
+    filt.read(0.8)
     fmark = filt.mark()
     filt.send(f"PRIVMSG {room} :buynow{SUF} from an operator")
     filt.read(0.8)
@@ -1230,6 +1235,113 @@ if sh.find(" 381 "):
     sh.send(f"UNSHUN elsewhere{SUF}!*@*")
     sh.read(1.0)
 sh.close()
+
+section("a secret channel is not there as far as a stranger is concerned")
+
+# Every way of asking has to give a stranger the same answer for a channel
+# that is secret as for one that does not exist. A single reply that differs
+# is the whole of what +s was meant to hide.
+SEC = f"#sec{SUF}"
+ABSENT = f"#gone{SUF}"
+keeper = Client(f"kp{SUF}")
+keeper.join(SEC)
+keeper.send(f"MODE {SEC} +s")
+keeper.send(f"MODE {SEC} +b nobody{SUF}!*@*")
+keeper.read(1.5)
+
+stranger = Client(f"sg{SUF}")
+def answer_for(chan, line):
+    m = stranger.mark()
+    stranger.send(line.format(chan))
+    stranger.wait_for(" 401 ", " 403 ", " 404 ", " 480 ", " 331 ", " 332 ", " 366 ",
+                      " 315 ", " 368 ", " 442 ", " FAIL ", seconds=4)
+    got = [l.split(" ", 1)[1] for l in stranger.since(m)]
+    return got[0].replace(chan, "<chan>") if got else "(silence)"
+
+for what, line in (("PRIVMSG", "PRIVMSG {} :probe"), ("NOTICE", "NOTICE {} :probe"),
+                   ("KNOCK", "KNOCK {}"), ("TAGMSG", "@+draft/typing=active TAGMSG {}"),
+                   ("TOPIC", "TOPIC {}"), ("NAMES", "NAMES {}"), ("WHO", "WHO {}"),
+                   ("MODE +b", "MODE {} b"), ("CHANACCESS", "CHANACCESS {}")):
+    secret, absent = answer_for(SEC, line), answer_for(ABSENT, line)
+    check(f"{what} answers the same for a secret channel as for one that is not there",
+          secret == absent, (secret, absent))
+
+check("and nothing a stranger sent reached the channel",
+      not keeper.find("probe", lines=keeper.since(keeper.mark())), "nothing")
+
+section("a channel's own business stays inside it")
+
+PUB = f"#pub{SUF}"
+keeper.join(PUB)
+keeper.send(f"MODE {PUB} +b someone{SUF}!*@*")
+keeper.read(1.2)
+hidden = Client(f"hd{SUF}")
+hidden.join(PUB)
+hidden.send(f"MODE hd{SUF} +i")
+hidden.read(1.0)
+
+m = stranger.mark()
+stranger.send(f"MODE {PUB} b")
+stranger.wait_for(" 442 ", " 368 ", seconds=4)
+check("a stranger may not read a channel's ban list",
+      bool(stranger.find(" 442 ", lines=stranger.since(m)))
+      and not stranger.find(" 367 ", lines=stranger.since(m)),
+      stranger.since(m)[-2:])
+
+m = stranger.mark()
+stranger.send(f"WHO {PUB}")
+stranger.wait_for(" 315 ", seconds=4)
+seen = " ".join(stranger.since(m))
+check("WHO on a public channel does not list somebody invisible",
+      f"hd{SUF}" not in seen and f"kp{SUF}" in seen, seen[-160:])
+
+stranger.send(f"JOIN {PUB}")
+stranger.read(1.2)
+m = stranger.mark()
+stranger.send(f"WHO {PUB}")
+stranger.wait_for(" 315 ", seconds=4)
+seen = " ".join(stranger.since(m))
+check("but a member of it sees everybody", f"hd{SUF}" in seen, seen[-160:])
+m = stranger.mark()
+stranger.send(f"MODE {PUB} b")
+stranger.wait_for(" 368 ", seconds=4)
+check("and a member may read the ban list",
+      bool(stranger.find(" 367 ", lines=stranger.since(m))), stranger.since(m)[-2:])
+
+section("what a new channel is created with")
+
+fresh = Client(f"fr{SUF}")
+FRESH = f"#fresh{SUF}"
+fresh.join(FRESH)
+m = fresh.mark()
+fresh.send(f"MODE {FRESH}")
+fresh.wait_for(" 324 ", seconds=4)
+modes = " ".join(fresh.since(m))
+# Without +n anybody may talk into a room without joining it, which is how one
+# spammer reaches a hundred rooms; without +t any of the people in it may
+# rewrite the topic.
+check("a new channel is created +nt", "+nt" in modes or ("n" in modes and "t" in modes),
+      modes[-80:])
+
+section("every numeric names the client it is for")
+
+# A client reading parameters by position reads the command where the nick
+# should be when one is left out.
+for what, line, code in (("JOIN", "JOIN", " 461 "), ("RENAME", "RENAME", " 461 "),
+                         ("GHOST", "GHOST", " 461 "), ("SETNAME", "SETNAME", " 461 "),
+                         ("SETUSER", "SETUSER", " 461 "), ("SETHOST", "SETHOST", " 461 "),
+                         ("TAGMSG", "TAGMSG", " 411 ")):
+    m = fresh.mark()
+    fresh.send(line)
+    fresh.wait_for(code, seconds=4)
+    got = [l for l in fresh.since(m) if code in l]
+    named = bool(got) and got[0].split(f"{code.strip()} ", 1)[1].split(" ")[0] == f"fr{SUF}"
+    check(f"{what} names the client in its numeric", named, got[-1:] or "(no reply)")
+
+fresh.close()
+hidden.close()
+stranger.close()
+keeper.close()
 
 section("still standing")
 check("the server is still accepting and serving clients", still_alive("everything", f"h12{RUN}"))

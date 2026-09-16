@@ -1321,6 +1321,22 @@ pub async fn handle_knock(
         }
     };
 
+    // A channel that keeps itself to itself answers a stranger the way one that
+    // is not there answers: otherwise "not invite-only" and "no such channel"
+    // are two different replies, and the difference is the secret.
+    if (ch.modes.secret || ch.modes.private) && !ch.is_member(&state.user_id(client_id)) {
+        drop(ch);
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new("403", vec![nick, ch_name.to_string(), "No such channel".into()])
+                .with_prefix(s),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+
     if !ch.modes.invite_only {
         // 480: ERR_CANNOTKNOCK — channel is not invite-only
         reply_to_client(
@@ -2289,7 +2305,7 @@ pub async fn handle_kline(
     else {
         return Ok(());
     };
-    let Some((duration, mask, reason)) = ban_arguments(&msg, "KLINE", &senders, client_id, cfg, label).await
+    let Some((duration, mask, reason)) = ban_arguments(&msg, "KLINE", &nick, &senders, client_id, cfg, label).await
     else {
         return Ok(());
     };
@@ -2387,6 +2403,7 @@ async fn may_ban(
 async fn ban_arguments(
     msg: &Message,
     command: &str,
+    nick: &str,
     senders: &Senders,
     client_id: &str,
     cfg: &Config,
@@ -2406,7 +2423,7 @@ async fn ban_arguments(
         reply_to_client(
             senders,
             client_id,
-            Message::new("461", vec![command.into(), "Not enough parameters".into()])
+            Message::new("461", vec![nick.into(), command.into(), "Not enough parameters".into()])
                 .with_prefix(&cfg.server.name),
             label,
         )
@@ -2544,7 +2561,7 @@ pub async fn handle_dline(
     else {
         return Ok(());
     };
-    let Some((duration, mask, reason)) = ban_arguments(&msg, "DLINE", &senders, client_id, cfg, label).await
+    let Some((duration, mask, reason)) = ban_arguments(&msg, "DLINE", &nick, &senders, client_id, cfg, label).await
     else {
         return Ok(());
     };
@@ -4118,7 +4135,7 @@ pub async fn handle_shun(
         return Ok(());
     };
     let Some((duration, mask, reason)) =
-        ban_arguments(&msg, "SHUN", &senders, client_id, cfg, label).await
+        ban_arguments(&msg, "SHUN", &nick, &senders, client_id, cfg, label).await
     else {
         return Ok(());
     };
@@ -4267,7 +4284,7 @@ pub async fn handle_eline(
         return Ok(());
     };
     let Some((duration, mask, reason)) =
-        ban_arguments(&msg, "ELINE", &senders, client_id, cfg, label).await
+        ban_arguments(&msg, "ELINE", &nick, &senders, client_id, cfg, label).await
     else {
         return Ok(());
     };
@@ -4721,7 +4738,7 @@ pub async fn handle_resv(
         return Ok(());
     };
     let Some((duration, pattern, reason)) =
-        ban_arguments(&msg, "RESV", &senders, client_id, cfg, label).await
+        ban_arguments(&msg, "RESV", &nick, &senders, client_id, cfg, label).await
     else {
         return Ok(());
     };

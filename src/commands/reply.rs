@@ -13,6 +13,22 @@ pub async fn session_caps(senders: &Senders, client_id: &str) -> std::collection
 
 /// Sends a reply to the requesting client. If `label` is Some (labeled-response),
 /// the message is sent with a `label` tag so the client can correlate the reply.
+/// The nick a numeric should be addressed to, or `*` where there is not one yet.
+///
+/// Every numeric begins with the client it is for. A handful here left it out,
+/// and a client reading its parameters by position then read each one a place
+/// to the left of where it was — the command name where the nick should be,
+/// and the reason where the command should be.
+pub async fn numeric_nick(
+    state: &std::sync::Arc<tokio::sync::RwLock<crate::user::ServerState>>,
+    client_id: &str,
+) -> String {
+    match state.read().await.clients.get(client_id) {
+        Some(c) => c.read().await.nick_or_id().to_string(),
+        None => "*".to_string(),
+    }
+}
+
 pub async fn reply_to_client(
     senders: &Senders,
     client_id: &str,

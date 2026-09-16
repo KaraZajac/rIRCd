@@ -114,6 +114,11 @@ pub async fn handle_who(
         None => return Ok(()),
     };
     let nick = client.read().await.nick_or_id().to_string();
+    // Who is asking, for the two questions that depend on it: whether a
+    // channel they are not in is theirs to look into, and whether somebody
+    // who has asked not to be listed is listed to them anyway.
+    let asker_is_oper = client.read().await.oper;
+    let asker_id = state.user_id(client_id);
     let client_caps = session_caps(&senders, client_id).await;
     let use_multi_prefix = client_caps.contains("multi-prefix");
     // WHOX has no capability: support is advertised with the WHOX ISUPPORT token,
@@ -146,9 +151,24 @@ pub async fn handle_who(
         let ch_key = crate::channel::canonical_channel_key(target);
         if let Some(ch) = ch_store.channels.get(&ch_key) {
             let ch = ch.read().await;
+            let inside = ch.members.contains_key(&asker_id);
+            // A channel that keeps itself to itself does that here too. Every
+            // other way of asking — NAMES, TOPIC, MODE, LIST, WHOIS — already
+            // told an outsider nothing; this one listed the members, their
+            // hosts and which of them held ops.
+            let may_look_in = inside || asker_is_oper || !(ch.modes.secret || ch.modes.private);
             for (mid, memb) in &ch.members {
+                if !may_look_in {
+                    break;
+                }
                 if let Some(c) = state.clients.get(mid) {
                     let c = c.read().await;
+                    // Somebody invisible is listed to the people they share a
+                    // channel with, and to nobody else. An outsider asking
+                    // about a channel is not one of those people.
+                    if c.invisible && !inside && !asker_is_oper {
+                        continue;
+                    }
                     let prefix_str = if use_multi_prefix {
                         memb.modes.prefixes_ordered()
                     } else {

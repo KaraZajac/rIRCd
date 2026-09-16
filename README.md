@@ -807,6 +807,27 @@ server when set, listed by `STATS s`, lifted by `UNSHUN`, and expiring on their
 own when given a duration. A mask made only of wildcards is refused, and so is
 one covering the operator setting it.
 
+### What a secret channel gives away
+
+Nothing, and that takes saying, because it is the reply that leaks rather than
+the data. A stranger asking about a `+s` channel gets exactly what they would
+get for a channel that does not exist — the same numeric, the same text — from
+`PRIVMSG`, `NOTICE`, `TAGMSG`, `KNOCK`, `TOPIC`, `NAMES`, `WHO`, `MODE`,
+`CHATHISTORY`, `LIST` and `CHANACCESS` alike. One command answering differently
+is the whole of what `+s` was meant to hide, and the message is not delivered
+either.
+
+A channel's own business stays inside it. The ban, exception and invite lists
+(`MODE #channel b`, `e`, `I`) are for the people in the channel: a stranger is
+told they are not on it, or for a secret channel that there is no such channel.
+`WHO` on a channel lists the members to the members; somebody carrying `+i`
+is listed to the people they share a channel with and to nobody else.
+
+A new channel is created `+nt`. Without `+n` anybody may talk into a room
+without joining it, which is how one spammer reaches a hundred rooms without
+ever appearing in one; without `+t` any of the people in it may rewrite the
+topic. An operator who wants either off can take it off.
+
 ### Who stands where in a channel
 
 ```
@@ -1254,8 +1275,9 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+i` | Invite-only |
 | `+m` | Moderated — only `+v`/`+h`/`+o` may speak |
 | `+n` | No external messages |
-| `+s` | Secret channel |
-| `+t` | Topic restricted to ops |
+| `+s` | Secret channel — see **What a secret channel gives away** |
+| `+t` | Topic restricted to ops. Set on every new channel |
+| `+n` | No messages from outside the channel. Set on every new channel |
 | `+k` | Channel key (password) |
 | `+l` | User limit |
 | `+j` | Join throttle, `<joins>:<seconds>` — no more than that many joins in that many seconds (480 past it). Whoever holds the channel, whoever it invited, and operators are let past, so a join flood slows the crowd without locking the owner out |

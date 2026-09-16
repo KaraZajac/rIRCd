@@ -106,7 +106,18 @@ async fn handle_join_inner(
     let ch_names = msg.params.first().map(|s| s.as_str()).unwrap_or("");
     if ch_names.is_empty() {
         reply_self!(
-            Message::new("461", vec!["JOIN".into(), "Not enough parameters".into()])
+            Message::new(
+                "461",
+                vec![
+                    // `state` here is already a read guard on the server state.
+                    match state.clients.get(client_id) {
+                        Some(c) => c.read().await.nick_or_id().to_string(),
+                        None => "*".to_string(),
+                    },
+                    "JOIN".into(),
+                    "Not enough parameters".into(),
+                ],
+            )
                 .with_prefix(&cfg.server.name)
         );
         return Ok(());
@@ -1733,12 +1744,40 @@ pub async fn handle_mode_as(
 
             let mode_str = msg.params.get(1).map(|s| s.as_str()).unwrap_or("");
             // `MODE #chan +b` with no mask asks what the list holds. Reading a
-            // list is not changing one, so it does not need op.
+            // list is not changing one, so it does not need op — but it is
+            // still the channel's business. Who is banned from a room, who is
+            // excepted and who is invited are things the people in it may see,
+            // and a stranger asking a secret channel used to be told the lot,
+            // along with the fact that there was a channel there at all.
             let list_query_only = msg.params.len() == 2
                 && !mode_str.is_empty()
                 && mode_str
                     .chars()
                     .all(|c| matches!(c, '+' | '-' | 'b' | 'e' | 'I' | 'q'));
+            if list_query_only && member.is_none() && !sender_is_oper && !forced {
+                let hidden = ch.modes.secret || ch.modes.private;
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    if hidden {
+                        // The same answer a channel that is not there gives, so
+                        // asking does not say whether there is one.
+                        Message::new(
+                            "403",
+                            vec![nick.clone(), target.into(), "No such channel".into()],
+                        )
+                    } else {
+                        Message::new(
+                            "442",
+                            vec![nick.clone(), target.into(), "You're not on that channel".into()],
+                        )
+                    }
+                    .with_prefix(&cfg.server.name),
+                    label,
+                )
+                .await;
+                return Ok(());
+            }
             if !is_op && !list_query_only && !forced {
                 reply_to_client(
                     &senders,
@@ -4054,7 +4093,7 @@ pub async fn handle_rename(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("461", vec!["RENAME".into(), "Not enough parameters".into()])
+            Message::new("461", vec![crate::commands::numeric_nick(&state, client_id).await, "RENAME".into(), "Not enough parameters".into()])
                 .with_prefix(&cfg.server.name),
             label,
         )

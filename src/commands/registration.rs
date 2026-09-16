@@ -4783,7 +4783,7 @@ pub async fn handle_ghost(
         reply_to_client(
             &senders,
             client_id,
-            Message::new("461", vec!["GHOST".into(), "Not enough parameters".into()])
+            Message::new("461", vec![crate::commands::numeric_nick(&state, client_id).await, "GHOST".into(), "Not enough parameters".into()])
                 .with_prefix(&cfg.server.name),
             label,
         )
@@ -5337,7 +5337,7 @@ pub async fn handle_setname(
                 client_id,
                 Message::new(
                     "461",
-                    vec!["SETNAME".into(), "Realname is not valid".into()],
+                    vec![crate::commands::numeric_nick(&state, client_id).await, "SETNAME".into(), "Realname is not valid".into()],
                 )
                 .with_prefix(&cfg.server.name),
                 label,
@@ -5435,7 +5435,7 @@ pub async fn handle_sethost(
             client_id,
             Message::new(
                 "461",
-                vec!["SETHOST".into(), "Not enough parameters".into()],
+                vec![crate::commands::numeric_nick(&state, client_id).await, "SETHOST".into(), "Not enough parameters".into()],
             )
             .with_prefix(&cfg.server.name),
             label,
@@ -5551,7 +5551,7 @@ pub async fn handle_setuser(
             client_id,
             Message::new(
                 "461",
-                vec!["SETUSER".into(), "Not enough parameters".into()],
+                vec![crate::commands::numeric_nick(&state, client_id).await, "SETUSER".into(), "Not enough parameters".into()],
             )
             .with_prefix(&cfg.server.name),
             label,

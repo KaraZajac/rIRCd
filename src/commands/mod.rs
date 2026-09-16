@@ -11,8 +11,8 @@ mod webpush_cmds;
 pub mod whois_remote;
 
 pub use reply::{
-    end_labeled_batch, reply_in_batch, reply_to_client, reply_to_sender, send_labeled_ack,
-    session_caps, start_labeled_batch,
+    end_labeled_batch, numeric_nick, reply_in_batch, reply_to_client, reply_to_sender,
+    send_labeled_ack, session_caps, start_labeled_batch,
 };
 
 use crate::channel::ChannelStore;

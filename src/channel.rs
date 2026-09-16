@@ -26,6 +26,24 @@ pub struct ChannelMemberModeSet {
     pub halfop: bool,
 }
 
+impl ChannelModeSet {
+    /// What a channel is created with: `+nt`.
+    ///
+    /// A channel with neither is open to the network. Without `+n` anybody may
+    /// talk into it without joining — which is how a spammer reaches a hundred
+    /// rooms without ever appearing in one — and without `+t` any of the people
+    /// in it may rewrite the topic. Every server that has been running long
+    /// enough to have learned this creates channels with both, and an operator
+    /// who wants them off can take them off.
+    pub fn new_channel() -> Self {
+        Self {
+            no_external: true,
+            topic_protect: true,
+            ..Self::default()
+        }
+    }
+}
+
 impl ChannelMemberModeSet {
     pub fn prefix(&self) -> &'static str {
         if self.founder {
@@ -469,7 +487,7 @@ impl Channel {
             topic_setter: None,
             topic_time: None,
             members: BTreeMap::new(),
-            modes: ChannelModeSet::default(),
+            modes: ChannelModeSet::new_channel(),
             key: None,
             invite_list: HashSet::new(),
             bans: Vec::new(),
