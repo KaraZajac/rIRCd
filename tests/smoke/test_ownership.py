@@ -672,6 +672,90 @@ check("while the owner is an operator whenever they return",
 passerby.close()
 back2.close()
 
+section("giving a channel up takes the prefix with it")
+
+# `^` comes from the registration. A channel given up belongs to nobody, so
+# nobody should still be standing in it outranking everyone else.
+GIVEN = f"#given{RUN}"
+holder = logged_in(f"{owner}_g", owner)
+holder.join(GIVEN)
+holder.read(1.2)
+mark = holder.mark()
+holder.send(f"NAMES {GIVEN}")
+holder.wait_for(" 366 ", seconds=5)
+check("the founder wears it while the channel is theirs",
+      bool(holder.find(" 353 ", f"^{owner}_g", lines=holder.since(mark))),
+      holder.since(mark)[-2:])
+
+holder.send(f"CHANDROP {GIVEN} {PW}")
+holder.wait_for("CHANDROP", seconds=10)
+mark = holder.mark()
+holder.send(f"NAMES {GIVEN}")
+holder.wait_for(" 366 ", seconds=5)
+names = " ".join(holder.since(mark))
+check("and stops wearing it once the channel is nobody's",
+      f"^{owner}_g" not in names, names[-120:])
+holder.close()
+
+section("what a half-operator may do, and where they stop")
+
+# `%` is a moderator, not a decoration: they mind the room. What they may not
+# do is make more of themselves, or touch somebody standing level with them —
+# two half-operators could otherwise take a channel apart between them.
+HALF = f"#half{RUN}"
+boss_h = Client(f"bh{RUN}")
+boss_h.join(HALF)
+boss_h.send(f"MODE {HALF} +t")
+boss_h.read(1.0)
+mod = Client(f"md{RUN}")
+mod.join(HALF)
+mod2 = Client(f"m2{RUN}")
+mod2.join(HALF)
+guest = Client(f"gu{RUN}")
+guest.join(HALF)
+boss_h.send(f"MODE {HALF} +h md{RUN}")
+boss_h.send(f"MODE {HALF} +h m2{RUN}")
+boss_h.read(1.5)
+for c in (mod, mod2, guest):
+    c.read(0.8)
+
+def half_may(label, line, expect_allowed):
+    m = mod.mark()
+    mod.send(line)
+    mod.wait_for(" 482 ", " MODE ", " KICK ", " TOPIC ", seconds=5)
+    got = mod.since(m)
+    refused = bool(mod.find(" 482 ", lines=got))
+    check(label, refused != expect_allowed, got[-2:])
+
+half_may("a half-operator may set the topic under +t", f"TOPIC {HALF} :minded", True)
+half_may("and voice somebody", f"MODE {HALF} +v gu{RUN}", True)
+half_may("and set a ban", f"MODE {HALF} +b spammer{RUN}!*@*", True)
+half_may("and moderate the room", f"MODE {HALF} +m", True)
+half_may("and throw out somebody below them", f"KICK {HALF} gu{RUN} :off you go", True)
+half_may("but may not appoint another half-operator", f"MODE {HALF} +h m2{RUN}", False)
+half_may("nor op themselves", f"MODE {HALF} +o md{RUN}", False)
+half_may("nor make themselves admin", f"MODE {HALF} +a md{RUN}", False)
+half_may("nor founder", f"MODE {HALF} +x md{RUN}", False)
+half_may("nor throw out the operator", f"KICK {HALF} bh{RUN} :bye", False)
+half_may("nor another half-operator", f"KICK {HALF} m2{RUN} :bye", False)
+half_may("nor deop the operator", f"MODE {HALF} -o bh{RUN}", False)
+
+# An operator may still act on an equal, which is how a channel is taken back
+# from one who has gone wrong.
+second = Client(f"sd{RUN}")
+second.join(HALF)
+boss_h.send(f"MODE {HALF} +o sd{RUN}")
+boss_h.read(1.2)
+second.read(0.8)
+m = boss_h.mark()
+boss_h.send(f"KICK {HALF} sd{RUN} :bye")
+boss_h.wait_for(" KICK ", " 482 ", seconds=5)
+check("an operator may still throw out another operator",
+      not boss_h.find(" 482 ", lines=boss_h.since(m)), boss_h.since(m)[-2:])
+
+for c in (boss_h, mod, mod2, guest, second):
+    c.close()
+
 section("the founder wears it, and the ladder holds")
 
 # `^` is the person the channel belongs to and `&` somebody they put above the

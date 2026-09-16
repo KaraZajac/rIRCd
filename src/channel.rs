@@ -534,6 +534,19 @@ impl Channel {
     /// as it is the owner — on any connection, under any name. Somebody who is
     /// not logged in owns nothing, which is why a bare `None` is never a match
     /// even when the channel has no founder at all.
+    /// The channel belongs to nobody now, and nobody wears it.
+    ///
+    /// `^` comes from the registration, so giving the registration up has to
+    /// take the prefix with it. Otherwise whoever was standing there keeps
+    /// rank over everybody in a channel that has no founder at all — and
+    /// keeps the founder's powers with it.
+    pub fn clear_founder(&mut self) {
+        self.founder.clear();
+        for memb in self.members.values_mut() {
+            memb.modes.founder = false;
+        }
+    }
+
     pub fn is_founder(&self, account: Option<&str>) -> bool {
         match account {
             Some(account) if !self.founder.is_empty() => {

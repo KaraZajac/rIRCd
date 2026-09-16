@@ -843,6 +843,17 @@ reaches above themselves: an operator may op an operator as they always could,
 but not appoint an admin over their own head, and an admin may not unseat the
 founder. A server operator stands outside the ladder.
 
+A half-operator is the one exception to "an equal may act on an equal": they
+may not throw out another half-operator, or appoint one. Two of them could
+otherwise take a channel apart between them, which is the whole reason the rank
+is half of something.
+
+`^` is not a mode anybody sets, so it moves when the registration moves:
+`CHANOWN` takes it off the outgoing founder and gives it to the incoming one
+there and then, and `CHANDROP` — or the account expiring, or being dropped —
+takes it off altogether. A channel that belongs to nobody has nobody wearing
+it.
+
 `^` is not a mode anybody sets on the founder. It comes from the registration,
 so it is true again every time they walk in and cannot be taken from them by a
 MODE — `CHANOWN` is how a channel stops being theirs. `&` is an appointment for
@@ -1265,7 +1276,7 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 |------|-------------|
 | `+o` | Channel operator |
 | `+v` | Voice (+) |
-| `+h` | Half-op (%) |
+| `+h` | Half-op (%) — a moderator. May set the topic under `+t`, voice, ban, moderate, and throw out somebody below them, but may not hand out status at or above their own, and may not act on somebody standing level with them. Appointed by an operator: one who could appoint another could fill a channel with them |
 | `+b` | Ban list — glob masks and the extended bans `~a:` (account), `~r:` (real name), `~j:` (in another channel), `~S:` (client certificate), `~O` (operators), `~m:` (mute rather than ban), `~n:` (no nick change) and `~t:` (lifts itself). The prefixes peel one at a time, so they stack: `~m:~r:*spam*` mutes by real name, `~t:1h:~j:#raiders` expires |
 | `+e` | Ban exception list — exempt users bypass `+b` bans |
 | `+I` | Invite exception list — matching users bypass `+i` without explicit INVITE |

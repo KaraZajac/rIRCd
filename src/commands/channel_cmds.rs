@@ -1778,7 +1778,12 @@ pub async fn handle_mode_as(
                 .await;
                 return Ok(());
             }
-            if !is_op && !list_query_only && !forced {
+            // A half-operator may do what an operator may, except hand out
+            // status at or above their own — that is what makes them a half.
+            // Which letters those are is decided per letter below, where the
+            // rank rule already lives.
+            let may_set_modes = member.map(|m| m.modes.at_least_halfop()).unwrap_or(false);
+            if !may_set_modes && !list_query_only && !forced {
                 reply_to_client(
                     &senders,
                     client_id,
@@ -1984,7 +1989,7 @@ pub async fn handle_mode_as(
                             param_idx += 1;
                         }
                     }
-                    'o' | 'a' | 'x' => {
+                    'o' | 'a' | 'x' | 'h' => {
                         let Some(target_nick) = msg.params.get(param_idx).cloned() else {
                             continue;
                         };
@@ -2072,6 +2077,11 @@ pub async fn handle_mode_as(
                         // but not appoint an admin above themselves, and an
                         // admin may not unseat the founder. A server operator
                         // is outside the ladder and is not measured against it.
+                        // What rank you must hold to hand this one out. A
+                        // half-operator is an appointment an operator makes:
+                        // one who could appoint another could fill a channel
+                        // with them, which is the same objection as letting one
+                        // throw out another.
                         let wanted = match c {
                             'x' => 4u8,
                             'a' => 3,
@@ -2105,7 +2115,7 @@ pub async fn handle_mode_as(
                                             match wanted {
                                                 4 => "the founder",
                                                 3 => "an admin or the founder",
-                                                _ => "an operator",
+                                                _ => "an operator, and no lower than whoever you name",
                                             }
                                         ),
                                     ],
@@ -2121,6 +2131,7 @@ pub async fn handle_mode_as(
                             match c {
                                 'x' => memb.modes.founder = plus,
                                 'a' => memb.modes.admin = plus,
+                                'h' => memb.modes.halfop = plus,
                                 _ => memb.modes.op = plus,
                             }
                         }
@@ -2371,35 +2382,6 @@ pub async fn handle_mode_as(
                                         }
                                         access_changes.push((who, false, plus));
                                     }
-                                } else {
-                                    let _ = reply_to_client(
-                                        &senders,
-                                        client_id,
-                                        Message::new(
-                                            "441",
-                                            vec![
-                                                nick.clone(),
-                                                target_nick.clone(),
-                                                target.into(),
-                                                "They aren't on that channel".into(),
-                                            ],
-                                        )
-                                        .with_prefix(&cfg.server.name),
-                                        label,
-                                    )
-                                    .await;
-                                }
-                            }
-                            param_idx += 1;
-                        }
-                    }
-                    'h' => {
-                        if let Some(target_nick) = msg.params.get(param_idx) {
-                            if let Some(target_id) =
-                                state.nick_to_id.get(&crate::casefold::upper(target_nick))
-                            {
-                                if let Some(memb) = ch.members.get_mut(target_id) {
-                                    memb.modes.halfop = plus;
                                 } else {
                                     let _ = reply_to_client(
                                         &senders,
@@ -3223,7 +3205,14 @@ pub async fn handle_topic(
             return Ok(());
         }
 
-        if ch.modes.topic_protect && !is_op {
+        // A half-operator may set the topic under `+t`: minding what the
+        // channel says about itself is the other half of what they are for.
+        let may_set_topic = ch
+            .members
+            .get(&state.user_id(client_id))
+            .map(|m| m.modes.at_least_halfop())
+            .unwrap_or(false);
+        if ch.modes.topic_protect && !may_set_topic {
             reply_to_client(
                 &senders,
                 client_id,
@@ -3383,12 +3372,15 @@ pub async fn handle_kick(
     }
     if let Some(ch) = ch_store.channels.get_mut(&ch_key) {
         let mut ch = ch.write().await;
-        let is_op = ch
+        // A half-operator may throw somebody out, which is most of what being
+        // one is for. Not somebody standing level with them or above, though:
+        // that is the rule everywhere else in a channel and it holds here.
+        let kicker_rank = ch
             .members
             .get(&state.user_id(client_id))
-            .map(|m| m.modes.is_op())
-            .unwrap_or(false);
-        if !is_op {
+            .map(|m| m.modes.rank())
+            .unwrap_or(0);
+        if kicker_rank == 0 {
             let nick = client.read().await.nick_or_id().to_string();
             reply_to_client(
                 &senders,
@@ -3396,6 +3388,37 @@ pub async fn handle_kick(
                 Message::new(
                     "482",
                     vec![nick, ch_name.into(), "You're not channel operator".into()],
+                )
+                .with_prefix(&cfg.server.name),
+                label,
+            )
+            .await;
+            return Ok(());
+        }
+        let target_rank = target_id
+            .as_ref()
+            .and_then(|tid| ch.members.get(tid))
+            .map(|m| m.modes.rank())
+            .unwrap_or(0);
+        // An operator and above may throw out an equal; a half-operator may
+        // not, or two of them could take a channel apart between them.
+        let outranked = if kicker_rank == 1 {
+            target_rank < kicker_rank
+        } else {
+            target_rank <= kicker_rank
+        };
+        if !outranked {
+            let nick = client.read().await.nick_or_id().to_string();
+            reply_to_client(
+                &senders,
+                client_id,
+                Message::new(
+                    "482",
+                    vec![
+                        nick,
+                        ch_name.into(),
+                        "They stand at least as high as you do here".into(),
+                    ],
                 )
                 .with_prefix(&cfg.server.name),
                 label,
@@ -4589,7 +4612,11 @@ pub async fn handle_chanown(
                 ch.persisted_operators.push(who.clone());
             }
         }
-        // If the new owner is standing in the channel, they hold it now.
+        // If the new owner is standing in the channel, they hold it now — and
+        // wear it. The `^` comes from the registration, so it has to move with
+        // the registration: whoever is standing there under the old name keeps
+        // it otherwise, outranking the person the channel now belongs to, and
+        // the new owner cannot so much as throw them out.
         let mut reopped = Vec::new();
         let state_r = state.read().await;
         for member_id in ch.members.keys().cloned().collect::<Vec<_>>() {
@@ -4597,13 +4624,16 @@ pub async fn handle_chanown(
                 continue;
             };
             let theirs = c.read().await.account.clone();
-            if theirs
+            let is_new_owner = theirs
                 .as_deref()
-                .is_some_and(|a| a.eq_ignore_ascii_case(&new_owner))
-            {
-                if let Some(memb) = ch.members.get_mut(&member_id) {
+                .is_some_and(|a| a.eq_ignore_ascii_case(&new_owner));
+            if let Some(memb) = ch.members.get_mut(&member_id) {
+                memb.modes.founder = is_new_owner;
+                if is_new_owner {
                     memb.modes.op = true;
                 }
+            }
+            if is_new_owner {
                 reopped.push(c.read().await.nick_or_id().to_string());
             }
         }
@@ -4947,7 +4977,7 @@ pub async fn handle_chandrop(
     {
         let store = channels.read().await;
         if let Some(entry) = store.channels.get(&ch_key) {
-            entry.write().await.founder.clear();
+            entry.write().await.clear_founder();
         }
     }
     if let Some(ref pool) = cfg.db {

@@ -2909,7 +2909,7 @@ async fn accept_remote_access(ctx: &LinkContext, msg: &Message, peer_sid: &str) 
                 // peer saying "-alice" about a channel bob owns says nothing.
                 let gone = &names[0][1..];
                 if !ch.founder.is_empty() && ch.founder.eq_ignore_ascii_case(gone) {
-                    ch.founder.clear();
+                    ch.clear_founder();
                     founder_cleared = true;
                 }
             }

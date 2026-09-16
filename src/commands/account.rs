@@ -98,7 +98,7 @@ pub async fn forget_account(
         for (key, entry) in store.channels.iter() {
             let mut ch = entry.write().await;
             if ch.is_founder(Some(account)) {
-                ch.founder.clear();
+                ch.clear_founder();
                 orphaned.push((
                     key.clone(),
                     ch.created_at,
