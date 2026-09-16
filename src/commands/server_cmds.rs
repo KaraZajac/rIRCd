@@ -1379,7 +1379,7 @@ pub async fn handle_knock(
     let op_ids: Vec<String> = ch
         .members
         .iter()
-        .filter(|(_, m)| m.modes.op)
+        .filter(|(_, m)| m.modes.is_op())
         .map(|(id, _)| id.clone())
         .collect();
     drop(ch);

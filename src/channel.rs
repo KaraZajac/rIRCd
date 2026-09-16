@@ -17,6 +17,10 @@ pub struct ChannelMembership {
 
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMemberModeSet {
+    /// `+x`, shown as `^`: the person the channel belongs to.
+    pub founder: bool,
+    /// `+a`, shown as `&`: somebody the founder has put above the operators.
+    pub admin: bool,
     pub op: bool,
     pub voice: bool,
     pub halfop: bool,
@@ -24,7 +28,11 @@ pub struct ChannelMemberModeSet {
 
 impl ChannelMemberModeSet {
     pub fn prefix(&self) -> &'static str {
-        if self.op {
+        if self.founder {
+            "^"
+        } else if self.admin {
+            "&"
+        } else if self.op {
             "@"
         } else if self.halfop {
             "%"
@@ -35,9 +43,15 @@ impl ChannelMemberModeSet {
         }
     }
 
-    /// All prefixes in rank order (op, halfop, voice) for multi-prefix cap.
+    /// All prefixes in rank order for the multi-prefix cap.
     pub fn prefixes_ordered(&self) -> String {
         let mut s = String::new();
+        if self.founder {
+            s.push('^');
+        }
+        if self.admin {
+            s.push('&');
+        }
         if self.op {
             s.push('@');
         }
@@ -48,6 +62,117 @@ impl ChannelMemberModeSet {
             s.push('+');
         }
         s
+    }
+
+    /// Whether this member has an operator's powers.
+    ///
+    /// Asked wherever the question is "may they do this", rather than "do they
+    /// hold `+o`". A founder and an admin can do everything an operator can —
+    /// that is what putting them above the operators means — so a check written
+    /// against `op` alone would give the person who owns the room less than the
+    /// people they appointed.
+    pub fn is_op(&self) -> bool {
+        self.founder || self.admin || self.op
+    }
+
+    /// Whether they may do what a half-operator may.
+    pub fn at_least_halfop(&self) -> bool {
+        self.is_op() || self.halfop
+    }
+
+    /// Whether they hold any status at all — the question `+m` asks.
+    pub fn at_least_voice(&self) -> bool {
+        self.at_least_halfop() || self.voice
+    }
+
+    /// How far up the ladder this member stands: founder 4, admin 3, op 2,
+    /// half-operator 1, and 0 for everybody else.
+    ///
+    /// Status is given and taken by people who have some of their own, and the
+    /// rule throughout is that nobody reaches above themselves. One number is
+    /// the whole of that comparison.
+    pub fn rank(&self) -> u8 {
+        if self.founder {
+            4
+        } else if self.admin {
+            3
+        } else if self.op {
+            2
+        } else if self.halfop {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    fn with(founder: bool, admin: bool, op: bool, halfop: bool, voice: bool) -> ChannelMemberModeSet {
+        ChannelMemberModeSet { founder, admin, op, halfop, voice }
+    }
+
+    /// A founder and an admin can do everything an operator can. A check
+    /// written against `op` alone would give the person who owns the room less
+    /// than the people they appointed.
+    #[test]
+    fn standing_above_an_operator_includes_standing_as_one() {
+        assert!(with(true, false, false, false, false).is_op(), "the founder");
+        assert!(with(false, true, false, false, false).is_op(), "an admin");
+        assert!(with(false, false, true, false, false).is_op(), "an operator");
+        assert!(!with(false, false, false, true, false).is_op(), "a half-operator is not");
+        assert!(with(false, false, false, true, false).at_least_halfop());
+        assert!(with(true, false, false, false, false).at_least_halfop(), "the founder is above one");
+        assert!(with(false, false, false, false, true).at_least_voice());
+        assert!(with(true, false, false, false, false).at_least_voice());
+        assert!(!with(false, false, false, false, false).at_least_voice());
+    }
+
+    /// The prefix shown is the highest held, and multi-prefix lists them all
+    /// strongest first — in the order `PREFIX` in ISUPPORT promises.
+    #[test]
+    fn the_prefix_is_the_highest_and_the_list_is_in_order() {
+        assert_eq!(with(true, true, true, false, true).prefix(), "^");
+        assert_eq!(with(false, true, true, false, false).prefix(), "&");
+        assert_eq!(with(false, false, true, false, false).prefix(), "@");
+        assert_eq!(with(false, false, false, true, false).prefix(), "%");
+        assert_eq!(with(false, false, false, false, true).prefix(), "+");
+        assert_eq!(with(false, false, false, false, false).prefix(), "");
+        assert_eq!(with(true, true, true, true, true).prefixes_ordered(), "^&@%+");
+        assert_eq!(with(true, false, false, false, true).prefixes_ordered(), "^+");
+    }
+
+    /// The order in `PREFIX_CHARS` is the order `prefixes_ordered` uses, and
+    /// the two lists are the same length. A mode added to one and not the
+    /// other is how a server ends up advertising a prefix it never sends.
+    #[test]
+    fn the_advertised_prefixes_are_the_ones_given_out() {
+        assert_eq!(PREFIX_MODES.len(), PREFIX_CHARS.len());
+        assert_eq!(
+            with(true, true, true, true, true).prefixes_ordered(),
+            PREFIX_CHARS,
+            "everything held at once spells the advertised list"
+        );
+        for letter in PREFIX_MODES.chars() {
+            assert!(mode_takes_param(letter, true), "+{letter} names somebody");
+            assert!(mode_takes_param(letter, false), "-{letter} names somebody");
+        }
+        // The quiet list keeps its letter, which is why the founder has x.
+        assert!(CHANMODES_LIST.contains('q'));
+        assert!(!PREFIX_MODES.contains('q'));
+    }
+
+    /// Nobody reaches above themselves.
+    #[test]
+    fn rank_puts_them_in_order() {
+        assert!(with(true, false, false, false, false).rank() > with(false, true, false, false, false).rank());
+        assert!(with(false, true, false, false, false).rank() > with(false, false, true, false, false).rank());
+        assert!(with(false, false, true, false, false).rank() > with(false, false, false, true, false).rank());
+        assert!(with(false, false, false, true, false).rank() > with(false, false, false, false, true).rank());
+        assert_eq!(with(false, false, false, false, true).rank(), 0, "voice is not a rung");
     }
 }
 
@@ -68,9 +193,15 @@ pub const CHANMODES_PARAM_SET: &str = "fjlL";
 /// Channel modes that never carry one. Group D.
 pub const CHANMODES_FLAG: &str = "imnstpRcCMZNOTz";
 /// The modes that give a member a prefix, strongest first.
-pub const PREFIX_MODES: &str = "ohv";
+///
+/// `x` is the founder and `a` the admin. Not `q` and `a` as on the servers
+/// that have these: `q` is this server's quiet list, which is persisted, takes
+/// timed bans and feeds `+z`, and was not worth breaking for a letter. The
+/// prefix characters are what clients show, and those are read from `PREFIX`
+/// in ISUPPORT rather than assumed.
+pub const PREFIX_MODES: &str = "xaohv";
 /// The prefixes they give, in the same order.
-pub const PREFIX_CHARS: &str = "@%+";
+pub const PREFIX_CHARS: &str = "^&@%+";
 /// User modes that carry a parameter when set: the server notice mask.
 pub const USERMODES_PARAM_SET: &str = "s";
 /// User modes that never carry one.
@@ -115,6 +246,25 @@ pub fn all_user_modes() -> String {
 
 /// Whether a channel mode letter carries a parameter. A list mode, a group B
 /// mode and a prefix mode always do; a group C mode does only when set.
+/// The mode letter a prefix character stands for, if it is one.
+///
+/// `PREFIX_CHARS` and `PREFIX_MODES` are the same list in the same order, so
+/// this is a lookup rather than a second copy of the mapping. Written once
+/// because the two places that had it written out by hand both stopped at
+/// `+` and silently dropped everything above an operator.
+pub fn mode_letter_for_prefix(prefix: char) -> Option<char> {
+    PREFIX_CHARS
+        .chars()
+        .position(|c| c == prefix)
+        .and_then(|i| PREFIX_MODES.chars().nth(i))
+}
+
+/// Whether this character is one of the prefixes a member may wear.
+pub fn is_prefix_char(c: char) -> bool {
+    PREFIX_CHARS.contains(c)
+}
+
+
 pub fn mode_takes_param(letter: char, plus: bool) -> bool {
     PREFIX_MODES.contains(letter)
         || CHANMODES_LIST.contains(letter)

@@ -2290,8 +2290,12 @@ async fn accept_remote_away(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
 
 /// A member as it appears in a burst: its prefixes, then its id.
 fn split_member(token: &str) -> (&str, &str) {
+    // Every prefix this server gives out, not a list written here. The list
+    // written here stopped at `+`, so a member wearing anything above an
+    // operator kept their prefix as part of their id, failed to be a valid
+    // one, and was dropped from the channel on the far side without a word.
     let at = token
-        .find(|c: char| c != '@' && c != '%' && c != '+')
+        .find(|c: char| !crate::channel::is_prefix_char(c))
         .unwrap_or(token.len());
     token.split_at(at)
 }
@@ -2300,6 +2304,8 @@ fn member_modes_from(prefixes: &str) -> crate::channel::ChannelMemberModeSet {
     let mut modes = crate::channel::ChannelMemberModeSet::default();
     for c in prefixes.chars() {
         match c {
+            '^' => modes.founder = true,
+            '&' => modes.admin = true,
             '@' => modes.op = true,
             '%' => modes.halfop = true,
             '+' => modes.voice = true,
@@ -2363,13 +2369,29 @@ async fn seat_member(
         tracing::debug!(uid = %uid, channel = %key, "Not seating a user nobody introduced");
         return;
     }
+    // Who the channel belongs to is not a mode anybody sets: it comes from the
+    // registration, which every server on the network has. So it is worked out
+    // here rather than carried, and a plain JOIN — which has no prefixes on it
+    // at all — seats the founder wearing what they wear at home.
+    let account = {
+        let state = ctx.state.read().await;
+        match state.clients.get(uid) {
+            Some(c) => c.read().await.account.clone(),
+            None => None,
+        }
+    };
+    let mut modes = modes;
     {
         let mut store = ctx.channels.write().await;
         let entry = store
             .channels
             .entry(key.to_string())
             .or_insert_with(|| RwLock::new(crate::channel::Channel::new(name.to_string())));
-        entry.write().await.members.insert(
+        let mut ch = entry.write().await;
+        if ch.is_founder(account.as_deref()) {
+            modes.founder = true;
+        }
+        ch.members.insert(
             uid.to_string(),
             crate::channel::ChannelMembership {
                 client_id: uid.to_string(),
@@ -2505,7 +2527,7 @@ async fn accept_remote_sjoin(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
             let deopped: Vec<String> = ch
                 .members
                 .iter()
-                .filter(|(_, m)| m.modes.op || m.modes.halfop || m.modes.voice)
+                .filter(|(_, m)| m.modes.at_least_voice())
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &deopped {
@@ -2583,11 +2605,7 @@ async fn accept_remote_sjoin(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
             };
             let letters: String = prefixes
                 .chars()
-                .map(|c| match c {
-                    '@' => 'o',
-                    '%' => 'h',
-                    _ => 'v',
-                })
+                .filter_map(crate::channel::mode_letter_for_prefix)
                 .collect();
             let mut params = vec![name.clone(), format!("+{}", letters)];
             for _ in letters.chars() {
@@ -3354,7 +3372,7 @@ async fn accept_remote_mode(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
             match c {
                 '+' => adding = true,
                 '-' => adding = false,
-                'o' | 'h' | 'v' => {
+                'x' | 'a' | 'o' | 'h' | 'v' => {
                     let Some(target) = arg.next() else { continue };
                     let nick = match state.clients.get(target) {
                         Some(cl) => cl.read().await.nick_or_id().to_string(),
@@ -3362,6 +3380,8 @@ async fn accept_remote_mode(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
                     };
                     if let Some(m) = ch.members.get_mut(target) {
                         match c {
+                            'x' => m.modes.founder = adding,
+                            'a' => m.modes.admin = adding,
                             'o' => m.modes.op = adding,
                             'h' => m.modes.halfop = adding,
                             _ => m.modes.voice = adding,

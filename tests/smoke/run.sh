@@ -231,6 +231,12 @@ upload_dir = "$RUN_DIR/uploads"
 max_size = 65536
 max_uploads_per_hour = 5
 
+# The second plain listener stands in for a hidden service: one file host,
+# two front doors, and a client should be told the one it came in by.
+[[filehost.alternates]]
+listener = "127.0.0.1:16669"
+public_url = "https://onion.invalid:16671/uploads"
+
 [network]
 name = "SmokeNet"
 

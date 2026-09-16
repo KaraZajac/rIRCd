@@ -37,17 +37,87 @@ pub struct VapidKey {
     public_b64: String,
 }
 
+/// Read a VAPID private key in whichever shape it arrived in.
+///
+/// This server writes the bare 32-byte scalar, base64url, and that is what it
+/// reads back. But nobody generating a key for the first time gets one of
+/// those: `web-push`, `py_vapid` and every online generator hand out a PKCS#8
+/// key, base64 or base64url, sometimes wrapped in PEM. Refusing those means
+/// every operator's first attempt fails on a detail that does not matter —
+/// they are the same 32 bytes either way.
+fn parse_private_key(text: &str) -> anyhow::Result<SecretKey> {
+    let text = text.trim();
+
+    // PEM, as `openssl ec` writes it: take what is between the markers.
+    let body: String = if text.contains("-----BEGIN") {
+        text.lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("")
+    } else {
+        text.to_string()
+    };
+    let body = body.trim();
+
+    // base64url and standard base64 differ only in two characters, and a key
+    // pasted from one tool into a file meant for the other is the commonest
+    // way to get this wrong. Both are read.
+    let bytes = B64URL
+        .decode(body)
+        .or_else(|_| {
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(body.trim_end_matches('='))
+        })
+        .map_err(|e| anyhow::anyhow!("VAPID key is not base64: {e}"))?;
+
+    // The bare scalar, which is what this server writes.
+    if bytes.len() == 32 {
+        return SecretKey::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("VAPID key is not a P-256 key: {e}"));
+    }
+
+    // A PKCS#8 key: the scalar is the 32-byte OCTET STRING inside it. Found by
+    // its tag and length rather than by parsing the whole structure, which for
+    // one fixed curve is the same answer with far less to go wrong.
+    if let Some(scalar) = pkcs8_scalar(&bytes) {
+        return SecretKey::from_slice(scalar)
+            .map_err(|e| anyhow::anyhow!("VAPID key is not a P-256 key: {e}"));
+    }
+
+    Err(anyhow::anyhow!(
+        "VAPID key is {} bytes: expected a 32-byte P-256 scalar or a PKCS#8 key",
+        bytes.len()
+    ))
+}
+
+/// The private scalar inside a PKCS#8 P-256 key.
+///
+/// `30 … 04 20 <32 bytes>` inside the inner `ECPrivateKey`. The 32-byte OCTET
+/// STRING that follows the version integer is the scalar; the public point
+/// after it is tagged `[1]`, so there is no second `04 20` to confuse it with.
+fn pkcs8_scalar(der: &[u8]) -> Option<&[u8]> {
+    let mut i = 0usize;
+    while i + 34 <= der.len() {
+        if der[i] == 0x04 && der[i + 1] == 0x20 {
+            // Only when what came before it is the ECPrivateKey version, so a
+            // stray pair of bytes in the middle of something else is not read
+            // as a key.
+            if i >= 3 && der[i - 3..i] == [0x02, 0x01, 0x01] {
+                return Some(&der[i + 2..i + 34]);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 impl VapidKey {
     /// Load the key from `path`, generating and storing one if it isn't there yet.
     /// The file holds the base64url-encoded 32-byte private scalar.
     pub fn load_or_create(path: &Path) -> anyhow::Result<Self> {
         if path.exists() {
             let raw = std::fs::read_to_string(path)?;
-            let bytes = B64URL
-                .decode(raw.trim())
-                .map_err(|e| anyhow::anyhow!("VAPID key file is not base64url: {}", e))?;
-            let secret = SecretKey::from_slice(&bytes)
-                .map_err(|e| anyhow::anyhow!("VAPID key file is not a P-256 key: {}", e))?;
+            let secret = parse_private_key(raw.trim())?;
             return Ok(Self::from_secret(secret));
         }
 
@@ -548,6 +618,70 @@ mod tests {
         );
         assert!(encrypt(&valid_key, &B64URL.encode([7u8; 8]), b"hi").is_err());
         assert!(encrypt(&valid_key, &auth, b"hi").is_ok());
+    }
+
+    #[test]
+    fn a_key_is_read_in_whichever_shape_it_arrived_in() {
+        use base64::Engine;
+        // A throwaway key made here: nothing secret is written down, and the
+        // check is that every spelling of one key reaches the same key.
+        let secret = SecretKey::random(&mut rand_core_compat::OsRng);
+        let scalar = secret.to_bytes();
+        let point = secret.public_key().to_encoded_point(false);
+        let expected = B64URL.encode(point.as_bytes());
+
+        // The bare scalar, which is what this server writes for itself.
+        let raw = B64URL.encode(scalar);
+        assert_eq!(
+            B64URL.encode(
+                parse_private_key(&raw)
+                    .expect("the bare scalar")
+                    .public_key()
+                    .to_encoded_point(false)
+                    .as_bytes()
+            ),
+            expected
+        );
+
+        // PKCS#8, which is what every generator hands out. The wrapper is
+        // fixed for P-256; only the scalar and the point inside it vary.
+        let mut der: Vec<u8> = vec![
+            0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce,
+            0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04,
+            0x6d, 0x30, 0x6b, 0x02, 0x01, 0x01, 0x04, 0x20,
+        ];
+        der.extend_from_slice(&scalar);
+        der.extend_from_slice(&[0xa1, 0x44, 0x03, 0x42, 0x00]);
+        der.extend_from_slice(point.as_bytes());
+
+        for spelling in [
+            B64URL.encode(&der),
+            base64::engine::general_purpose::STANDARD.encode(&der),
+            format!(
+                "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
+                base64::engine::general_purpose::STANDARD.encode(&der)
+            ),
+        ] {
+            let got = parse_private_key(&spelling)
+                .unwrap_or_else(|e| panic!("should have read this key: {e}"));
+            assert_eq!(
+                B64URL.encode(got.public_key().to_encoded_point(false).as_bytes()),
+                expected,
+                "every spelling of one key is that key"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_that_is_not_one_is_refused_with_a_reason() {
+        assert!(parse_private_key("not base64 at all !!!").is_err());
+        assert!(
+            parse_private_key(&B64URL.encode([7u8; 20]))
+                .unwrap_err()
+                .to_string()
+                .contains("20 bytes"),
+            "the length it actually got is worth saying"
+        );
     }
 
     #[test]

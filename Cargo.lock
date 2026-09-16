@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "rircd"
-version = "1.25.1"
+version = "1.26.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

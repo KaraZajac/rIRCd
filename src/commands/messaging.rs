@@ -32,7 +32,7 @@ async fn op_moderated_delivery(
     word.tags.insert("msgid".to_string(), Some(msgid.to_string()));
     let registry = senders.read().await;
     for (mid, memb) in &ch.members {
-        if (memb.modes.op || memb.modes.halfop) && !state.is_self(mid, client_id) {
+        if (memb.modes.at_least_halfop()) && !state.is_self(mid, client_id) {
             registry.deliver(mid, &word);
         }
     }
@@ -717,7 +717,7 @@ pub async fn handle_privmsg(
             if !ch
                 .members
                 .get(&state_guard.user_id(client_id))
-                .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                .map(|m| m.modes.at_least_voice())
                 .unwrap_or(false)
                 && ch.is_muted(
                     &crate::channel::Subject::from_source(&source)
@@ -759,7 +759,7 @@ pub async fn handle_privmsg(
                 && !ch
                     .members
                     .get(&state_guard.user_id(client_id))
-                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .map(|m| m.modes.at_least_voice())
                     .unwrap_or(false)
             {
                 if ch.modes.op_moderated {
@@ -809,7 +809,7 @@ pub async fn handle_privmsg(
                 && !ch
                     .members
                     .get(&state_guard.user_id(client_id))
-                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .map(|m| m.modes.at_least_voice())
                     .unwrap_or(false)
             {
                 if ch.modes.op_moderated {
@@ -844,7 +844,7 @@ pub async fn handle_privmsg(
                 let staff = ch
                     .members
                     .get(&user_id)
-                    .map(|m| m.modes.op || m.modes.halfop)
+                    .map(|m| m.modes.at_least_halfop())
                     .unwrap_or(false);
                 if !staff
                     && !sender_is_oper
@@ -910,8 +910,8 @@ pub async fn handle_privmsg(
                 // STATUSMSG filter: @ → ops/halfops only; + → voiced/halfop/op only
                 if let Some(pfx) = statusmsg_prefix {
                     let passes = match pfx {
-                        '@' => memb.modes.op || memb.modes.halfop,
-                        '+' => memb.modes.voice || memb.modes.halfop || memb.modes.op,
+                        '@' => memb.modes.at_least_halfop(),
+                        '+' => memb.modes.at_least_voice(),
                         _ => true,
                     };
                     if !passes {
@@ -1278,7 +1278,7 @@ pub async fn handle_notice(
                 && !ch
                     .members
                     .get(&state_guard.user_id(client_id))
-                    .map(|m| m.modes.halfop || m.modes.op)
+                    .map(|m| m.modes.at_least_halfop())
                     .unwrap_or(false)
                 && !sender_is_oper
             {
@@ -1289,7 +1289,7 @@ pub async fn handle_notice(
                 && !ch
                     .members
                     .get(&state_guard.user_id(client_id))
-                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .map(|m| m.modes.at_least_voice())
                     .unwrap_or(false)
             {
                 return Ok(()); // NOTICE silently drops per RFC
@@ -1302,7 +1302,7 @@ pub async fn handle_notice(
                 && !ch
                     .members
                     .get(&state_guard.user_id(client_id))
-                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .map(|m| m.modes.at_least_voice())
                     .unwrap_or(false)
             {
                 return Ok(());
@@ -1315,7 +1315,7 @@ pub async fn handle_notice(
             if !ch
                 .members
                 .get(&state_guard.user_id(client_id))
-                .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                .map(|m| m.modes.at_least_voice())
                 .unwrap_or(false)
                 && ch.is_muted(
                     &crate::channel::Subject::from_source(&source)
@@ -1334,7 +1334,7 @@ pub async fn handle_notice(
                 let staff = ch
                     .members
                     .get(&user_id)
-                    .map(|m| m.modes.op || m.modes.halfop)
+                    .map(|m| m.modes.at_least_halfop())
                     .unwrap_or(false);
                 if !staff
                     && !sender_is_oper
@@ -1372,8 +1372,8 @@ pub async fn handle_notice(
                 // STATUSMSG filter
                 if let Some(pfx) = statusmsg_prefix {
                     let passes = match pfx {
-                        '@' => memb.modes.op || memb.modes.halfop,
-                        '+' => memb.modes.voice || memb.modes.halfop || memb.modes.op,
+                        '@' => memb.modes.at_least_halfop(),
+                        '+' => memb.modes.at_least_voice(),
                         _ => true,
                     };
                     if !passes {
@@ -2037,7 +2037,7 @@ pub async fn handle_tagmsg(
             if !ch
                 .members
                 .get(&state_guard.user_id(client_id))
-                .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                .map(|m| m.modes.at_least_voice())
                 .unwrap_or(false)
                 && ch.is_muted(
                     &crate::channel::Subject::from_source(&source)
@@ -2075,7 +2075,7 @@ pub async fn handle_tagmsg(
                 && !ch
                     .members
                     .get(&state_guard.user_id(client_id))
-                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .map(|m| m.modes.at_least_voice())
                     .unwrap_or(false)
             {
                 reply_to_sender(
@@ -2119,7 +2119,7 @@ pub async fn handle_tagmsg(
                 && !ch
                     .members
                     .get(&state_guard.user_id(client_id))
-                    .map(|m| m.modes.voice || m.modes.halfop || m.modes.op)
+                    .map(|m| m.modes.at_least_voice())
                     .unwrap_or(false)
             {
                 reply_to_sender(
@@ -2522,7 +2522,7 @@ pub async fn handle_redact(
                 .await
                 .members
                 .get(&uid)
-                .map(|m| m.modes.op)
+                .map(|m| m.modes.is_op())
                 .unwrap_or(false),
             None => false,
         }

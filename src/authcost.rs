@@ -58,6 +58,15 @@ struct Spent {
 #[derive(Debug, Default)]
 pub struct AuthCost {
     by_address: HashMap<String, Spent>,
+    /// The same, counted against the account somebody is trying to get into.
+    ///
+    /// An address is not always a person. Behind a hidden service every client
+    /// shares one, and there is no header that can say otherwise — so charging
+    /// the address alone either lets one guesser slow everybody who came that
+    /// way, or lets them all guess freely. The account being tried is the other
+    /// thing worth protecting, and it is the same account wherever the guessing
+    /// comes from.
+    by_account: HashMap<String, Spent>,
 }
 
 impl AuthCost {
@@ -90,6 +99,66 @@ impl AuthCost {
         // than the loop everybody shares is — so an untracked address goes
         // ahead rather than being punished for arriving late.
         Duration::ZERO
+    }
+
+    /// Charge one check to the address *and* to the account being tried, and
+    /// say how long to wait: the longer of what each of them has earned.
+    ///
+    /// Both are spent, not whichever is worse. A guesser working through one
+    /// account from many addresses is stopped by the account's allowance, and
+    /// one working through many accounts from a single address by the
+    /// address's, and neither is a way around the other.
+    pub fn spend_for(&mut self, address: &str, account: &str) -> Duration {
+        let by_address = self.spend(address);
+        let by_account = self.spend_on_account(account);
+        by_address.max(by_account)
+    }
+
+    /// Charge one check to an account, wherever it came from.
+    pub fn spend_on_account(&mut self, account: &str) -> Duration {
+        let account = crate::casefold::lower(account);
+        if account.is_empty() {
+            return Duration::ZERO;
+        }
+        let now = Instant::now();
+        if let Some(spent) = self.by_account.get_mut(&account) {
+            spent.forgive(now);
+            spent.amount += 1.0;
+            return wait_for(spent.amount);
+        }
+        self.by_account.retain(|_, spent| {
+            spent.forgive(now);
+            spent.amount > 0.0
+        });
+        if self.by_account.len() < MAX_TRACKED {
+            self.by_account.insert(
+                account,
+                Spent {
+                    amount: 1.0,
+                    at: now,
+                },
+            );
+        }
+        Duration::ZERO
+    }
+
+    /// Give back what a right answer spent, on both counts.
+    pub fn refund_for(&mut self, address: &str, account: &str) {
+        self.refund(address);
+        self.refund_account(account);
+    }
+
+    /// Give an account's allowance back.
+    pub fn refund_account(&mut self, account: &str) {
+        let account = crate::casefold::lower(account);
+        let now = Instant::now();
+        if let Some(spent) = self.by_account.get_mut(&account) {
+            spent.forgive(now);
+            spent.amount = (spent.amount - 1.0).max(0.0);
+            if spent.amount <= 0.0 {
+                self.by_account.remove(&account);
+            }
+        }
     }
 
     /// Give the allowance back: the credentials were right, so that check was
@@ -257,6 +326,75 @@ mod tests {
             *when -= Duration::from_secs(61);
         }
         assert!(cool.allow("alice@example.org", Duration::from_secs(60)), "the gap has passed");
+    }
+
+    /// Behind a hidden service every client has the same address, so charging
+    /// the address alone protects nobody from a guesser sharing it. The account
+    /// is the same account wherever it is tried from.
+    #[test]
+    fn an_account_under_guessing_is_slowed_wherever_it_is_tried_from() {
+        let mut cost = AuthCost::default();
+        // Every attempt from a different address, so the address never runs up
+        // an allowance of its own.
+        for i in 0..FAILURE_BURST as usize {
+            let from = format!("198.51.100.{i}");
+            assert_eq!(
+                cost.spend_for(&from, "victim"),
+                Duration::ZERO,
+                "attempt {i} is within the account's allowance"
+            );
+        }
+        let next = cost.spend_for("203.0.113.1", "victim");
+        assert!(
+            next > Duration::ZERO,
+            "past the allowance the account waits, though no address has"
+        );
+        assert_eq!(
+            cost.spend_for("203.0.113.2", "somebody-else"),
+            Duration::ZERO,
+            "and another account from another address is not made to wait for it"
+        );
+    }
+
+    /// Spending on both is not a way around either.
+    #[test]
+    fn the_wait_is_whichever_of_the_two_has_earned_more() {
+        let mut cost = AuthCost::default();
+        for _ in 0..FAILURE_BURST as usize + 4 {
+            cost.spend("198.51.100.7");
+        }
+        // The address is well past its allowance; a fresh account tried from
+        // it still waits, because the address has earned the wait.
+        assert!(cost.spend_for("198.51.100.7", "fresh-account") > Duration::ZERO);
+        // And the fresh account, tried from somewhere else, has not.
+        assert_eq!(cost.spend_for("203.0.113.9", "fresh-account"), Duration::ZERO);
+    }
+
+    /// A right answer gives back what it spent, on both counts.
+    #[test]
+    fn getting_it_right_costs_the_account_nothing() {
+        let mut cost = AuthCost::default();
+        for _ in 0..FAILURE_BURST as usize {
+            cost.spend_for("198.51.100.7", "someone");
+            cost.refund_for("198.51.100.7", "someone");
+        }
+        assert_eq!(
+            cost.spend_for("198.51.100.7", "someone"),
+            Duration::ZERO,
+            "a succession of right answers is not a succession of failures"
+        );
+    }
+
+    #[test]
+    fn an_account_is_one_account_however_it_is_spelled() {
+        let mut cost = AuthCost::default();
+        for _ in 0..FAILURE_BURST as usize {
+            cost.spend_on_account("Victim");
+        }
+        assert!(
+            cost.spend_on_account("victim") > Duration::ZERO,
+            "case is not a fresh allowance"
+        );
     }
 
     #[test]

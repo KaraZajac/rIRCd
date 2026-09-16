@@ -220,29 +220,7 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // These are the same passwords the IRC side takes such care over, and
-    // checking one costs the same bcrypt. An address that keeps getting it
-    // wrong is told to wait rather than having another check run for it —
-    // otherwise every bit of that care is one HTTP request away from being
-    // beside the point.
     let peer = peer_of(&req, &fh_state.trusted_proxies);
-    let wait = {
-        let mut state = fh_state.state.write().await;
-        state.auth_cost.spend(&peer)
-    };
-    if !wait.is_zero() {
-        warn!(peer = %peer, "Filehost upload rejected: too many failed credentials from this address");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(
-                header::RETRY_AFTER,
-                HeaderValue::from_str(&wait.as_secs().max(1).to_string())
-                    .unwrap_or(HeaderValue::from_static("5")),
-            )],
-            "Too many credential checks from your address just now; try again in a moment",
-        )
-            .into_response();
-    }
 
     let Some(auth_str) = auth_header else {
         warn!("Filehost upload rejected: no Authorization header");
@@ -281,12 +259,45 @@ async fn auth_middleware(
         return (StatusCode::BAD_REQUEST, "Invalid credentials format").into_response();
     };
 
+    // These are the same passwords the IRC side takes such care over, and
+    // checking one costs the same bcrypt. Whoever keeps getting it wrong is
+    // told to wait rather than having another check run for them — otherwise
+    // every bit of that care is one HTTP request away from being beside the
+    // point. Charged here, where what is about to happen is a credential
+    // check: a request with no credentials in it costs nobody an allowance.
+    //
+    // Both the address and the account, because behind a proxy or a hidden
+    // service the address is everybody's and the account is what is being
+    // guessed at.
+    let wait = {
+        let mut state = fh_state.state.write().await;
+        state.auth_cost.spend_for(&peer, user)
+    };
+    if !wait.is_zero() {
+        warn!(peer = %peer, account = %user, "Filehost upload rejected: too many failed credentials");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&wait.as_secs().max(1).to_string())
+                    .unwrap_or(HeaderValue::from_static("5")),
+            )],
+            "Too many credential checks just now; try again in a moment",
+        )
+            .into_response();
+    }
+
     if !crate::persist::verify_user(&fh_state.db_pool, user, pass).await {
         warn!(user = %user, peer = %peer, "Filehost upload rejected: bad credentials");
         return (StatusCode::FORBIDDEN, "Invalid username or password").into_response();
     }
     // Right first time is not guessing, so it is given back.
-    fh_state.state.write().await.auth_cost.refund(&peer);
+    fh_state
+        .state
+        .write()
+        .await
+        .auth_cost
+        .refund_for(&peer, user);
 
     info!(user = %user, "Filehost auth OK");
     let mut req = req;
@@ -545,7 +556,7 @@ fn sanitize_filename(name: &str) -> String {
 /// Extract the path component from a URL string.
 /// e.g. "https://example.com/uploads" → "/uploads"
 /// e.g. "https://example.com" → "/"
-fn extract_url_path(url: &str) -> String {
+pub fn extract_url_path(url: &str) -> String {
     // Find the start of the path after "://host"
     if let Some(after_scheme) = url.find("://") {
         let rest = &url[after_scheme + 3..];

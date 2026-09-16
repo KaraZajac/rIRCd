@@ -838,7 +838,7 @@ pub async fn handle_metadata(
                         .await
                         .members
                         .get(&uid)
-                        .map(|m| m.modes.op)
+                        .map(|m| m.modes.is_op())
                         .unwrap_or(false)
                 } else {
                     false
@@ -1035,7 +1035,7 @@ pub async fn handle_metadata(
                         .await
                         .members
                         .get(&uid)
-                        .map(|m| m.modes.op)
+                        .map(|m| m.modes.is_op())
                         .unwrap_or(false)
                 } else {
                     false

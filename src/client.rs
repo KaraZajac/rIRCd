@@ -498,6 +498,7 @@ pub async fn handle_client_tls(
     certfp: Option<String>,
     keepalive: KeepaliveConfig,
     limits: ConnectionLimits,
+    arrived_on: Arc<str>,
 ) {
     let addr = host.clone();
     info!("Client connected (TLS): {} from {}", client_id, addr);
@@ -533,6 +534,7 @@ pub async fn handle_client_tls(
         true,
         _slot.paced(keepalive),
         _slot.class_name("tls"),
+        arrived_on,
     )
     .await;
 }
@@ -545,6 +547,7 @@ pub async fn handle_client(
     server_name: String,
     keepalive: KeepaliveConfig,
     limits: ConnectionLimits,
+    arrived_on: Arc<str>,
 ) {
     let addr = stream
         .peer_addr()
@@ -582,6 +585,7 @@ pub async fn handle_client(
         false,
         _slot.paced(keepalive),
         _slot.class_name("plain"),
+        arrived_on,
     )
     .await;
 }
@@ -706,6 +710,7 @@ async fn handle_client_stream<S>(
     is_tls: bool,
     keepalive: KeepaliveConfig,
     class: Arc<str>,
+    arrived_on: Arc<str>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -726,7 +731,7 @@ async fn handle_client_stream<S>(
     let mut lines =
         crate::linereader::BoundedLines::new(crate::protocol::MAX_TOTAL_TAGGED.max(in_line_limit));
     // What crosses this connection, counted where the bytes are.
-    let stats = std::sync::Arc::new(crate::user::ConnStats::in_class(class));
+    let stats = std::sync::Arc::new(crate::user::ConnStats::arriving(class, arrived_on));
     let writer_stats = stats.clone();
     let mut writer_task = tokio::spawn(async move {
         write_loop(
@@ -994,6 +999,7 @@ pub async fn handle_client_ws(
     keepalive: KeepaliveConfig,
     is_tls: bool,
     limits: ConnectionLimits,
+    arrived_on: Arc<str>,
 ) {
     use axum::extract::ws;
 
@@ -1046,8 +1052,9 @@ pub async fn handle_client_ws(
     let kill = Arc::new(tokio::sync::Notify::new());
     // What crosses this connection. A frame is a message, which is the one
     // place a WebSocket client counts differently from a socket one.
-    let stats = std::sync::Arc::new(crate::user::ConnStats::in_class(
+    let stats = std::sync::Arc::new(crate::user::ConnStats::arriving(
         _slot.class_name("websocket"),
+        arrived_on,
     ));
 
     // Flood control

@@ -520,6 +520,24 @@ pub async fn run(
                 }
             });
         }
+        // One file host, one set of routes, mounted at the path its public URL
+        // names. An alternate that names a different path would be a link to
+        // somewhere nothing answers, so it is said now rather than found later.
+        let primary_path = crate::filehost::extract_url_path(&fh_cfg.public_url);
+        for alt in &fh_cfg.alternates {
+            let path = crate::filehost::extract_url_path(&alt.public_url);
+            if path == primary_path {
+                info!(
+                    "Clients arriving on {} are told the file host is at {}",
+                    alt.listener, alt.public_url
+                );
+            } else {
+                warn!(
+                    "Filehost alternate for {} has path {} but the routes are mounted at {}:                      links given to those clients will not answer. Give it the same path.",
+                    alt.listener, path, primary_path
+                );
+            }
+        }
         match cfg.expiry.as_ref().map(|e| e.uploads_days) {
             Some(days) if days > 0 => info!("Shared files are kept for {days} day(s)"),
             _ => info!(
@@ -601,6 +619,8 @@ pub async fn run(
         let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
         info!("Listening on {} (plain)", bind_addr);
 
+        // Which door this is, for whatever depends on which door somebody used.
+        let door: Arc<str> = Arc::from(bind_addr.as_str());
         let tx = tx.clone();
         let server_name = server_name.clone();
         // Counted against this door rather than against an address, when the
@@ -623,6 +643,7 @@ pub async fn run(
                         let tx = tx.clone();
                         let server_name = server_name.clone();
                         let limits = limits.clone();
+                        let arrived_on = door.clone();
                         tokio::spawn(async move {
                             client::handle_client(
                                 stream,
@@ -632,6 +653,7 @@ pub async fn run(
                                 server_name,
                                 keepalive,
                                 limits,
+                                arrived_on,
                             )
                             .await;
                         });
@@ -654,6 +676,7 @@ pub async fn run(
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
             info!("Listening on {} (TLS)", bind_addr);
 
+            let door: Arc<str> = Arc::from(bind_addr.as_str());
             let tx = tx.clone();
             let tls_acc = acceptor.clone();
             let server_name = server_name_tls.clone();
@@ -676,6 +699,7 @@ pub async fn run(
                             let acc = tls_acc.clone();
                             let server_name = server_name.clone();
                             let limits = limits.clone();
+                            let arrived_on = door.clone();
                             tokio::spawn(async move {
                                 let acc = acc.read().await.clone();
                                 match tokio::time::timeout(
@@ -696,6 +720,7 @@ pub async fn run(
                                             certfp,
                                             keepalive,
                                             limits,
+                                            arrived_on,
                                         )
                                         .await
                                     }
@@ -731,6 +756,7 @@ pub async fn run(
             keepalive: client::KeepaliveConfig,
             limits: client::ConnectionLimits,
             trusted_proxies: Arc<Vec<String>>,
+            arrived_on: Arc<str>,
         }
 
         let ws_state = WsState {
@@ -738,6 +764,7 @@ pub async fn run(
             server_name: server_name_ws,
             counter: connections.clone(),
             keepalive,
+            arrived_on: Arc::from(bind_addr.as_str()),
             limits: limits.on_listener(
                 &bind_addr,
                 &cfg.limits.shared_address_listeners,
@@ -777,6 +804,7 @@ pub async fn run(
                                     st.keepalive,
                                     false, // WS (plaintext)
                                     st.limits,
+                                    st.arrived_on,
                                 )
                             })
                     },
@@ -807,6 +835,7 @@ pub async fn run(
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
             info!("Listening on {} (WebSocket TLS)", bind_addr);
 
+            let door: Arc<str> = Arc::from(bind_addr.as_str());
             let tls_acc = acceptor.clone();
             let tx_wss = tx.clone();
             let server_name_wss = server_name.clone();
@@ -829,6 +858,7 @@ pub async fn run(
                             let tx = tx_wss.clone();
                             let sn = server_name_wss.clone();
                             let limits = limits_wss.clone();
+                            let arrived_on = door.clone();
                             tokio::spawn(async move {
                                 let acc = acc.read().await.clone();
                                 match tokio::time::timeout(
@@ -866,7 +896,7 @@ pub async fn run(
                                                                 socket, client_id, host, tx, sn,
                                                                 certfp, keepalive,
                                                                 true, // WSS (TLS)
-                                                                limits,
+                                                                limits, arrived_on,
                                                             )
                                                         })
                                                     }

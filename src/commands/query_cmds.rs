@@ -164,7 +164,7 @@ pub async fn handle_who(
                     // levels. It must not be empty — an empty parameter in the
                     // middle of a message cannot be sent, so it would vanish
                     // and shift every field after it.
-                    let oplevel = if memb.modes.op { "@" } else { "n/a" };
+                    let oplevel = if memb.modes.is_op() { "@" } else { "n/a" };
 
                     if use_whox {
                         let params = build_354_params(

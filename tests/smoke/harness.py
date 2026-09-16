@@ -269,7 +269,15 @@ def check(name, condition, detail=""):
         _failures.append(name)
         print(f"  {RED}FAIL{RESET} {name}")
         if detail:
-            text = detail if isinstance(detail, str) else "\n         ".join(map(str, detail))
+            if isinstance(detail, str):
+                text = detail
+            elif isinstance(detail, (list, tuple, set)):
+                text = "\n         ".join(map(str, detail))
+            else:
+                # Anything else — a status code, None — is just printed. A
+                # detail that cannot be joined should not turn one failed
+                # check into no suite at all.
+                text = str(detail)
             print(f"         {DIM}{text}{RESET}")
     return condition
 

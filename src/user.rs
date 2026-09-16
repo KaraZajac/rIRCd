@@ -464,6 +464,11 @@ pub struct ConnStats {
     /// The kind of client this is: the name of its `[[classes]]` block, or
     /// how it arrived — `plain`, `tls`, `websocket` — when no class named it.
     pub class: Arc<str>,
+    /// The listener this connection came in by, as the configuration writes
+    /// it. Which door somebody used is a thing about them: a network reachable
+    /// both over Tor and by name has two, and what to tell a client about
+    /// where the file host is depends on which one they knocked at.
+    pub arrived_on: Arc<str>,
 }
 
 impl Default for ConnStats {
@@ -478,6 +483,10 @@ impl ConnStats {
     }
 
     pub fn in_class(class: impl Into<Arc<str>>) -> Self {
+        Self::arriving(class, "")
+    }
+
+    pub fn arriving(class: impl Into<Arc<str>>, arrived_on: impl Into<Arc<str>>) -> Self {
         Self {
             bytes_in: std::sync::atomic::AtomicU64::new(0),
             bytes_out: std::sync::atomic::AtomicU64::new(0),
@@ -485,6 +494,7 @@ impl ConnStats {
             messages_out: std::sync::atomic::AtomicU64::new(0),
             since: Utc::now().timestamp(),
             class: class.into(),
+            arrived_on: arrived_on.into(),
         }
     }
 

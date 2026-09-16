@@ -73,7 +73,9 @@ section("a channel with a founder")
 
 a = logged_in(f"{owner}_c", owner)
 a.join(CH)
-check("whoever made it is opped", bool(a.find(f"@{owner}_c") or a.find(f"+o {owner}_c")), a.lines[-6:])
+check("whoever made it is opped",
+      bool(a.find(f"@{owner}_c") or a.find(f"^{owner}_c") or a.find(f"+o {owner}_c")),
+      a.lines[-6:])
 check("and is recorded as the founder", channel_row(CH, "founder") == owner, channel_row(CH, "founder"))
 
 a.send(f"MODE {CH} +i")
@@ -114,7 +116,10 @@ a.send(f"MODE {CH}")
 a.send(f"MODE {CH} b")
 a.read(1.5)
 back = a.since(mark)
-check("they are opped again", bool(a.find(f"@{owner}_r", lines=back) or a.find(f"+o {owner}_r", lines=back)), back[-6:])
+check("they are opped again",
+      bool(a.find(f"@{owner}_r", lines=back) or a.find(f"^{owner}_r", lines=back)
+           or a.find(f"+o {owner}_r", lines=back)),
+      back[-6:])
 check("the ban list survived", bool(a.find("nobody!*@*", lines=back)), back[-6:])
 check("the topic survived", bool(a.find(f"belongs to {owner}", lines=back)), back[-6:])
 
@@ -661,9 +666,87 @@ back2.join(OPEN_OWNED)
 back2.read(1.5)
 check("while the owner is an operator whenever they return",
       bool(back2.find(f"@{owner}_o2", lines=back2.since(mark))
+           or back2.find(f"^{owner}_o2", lines=back2.since(mark))
            or back2.find(f"+o {owner}_o2", lines=back2.since(mark))),
       back2.since(mark)[-5:])
 passerby.close()
 back2.close()
+
+section("the founder wears it, and the ladder holds")
+
+# `^` is the person the channel belongs to and `&` somebody they put above the
+# operators. Not `~` and `+q` as on the servers that have these: `+q` here is
+# the quiet list, which is persisted and takes timed bans, and was not worth
+# breaking for a letter. Clients read the prefixes from ISUPPORT, so what
+# matters is that the server means what it advertises.
+LADDER = f"#ladder{RUN}"
+boss = logged_in(f"{owner}_b", owner)
+boss.join(LADDER)
+boss.read(1.0)
+
+advertised = ""
+for line in boss.find(" 005 "):
+    for tok in line.split(" 005 ", 1)[1].split(" ", 1)[1].split(" :", 1)[0].split():
+        name, _, value = tok.partition("=")
+        if name == "PREFIX":
+            advertised = value
+check("ISUPPORT advertises the founder and admin prefixes",
+      advertised == "(xaohv)^&@%+", advertised)
+
+mark = boss.mark()
+boss.send(f"NAMES {LADDER}")
+boss.wait_for(" 366 ", seconds=5)
+check("the founder is shown with ^ in their own channel",
+      bool(boss.find(" 353 ", f"^{owner}_b", lines=boss.since(mark))), boss.since(mark)[-3:])
+
+# An ordinary member, opped, may not appoint somebody above themselves.
+hand = Client(f"hand{RUN}")
+hand.join(LADDER)
+boss.read(0.8)
+mark = boss.mark()
+boss.send(f"MODE {LADDER} +o hand{RUN}")
+boss.read(1.0)
+check("the founder may make somebody an operator",
+      bool(boss.find("MODE", "+o", lines=boss.since(mark))), boss.since(mark)[-3:])
+
+hmark = hand.mark()
+hand.send(f"MODE {LADDER} +a hand{RUN}")
+hand.read(1.2)
+check("an operator may not make themselves an admin",
+      bool(hand.find(" 482 ", lines=hand.since(hmark))), hand.since(hmark)[-3:])
+hmark = hand.mark()
+hand.send(f"MODE {LADDER} +x hand{RUN}")
+hand.read(1.2)
+check("nor the founder", bool(hand.find(" 482 ", lines=hand.since(hmark))),
+      hand.since(hmark)[-3:])
+
+mark = boss.mark()
+boss.send(f"MODE {LADDER} +a hand{RUN}")
+boss.read(1.2)
+check("but the founder may", bool(boss.find("MODE", "+a", lines=boss.since(mark))),
+      boss.since(mark)[-3:])
+
+mark = boss.mark()
+boss.send(f"NAMES {LADDER}")
+boss.wait_for(" 366 ", seconds=5)
+names = " ".join(boss.since(mark))
+check("and the admin is shown with &", f"&hand{RUN}" in names or f"&@hand{RUN}" in names, names[-200:])
+
+# An admin has an operator's powers without holding +o.
+hmark = hand.mark()
+hand.send(f"TOPIC {LADDER} :set by the admin")
+hand.read(1.2)
+check("an admin may do what an operator may",
+      not hand.find(" 482 ", lines=hand.since(hmark)), hand.since(hmark)[-3:])
+
+# And may not unseat the founder.
+hmark = hand.mark()
+hand.send(f"MODE {LADDER} -x {owner}_b")
+hand.read(1.2)
+check("an admin may not take the channel from its founder",
+      bool(hand.find(" 482 ", lines=hand.since(hmark))), hand.since(hmark)[-3:])
+
+hand.close()
+boss.close()
 
 summary("ownership")

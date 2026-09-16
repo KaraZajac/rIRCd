@@ -485,8 +485,11 @@ if made:
     mark = founder.mark()
     founder.join(OWNED)
     founder.read(1.5)
+    # `^` rather than `@`: the founder outranks an operator, and the prefix
+    # shown is the highest held.
     check("the account founds the channel on A",
           bool(founder.find(f"@fa{RUN}", lines=founder.since(mark))
+               or founder.find(f"^fa{RUN}", lines=founder.since(mark))
                or founder.find(f"+o fa{RUN}", lines=founder.since(mark))),
           founder.since(mark)[-5:])
     check("A wrote the founder down",
@@ -505,6 +508,29 @@ if made:
           side_db("b",
               "SELECT GROUP_CONCAT(nick_or_account) FROM channel_operators o "
               f"JOIN channels c ON o.channel_id = c.id WHERE c.name='{OWNED}'"))
+
+    # The prefixes cross the link too. `^` and `&` travel in SJOIN the way
+    # `@`, `%` and `+` always did, so somebody on B sees the founder wearing
+    # what the founder wears on A.
+    watcher = Client(f"wat{RUN}", port=B_PORT)
+    watcher.join(OWNED)
+    watcher.read(1.5)
+    wmark = watcher.mark()
+    watcher.send(f"NAMES {OWNED}")
+    watcher.wait_for(" 366 ", seconds=6)
+    seen = " ".join(watcher.since(wmark))
+    check("B shows the founder with ^, as A does", f"^fa{RUN}" in seen, seen[-200:])
+
+    mark = founder.mark()
+    founder.send(f"MODE {OWNED} +a wat{RUN}")
+    founder.read(1.5)
+    watcher.read(1.5)
+    wmark = watcher.mark()
+    watcher.send(f"NAMES {OWNED}")
+    watcher.wait_for(" 366 ", seconds=6)
+    seen = " ".join(watcher.since(wmark))
+    check("an admin appointed on A is an admin on B", f"&wat{RUN}" in seen, seen[-200:])
+    watcher.close()
 
     # Status granted on one server is status on the network, not just there —
     # and it is granted to an account, because that is what it is remembered

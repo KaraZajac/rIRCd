@@ -560,7 +560,14 @@ async fn handle_join_inner(
         // leaves would otherwise hand `@` to whoever came back first — which is
         // every restart, and every quiet hour, and is exactly the takeover that
         // keeping the channel was meant to stop.
+        // The person the channel belongs to wears it. Not stored with the
+        // other status: it comes from the registration, so it is true again
+        // every time they walk in and cannot be taken from them by a MODE.
+        let is_the_founder = account
+            .as_deref()
+            .is_some_and(|a| !ch.founder.is_empty() && a.eq_ignore_ascii_case(&ch.founder));
         let modes = ChannelMemberModeSet {
+            founder: is_the_founder,
             op: persisted_op || (is_first && !ch.is_registered()),
             voice: persisted_voice,
             ..Default::default()
@@ -1603,7 +1610,7 @@ pub async fn handle_mode_as(
         {
             let mut ch = ch_entry.write().await;
             let member = ch.members.get(&state.user_id(client_id));
-            let is_op = member.map(|m| m.modes.op).unwrap_or(false);
+            let is_op = member.map(|m| m.modes.is_op()).unwrap_or(false);
 
             if msg.params.len() == 1 {
                 // The modes of a channel that hides itself are not for
@@ -1938,7 +1945,7 @@ pub async fn handle_mode_as(
                             param_idx += 1;
                         }
                     }
-                    'o' => {
+                    'o' | 'a' | 'x' => {
                         let Some(target_nick) = msg.params.get(param_idx).cloned() else {
                             continue;
                         };
@@ -1965,7 +1972,7 @@ pub async fn handle_mode_as(
                                 label,
                             )
                             .await;
-                            rejected_modes.push(('o', plus));
+                            rejected_modes.push((c, plus));
                             continue;
                         };
                         if !ch.members.contains_key(&target_id) {
@@ -1985,7 +1992,7 @@ pub async fn handle_mode_as(
                                 label,
                             )
                             .await;
-                            rejected_modes.push(('o', plus));
+                            rejected_modes.push((c, plus));
                             continue;
                         }
                         // Taking the founder's operator status away would be
@@ -2017,11 +2024,73 @@ pub async fn handle_mode_as(
                                 label,
                             )
                             .await;
-                            rejected_modes.push(('o', plus));
+                            rejected_modes.push((c, plus));
+                            continue;
+                        }
+                        // Nobody hands out what they do not have. A rank is
+                        // given or taken by somebody standing at least as high:
+                        // an operator may op an operator, as they always could,
+                        // but not appoint an admin above themselves, and an
+                        // admin may not unseat the founder. A server operator
+                        // is outside the ladder and is not measured against it.
+                        let wanted = match c {
+                            'x' => 4u8,
+                            'a' => 3,
+                            _ => 2,
+                        };
+                        let sender_rank = ch
+                            .members
+                            .get(&state.user_id(client_id))
+                            .map(|m| m.modes.rank())
+                            .unwrap_or(0);
+                        let target_rank = ch
+                            .members
+                            .get(&target_id)
+                            .map(|m| m.modes.rank())
+                            .unwrap_or(0);
+                        let founder_here = ch.is_founder(sender_account.as_deref());
+                        let high_enough = sender_is_oper
+                            || founder_here
+                            || (sender_rank >= wanted && sender_rank >= target_rank);
+                        if !high_enough {
+                            reply_to_client(
+                                &senders,
+                                client_id,
+                                Message::new(
+                                    "482",
+                                    vec![
+                                        nick.clone(),
+                                        target.into(),
+                                        format!(
+                                            "You need to be {} to set +{c} here",
+                                            match wanted {
+                                                4 => "the founder",
+                                                3 => "an admin or the founder",
+                                                _ => "an operator",
+                                            }
+                                        ),
+                                    ],
+                                )
+                                .with_prefix(&cfg.server.name),
+                                label,
+                            )
+                            .await;
+                            rejected_modes.push((c, plus));
                             continue;
                         }
                         if let Some(memb) = ch.members.get_mut(&target_id) {
-                            memb.modes.op = plus;
+                            match c {
+                                'x' => memb.modes.founder = plus,
+                                'a' => memb.modes.admin = plus,
+                                _ => memb.modes.op = plus,
+                            }
+                        }
+                        // Only `+o` is written down. The founder's own `^`
+                        // comes back from the registration every time they
+                        // join, and an admin is an appointment for the visit —
+                        // the way a half-operator is.
+                        if c != 'o' {
+                            continue;
                         }
                         // Remember it, so the user keeps the status next time
                         // they join — in memory for this run, and in the
@@ -2938,7 +3007,7 @@ fn mode_params_for_link(params: &[String], state: &ServerState) -> Option<(Strin
                     continue;
                 }
                 let Some(p) = rest.next() else { continue };
-                if matches!(c, 'o' | 'v' | 'h') {
+                if matches!(c, 'o' | 'v' | 'h' | 'a' | 'x') {
                     match state.nick_to_id.get(&crate::casefold::upper(p)) {
                         Some(id) => out.push(id.clone()),
                         None => out.push(p.clone()),
@@ -3044,7 +3113,7 @@ pub async fn handle_topic(
         let is_op = ch
             .members
             .get(&state.user_id(client_id))
-            .map(|m| m.modes.op)
+            .map(|m| m.modes.is_op())
             .unwrap_or(false);
 
         if new_topic.is_none() {
@@ -3278,7 +3347,7 @@ pub async fn handle_kick(
         let is_op = ch
             .members
             .get(&state.user_id(client_id))
-            .map(|m| m.modes.op)
+            .map(|m| m.modes.is_op())
             .unwrap_or(false);
         if !is_op {
             let nick = client.read().await.nick_or_id().to_string();
@@ -3816,7 +3885,7 @@ pub async fn handle_invite(
         let is_op = ch
             .members
             .get(&state.user_id(client_id))
-            .map(|m| m.modes.op)
+            .map(|m| m.modes.is_op())
             .unwrap_or(false);
         if ch.modes.invite_only && !is_op {
             let nick = client.read().await.nick_or_id().to_string();
@@ -4076,7 +4145,7 @@ pub async fn handle_rename(
         let ch = ch_ref.read().await;
         let uid = state.read().await.user_id(client_id);
         let is_member = ch.members.contains_key(&uid);
-        let is_op = ch.members.get(&uid).map(|m| m.modes.op).unwrap_or(false);
+        let is_op = ch.members.get(&uid).map(|m| m.modes.is_op()).unwrap_or(false);
         let member_ids: Vec<String> = ch.members.keys().cloned().collect();
         (
             is_member,

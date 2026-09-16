@@ -75,6 +75,38 @@ asker.close()
 
 PREFIX = "/" + advertised.split("/", 3)[3] if advertised.count("/") >= 3 else "/uploads"
 
+section("which door the client came in by")
+
+# One file host, and on a network reachable both by name and as a hidden
+# service, two ways to reach it. A client that arrived through the onion
+# service and is handed the public name has been asked to leave Tor to fetch
+# a file — or its client refuses and sharing a file does not work for it at
+# all. The second plain listener stands in for that door here.
+def filehost_token(port):
+    c = Client(f"d{port % 1000}{RUN}", port=port)
+    found = ""
+    for line in c.find(" 005 "):
+        for tok in line.split(" 005 ", 1)[1].split(" ", 1)[1].split(" :", 1)[0].split():
+            name, _, value = tok.partition("=")
+            if name == "FILEHOST":
+                found = value
+    c.close()
+    return found
+
+from harness import IRC_PORT, IRC_PORT2
+
+by_name = filehost_token(IRC_PORT)
+by_other_door = filehost_token(IRC_PORT2)
+check("a client on the usual listener is told the usual address",
+      by_name == advertised, (by_name, advertised))
+check("and one that came in by the other door is told that door's address",
+      by_other_door.startswith("https://onion.invalid"), by_other_door)
+check("which is a different answer to the same question",
+      by_name != by_other_door, (by_name, by_other_door))
+check("and the path is the same, because the files are",
+      by_name.rsplit("/", 1)[-1] == by_other_door.rsplit("/", 1)[-1],
+      (by_name, by_other_door))
+
 section("who may put one there")
 
 owner = f"own{RUN}"
@@ -174,9 +206,17 @@ BEHIND = "203.0.113.10"
 ALSO_BEHIND = "203.0.113.11"
 NOT_A_PROXY = "127.0.0.11"
 
+# A failed check is charged to the address and to the account both, so telling
+# the two apart takes an account per address. Guessing at one account from one
+# address must not be what stops somebody else.
+guessed_at = f"gsd{RUN}"
+make_account(guessed_at)
+bystander = f"byst{RUN}"
+make_account(bystander)
+
 spent = []
 for i in range(14):
-    status, _, _ = request("POST", PREFIX, body=b"g", auth=(owner, f"forwarded{i}"),
+    status, _, _ = request("POST", PREFIX, body=b"g", auth=(guessed_at, f"forwarded{i}"),
                            headers={"X-Forwarded-For": BEHIND})
     spent.append(status)
     if status == 429:
@@ -184,14 +224,22 @@ for i in range(14):
 check("a forwarded address is told to wait once it has been guessing",
       429 in spent, spent)
 
-status, _, _ = request("POST", PREFIX, body=b"g", auth=(owner, "also-wrong"),
+status, _, _ = request("POST", PREFIX, body=b"g", auth=(bystander, "also-wrong"),
                        headers={"X-Forwarded-For": ALSO_BEHIND})
 check("and another address behind the same proxy still has its own allowance",
       status == 403, status)
 
+# The other half of the same idea: the account being guessed at is the same
+# account wherever it is tried from. Behind a hidden service there is no
+# address to tell anybody apart by, so this is the part that protects it.
+status, _, _ = request("POST", PREFIX, body=b"g", auth=(guessed_at, "from-elsewhere"),
+                       headers={"X-Forwarded-For": ALSO_BEHIND})
+check("but the account being guessed at is slowed wherever it is tried from",
+      status == 429, status)
+
 # The header only counts from the proxy. From anybody else it is a way of
 # spending somebody else's allowance, or of dodging your own.
-status, _, _ = request("POST", PREFIX, body=b"g", auth=(owner, "wrong-again"),
+status, _, _ = request("POST", PREFIX, body=b"g", auth=(bystander, "wrong-again"),
                        source=NOT_A_PROXY, headers={"X-Forwarded-For": BEHIND})
 check("a forwarded address from somebody who is not a proxy counts for nothing",
       status == 403, status)

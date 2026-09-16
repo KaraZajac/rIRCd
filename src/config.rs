@@ -162,6 +162,25 @@ pub struct FilehostConfig {
     /// Maximum upload size in bytes (default 50 MiB).
     #[serde(default = "default_filehost_max_size")]
     pub max_size: usize,
+    /// What to tell a client that arrived by a particular door instead.
+    ///
+    /// A network reachable both by name and as a hidden service has two front
+    /// doors to one file host. A client that came in through the onion service
+    /// and is handed the public name has been sent out of Tor to fetch a file,
+    /// which is the one thing it was trying not to do — and its client may
+    /// simply refuse, so sharing a file does not work for it at all. Naming
+    /// the listener here says what that client should be told.
+    #[serde(default)]
+    pub alternates: Vec<FilehostAlternate>,
+}
+
+/// One door and the address to give the people who came through it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FilehostAlternate {
+    /// The listener, spelled as it is in `[server] listen` — `127.0.0.1:6668`.
+    pub listener: String,
+    /// The base URL to advertise to clients that arrived on it.
+    pub public_url: String,
 }
 
 fn default_filehost_listen() -> String {

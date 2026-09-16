@@ -357,12 +357,47 @@ a sanitised extension — so nothing an uploader writes becomes a path, and
 nothing they upload can overwrite anything. `tests/smoke/test_filehost.py`
 covers the lot, including the links that try to leave the directory.
 
+### Two doors to one file host
+
+A network reachable both by name and as a hidden service has two front doors to
+one file host. A client that arrived through the onion service and is handed the
+public name has been asked to leave Tor to fetch a file — which is the one thing
+it was trying not to do — and its client may simply refuse, so sharing a file
+does not work for it at all.
+
+```toml
+[[filehost.alternates]]
+listener = "127.0.0.1:6668"                  # the port the onion service maps to
+public_url = "http://xyz…onion/uploads"
+```
+
+The `FILEHOST` token in ISUPPORT is then chosen per client, by the listener it
+arrived on. One upload directory, one set of routes, two names for it: the onion
+service points at the same file host, so the files are the same either way.
+
+Keep the **path** the same in both (`/uploads` here) and change only the scheme
+and host. Routes are mounted under the path the primary `public_url` names, so
+an alternate with a different one would hand out links that answer nowhere — the
+server says so at startup rather than leaving you to find out.
+
+What this does not do is rewrite links people paste in chat. A link is text once
+it is sent, so a file shared by a Tor user is an onion link to everybody. The
+server chooses where each client is told to *put* a file; it does not edit what
+anybody says.
+
 Behind a reverse proxy, set `[server] trusted_proxies` to the proxy's address.
 Without it every request looks like it came from the proxy, so everybody who
 came through that door shares one failed-login budget — and whoever is guessing
 spends the allowance of every real user behind it. That is worth more than it
 sounds on a network reachable over Tor, where the door those users arrive by is
 the same one.
+
+That last case has no header to fix it: a hidden service hands over no per-user
+address, so those clients share one whatever is read. So a failed check is
+charged twice — once to the address and once to **the account being tried** —
+and the wait is whichever has earned more. An account under guessing is slowed
+wherever the guessing comes from, and one guesser on a shared address no longer
+has to be paid for by everybody else on it. A right answer gives both back.
 
 Nothing reclaims that disk on its own. `[expiry] uploads_days` is how you say
 how long a file is kept; without it the server says so at startup, because a
@@ -419,11 +454,19 @@ A VAPID key pair is generated on first start and stored in `key_file` (mode 0600
 | Key | Default | Description |
 |-----|---------|-------------|
 | `contact` | _(required)_ | VAPID `sub` claim — a `mailto:` or `https:` URL identifying the operator |
-| `key_file` | `/etc/rIRCd/vapid.key` | Where the VAPID private key is stored (created if missing) |
+| `key_file` | `/etc/rIRCd/vapid.key` | Where the VAPID private key is stored. Generated on first start if missing; an existing key is read in whichever shape it came in — the bare 32-byte scalar this server writes, or the PKCS#8 that `web-push`, `py_vapid` and the online generators hand out, base64 or base64url, PEM wrapper or not. They are the same key either way, and the server says which public key it read at startup so it can be checked against whatever the web app was built with |
 | `max_subscriptions_per_account` | `5` | Endpoints one account may have registered at once |
 | `ttl_secs` | `3600` | TTL requested of the push service per notification |
 | `max_failures` | `5` | Consecutive delivery failures before a subscription is dropped |
 | `allow_private_endpoints` | `false` | Permit endpoints resolving to loopback/private addresses (testing only) |
+
+Bringing your own key: put it in `key_file` before the first start and the
+server uses it — no conversion, whatever your generator produced. It logs the
+public key it derived, which is the one the browser needs in
+`applicationServerKey`; if that does not match what the web app has, the
+subscriptions it creates cannot be decrypted by this server. Keep the file to
+the server and treat it the way you treat the TLS key: anything holding it can
+send notifications as this network.
 
 ```toml
 [webpush]
@@ -753,6 +796,32 @@ server when set, listed by `STATS s`, lifted by `UNSHUN`, and expiring on their
 own when given a duration. A mask made only of wildcards is refused, and so is
 one covering the operator setting it.
 
+### Who stands where in a channel
+
+```
+^ founder   +x   the person the channel belongs to
+& admin     +a   somebody they have put above the operators
+@ operator  +o
+% half-op   +h
++ voice     +v
+```
+
+Status is given and taken by people who have some of their own, and nobody
+reaches above themselves: an operator may op an operator as they always could,
+but not appoint an admin over their own head, and an admin may not unseat the
+founder. A server operator stands outside the ladder.
+
+`^` is not a mode anybody sets on the founder. It comes from the registration,
+so it is true again every time they walk in and cannot be taken from them by a
+MODE — `CHANOWN` is how a channel stops being theirs. `&` is an appointment for
+the visit, the way `+h` is: it is not written down.
+
+The letters are `x` and `a`, not the `q` and `a` used by the servers that have
+these. `+q` here is the quiet list — persisted, taking timed bans, feeding `+z`
+— and was not worth breaking for a letter. Clients read the prefixes from
+`PREFIX` in ISUPPORT rather than assuming them, so what they show is what this
+server advertises: `PREFIX=(xaohv)^&@%+`.
+
 ### Exemptions
 
 `ELINE [<seconds>] <mask> :<reason>` says who none of that applies to.
@@ -1030,7 +1099,7 @@ still accepted in `CAP REQ` so older clients keep working.
 | **message-ids** | Full | `msgid` tag (with message-tags); unique id per message |
 | **batch** | Full | NAMES and chathistory wrapped in BATCH |
 | **echo-message** | Full | PRIVMSG, NOTICE, TAGMSG echoed to sender when cap set |
-| **multi-prefix** | Full | NAMES/WHO send all prefixes in rank order (`@%+`) |
+| **multi-prefix** | Full | NAMES/WHO send all prefixes in rank order (`^&@%+`) |
 | **extended-join** | Full | JOIN `#ch account :realname` for clients with cap |
 | **account-tag** | Full | `account=` tag on messages for capped clients |
 | **account-notify** | Full | ACCOUNT on SASL login/quit to channel peers with cap |
@@ -1168,7 +1237,9 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `+b` | Ban list — glob masks and the extended bans `~a:` (account), `~r:` (real name), `~j:` (in another channel), `~S:` (client certificate), `~O` (operators), `~m:` (mute rather than ban), `~n:` (no nick change) and `~t:` (lifts itself). The prefixes peel one at a time, so they stack: `~m:~r:*spam*` mutes by real name, `~t:1h:~j:#raiders` expires |
 | `+e` | Ban exception list — exempt users bypass `+b` bans |
 | `+I` | Invite exception list — matching users bypass `+i` without explicit INVITE |
-| `+q` | Quiet list — silences matching users without kicking |
+| `+q` | Quiet list — silences matching users without kicking. Not the founder mode it is on some servers: that is `+x` here, because this list is persisted, takes timed bans and feeds `+z`, and was not worth breaking for a letter |
+| `+x` | Founder, shown as `^` — the person the channel belongs to. Given on join to whoever the registration names, so it cannot be taken by a MODE, and settable only by the founder or a server operator |
+| `+a` | Admin, shown as `&` — somebody the founder has put above the operators. An appointment for the visit, like `+h`: it is not written down |
 | `+i` | Invite-only |
 | `+m` | Moderated — only `+v`/`+h`/`+o` may speak |
 | `+n` | No external messages |

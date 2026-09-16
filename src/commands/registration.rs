@@ -84,13 +84,40 @@ async fn send_to_other_sessions(senders: &Senders, user_id: &str, except: &str, 
     }
 }
 
+/// Where to tell a client the file host is, for the door it came in by.
+///
+/// One file host, and on a network reachable both by name and as a hidden
+/// service, two ways to reach it. A client that arrived through the onion
+/// service and is handed the public name has been asked to leave Tor to fetch
+/// a file — or its client refuses and sharing files simply does not work for
+/// it. The files are the same either way: this is about which name to give.
+pub fn filehost_url_for<'a>(cfg: &'a Config, arrived_on: &str) -> Option<&'a str> {
+    let fh = cfg.filehost.as_ref()?;
+    let mine = crate::client::normalise_listen(arrived_on);
+    fh.alternates
+        .iter()
+        .find(|alt| crate::client::normalise_listen(&alt.listener) == mine)
+        .map(|alt| alt.public_url.as_str())
+        .or(Some(fh.public_url.as_str()))
+}
+
+/// The listener a connection arrived on, as its own accept loop recorded it.
+async fn arrived_on(senders: &Senders, client_id: &str) -> std::sync::Arc<str> {
+    senders
+        .read()
+        .await
+        .get(client_id)
+        .map(|sink| sink.stats().arrived_on.clone())
+        .unwrap_or_else(|| std::sync::Arc::from(""))
+}
+
 /// Maximum ISUPPORT tokens per 005 line (RFC recommends ≤13).
 const ISUPPORT_TOKENS_PER_LINE: usize = 13;
 
 /// ISUPPORT (005) token list; used at registration and for extended-isupport.
 /// `client_has_webpush` adds the VAPID token, which draft/webpush says to send
 /// only to clients that enabled the capability.
-fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
+fn isupport_tokens(cfg: &Config, client_has_webpush: bool, arrived_on: &str) -> String {
     let network = format!(" NETWORK={}", cfg.network.name);
     use crate::channel::{
         CHANMODES_FLAG, CHANMODES_LIST, CHANMODES_PARAM_ALWAYS, CHANMODES_PARAM_SET, EXTBAN_TYPES,
@@ -113,15 +140,8 @@ fn isupport_tokens(cfg: &Config, client_has_webpush: bool) -> String {
         .as_ref()
         .map(|url| format!(" ICON={}", url))
         .unwrap_or_default();
-    let filehost = cfg
-        .filehost
-        .as_ref()
-        .map(|fh| {
-            format!(
-                " FILEHOST={} draft/FILEHOST={}",
-                fh.public_url, fh.public_url
-            )
-        })
+    let filehost = filehost_url_for(cfg, arrived_on)
+        .map(|url| format!(" FILEHOST={url} draft/FILEHOST={url}"))
         .unwrap_or_default();
     // draft/webpush: public key clients use to verify notifications came from us.
     let vapid = match (client_has_webpush, cfg.webpush_runtime.as_ref()) {
@@ -497,6 +517,7 @@ pub async fn complete_registration(
         session_caps(&senders, client_id)
             .await
             .contains("draft/webpush"),
+        &arrived_on(&senders, client_id).await,
     );
     let tokens: Vec<&str> = isupport.split(' ').collect();
     for chunk in tokens.chunks(ISUPPORT_TOKENS_PER_LINE) {
@@ -879,7 +900,7 @@ pub async fn handle_isupport(
             ("*".to_string(), false)
         }
     };
-    let isupport = isupport_tokens(cfg, has_webpush);
+    let isupport = isupport_tokens(cfg, has_webpush, &arrived_on(&senders, client_id).await);
     let tokens: Vec<&str> = isupport.split(' ').collect();
     for chunk in tokens.chunks(ISUPPORT_TOKENS_PER_LINE) {
         reply_to_client(
@@ -1684,7 +1705,7 @@ pub async fn handle_nick(
                 let staff = ch
                     .members
                     .get(&user_id)
-                    .map(|m| m.modes.op || m.modes.halfop)
+                    .map(|m| m.modes.at_least_halfop())
                     .unwrap_or(false);
                 if (ch.modes.no_nick_change || ch.forbids_nick_change(&subject)) && !staff {
                     let (shown, current) = (
@@ -3153,7 +3174,9 @@ pub async fn handle_authenticate(
             );
             return Ok(());
         }
-        let wait = state_w.auth_cost.spend(host);
+        // The address and the account both. Behind a hidden service the
+        // address is everybody's, and the account is the thing being guessed at.
+        let wait = state_w.auth_cost.spend_for(host, authcid);
         if let Some(conn) = state_w.pending.get_mut(client_id) {
             // Long enough for the wait and the check, and no longer: if the
             // answer never comes the connection still gets to finish
@@ -3212,7 +3235,7 @@ pub async fn handle_authenticate(
         {
             let mut state_w = state.write().await;
             if verified {
-                state_w.auth_cost.refund(host);
+                state_w.auth_cost.refund_for(host, authcid);
             }
             // The answer is here, so the attempt is no longer in flight.
             if let Some(conn) = state_w.pending.get_mut(client_id) {

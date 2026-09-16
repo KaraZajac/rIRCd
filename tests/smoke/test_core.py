@@ -44,7 +44,7 @@ check("MOTD delivered (375/372/376)", bool(alice.find(" 376 ")) or bool(alice.fi
 isupport = " ".join(alice.find(" 005 "))
 # A feature the server implements but does not advertise is one no client will
 # offer, so the tokens are worth pinning alongside the behaviour.
-for token in ["CHANTYPES=#", "PREFIX=(ohv)@%+", "NETWORK=", "CASEMAPPING=", "CHATHISTORY=",
+for token in ["CHANTYPES=#", "PREFIX=(xaohv)^&@%+", "NETWORK=", "CASEMAPPING=", "CHATHISTORY=",
               "STATUSMSG=@+", "KNOCK", "EXCEPTS", "INVEX", "SAFELIST", "ELIST=CMNTU",
               "EXTBAN=~,OSajmnrt", "MONITOR=", "TARGMAX=", "METADATA=", "UTF8ONLY", "WHOX"]:
     check(f"ISUPPORT has {token}", token in isupport, isupport[:300])

@@ -234,7 +234,14 @@ class RircdController(BaseServerController, DirectoryBasedController):
         "INVEX": patma.ANYOPTSTR,
         "MONITOR": patma.ANYSTR,
         "MSGREFTYPES": "msgid,timestamp",
-        "PREFIX": "(ohv)@%+",
+        # `^` founder and `&` admin sit above `@`. Two irctest cases fail
+        # against this and are expected to:
+        # ServicesWhoisTestCase::testWhoisNumerics[normal] and [oper] assert
+        # RPL_WHOISCHANNELS reads `@#chan`, while rIRCd sends `^#chan` — a
+        # logged-in user who creates a channel becomes its founder here, and
+        # the Modern spec says the numeric carries the highest prefix the user
+        # holds. The test hardcodes `@` rather than reading PREFIX.
+        "PREFIX": "(xaohv)^&@%+",
         "STATUSMSG": "@+",
         "TARGMAX": patma.ANYSTR,
         "UTF8ONLY": None,

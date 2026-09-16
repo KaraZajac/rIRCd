@@ -656,8 +656,10 @@ returning.wait_for(" 001 ", seconds=6)
 returning.join(owner_chan)
 returning.read(1.5)
 names = " ".join(returning.find(" 353 "))
+# `^` rather than `@`: the founder outranks an operator, and the prefix shown
+# is the highest held.
 check("an account's standing is restored under any name",
-      f"@{back_nick}" in names, returning.lines[-6:])
+      f"@{back_nick}" in names or f"^{back_nick}" in names, returning.lines[-6:])
 returning.close()
 founder.close()
 
