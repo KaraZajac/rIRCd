@@ -247,9 +247,21 @@ fn forwarded_for(
     peer: std::net::SocketAddr,
     trusted: &[String],
 ) -> String {
-    let actual = peer.ip().to_string();
-    if !trusted.iter().any(|t| t == &actual) {
-        return actual;
+    forwarded_for_ip(headers, &peer.ip().to_string(), trusted)
+}
+
+/// The same rule, for a listener that has the address as a string already.
+///
+/// The file host's TLS accept loop records the address itself rather than
+/// letting axum do it, and it needs the same answer: the rule about who may
+/// be believed cannot be written twice and stay one rule.
+pub(crate) fn forwarded_for_ip(
+    headers: &axum::http::HeaderMap,
+    actual: &str,
+    trusted: &[String],
+) -> String {
+    if !trusted.iter().any(|t| t == actual) {
+        return actual.to_string();
     }
     headers
         .get("x-forwarded-for")
@@ -258,7 +270,7 @@ fn forwarded_for(
         .map(|v| v.trim())
         .filter(|v| !v.is_empty())
         .map(str::to_string)
-        .unwrap_or(actual)
+        .unwrap_or_else(|| actual.to_string())
 }
 
 pub async fn run(
@@ -428,6 +440,7 @@ pub async fn run(
             max_uploads_per_hour: fh_cfg.max_uploads_per_hour,
             db_pool,
             state: state.clone(),
+            trusted_proxies: Arc::new(cfg.server.trusted_proxies.clone()),
         });
 
         let app = crate::filehost::router(fh_state);

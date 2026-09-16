@@ -188,6 +188,10 @@ cloak_key = "smoke-cloak-key"
 # One account, several connections. On by default here because the session
 # path is where a connection id and a user id stop being the same string,
 # and only a test that opens two connections notices when they are confused.
+# 127.0.0.1 stands in for the reverse proxy a file host usually sits behind,
+# so the suite can check who a forwarded request is credited to. Only an
+# address named here may say whose request it is passing on.
+trusted_proxies = ["127.0.0.1"]
 multiclient = true
 # Off, so multiclient stands on its own. With both on, persistent sessions
 # answered the "is this nick yours?" question first and multiclient was never

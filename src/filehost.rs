@@ -39,10 +39,27 @@ pub struct FilehostState {
     /// same passwords, so guessing at them here has to cost what guessing at
     /// them there costs.
     pub state: Arc<tokio::sync::RwLock<crate::user::ServerState>>,
+    /// Addresses the operator says are their own proxies. Only a request
+    /// arriving from one of these may say whose it really is.
+    pub trusted_proxies: Arc<Vec<String>>,
 }
 
 /// Where a request came from, however its listener recorded it.
-fn peer_of(req: &Request<Body>) -> String {
+///
+/// Behind a reverse proxy the socket says the proxy, which is one address for
+/// everybody who came through it — so one failed-login budget for everybody,
+/// and whoever is guessing spends the allowance of every real user sharing
+/// that door. `X-Forwarded-For` is how the proxy says whose request it is
+/// passing on, and it is believed only when the connection carrying it came
+/// from an address the operator named as a proxy. Anybody may send the header;
+/// only a proxy is taken at its word.
+fn peer_of(req: &Request<Body>, trusted: &[String]) -> String {
+    let actual = socket_peer_of(req);
+    crate::server::forwarded_for_ip(req.headers(), &actual, trusted)
+}
+
+/// The address the connection itself came from, before any header is read.
+fn socket_peer_of(req: &Request<Body>) -> String {
     if let Some(PeerAddr(ip)) = req.extensions().get::<PeerAddr>() {
         return ip.clone();
     }
@@ -91,7 +108,10 @@ pub fn router(fh_state: Arc<FilehostState>) -> Router {
             fh_state.clone(),
             auth_middleware,
         ))
-        .layer(middleware::from_fn(request_logging))
+        .layer(middleware::from_fn_with_state(
+            fh_state.clone(),
+            request_logging,
+        ))
         .layer(cors)
         .with_state(fh_state)
 }
@@ -160,15 +180,24 @@ pub async fn sweep_uploads(dir: &std::path::Path, cutoff: i64) -> usize {
     gone
 }
 
-/// Log every incoming request.
-async fn request_logging(req: Request<Body>, next: Next) -> Response {
+/// Log every incoming request, with whose it is.
+///
+/// The address is the one the proxy vouched for where there is a proxy, which
+/// is the one an operator reading these lines is looking for: behind one, the
+/// socket address is the same for everybody and says nothing.
+async fn request_logging(
+    State(fh_state): State<Arc<FilehostState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    info!(method = %method, uri = %uri, "Filehost request");
+    let peer = peer_of(&req, &fh_state.trusted_proxies);
+    info!(method = %method, uri = %uri, %peer, "Filehost request");
     let resp = next.run(req).await;
     let status = resp.status();
     if status.is_client_error() || status.is_server_error() {
-        warn!(method = %method, uri = %uri, status = %status, "Filehost response error");
+        warn!(method = %method, uri = %uri, %peer, status = %status, "Filehost response error");
     }
     resp
 }
@@ -196,7 +225,7 @@ async fn auth_middleware(
     // wrong is told to wait rather than having another check run for it —
     // otherwise every bit of that care is one HTTP request away from being
     // beside the point.
-    let peer = peer_of(&req);
+    let peer = peer_of(&req, &fh_state.trusted_proxies);
     let wait = {
         let mut state = fh_state.state.write().await;
         state.auth_cost.spend(&peer)

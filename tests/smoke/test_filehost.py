@@ -161,6 +161,41 @@ for i in range(8):
 check("an account may upload up to its allowance", allowed > 0, allowed)
 check("and is asked to stop after it", refused == 1, (allowed, refused))
 
+section("who a request is from, behind a proxy")
+
+# A file host usually sits behind a reverse proxy, where the socket address is
+# the proxy's and is the same for everybody who came through it. One address
+# means one failed-login budget for the lot, so whoever is guessing spends the
+# allowance of every real user sharing that door — and on this network that
+# door is also the one Tor clients arrive by. X-Forwarded-For is how the proxy
+# says whose request it is passing on. Anybody may send the header; only an
+# address the operator named as a proxy is taken at its word.
+BEHIND = "203.0.113.10"
+ALSO_BEHIND = "203.0.113.11"
+NOT_A_PROXY = "127.0.0.11"
+
+spent = []
+for i in range(14):
+    status, _, _ = request("POST", PREFIX, body=b"g", auth=(owner, f"forwarded{i}"),
+                           headers={"X-Forwarded-For": BEHIND})
+    spent.append(status)
+    if status == 429:
+        break
+check("a forwarded address is told to wait once it has been guessing",
+      429 in spent, spent)
+
+status, _, _ = request("POST", PREFIX, body=b"g", auth=(owner, "also-wrong"),
+                       headers={"X-Forwarded-For": ALSO_BEHIND})
+check("and another address behind the same proxy still has its own allowance",
+      status == 403, status)
+
+# The header only counts from the proxy. From anybody else it is a way of
+# spending somebody else's allowance, or of dodging your own.
+status, _, _ = request("POST", PREFIX, body=b"g", auth=(owner, "wrong-again"),
+                       source=NOT_A_PROXY, headers={"X-Forwarded-For": BEHIND})
+check("a forwarded address from somebody who is not a proxy counts for nothing",
+      status == 403, status)
+
 section("how long a shared file is kept")
 
 # Disk is the one thing here nothing else reclaims. [expiry] uploads_days
