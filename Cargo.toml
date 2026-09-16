@@ -3,8 +3,8 @@ name = "rircd"
 version = "1.24.1"
 edition = "2021"
 description = "Bleeding-edge IRC server in Rust"
-license = "MIT"
-repository = "https://github.com/rircd/rircd"
+license = "BSD-3-Clause"
+repository = "https://github.com/KaraZajac/rIRCd"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -1249,4 +1249,4 @@ See [tests/smoke/README.md](tests/smoke/README.md) and
 
 ## License
 
-See [LICENSE](LICENSE).
+BSD 3-Clause. See [LICENSE](LICENSE).
