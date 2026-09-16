@@ -1197,6 +1197,38 @@ if sh.find(" 381 "):
     sh.read(0.8)
     sh.send("UNDLINE 127.0.0.9")
     sh.read(0.8)
+
+    section("the rules are the operators' to read")
+
+    # A shun is meant to be invisible — one that announced itself would just be
+    # a slower kill — and STATS s was announcing it to anybody who asked, the
+    # shunned person included. An exemption is the list of addresses the bans
+    # and the blocklist do not stop, which is a map of the way round them.
+    # The rules name somebody who is not the one doing the looking: a shunned
+    # user's commands reach nobody, so probing with the shunned nick would be
+    # testing the shun rather than the permission.
+    sh.send(f"ELINE elsewhere{SUF}!*@* :for the test")
+    sh.send(f"SHUN elsewhere{SUF}!*@* :for the test")
+    sh.read(1.5)
+    nosy = Client(f"spy{SUF}")
+    for letter, what in (("s", "shuns"), ("e", "exemptions"), ("k", "K-lines"), ("d", "D-lines")):
+        m = nosy.mark()
+        nosy.send(f"STATS {letter}")
+        nosy.wait_for(" 481 ", " 219 ", seconds=5)
+        got = nosy.since(m)
+        check(f"a user may not read the {what}",
+              bool(nosy.find(" 481 ", lines=got)) and not nosy.find(" 216 ", lines=got),
+              got[-3:])
+    # The operator still may, which is the half that has to keep working.
+    m = sh.mark()
+    sh.send("STATS e")
+    sh.wait_for(" 219 ", seconds=5)
+    check("but an operator may",
+          bool(sh.find(" 216 ", f"elsewhere{SUF}", lines=sh.since(m))), sh.since(m)[-3:])
+    nosy.close()
+    sh.send(f"UNELINE elsewhere{SUF}!*@*")
+    sh.send(f"UNSHUN elsewhere{SUF}!*@*")
+    sh.read(1.0)
 sh.close()
 
 section("still standing")

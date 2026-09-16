@@ -527,26 +527,38 @@ pub async fn handle_stats(
                 .await;
             }
         }
-        "k" | "K" => {
-            for m in stats_bans(&state, &nick, &cfg.server.name, crate::persist::BanKind::Kline).await {
-                reply_to_client(&senders, client_id, m, label).await;
-            }
-        }
-        "d" | "D" => {
-            for m in stats_bans(&state, &nick, &cfg.server.name, crate::persist::BanKind::Dline).await {
-                reply_to_client(&senders, client_id, m, label).await;
-            }
-        }
-        "s" | "S" => {
-            for m in stats_bans(&state, &nick, &cfg.server.name, crate::persist::BanKind::Shun).await {
-                reply_to_client(&senders, client_id, m, label).await;
-            }
-        }
-        // Who the rest of it does not apply to. Worth being able to read back:
-        // an exemption nobody remembers is how a ban quietly stops working.
-        "e" | "E" => {
-            for m in stats_bans(&state, &nick, &cfg.server.name, crate::persist::BanKind::Exempt).await {
-                reply_to_client(&senders, client_id, m, label).await;
+        // The rules this server is keeping, and who they do not apply to. All
+        // four are the operators' to read, which is what the documentation
+        // always said and what the code did not do.
+        //
+        // A shun is the sharpest case: it is meant to be invisible — "a shun
+        // that announced itself would just be a slower kill" — and `STATS s`
+        // was announcing it, to the shunned person along with everybody else.
+        // An exemption is the next sharpest, being a list of the addresses
+        // that the bans and the blocklist do not stop.
+        "k" | "K" | "d" | "D" | "s" | "S" | "e" | "E" => {
+            if !is_oper {
+                reply_to_client(
+                    &senders,
+                    client_id,
+                    Message::new(
+                        "481",
+                        vec![nick.clone(), "Permission Denied- You're not an IRC operator".into()],
+                    )
+                    .with_prefix(s),
+                    label,
+                )
+                .await;
+            } else {
+                let kind = match query.to_ascii_lowercase().as_str() {
+                    "d" => crate::persist::BanKind::Dline,
+                    "s" => crate::persist::BanKind::Shun,
+                    "e" => crate::persist::BanKind::Exempt,
+                    _ => crate::persist::BanKind::Kline,
+                };
+                for m in stats_bans(&state, &nick, &cfg.server.name, kind).await {
+                    reply_to_client(&senders, client_id, m, label).await;
+                }
             }
         }
         // The kinds of client this server tells apart. No hosts of anybody's

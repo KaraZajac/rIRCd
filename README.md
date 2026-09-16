@@ -789,7 +789,8 @@ connected and lets nothing they say reach anybody:
 - `QUIT` and `PART` still work, without the parting words: a quit reason is
   shouted into every channel they were in, so it is dropped with the rest.
 - They are never told, and neither is anybody else except the operators, under
-  snomask `b`.
+  snomask `b`. `STATS s` is the operators' too, for the same reason: a list
+  anybody could read would tell the shunned person they had been shunned.
 
 Shuns live beside K-lines and D-lines: stored in the database, carried to every
 server when set, listed by `STATS s`, lifted by `UNSHUN`, and expiring on their
