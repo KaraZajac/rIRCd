@@ -282,6 +282,71 @@ check(
 rich.close()
 plain.close()
 talker.close()
+
+section("the order a real client sends things in")
+
+# irssi, WeeChat and HexChat all send NICK and USER before they authenticate.
+# A server that decides who owns a nick at NICK time is deciding it before the
+# client has said who it is, and the answer it gets is about a stranger. This
+# is the order that matters, and the one the tests above did not use.
+def session_nick_first(nick=None):
+    nick = nick or ACCOUNT
+    c = Client()
+    c.send("CAP LS 302")
+    c.read(0.5)
+    c.send("CAP REQ :sasl")
+    c.read(0.3)
+    c.send(f"NICK {nick}")
+    c.send(f"USER {nick} 0 * :{nick}")
+    c.sasl_plain(ACCOUNT, PASSWORD)
+    c.nick = nick
+    c.send("CAP END")
+    c.wait_for(" 376 ", " 422 ", " 001 ", " 433 ", seconds=8)
+    return c
+
+third = session_nick_first()
+check(
+    "a session that sends NICK before it authenticates is still let in",
+    bool(third.find(" 001 ")) and not third.find(" 433 "),
+    third.lines[-4:],
+)
+check(
+    "and it is another session of the same user, not a second one",
+    bool(third.find(" 001 ", ACCOUNT)),
+    third.lines[-4:],
+)
+
+section("and the nick is still nobody else's")
+
+stranger = Client()
+stranger.send("CAP LS 302")
+stranger.read(0.5)
+stranger.send("CAP REQ :sasl")
+stranger.read(0.3)
+stranger.send(f"NICK {ACCOUNT}")
+stranger.send(f"USER x{RUN} 0 * :x{RUN}")
+stranger.send("CAP END")
+stranger.wait_for(" 433 ", " 001 ", seconds=8)
+check(
+    "somebody with no account is refused the registered nick",
+    bool(stranger.find(" 433 ")) and not stranger.find(" 001 "),
+    stranger.lines[-4:],
+)
+
+# The refusal has to leave the connection able to ask for something else: it
+# has told the server its user and its capabilities already, and losing that
+# would strand a client that did nothing wrong.
+free = f"guest{RUN}"
+stranger.send(f"NICK {free}")
+stranger.wait_for(" 001 ", " 433 ", seconds=8)
+check(
+    "and may ask for a free nick instead and be let in",
+    bool(stranger.find(" 001 ", free)),
+    stranger.lines[-4:],
+)
+
+stranger.close()
+third.close()
 second.close()
 first.close()
 summary("multiclient")

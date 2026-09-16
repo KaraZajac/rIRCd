@@ -4,7 +4,7 @@ use crate::commands::{reply_to_client, session_caps};
 use crate::config::Config;
 use crate::persist::{self, RegisterError};
 use crate::protocol::Message;
-use crate::user::{Client, ScramServerState, Senders, ServerState};
+use crate::user::{Client, PendingConnection, ScramServerState, Senders, ServerState};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hmac::{Hmac, Mac};
 use rand::Rng;
@@ -176,9 +176,44 @@ pub async fn complete_registration(
         }
     }
 
-    let nick = pending.nick.unwrap();
-    let user = pending.user.unwrap();
-    let realname = pending.realname.unwrap_or_else(|| nick.clone());
+    let nick = pending.nick.clone().unwrap();
+
+    // A registered nick belongs to its account. The NICK asking for this one
+    // may have arrived before the client had authenticated, in which case the
+    // question could not be answered then and was left to here. Asked outside
+    // the state lock: it reaches the database, and nothing else should wait on
+    // that.
+    if cfg.server.nick_protection {
+        let owns_it = state
+            .read()
+            .await
+            .account_holds_nick(pending.account.as_deref(), &nick);
+        if !owns_it {
+            let registered = state.read().await.grouped_owner(&nick).is_some()
+                || match cfg.db {
+                    Some(ref pool) => {
+                        crate::persist::nick_is_registered(pool, &cfg.db_health, &nick).await
+                    }
+                    None => false,
+                };
+            if registered {
+                return refuse_nick_and_wait(
+                    client_id,
+                    &state,
+                    &senders,
+                    cfg,
+                    label,
+                    pending,
+                    nick,
+                    "Nickname is registered to another account",
+                )
+                .await;
+            }
+        }
+    }
+
+    let user = pending.user.clone().unwrap();
+    let realname = pending.realname.clone().unwrap_or_else(|| nick.clone());
     let pending_metadata: Vec<(String, String)> =
         std::mem::take(&mut pending.metadata).into_iter().collect();
 
@@ -211,22 +246,18 @@ pub async fn complete_registration(
             );
             attach_to = Some(holder_id);
         } else if !(same_account && cfg.server.persistent_sessions) {
-            reply_to_client(
-                &senders,
+            drop(state_guard);
+            return refuse_nick_and_wait(
                 client_id,
-                Message::new(
-                    "433",
-                    vec![
-                        "*".into(),
-                        nick.clone(),
-                        "Nickname is already in use".into(),
-                    ],
-                )
-                .with_prefix(&cfg.server.name),
+                &state,
+                &senders,
+                cfg,
                 label,
+                pending,
+                nick,
+                "Nickname is already in use",
             )
             .await;
-            return Ok(());
         } else {
             tracing::info!(
                 client_id,
@@ -1515,9 +1546,27 @@ pub async fn handle_nick(
         state_guard = state.write().await;
     }
 
+    // Whether this connection may still prove who it is.
+    //
+    // A client that negotiated SASL usually sends NICK before it authenticates
+    // — irssi, WeeChat and HexChat all do — so at this moment it has no account
+    // and every question about who owns a nick has the wrong answer. Asking now
+    // would tell somebody their own registered nick belongs to a stranger.
+    // These questions are deferred to complete_registration, which runs after
+    // SASL either succeeded or did not.
+    let account_still_to_come = !state_guard.clients.contains_key(client_id)
+        && match state_guard.pending.get(client_id) {
+            Some(p) => {
+                p.account.is_none()
+                    && !p.cap_ended
+                    && (p.capabilities.contains("sasl") || p.sasl_check_until.is_some())
+            }
+            None => false,
+        };
+
     // A registered nick belongs to its account: refuse it to anyone else, unless
     // the operator has turned that off.
-    if cfg.server.nick_protection {
+    if cfg.server.nick_protection && !account_still_to_come {
         // Who is asking, and are they already logged in to this account?
         let (current_nick, current_account) = match state_guard.clients.get(client_id) {
             Some(client) => {
@@ -1668,10 +1717,12 @@ pub async fn handle_nick(
         return Ok(());
     }
 
-    // With persistent sessions, a client already authenticated to the account
-    // that holds this nick is that account returning, so the nick is not taken
-    // as far as it is concerned; complete_registration hands it over.
-    let resuming_own_session = cfg.server.persistent_sessions && {
+    // A connection that has proved it is the account already holding this nick
+    // is not a stranger asking for it, so the nick is not taken as far as it is
+    // concerned. What happens next is complete_registration's to decide and the
+    // operator's to configure: join the two as sessions of one user, or hand
+    // the nick over and close the earlier connection.
+    let resuming_own_session = (cfg.server.persistent_sessions || cfg.server.multiclient) && {
         let pending_account = state_guard
             .pending
             .get(client_id)
@@ -1693,7 +1744,8 @@ pub async fn handle_nick(
     let nick_taken = state_guard
         .nick_to_id
         .contains_key(&crate::casefold::upper(&nick))
-        && !resuming_own_session;
+        && !resuming_own_session
+        && !account_still_to_come;
     if nick_taken {
         // Remember what was asked for: REGISTER needs to tell someone trying to
         // claim a nick in use that the account is taken, not that they gave no
@@ -1731,6 +1783,44 @@ pub async fn handle_nick(
         complete_registration(client_id, state, channels, senders, cfg, label).await?;
     }
 
+    Ok(())
+}
+
+/// Refuse a nick to a connection that has not finished registering, and leave
+/// it able to ask for another.
+///
+/// Registration has not happened, so everything the client has told us — the
+/// capabilities it negotiated, the account it proved, the user and real name it
+/// gave — must still be there for the NICK it sends next. Taking its pending
+/// state away would leave a connection that has authenticated and can never
+/// register: it would answer the 433 with another NICK and be a stranger again.
+async fn refuse_nick_and_wait(
+    client_id: &str,
+    state: &Arc<RwLock<ServerState>>,
+    senders: &Senders,
+    cfg: &Config,
+    label: Option<&str>,
+    mut pending: PendingConnection,
+    nick: String,
+    reason: &str,
+) -> anyhow::Result<()> {
+    // Without a nick it is not ready to register, so the next NICK is what
+    // finishes the handshake rather than this one finishing it twice.
+    pending.nick = None;
+    pending.nick_in_use = Some(nick.clone());
+    state
+        .write()
+        .await
+        .pending
+        .insert(client_id.to_string(), pending);
+    reply_to_client(
+        senders,
+        client_id,
+        Message::new("433", vec!["*".into(), nick, reason.into()])
+            .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
     Ok(())
 }
 

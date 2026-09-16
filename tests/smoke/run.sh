@@ -189,7 +189,11 @@ cloak_key = "smoke-cloak-key"
 # path is where a connection id and a user id stop being the same string,
 # and only a test that opens two connections notices when they are confused.
 multiclient = true
-persistent_sessions = true
+# Off, so multiclient stands on its own. With both on, persistent sessions
+# answered the "is this nick yours?" question first and multiclient was never
+# reached — a server configured the way most would configure it refused the
+# second session, and the suite here passed anyway.
+persistent_sessions = false
 
 [tls]
 cert = "$ETC_DIR/tls.cert.pem"
