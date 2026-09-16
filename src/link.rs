@@ -3007,6 +3007,7 @@ async fn accept_remote_kline(ctx: &LinkContext, msg: &Message, peer_sid: &str) {
     let kind = match msg.command.as_str() {
         "DLINE" => crate::persist::BanKind::Dline,
         "SHUN" => crate::persist::BanKind::Shun,
+        "ELINE" => crate::persist::BanKind::Exempt,
         _ => crate::persist::BanKind::Kline,
     };
     let (Some(mask), Some(set_at), Some(expires), Some(set_by)) = (
@@ -3286,14 +3287,24 @@ async fn accept_remote_unkline(ctx: &LinkContext, msg: &Message, peer_sid: &str)
     let Some(mask) = msg.params.first().cloned() else {
         return;
     };
+    // Which kind is lifted is in the verb. Lifting a shun is not lifting the
+    // K-line that may stand on the same mask.
+    let kind = match msg.command.as_str() {
+        "UNDLINE" => crate::persist::BanKind::Dline,
+        "UNSHUN" => crate::persist::BanKind::Shun,
+        "UNELINE" => crate::persist::BanKind::Exempt,
+        _ => crate::persist::BanKind::Kline,
+    };
     let pool = ctx.cfg.read().await.db.clone();
     if let Some(pool) = pool {
-        crate::persist::delete_server_ban(&pool, &mask).await;
+        crate::persist::delete_server_ban(&pool, &mask, kind).await;
     }
     {
         let mut state = ctx.state.write().await;
-        state.server_bans.retain(|b| b.mask != mask);
-        state.publish_dlines();
+        state
+            .server_bans
+            .retain(|b| !(b.kind == kind && b.mask == mask));
+        state.publish_door_bans();
     }
     crate::commands::server_cmds::apply_shuns(&ctx.state).await;
     info!(peer = %peer_sid, %mask, "Server ban removed from the network");
@@ -3879,6 +3890,7 @@ fn kline_message(ban: &crate::persist::ServerBan, sid: &str) -> Message {
             crate::persist::BanKind::Kline => "KLINE",
             crate::persist::BanKind::Dline => "DLINE",
             crate::persist::BanKind::Shun => "SHUN",
+            crate::persist::BanKind::Exempt => "ELINE",
         },
         vec![
             ban.mask.clone(),
@@ -3903,6 +3915,7 @@ pub async fn announce_unkline(cfg: &Config, mask: &str, kind: crate::persist::Ba
                 crate::persist::BanKind::Kline => "UNKLINE",
                 crate::persist::BanKind::Dline => "UNDLINE",
                 crate::persist::BanKind::Shun => "UNSHUN",
+                crate::persist::BanKind::Exempt => "UNELINE",
             },
             vec![mask.to_string()],
         )
@@ -4160,11 +4173,11 @@ async fn handle_link_message(
             accept_remote_unspamfilter(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }
-        "KLINE" | "DLINE" | "SHUN" => {
+        "KLINE" | "DLINE" | "SHUN" | "ELINE" => {
             accept_remote_kline(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }
-        "UNKLINE" | "UNDLINE" | "UNSHUN" => {
+        "UNKLINE" | "UNDLINE" | "UNSHUN" | "UNELINE" => {
             accept_remote_unkline(ctx, msg, peer_sid).await;
             std::ops::ControlFlow::Continue(())
         }

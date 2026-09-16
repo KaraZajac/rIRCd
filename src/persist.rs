@@ -377,6 +377,32 @@ pub async fn init_schema(pool: &sqlx::MySqlPool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE server_bans ADD COLUMN IF NOT EXISTS kind CHAR(1) NOT NULL DEFAULT 'K'")
         .execute(pool)
         .await;
+    // What names an entry is the mask *and* the kind. The table was written
+    // when a mask could only mean one thing, so a shun on a mask replaced the
+    // K-line on it and UNSHUN deleted one. Older databases are moved over; a
+    // table already keyed this way refuses the change and is left alone.
+    let keyed_by_mask_alone = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'server_bans'
+           AND INDEX_NAME = 'PRIMARY'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(2);
+    if keyed_by_mask_alone == 1 {
+        // Two rows that differ only by kind cannot both survive a key that
+        // does not include it, and there can be none: the old key forbade them.
+        if let Err(e) = sqlx::query(
+            "ALTER TABLE server_bans DROP PRIMARY KEY, ADD PRIMARY KEY (mask, kind)",
+        )
+        .execute(pool)
+        .await
+        {
+            tracing::warn!("Could not key the server bans by mask and kind: {e}");
+        } else {
+            tracing::info!("Server bans are now keyed by mask and kind");
+        }
+    }
 
     // Which channels an account is in, remembered across disconnects so a user
     // with a push subscription can be notified while they are away.
@@ -2224,6 +2250,15 @@ pub enum BanKind {
     /// for somebody who would come straight back under another address if
     /// they knew they had been dealt with.
     Shun,
+    /// Not a ban but its opposite: whoever it names is not turned away by any
+    /// of the others, and is not asked about on a blocklist.
+    ///
+    /// Every blocklist eventually lists somebody who belongs here — a shared
+    /// address, a VPN, an exit node — and without a way to say so the only
+    /// answers are to stop believing the list for everybody or to stop asking
+    /// it. An exemption is how one address is vouched for without giving up
+    /// either.
+    Exempt,
 }
 
 impl BanKind {
@@ -2232,6 +2267,7 @@ impl BanKind {
             BanKind::Kline => "K",
             BanKind::Dline => "D",
             BanKind::Shun => "S",
+            BanKind::Exempt => "E",
         }
     }
 
@@ -2240,15 +2276,25 @@ impl BanKind {
             BanKind::Dline
         } else if s.eq_ignore_ascii_case("S") {
             BanKind::Shun
+        } else if s.eq_ignore_ascii_case("E") {
+            BanKind::Exempt
         } else {
             BanKind::Kline
         }
     }
 
     /// Whether a ban of this kind turns a connection away. A shun does not:
-    /// that is the whole of what makes it one.
+    /// that is the whole of what makes it one. Neither does an exemption,
+    /// which turns nobody anywhere.
     pub fn closes_the_connection(self) -> bool {
-        !matches!(self, BanKind::Shun)
+        !matches!(self, BanKind::Shun | BanKind::Exempt)
+    }
+
+    /// Whether this says somebody is *not* to be kept out. Worth asking on
+    /// its own: an exemption shares a table and a shape with the bans, and
+    /// every place that acts on one would otherwise act on it too.
+    pub fn is_exemption(self) -> bool {
+        matches!(self, BanKind::Exempt)
     }
 }
 
@@ -2265,18 +2311,25 @@ impl ServerBan {
             BanKind::Dline => address_in(&self.mask, ip).unwrap_or(false),
             // A shun names somebody the way a K-line does; what differs is
             // what happens to them, not how they are found.
-            BanKind::Kline | BanKind::Shun => {
+            BanKind::Kline | BanKind::Shun | BanKind::Exempt => {
                 let mask = crate::casefold::lower(&self.mask);
                 let source = crate::casefold::lower(source);
                 // `nick!user@1.2.3.0/24`: the mask up to the host is a glob and
                 // the host is a network.
                 if let Some((front, net)) = mask.rsplit_once('@') {
                     if net.contains('/') {
-                        let Some((user_part, _)) = source.rsplit_once('@') else {
-                            return false;
+                        return match source.rsplit_once('@') {
+                            Some((user_part, _)) => {
+                                crate::user::glob_match(front, user_part)
+                                    && address_in(net, ip).unwrap_or(false)
+                            }
+                            // Asked at the door, before there is a nick or a
+                            // user to ask about: the address is the whole of
+                            // what is known, so it is the whole of the test.
+                            None => {
+                                source.is_empty() && address_in(net, ip).unwrap_or(false)
+                            }
                         };
-                        return crate::user::glob_match(front, user_part)
-                            && address_in(net, ip).unwrap_or(false);
                     }
                 }
                 let ip = ip.to_lowercase();
@@ -2361,9 +2414,13 @@ pub async fn save_server_ban(pool: &sqlx::MySqlPool, ban: &ServerBan) -> Result<
 }
 
 /// Remove a ban. Returns true if one was removed.
-pub async fn delete_server_ban(pool: &sqlx::MySqlPool, mask: &str) -> bool {
-    sqlx::query("DELETE FROM server_bans WHERE mask = ?")
+/// Take one entry away. The kind is part of what names it: a shun and a
+/// K-line may both be written against the same mask, and lifting one is not
+/// lifting the other.
+pub async fn delete_server_ban(pool: &sqlx::MySqlPool, mask: &str, kind: BanKind) -> bool {
+    sqlx::query("DELETE FROM server_bans WHERE mask = ? AND kind = ?")
         .bind(mask)
+        .bind(kind.letter())
         .execute(pool)
         .await
         .map(|r| r.rows_affected() > 0)
@@ -3435,6 +3492,43 @@ mod ban_tests {
         assert!(!network_too_broad("2001:db8::/32"));
         assert!(!network_too_broad("203.0.113.5"), "a single address is never too broad");
         assert!(network_too_broad("203.0.113.0/x"));
+    }
+
+    /// An exemption is judged twice: at the door, where there is an address
+    /// and nothing else, and again once there is a nick to go with it. Both
+    /// have to reach the same answer or it would vouch for somebody only
+    /// until they said who they were.
+    #[test]
+    fn an_exemption_is_judged_by_address_before_there_is_a_nick() {
+        let e = ban("*!*@203.0.113.0/24", BanKind::Exempt);
+        assert!(
+            e.matches("", "203.0.113.7"),
+            "at the door, where the address is all there is"
+        );
+        assert!(
+            e.matches("nick!user@cloaked.host", "203.0.113.7"),
+            "and again once there is a nick, on the same address"
+        );
+        assert!(!e.matches("", "198.51.100.7"), "and not for another address");
+
+        // A plain host mask has to work from the address alone too: at the
+        // door nothing has resolved or cloaked anything yet.
+        let by_host = ban("*!*@203.0.113.9", BanKind::Exempt);
+        assert!(by_host.matches("", "203.0.113.9"));
+        assert!(!by_host.matches("", "203.0.113.10"));
+    }
+
+    /// It is the opposite of the others and has to answer as one: nothing it
+    /// covers is closed, and nothing it covers is silenced.
+    #[test]
+    fn an_exemption_closes_nothing_and_is_not_a_ban() {
+        assert!(!BanKind::Exempt.closes_the_connection());
+        assert!(BanKind::Exempt.is_exemption());
+        assert!(!BanKind::Shun.is_exemption(), "a shun is still a ban");
+        assert!(!BanKind::Kline.is_exemption());
+        assert_eq!(BanKind::Exempt.letter(), "E");
+        assert_eq!(BanKind::from_letter("E"), BanKind::Exempt);
+        assert_eq!(BanKind::from_letter("e"), BanKind::Exempt);
     }
 
     /// A shun is found the way a K-line is; what differs is what happens to

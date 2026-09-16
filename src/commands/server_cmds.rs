@@ -542,6 +542,13 @@ pub async fn handle_stats(
                 reply_to_client(&senders, client_id, m, label).await;
             }
         }
+        // Who the rest of it does not apply to. Worth being able to read back:
+        // an exemption nobody remembers is how a ban quietly stops working.
+        "e" | "E" => {
+            for m in stats_bans(&state, &nick, &cfg.server.name, crate::persist::BanKind::Exempt).await {
+                reply_to_client(&senders, client_id, m, label).await;
+            }
+        }
         // The kinds of client this server tells apart. No hosts of anybody's
         // in it, but it describes the shape of the server, so it keeps the
         // company the rest of STATS keeps.
@@ -1036,9 +1043,22 @@ pub async fn handle_help(
             &[
                 "STATS <letter>",
                 "  u uptime, m command counts, o operator blocks, k K-lines, d D-lines,",
-                "  s shuns, y connection classes, l what each connection has carried,",
-                "  t what this server has been doing. Everything but u and m is for",
-                "  operators.",
+                "  s shuns, e exemptions, y connection classes, l what each connection",
+                "  has carried, t what this server has been doing. Everything but u and",
+                "  m is for operators.",
+            ],
+        ),
+        Some("ELINE") | Some("UNELINE") => (
+            "ELINE",
+            &[
+                "ELINE [<duration>] <mask> :<reason>",
+                "  Say who the bans do not apply to. A blocklist eventually lists",
+                "  somebody who belongs here — a shared address, a VPN, an exit node —",
+                "  and this is how one address is vouched for without having to stop",
+                "  believing the list for everybody. It covers the D-lines and the",
+                "  blocklist at the door, and the K-lines and shuns after. It is not a",
+                "  promise about behaviour: KILL still works. UNELINE stops vouching,",
+                "  and STATS e reads them back.",
             ],
         ),
         Some("RESV") => (
@@ -2114,7 +2134,12 @@ pub fn ban_too_broad(mask: &str, kind: crate::persist::BanKind) -> bool {
     match kind {
         // A shun names somebody the way a K-line does, so it is held to the
         // same rule: a mask made of wildcards would silence the network.
-        crate::persist::BanKind::Kline | crate::persist::BanKind::Shun => mask_too_broad(mask),
+        // An exemption is held to the same rule, and for a sharper reason:
+        // a mask of wildcards would not silence the network, it would vouch
+        // for it — every ban and every blocklist answer undone at once.
+        crate::persist::BanKind::Kline
+        | crate::persist::BanKind::Shun
+        | crate::persist::BanKind::Exempt => mask_too_broad(mask),
         crate::persist::BanKind::Dline => {
             let parses = crate::persist::address_in(mask, "0.0.0.0").is_some()
                 || crate::persist::address_in(mask, "::").is_some();
@@ -2148,9 +2173,19 @@ pub async fn enforce_ban(
     let mut hits: Vec<(String, String)> = Vec::new();
     {
         let mut state_w = state.write().await;
-        state_w.server_bans.retain(|b| b.mask != ban.mask);
+        state_w
+            .server_bans
+            .retain(|b| !(b.kind == ban.kind && b.mask == ban.mask));
         state_w.server_bans.push(ban.clone());
-        state_w.publish_dlines();
+        state_w.publish_door_bans();
+        if ban.kind.is_exemption() {
+            // Nobody is closed and nobody is silenced: this says who is *not*
+            // to be kept out. It takes effect on whoever knocks next, and on
+            // the shuns, which may now be covering somebody vouched for.
+            drop(state_w);
+            apply_shuns(state).await;
+            return hits;
+        }
         for (id, client) in state_w.users() {
             let g = client.read().await;
             // Only this server's own users are closed. Somebody on another
@@ -2159,7 +2194,11 @@ pub async fn enforce_ban(
                 continue;
             }
             let source = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
-            if ban.matches(&source, &g.host) {
+            // A ban placed now is judged the same way a ban already standing
+            // is judged when somebody arrives: an exemption comes first.
+            // Otherwise being vouched for would only protect whoever was not
+            // already connected when the ban was typed.
+            if ban.matches(&source, &g.host) && state_w.exemption_for(&source, &g.host).is_none() {
                 hits.push((id.clone(), g.nick_or_id().to_string()));
             }
         }
@@ -2204,11 +2243,13 @@ pub async fn apply_shuns(state: &Arc<RwLock<ServerState>>) {
             if g.server.is_some() {
                 continue;
             }
-            people.push((
-                id.clone(),
-                g.source().unwrap_or_else(|| g.nick_or_id().to_string()),
-                g.host.clone(),
-            ));
+            let source = g.source().unwrap_or_else(|| g.nick_or_id().to_string());
+            // Somebody vouched for is not silenced either: a shun is a ban,
+            // and an exemption is about all of them.
+            if state_r.exemption_for(&source, &g.host).is_some() {
+                continue;
+            }
+            people.push((id.clone(), source, g.host.clone()));
         }
         (shuns, people)
     };
@@ -2369,6 +2410,7 @@ fn ban_noun(kind: crate::persist::BanKind) -> &'static str {
         crate::persist::BanKind::Kline => "K-line",
         crate::persist::BanKind::Dline => "D-line",
         crate::persist::BanKind::Shun => "shun",
+        crate::persist::BanKind::Exempt => "exemption",
     }
 }
 
@@ -2446,13 +2488,21 @@ async fn place_ban(
             "NOTICE",
             vec![
                 nick.to_string(),
-                format!(
-                    "{} on {} added ({} connection(s) {})",
-                    ban_noun(ban.kind),
-                    ban.mask,
-                    hits.len(),
-                    if ban.kind.closes_the_connection() { "closed" } else { "silenced" }
-                ),
+                if ban.kind.is_exemption() {
+                    format!(
+                        "{} on {} added: the bans and the blocklist no longer apply there",
+                        ban_noun(ban.kind),
+                        ban.mask,
+                    )
+                } else {
+                    format!(
+                        "{} on {} added ({} connection(s) {})",
+                        ban_noun(ban.kind),
+                        ban.mask,
+                        hits.len(),
+                        if ban.kind.closes_the_connection() { "closed" } else { "silenced" }
+                    )
+                },
             ],
         )
         .with_prefix(&cfg.server.name),
@@ -2559,7 +2609,7 @@ pub async fn handle_undline(
         return Ok(());
     }
     let removed = match cfg.db {
-        Some(ref pool) => crate::persist::delete_server_ban(pool, &mask).await,
+        Some(ref pool) => crate::persist::delete_server_ban(pool, &mask, crate::persist::BanKind::Dline).await,
         None => false,
     };
     let known = {
@@ -2568,7 +2618,7 @@ pub async fn handle_undline(
         state_w
             .server_bans
             .retain(|b| !(b.kind == crate::persist::BanKind::Dline && b.mask == mask));
-        state_w.publish_dlines();
+        state_w.publish_door_bans();
         state_w.server_bans.len() != before
     };
     tracing::warn!(oper = %nick, %mask, removed, "D-line removed");
@@ -2639,13 +2689,15 @@ pub async fn handle_unkline(
 
     let mask = normalize_ban_mask(msg.params.first().map(|s| s.as_str()).unwrap_or(""));
     let removed = match cfg.db {
-        Some(ref pool) => crate::persist::delete_server_ban(pool, &mask).await,
+        Some(ref pool) => crate::persist::delete_server_ban(pool, &mask, crate::persist::BanKind::Kline).await,
         None => false,
     };
     {
         let mut state_w = state.write().await;
-        state_w.server_bans.retain(|b| b.mask != mask);
-        state_w.publish_dlines();
+        state_w
+            .server_bans
+            .retain(|b| !(b.kind == crate::persist::BanKind::Kline && b.mask == mask));
+        state_w.publish_door_bans();
     }
     tracing::warn!(oper = %nick, %mask, removed, "Server ban removed");
     crate::link::announce_unkline(cfg, &mask, crate::persist::BanKind::Kline).await;
@@ -4127,7 +4179,7 @@ pub async fn handle_unshun(
     };
     let mask = normalize_ban_mask(given);
     let removed = match cfg.db {
-        Some(ref pool) => crate::persist::delete_server_ban(pool, &mask).await,
+        Some(ref pool) => crate::persist::delete_server_ban(pool, &mask, crate::persist::BanKind::Shun).await,
         None => false,
     };
     let known = {
@@ -4163,6 +4215,146 @@ pub async fn handle_unshun(
                     format!("Shun on {mask} removed")
                 } else {
                     format!("No shun on {mask}")
+                },
+            ],
+        )
+        .with_prefix(&cfg.server.name),
+        label,
+    )
+    .await;
+    Ok(())
+}
+
+/// `ELINE [<duration>] <mask> :<reason>` — say who the bans do not apply to.
+///
+/// ```text
+/// ELINE *!*@10.0.0.0/8 :the office
+/// ELINE 30d *!*@vpn.example :a shared address people we know come through
+/// ```
+///
+/// Every blocklist eventually lists somebody who belongs here: a shared
+/// address, a VPN, an exit node. Without a way to say so, the only answers
+/// are to stop believing the list for everybody or to stop asking it — both
+/// of which give up more than the one address was worth. An exemption is how
+/// one address is vouched for while the rest of it stands.
+///
+/// It covers all of them: a D-line and the blocklist at the door, a K-line
+/// once there is a nick to judge, and a shun. An exemption is not a promise
+/// about behaviour, so an operator can still close a connection by hand with
+/// KILL — what it says is that no *standing rule* turns this address away.
+pub async fn handle_eline(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    const KIND: crate::persist::BanKind = crate::persist::BanKind::Exempt;
+    let Some((nick, _, _)) = may_ban(&state, &senders, client_id, cfg, label).await else {
+        return Ok(());
+    };
+    let Some((duration, mask, reason)) =
+        ban_arguments(&msg, "ELINE", &senders, client_id, cfg, label).await
+    else {
+        return Ok(());
+    };
+    let normalized = normalize_ban_mask(&mask);
+    if ban_too_broad(&normalized, KIND) {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "FAIL",
+                vec![
+                    "ELINE".into(),
+                    "MASK_TOO_BROAD".into(),
+                    normalized,
+                    "An exemption needs a mask that names somebody: at least four characters that are not wildcards".into(),
+                ],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    }
+    // No check against the operator's own address here, unlike the bans. That
+    // check is there to stop somebody shutting themselves out by accident, and
+    // an exemption cannot: vouching for the address you are sitting at is a
+    // reasonable thing to do and the usual first one.
+    let ban = new_ban(normalized, reason, &nick, duration, KIND);
+    place_ban(client_id, &nick, ban, &state, &senders, cfg, label).await;
+    Ok(())
+}
+
+/// `UNELINE <mask>` — stop vouching for an address.
+pub async fn handle_uneline(
+    client_id: &str,
+    msg: Message,
+    state: Arc<RwLock<ServerState>>,
+    senders: Senders,
+    cfg: &Config,
+    label: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((nick, _, _)) = may_ban(&state, &senders, client_id, cfg, label).await else {
+        return Ok(());
+    };
+    let Some(given) = msg.params.first() else {
+        reply_to_client(
+            &senders,
+            client_id,
+            Message::new(
+                "461",
+                vec![nick, "UNELINE".into(), "Not enough parameters".into()],
+            )
+            .with_prefix(&cfg.server.name),
+            label,
+        )
+        .await;
+        return Ok(());
+    };
+    let mask = normalize_ban_mask(given);
+    let removed = match cfg.db {
+        Some(ref pool) => crate::persist::delete_server_ban(pool, &mask, crate::persist::BanKind::Exempt).await,
+        None => false,
+    };
+    let known = {
+        let mut state_w = state.write().await;
+        let before = state_w.server_bans.len();
+        state_w
+            .server_bans
+            .retain(|b| !(b.kind.is_exemption() && b.mask == mask));
+        let gone = state_w.server_bans.len() != before;
+        // The door is told at once: until it is, it would keep waving through
+        // an address nothing vouches for any more.
+        state_w.publish_door_bans();
+        gone
+    };
+    // Whoever this was covering may be under a shun that was never applied to
+    // them while it stood.
+    apply_shuns(&state).await;
+    tracing::warn!(oper = %nick, %mask, removed, "Exemption removed");
+    crate::link::announce_unkline(cfg, &mask, crate::persist::BanKind::Exempt).await;
+    crate::commands::registration::notify_opers(
+        &state,
+        &senders,
+        &cfg.server.name,
+        'b',
+        &format!("{nick} removed the exemption on {mask}"),
+    )
+    .await;
+    reply_to_client(
+        &senders,
+        client_id,
+        Message::new(
+            "NOTICE",
+            vec![
+                nick,
+                if known || removed {
+                    format!("Exemption on {mask} removed")
+                } else {
+                    format!("No exemption on {mask}")
                 },
             ],
         )

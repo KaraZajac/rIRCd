@@ -111,7 +111,7 @@ pub async fn sweep(
         for mask in gone {
             tracing::info!(%mask, "Shun expired");
             if let Some(ref pool) = cfg.read().await.db {
-                crate::persist::delete_server_ban(pool, &mask).await;
+                crate::persist::delete_server_ban(pool, &mask, crate::persist::BanKind::Shun).await;
             }
         }
     }

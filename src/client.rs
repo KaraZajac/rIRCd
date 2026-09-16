@@ -48,6 +48,8 @@ pub struct ConnectionLimits {
     /// before a nick, a handshake, or a database has cost anything. Shared
     /// with the server state that keeps them current.
     dlines: Option<Arc<std::sync::RwLock<Vec<crate::persist::ServerBan>>>>,
+    /// Exemptions: who none of that applies to. Shared the same way.
+    exempts: Option<Arc<std::sync::RwLock<Vec<crate::persist::ServerBan>>>>,
     /// Kinds of client, in the order they are tried. See `ClassConfig`.
     classes: Arc<Vec<Arc<crate::config::ClassConfig>>>,
     /// How many connections each class is holding.
@@ -230,10 +232,37 @@ impl ConnectionLimits {
         self
     }
 
+    /// Give this view the exemptions, so the door can tell who is vouched for.
+    pub fn with_exempts(
+        mut self,
+        exempts: Arc<std::sync::RwLock<Vec<crate::persist::ServerBan>>>,
+    ) -> Self {
+        self.exempts = Some(exempts);
+        self
+    }
+
+    /// Whether an exemption vouches for this address.
+    ///
+    /// Asked at the door, where a connection has an address and nothing else,
+    /// so an exemption written as `*!*@host` or as a network is judged on the
+    /// address alone.
+    pub fn is_exempt(&self, host: &str) -> bool {
+        let Some(exempts) = self.exempts.as_ref() else {
+            return false;
+        };
+        let Ok(exempts) = exempts.read() else {
+            return false;
+        };
+        let now = chrono::Utc::now().timestamp();
+        exempts
+            .iter()
+            .any(|e| !e.is_expired(now) && e.matches("", host))
+    }
+
     /// The reason this address is D-lined, if it is. Nothing on a listener
     /// behind one address, where the address is everybody's.
     pub fn dline_for(&self, host: &str) -> Option<String> {
-        if self.shared.is_some() {
+        if self.shared.is_some() || self.is_exempt(host) {
             return None;
         }
         let dlines = self.dlines.as_ref()?.read().ok()?;
@@ -248,7 +277,10 @@ impl ConnectionLimits {
     /// does. Nothing on a listener behind one address: the address there is
     /// everybody's.
     pub async fn dnsbl_listing(&self, host: &str) -> Option<String> {
-        if self.shared.is_some() {
+        // An exempt address is not asked about. Every blocklist eventually
+        // lists somebody who belongs here, and this is the answer to that
+        // which does not mean disbelieving the list for everybody else.
+        if self.shared.is_some() || self.is_exempt(host) {
             return None;
         }
         self.dnsbl.as_ref()?.listing(host).await

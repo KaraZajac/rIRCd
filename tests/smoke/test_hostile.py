@@ -1101,6 +1101,102 @@ if sh.find(" 381 "):
     sh.read(1.0)
     check("UNSHUN gives them their voice back", bool(sh.find("hello again", lines=sh.since(smark))), sh.since(smark)[-2:])
     victim.close()
+
+    section("exemptions: who the bans do not apply to")
+
+    # Every blocklist eventually lists somebody who belongs here. An exemption
+    # is how one address is vouched for without giving up the rest of it, so
+    # what matters is that it beats each kind of ban in turn.
+    emark = sh.mark()
+    sh.send("ELINE *!*@* :everybody")
+    sh.read(1.2)
+    check("an exemption for everybody is refused",
+          bool(sh.find("FAIL ELINE MASK_TOO_BROAD", lines=sh.since(emark))), sh.since(emark)[-3:])
+
+    # Unlike a ban, one that covers the operator setting it is fine: vouching
+    # for the address you are sitting at is the usual first thing to do.
+    emark = sh.mark()
+    sh.send(f"ELINE sh{SUF}!*@* :myself")
+    sh.read(1.2)
+    check("but one covering the operator who set it is allowed",
+          bool(sh.find("exemption on", lines=sh.since(emark)))
+          and not sh.find("MATCHES_YOURSELF", lines=sh.since(emark)),
+          sh.since(emark)[-3:])
+    sh.send(f"UNELINE sh{SUF}!*@*")
+    sh.read(0.8)
+
+    # A shun first: exempt, then shunned, and still heard.
+    spared = Client(f"spa{SUF}")
+    spared.join(ROOM)
+    sh.send(f"ELINE spa{SUF}!*@* :vouched for")
+    sh.read(1.0)
+    sh.send(f"SHUN spa{SUF}!*@* :quiet please")
+    sh.read(1.2)
+    smark = sh.mark()
+    spared.send(f"PRIVMSG {ROOM} :I am still here")
+    spared.read(1.0)
+    sh.read(1.0)
+    check("a shun does not silence somebody an exemption vouches for",
+          bool(sh.find("I am still here", lines=sh.since(smark))), sh.since(smark)[-3:])
+
+    # Then a K-line, which would close them.
+    sh.send(f"KLINE spa{SUF}!*@* :go away")
+    sh.read(1.5)
+    spared.send(f"PING alive{SUF}")
+    check("and a K-line does not close them either",
+          bool(spared.wait_for(f"alive{SUF}", seconds=5)), spared.lines[-3:])
+
+    emark = sh.mark()
+    sh.send("STATS e")
+    sh.wait_for(" 219 ", seconds=5)
+    check("STATS e lists the exemption",
+          bool(sh.find(" 216 ", "E", f"spa{SUF}", lines=sh.since(emark))), sh.since(emark)[-3:])
+
+    # And once it is taken away the bans that were always there apply.
+    sh.send(f"UNELINE spa{SUF}!*@*")
+    sh.read(1.0)
+    sh.send(f"KLINE spa{SUF}!*@* :go away for real")
+    spared.read(2.0)
+    check("UNELINE lets the ban take hold", spared.closed or bool(spared.find("Closing link")),
+          spared.lines[-3:])
+    spared.close()
+    sh.send(f"UNKLINE spa{SUF}!*@*")
+    sh.read(0.8)
+    sh.send(f"UNSHUN spa{SUF}!*@*")
+    sh.read(0.8)
+
+    # The door is the case that matters most: a D-line is judged on the
+    # address before there is a nick, which is where a blocklist answer is
+    # judged too. 127.0.0.9 is nobody else's address in these suites.
+    sh.send("DLINE 127.0.0.9 :the door is shut")
+    sh.read(1.2)
+    turned_away = None
+    try:
+        turned_away = Client(f"dor{SUF}", source="127.0.0.9", timeout=6)
+    except Exception:
+        pass
+    check("a D-lined address is turned away at the door",
+          turned_away is None or turned_away.closed or bool(turned_away.find("banned")),
+          turned_away.lines[-2:] if turned_away else "refused the connection")
+    if turned_away:
+        turned_away.close()
+
+    sh.send("ELINE *!*@127.0.0.9 :vouched for at the door")
+    sh.read(1.5)
+    let_in = None
+    try:
+        let_in = Client(f"dor2{SUF}", source="127.0.0.9", timeout=6)
+    except Exception as e:
+        let_in = None
+    check("and an exemption gets it in even so",
+          let_in is not None and bool(let_in.find(" 001 ")),
+          let_in.lines[-3:] if let_in else "still refused")
+    if let_in:
+        let_in.close()
+    sh.send("UNELINE *!*@127.0.0.9")
+    sh.read(0.8)
+    sh.send("UNDLINE 127.0.0.9")
+    sh.read(0.8)
 sh.close()
 
 section("still standing")

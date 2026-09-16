@@ -933,9 +933,12 @@ pub struct ServerState {
     /// this once per message, and the usual answer is that the set is empty.
     pub shunned: HashSet<String>,
     /// The D-lines among them, as the listeners see them: judged the moment a
-    /// connection arrives, with no lock on this state. `publish_dlines` keeps
+    /// connection arrives, with no lock on this state. `publish_door_bans` keeps
     /// it current.
     pub dlines: Arc<std::sync::RwLock<Vec<crate::persist::ServerBan>>>,
+    /// The exemptions, shared the same way and for the same reason: the door
+    /// has to know who is vouched for before it can turn anybody away.
+    pub exempts: Arc<std::sync::RwLock<Vec<crate::persist::ServerBan>>>,
     /// `WHOIS` answers this server has asked another one for and not yet had.
     pub pending_whois: PendingWhois,
     /// What each address has spent failing to log in. Checking a password is
@@ -1312,8 +1315,12 @@ impl ServerState {
             .or_insert_with(|| PendingConnection::new(host.to_string()))
     }
 
-    /// The ban matching this user, if any. Expired entries are ignored.
+    /// The ban matching this user, if any. Expired entries are ignored, and so
+    /// is every ban when an exemption vouches for them.
     pub fn matching_ban(&self, source: &str, ip: &str) -> Option<&crate::persist::ServerBan> {
+        if self.exemption_for(source, ip).is_some() {
+            return None;
+        }
         let now = Utc::now().timestamp();
         self.server_bans.iter().find(|ban| {
             // A shun is not a reason to turn somebody away — it is the reason
@@ -1368,20 +1375,39 @@ impl ServerState {
                 .is_some_and(|owner| owner.eq_ignore_ascii_case(account))
     }
 
-    /// Copy the D-lines out to where a connection is judged the moment it
-    /// arrives — the listeners, which have no lock on this state and must
-    /// not wait for one. Called after anything changes `server_bans`.
-    pub fn publish_dlines(&self) {
+    /// Copy what the door needs out to where a connection is judged the moment
+    /// it arrives — the listeners, which have no lock on this state and must
+    /// not wait for one. That is the D-lines, which turn an address away, and
+    /// the exemptions, which stop anything turning it away. Called after
+    /// anything changes `server_bans`.
+    pub fn publish_door_bans(&self) {
         let now = Utc::now().timestamp();
-        let dlines: Vec<crate::persist::ServerBan> = self
-            .server_bans
-            .iter()
-            .filter(|b| b.kind == crate::persist::BanKind::Dline && !b.is_expired(now))
-            .cloned()
-            .collect();
+        let of_kind = |kind| -> Vec<crate::persist::ServerBan> {
+            self.server_bans
+                .iter()
+                .filter(|b| b.kind == kind && !b.is_expired(now))
+                .cloned()
+                .collect()
+        };
         if let Ok(mut shared) = self.dlines.write() {
-            *shared = dlines;
+            *shared = of_kind(crate::persist::BanKind::Dline);
         }
+        if let Ok(mut shared) = self.exempts.write() {
+            *shared = of_kind(crate::persist::BanKind::Exempt);
+        }
+    }
+
+    /// The exemption covering somebody, if one does. `source` may be empty
+    /// where there is not yet a nick to go on.
+    pub fn exemption_for(
+        &self,
+        source: &str,
+        ip: &str,
+    ) -> Option<&crate::persist::ServerBan> {
+        let now = Utc::now().timestamp();
+        self.server_bans.iter().find(|b| {
+            b.kind.is_exemption() && !b.is_expired(now) && b.matches(source, ip)
+        })
     }
 
     pub fn record_msgid(&mut self, msgid: String, target: String, sender_id: String) {

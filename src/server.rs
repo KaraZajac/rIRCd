@@ -361,7 +361,7 @@ pub async fn run(
         state_w.read_markers = markers;
         state_w.metadata = meta;
         state_w.server_bans = bans;
-        state_w.publish_dlines();
+        state_w.publish_door_bans();
         state_w.grouped_nicks = grouped;
         state_w.reservations = reservations;
         for (pattern, targets, action, duration, set_by, set_at) in filters {
@@ -527,6 +527,7 @@ pub async fn run(
                     .map(|d| Arc::new(crate::dnsbl::Dnsbl::from_config(d))),
             )
             .with_dlines(state.read().await.dlines.clone())
+            .with_exempts(state.read().await.exempts.clone())
             .with_classes(&cfg.classes);
     state.write().await.classes = cfg.classes.clone();
     for class in &cfg.classes {

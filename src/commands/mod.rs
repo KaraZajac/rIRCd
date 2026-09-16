@@ -1125,6 +1125,12 @@ pub async fn handle_message(
         "UNSHUN" => {
             server_cmds::handle_unshun(&client_id, msg, state, senders, cfg, label.as_deref()).await
         }
+        "ELINE" => {
+            server_cmds::handle_eline(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
+        "UNELINE" => {
+            server_cmds::handle_uneline(&client_id, msg, state, senders, cfg, label.as_deref()).await
+        }
         "UNDLINE" => {
             server_cmds::handle_undline(&client_id, msg, state, senders, cfg, label.as_deref())
                 .await

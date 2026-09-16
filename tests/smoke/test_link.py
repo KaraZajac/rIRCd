@@ -582,6 +582,43 @@ if banner.find(" 381 "):
     check("and they are welcome again", bool(back.find(" 001 ")), back.lines[-2:])
     back.close()
     target.close()
+
+    # An exemption is a fact about the network the same way, and it has to
+    # arrive before the ban means anything different on the far side.
+    banner.send(f"ELINE exm{RUN}!*@* :vouched for network-wide")
+    banner.read(1.5)
+    carried = eventually(
+        lambda: side_db("b", f"SELECT kind FROM server_bans WHERE mask LIKE 'exm{RUN}%'") == "E",
+        seconds=6,
+    )
+    check("an exemption set on A reaches B", bool(carried),
+          side_db("b", "SELECT mask, kind FROM server_bans"))
+
+    banner.send(f"KLINE exm{RUN}!*@* :not welcome anywhere")
+    banner.read(1.5)
+    vouched = Client(f"exm{RUN}", port=B_PORT)
+    vouched.read(1.5)
+    check("and B lets in somebody the ban would otherwise have kept out",
+          bool(vouched.find(" 001 ")) and not vouched.find("banned"), vouched.lines[-3:])
+    vouched.close()
+
+    # Lifting the exemption must not lift the K-line standing on the same
+    # mask: a mask and a kind together are what name an entry.
+    banner.send(f"UNELINE exm{RUN}!*@*")
+    banner.read(1.5)
+    kept = eventually(
+        lambda: side_db("b", f"SELECT kind FROM server_bans WHERE mask LIKE 'exm{RUN}%'") == "K",
+        seconds=6,
+    )
+    check("lifting it on A leaves the ban on the same mask standing on B",
+          bool(kept), side_db("b", "SELECT mask, kind FROM server_bans"))
+    shut_out = Client(f"exm{RUN}", port=B_PORT)
+    shut_out.read(1.5)
+    check("so the ban keeps them out again",
+          bool(shut_out.find("banned")) or not shut_out.find(" 001 "), shut_out.lines[-2:])
+    shut_out.close()
+    banner.send(f"UNKLINE exm{RUN}!*@*")
+    banner.read(1.0)
 banner.close()
 
 section("a mode lock and a timed ban are the same on both servers")

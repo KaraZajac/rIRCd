@@ -1,6 +1,6 @@
 [package]
 name = "rircd"
-version = "1.24.1"
+version = "1.25.0"
 edition = "2021"
 description = "Bleeding-edge IRC server in Rust"
 license = "BSD-3-Clause"

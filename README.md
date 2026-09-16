@@ -746,6 +746,41 @@ server when set, listed by `STATS s`, lifted by `UNSHUN`, and expiring on their
 own when given a duration. A mask made only of wildcards is refused, and so is
 one covering the operator setting it.
 
+### Exemptions
+
+`ELINE [<seconds>] <mask> :<reason>` says who none of that applies to.
+
+Every blocklist eventually lists somebody who belongs here — a shared address,
+a VPN, an exit node — and without a way to say so the only answers are to stop
+believing the list for everybody or to stop asking it. Both give up more than
+the one address was worth. An exemption is how one address is vouched for while
+the rest of it stands.
+
+```
+ELINE *!*@10.0.0.0/8 :the office
+ELINE 30d *!*@vpn.example :people we know come through here
+```
+
+It covers every kind of refusal this server makes on its own account: a D-line
+and the blocklist at the door, and a K-line or a shun once there is a nick to
+judge. It is judged twice — on the address alone before there is a nick, and on
+`nick!user@host` after — so being vouched for does not stop when somebody says
+who they are.
+
+It is not a promise about behaviour. `KILL` still works, and so does a channel
+ban: an exemption is about the standing rules, not about an operator's hand.
+
+Like the bans it lives in the database, goes to every server when set, expires
+on its own when given a duration, and is refused if the mask is nothing but
+wildcards — that one would vouch for the network and undo every ban at once.
+`STATS e` reads them back and `UNELINE` stops vouching. Unlike a ban, a mask
+covering the operator setting it is allowed: that check exists to stop somebody
+shutting themselves out by accident, and an exemption cannot.
+
+A mask and a kind together are what name an entry, so a K-line, a shun and an
+exemption can each stand against the same mask and lifting one leaves the
+others.
+
 ### Spam filters
 
 `SPAMFILTER` is a pattern, what it is looked for in, and what happens when it
@@ -1080,12 +1115,14 @@ In addition to IRCv3 features, rIRCd implements the standard IRC command set:
 | `RESV` | — | Oper-only (`ban`): `RESV [<seconds>] <pattern> :<reason>` — a name this network keeps for itself. `#`-patterns are channels, anything else nicks |
 | `UNRESV` | — | Oper-only (`ban`): give a reserved name back |
 | `UNSHUN` | — | Oper-only (`ban`): lift a shun |
+| `ELINE` | — | Oper-only (`ban`): `ELINE [<seconds>] <mask> :<reason>` — say who the bans and the blocklist do not apply to. See **Exemptions** |
+| `UNELINE` | — | Oper-only (`ban`): stop vouching for a mask |
 | `GROUP` | — | Reserve the nick you are using for your account; `GROUP -<nick>` releases one, `GROUP *` lists them |
 | `SETEMAIL` | — | `SETEMAIL <current password> <new address>` then `SETEMAIL <code>` — move your account to another address. See **Looking after your own account** |
 | `ACCOUNTINFO` | — | `ACCOUNTINFO [<account>]` — what the server is holding about an account. Yours without asking; somebody else's needs the `ban` privilege. `ACCINFO` is the same command |
 | `NOEXPIRE` | — | Oper-only (`channels`): keep an account or a channel out of `[expiry]`'s reach |
 | `MAP` | — | The network as a tree with a user count per server (015/017) |
-| `STATS` | — | `STATS u` uptime and `STATS m` command counts are for anybody; `o` (operator blocks), `k` (K-lines), `d` (D-lines), `s` (shuns), `y` (connection classes — 218), `l` (what each connection has carried: send queue, messages and bytes each way, how long it has been open — 211) and `t` (what this server has been doing — 249) are for operators |
+| `STATS` | — | `STATS u` uptime and `STATS m` command counts are for anybody; `o` (operator blocks), `k` (K-lines), `d` (D-lines), `s` (shuns), `e` (exemptions), `y` (connection classes — 218), `l` (what each connection has carried: send queue, messages and bytes each way, how long it has been open — 211) and `t` (what this server has been doing — 249) are for operators |
 | `TRACE` | — | Oper-only: `TRACE [<nick>]` — the connections this server is holding (204/205) and the servers it is linked to (206), ending with 262. The class is how each one arrived: `plain`, `tls` or `websocket` |
 | `SAJOIN` | — | Oper-only (`channels`): `SAJOIN <nick> <#channel>` — put somebody in a channel. The server invites them, so `+b`, `+i`, `+k`, `+l` and `+j` open; `+O`, `+Z` and `+R` still hold, because a forced join that broke a channel's promise would be the server lying on the operator's behalf. Somebody on another server is joined by that server at this one's request |
 | `SAPART` | — | Oper-only (`channels`): `SAPART <nick> <#channel> [:<reason>]` — take somebody out of a channel; an ordinary PART, with the reason given |
