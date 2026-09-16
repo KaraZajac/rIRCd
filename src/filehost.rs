@@ -42,6 +42,69 @@ pub struct FilehostState {
     /// Addresses the operator says are their own proxies. Only a request
     /// arriving from one of these may say whose it really is.
     pub trusted_proxies: Arc<Vec<String>>,
+    /// The other names this file host answers to, and the base URL to hand
+    /// back to somebody who came in by each: `(host, public_url)`.
+    ///
+    /// Behind a proxy every door arrives on the same socket, so the listener
+    /// cannot tell them apart the way the IRC side can. What does tell them
+    /// apart is the name the client dialled, which the proxy passes on in
+    /// `Host`.
+    pub alternates: Arc<Vec<(String, String)>>,
+}
+
+/// The host part of a URL, without any port.
+pub fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let host = rest.split('/').next().unwrap_or(rest);
+    // A bracketed address holds colons of its own; the port, if there is one,
+    // comes after the closing bracket.
+    if let Some(end) = host.find(']') {
+        return host[..=end].to_ascii_lowercase();
+    }
+    match host.rsplit_once(':') {
+        Some((before, _)) if !before.contains(':') => before.to_ascii_lowercase(),
+        _ => host.to_ascii_lowercase(),
+    }
+}
+
+/// Which base URL a request asking for `host` should be answered with.
+///
+/// A link is text once it is pasted, so the one given to somebody who came in
+/// through the onion service has to be an onion link — otherwise they have
+/// uploaded over Tor and been handed a clearnet address to share, which is the
+/// thing the whole arrangement was for.
+///
+/// `Host` is a header and anybody may send one, but it is not used as a URL:
+/// it only chooses among the URLs the operator has already written down. The
+/// worst a made-up one can do is pick another of this server's own doors,
+/// which is what a client is supposed to be able to do.
+fn pick_base_url<'a>(primary: &'a str, alternates: &'a [(String, String)], host: Option<&str>) -> &'a str {
+    let Some(host) = host else {
+        return primary;
+    };
+    let asked = host_of(host);
+    alternates
+        .iter()
+        .find(|(h, _)| *h == asked)
+        .map(|(_, url)| url.as_str())
+        .unwrap_or(primary)
+}
+
+impl FilehostState {
+    /// Which base URL to hand back to a request that arrived asking for `host`.
+    ///
+    /// A link is text once it is pasted, so the one given to somebody who came
+    /// in through the onion service has to be an onion link — otherwise they
+    /// have uploaded over Tor and been handed a clearnet address to share,
+    /// which is the thing the whole arrangement was for.
+    ///
+    /// `Host` is a header and anybody may send one, but it is not used as a
+    /// URL: it only chooses among the URLs the operator has already written
+    /// down. The worst a made-up one can do is pick another of this server's
+    /// own doors, which is what a client is supposed to be able to do.
+    pub fn base_url_for(&self, host: Option<&str>) -> &str {
+        pick_base_url(&self.public_url, &self.alternates, host)
+    }
 }
 
 /// Where a request came from, however its listener recorded it.
@@ -398,11 +461,9 @@ async fn upload_file(
         return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to store file").into_response();
     }
 
-    let url = format!(
-        "{}/{}",
-        fh_state.public_url.trim_end_matches('/'),
-        stored_name
-    );
+    // The door they came in by, not the one named first in the configuration.
+    let base = fh_state.base_url_for(headers.get(header::HOST).and_then(|v| v.to_str().ok()));
+    let url = format!("{}/{}", base.trim_end_matches('/'), stored_name);
     info!(
         file = %stored_name,
         size = body.len(),
@@ -578,6 +639,48 @@ pub fn extract_url_path(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A link is text once it is pasted. Somebody who uploaded over Tor and is
+    /// handed a clearnet address to share has had the whole arrangement undone
+    /// at the last step.
+    #[test]
+    fn the_link_is_for_the_door_it_came_in_by() {
+        let primary = "https://irc.example.org/uploads";
+        let alts = vec![("xyz.onion".to_string(), "http://xyz.onion/uploads".to_string())];
+        let pick = |h: Option<&str>| pick_base_url(primary, &alts, h);
+
+        assert_eq!(pick(None), primary, "no Host at all");
+        assert_eq!(pick(Some("irc.example.org")), primary);
+        assert_eq!(
+            pick(Some("xyz.onion")),
+            "http://xyz.onion/uploads",
+            "the onion gets an onion link"
+        );
+        assert_eq!(
+            pick(Some("xyz.onion:80")),
+            "http://xyz.onion/uploads",
+            "a port on the Host header is not part of the name"
+        );
+        assert_eq!(
+            pick(Some("XYZ.ONION")),
+            "http://xyz.onion/uploads",
+            "a host name is a host name however it is capitalised"
+        );
+        // A name nobody configured picks nothing: the header chooses among the
+        // operator's own doors, it does not invent one.
+        assert_eq!(pick(Some("evil.example")), primary);
+        assert_eq!(pick(Some("")), primary);
+    }
+
+    #[test]
+    fn a_host_is_read_out_of_a_url_without_its_port() {
+        assert_eq!(host_of("https://irc.example.org/uploads"), "irc.example.org");
+        assert_eq!(host_of("http://xyz.onion:8080/uploads"), "xyz.onion");
+        assert_eq!(host_of("https://[::1]:8080/uploads"), "[::1]");
+        assert_eq!(host_of("https://[::1]/uploads"), "[::1]");
+        assert_eq!(host_of("irc.example.org"), "irc.example.org");
+    }
+
     use super::*;
 
     #[test]

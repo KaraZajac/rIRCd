@@ -107,6 +107,13 @@ check("and the path is the same, because the files are",
       by_name.rsplit("/", 1)[-1] == by_other_door.rsplit("/", 1)[-1],
       (by_name, by_other_door))
 
+# And the link handed back has to be for that door too. Behind a proxy every
+# door arrives on the same socket, so the file host cannot tell them apart the
+# way the IRC side can — what tells them apart is the name the client dialled,
+# which the proxy passes on in Host. A client that uploaded over Tor and was
+# handed a clearnet link has had the whole arrangement undone at the last step.
+ONION_HOST = "onion.invalid"
+
 section("who may put one there")
 
 owner = f"own{RUN}"
@@ -243,6 +250,33 @@ status, _, _ = request("POST", PREFIX, body=b"g", auth=(bystander, "wrong-again"
                        source=NOT_A_PROXY, headers={"X-Forwarded-For": BEHIND})
 check("a forwarded address from somebody who is not a proxy counts for nothing",
       status == 403, status)
+
+section("the link points at the door the file came in by")
+
+doorman = f"door{RUN}"
+make_account(doorman)
+status, headers, _ = request("POST", PREFIX, body=b"through the front door",
+                             auth=(doorman, PASSWORD))
+front = headers.get("location", "")
+check("an upload with no Host of its own gets the usual address",
+      front.startswith("https://127.0.0.1"), front)
+
+status, headers, _ = request("POST", PREFIX, body=b"through the other door",
+                             auth=(doorman, PASSWORD),
+                             headers={"Host": f"{ONION_HOST}:{FH_PORT}"})
+other = headers.get("location", "")
+check("one that came in by the other door gets that door's address",
+      other.startswith(f"https://{ONION_HOST}"), other)
+check("which is a different link to the same file host",
+      front.rsplit("/", 1)[0] != other.rsplit("/", 1)[0], (front, other))
+
+# The header chooses among the operator's doors; it does not invent one.
+status, headers, _ = request("POST", PREFIX, body=b"through a door nobody built",
+                             auth=(doorman, PASSWORD),
+                             headers={"Host": "evil.example"})
+forged = headers.get("location", "")
+check("a Host nobody configured gets the usual address, not its own",
+      forged.startswith("https://127.0.0.1"), forged)
 
 section("how long a shared file is kept")
 

@@ -441,6 +441,18 @@ pub async fn run(
             db_pool,
             state: state.clone(),
             trusted_proxies: Arc::new(cfg.server.trusted_proxies.clone()),
+            alternates: Arc::new(
+                fh_cfg
+                    .alternates
+                    .iter()
+                    .map(|a| {
+                        (
+                            crate::filehost::host_of(&a.public_url),
+                            a.public_url.clone(),
+                        )
+                    })
+                    .collect(),
+            ),
         });
 
         let app = crate::filehost::router(fh_state);

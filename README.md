@@ -375,15 +375,25 @@ The `FILEHOST` token in ISUPPORT is then chosen per client, by the listener it
 arrived on. One upload directory, one set of routes, two names for it: the onion
 service points at the same file host, so the files are the same either way.
 
+The link handed back matches too. Behind a proxy every door arrives on the same
+socket, so the file host cannot tell them apart the way the IRC side can — what
+tells them apart is the name the client dialled, which the proxy passes on in
+`Host`. That header is not used as a URL: it only chooses among the ones written
+here, so the worst a made-up one can do is pick another of your own doors. Point
+the proxy at the file host with the client's `Host` preserved, which is the
+default in Caddy and nginx's `proxy_set_header Host $host`.
+
 Keep the **path** the same in both (`/uploads` here) and change only the scheme
 and host. Routes are mounted under the path the primary `public_url` names, so
 an alternate with a different one would hand out links that answer nowhere — the
 server says so at startup rather than leaving you to find out.
 
 What this does not do is rewrite links people paste in chat. A link is text once
-it is sent, so a file shared by a Tor user is an onion link to everybody. The
-server chooses where each client is told to *put* a file; it does not edit what
-anybody says.
+it is sent, so a file shared by a Tor user is an onion link to everybody, and one
+shared by a clearnet user is a clearnet link — including to the people on the
+onion service, who will have to decide for themselves whether to follow it. The
+server chooses which door each client is told to use, and gives them a link on
+that door; it does not edit what anybody says.
 
 Behind a reverse proxy, set `[server] trusted_proxies` to the proxy's address.
 Without it every request looks like it came from the proxy, so everybody who
