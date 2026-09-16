@@ -2179,19 +2179,23 @@ pub async fn handle_mode_as(
                     'b' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
-                                if let Some(Err(why)) = crate::timed_bans::parse_timed(mask) {
+                                // `~t:` was always checked here; everything
+                                // else fell through to being matched as a plain
+                                // glob, so a mistyped type was a ban on nobody
+                                // that looked exactly like a ban on somebody.
+                                if let Err(why) = crate::channel::check_mask(mask) {
                                     reply_to_client(
                                         &senders,
                                         client_id,
                                         Message::new(
                                             "696",
-                                            vec![nick.clone(), target.into(), "b".into(), mask.clone(), why.into()],
+                                            vec![nick.clone(), target.into(), c.to_string(), mask.clone(), why],
                                         )
                                         .with_prefix(&cfg.server.name),
                                         label,
                                     )
                                     .await;
-                                    rejected_modes.push(('b', plus));
+                                    rejected_modes.push((c, plus));
                                     param_idx += 1;
                                     continue;
                                 }
@@ -2269,13 +2273,13 @@ pub async fn handle_mode_as(
                     'q' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
-                                if let Some(Err(why)) = crate::timed_bans::parse_timed(mask) {
+                                if let Err(why) = crate::channel::check_mask(mask) {
                                     reply_to_client(
                                         &senders,
                                         client_id,
                                         Message::new(
                                             "696",
-                                            vec![nick.clone(), target.into(), "q".into(), mask.clone(), why.into()],
+                                            vec![nick.clone(), target.into(), "q".into(), mask.clone(), why],
                                         )
                                         .with_prefix(&cfg.server.name),
                                         label,
@@ -2507,6 +2511,31 @@ pub async fn handle_mode_as(
                     'e' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
+                                // An exception that matches nobody is worse
+                                // than a ban that does: somebody is believed
+                                // to be let through and is not.
+                                if let Err(why) = crate::channel::check_mask(mask) {
+                                    reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "696",
+                                            vec![
+                                                nick.clone(),
+                                                target.into(),
+                                                "e".into(),
+                                                mask.clone(),
+                                                why,
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
+                                    rejected_modes.push(('e', plus));
+                                    param_idx += 1;
+                                    continue;
+                                }
                                 if ch.ban_exceptions.len() >= crate::config::MAXLIST {
                                     reply_to_client(
                                         &senders,
@@ -2588,6 +2617,31 @@ pub async fn handle_mode_as(
                     'I' => {
                         if let Some(mask) = msg.params.get(param_idx) {
                             if plus {
+                                // An exception that matches nobody is worse
+                                // than a ban that does: somebody is believed
+                                // to be let through and is not.
+                                if let Err(why) = crate::channel::check_mask(mask) {
+                                    reply_to_client(
+                                        &senders,
+                                        client_id,
+                                        Message::new(
+                                            "696",
+                                            vec![
+                                                nick.clone(),
+                                                target.into(),
+                                                "I".into(),
+                                                mask.clone(),
+                                                why,
+                                            ],
+                                        )
+                                        .with_prefix(&cfg.server.name),
+                                        label,
+                                    )
+                                    .await;
+                                    rejected_modes.push(('I', plus));
+                                    param_idx += 1;
+                                    continue;
+                                }
                                 if ch.invite_exceptions.len() >= crate::config::MAXLIST {
                                     reply_to_client(
                                         &senders,

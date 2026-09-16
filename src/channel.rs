@@ -126,6 +126,74 @@ impl ChannelMemberModeSet {
 
 
 #[cfg(test)]
+mod mask_tests {
+    use super::*;
+
+    /// A type this server does not have falls through to being matched as a
+    /// glob, so it is a ban on nobody that looks exactly like a ban on
+    /// somebody. It is refused now, with the list of types that do exist.
+    #[test]
+    fn a_ban_type_this_server_does_not_have_is_refused() {
+        let err = check_mask("~Z:spammer").unwrap_err();
+        assert!(err.contains("~Z"), "{err}");
+        assert!(err.contains(EXTBAN_TYPES), "it says which types there are: {err}");
+        assert!(check_mask("~").is_err(), "a bare tilde names no type");
+    }
+
+    /// Every type that takes an argument needs one, and `~O` takes none.
+    #[test]
+    fn an_extended_ban_needs_what_its_type_needs() {
+        for bad in ["~a:", "~r:", "~S:", "~j:", "~m:", "~n:", "~a", "~jfoo"] {
+            assert!(check_mask(bad).is_err(), "{bad} should be refused");
+        }
+        assert!(check_mask("~O").is_ok(), "~O takes nothing");
+        assert!(check_mask("~O:something").is_err(), "and nothing is what it takes");
+        assert!(
+            check_mask("~j:notachannel").is_err(),
+            "a channel name starts with #, and one that does not names no channel"
+        );
+        assert!(check_mask("~j:#raiders").is_ok());
+    }
+
+    /// The good ones stay good, plain masks are never wrong, and the prefixes
+    /// still stack.
+    #[test]
+    fn the_masks_people_actually_write_are_accepted() {
+        for good in [
+            "nick!user@host",
+            "*!*@*",
+            "~a:someaccount",
+            "~r:*viagra*",
+            "~S:*",
+            "~O",
+            "~m:~r:*spam*",
+            "~n:nick!*@*",
+            "~t:1h:~j:#raiders",
+            "~t:30m:*!*@bad.example",
+        ] {
+            assert!(check_mask(good).is_ok(), "{good} should be accepted: {:?}", check_mask(good));
+        }
+    }
+
+    /// They stack, but not without end.
+    #[test]
+    fn a_mask_wrapped_in_itself_for_ever_is_refused() {
+        let deep = "~m:".repeat(50) + "nick!*@*";
+        assert!(check_mask(&deep).is_err());
+        assert!(check_mask("~m:~m:~m:nick!*@*").is_ok(), "three deep is still reasonable");
+    }
+
+    /// A bad duration was always refused; it still is, and now so is a bad
+    /// mask underneath a good duration.
+    #[test]
+    fn a_timed_mask_is_checked_through_to_what_it_wraps() {
+        assert!(check_mask("~t:").is_err());
+        assert!(check_mask("~t:notatime:nick!*@*").is_err());
+        assert!(check_mask("~t:1h:~Z:nobody").is_err(), "the type under the clock counts too");
+    }
+}
+
+#[cfg(test)]
 mod prefix_tests {
     use super::*;
 
@@ -288,6 +356,69 @@ pub fn mode_takes_param(letter: char, plus: bool) -> bool {
         || CHANMODES_LIST.contains(letter)
         || CHANMODES_PARAM_ALWAYS.contains(letter)
         || (CHANMODES_PARAM_SET.contains(letter) && plus)
+}
+
+/// What is wrong with this mask, if anything.
+///
+/// A plain mask is a glob over `nick!user@host` and cannot be wrong. An
+/// extended one names a type, and a type this server does not have falls
+/// through to being matched as a glob — so `~Z:spammer` is a ban on somebody
+/// literally called that, which is nobody. The operator who set it believes
+/// the room is guarded and it is not, and nothing ever tells them otherwise.
+/// `~t:` was already checked this way; the rest were not.
+pub fn check_mask(mask: &str) -> Result<(), String> {
+    check_mask_inner(mask, 0)
+}
+
+fn check_mask_inner(mask: &str, depth: usize) -> Result<(), String> {
+    // They stack, but not without end: a mask wrapped in itself a thousand
+    // times is a mask nobody meant and a stack nobody wants to walk.
+    if depth > 4 {
+        return Err("too many extended bans wrapped in one another".into());
+    }
+    let mask = match crate::timed_bans::parse_timed(mask) {
+        Some(Ok((_, inner))) => inner,
+        Some(Err(why)) => return Err(why.to_string()),
+        None => mask,
+    };
+    let Some(rest) = mask.strip_prefix('~') else {
+        return Ok(());
+    };
+    let mut chars = rest.chars();
+    let Some(letter) = chars.next() else {
+        return Err(format!(
+            "an extended ban needs a type after the ~: this server has {EXTBAN_TYPES}"
+        ));
+    };
+    if !EXTBAN_TYPES.contains(letter) {
+        return Err(format!(
+            "~{letter} is not a ban type this server has: it has {EXTBAN_TYPES}"
+        ));
+    }
+    let after = chars.as_str();
+    // `~O` asks whether somebody is an operator and takes nothing else.
+    if letter == 'O' {
+        return if after.is_empty() {
+            Ok(())
+        } else {
+            Err("~O takes nothing after it".into())
+        };
+    }
+    let Some(inner) = after.strip_prefix(':') else {
+        return Err(format!("~{letter} needs a colon and something after it"));
+    };
+    if inner.is_empty() {
+        return Err(format!("~{letter} needs something after the colon"));
+    }
+    // `~j:` names a channel, and a name that is not one names no channel.
+    if letter == 'j' && !inner.starts_with('#') {
+        return Err("~j: needs a channel name, which starts with #".into());
+    }
+    // `~m:` and `~n:` wrap another mask rather than taking an argument.
+    if matches!(letter, 'm' | 'n') {
+        return check_mask_inner(inner, depth + 1);
+    }
+    Ok(())
 }
 
 /// Everything a channel's masks can be asked about.

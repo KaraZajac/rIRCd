@@ -1479,6 +1479,47 @@ check("and stops them talking", bool(loud.find(" 404 ", lines=loud.since(lmark))
 loud.close()
 xb.close()
 
+section("a ban that names nothing is refused rather than kept")
+
+# A type this server does not have used to fall through to being matched as a
+# plain glob: a ban on somebody literally called `~Z:spammer`, which is nobody.
+# It looked exactly like a ban that worked.
+vb = Client(f"vb{RUN_ID}")
+VBC = f"#vb{RUN_ID}"
+vb.join(VBC)
+vb.read(1.0)
+
+def mask_verdict(mode, mask):
+    m = vb.mark()
+    vb.send(f"MODE {VBC} {mode} {mask}")
+    vb.wait_for(" MODE ", " 696 ", seconds=4)
+    return any(" MODE " in l for l in vb.since(m)), vb.since(m)[-1:]
+
+for label, mode, mask in (
+    ("a ban type this server does not have", "+b", "~Z:spammer"),
+    ("an account ban naming no account", "+b", "~a:"),
+    ("a bare tilde", "+b", "~"),
+    ("~O with something after it", "+b", "~O:extra"),
+    ("a channel ban on something that is not a channel", "+b", "~j:notachannel"),
+    ("a mask wrapped in itself fifty times", "+b", "~m:" * 50 + "n!*@*"),
+    ("the same, as an exception", "+e", "~Z:spammer"),
+    ("and as an invite exception", "+I", "~Z:spammer"),
+):
+    accepted, detail = mask_verdict(mode, mask)
+    check(f"{label} is refused", not accepted, detail)
+
+for label, mode, mask in (
+    ("an account ban", "+b", f"~a:someone{RUN_ID}"),
+    ("a mute by real name", "+b", "~m:~r:*spam*"),
+    ("a timed ban on another channel", "+b", "~t:1h:~j:#raiders"),
+    ("a plain mask", "+b", "bad!*@*"),
+    ("an exception for the operators", "+e", "~O"),
+):
+    accepted, detail = mask_verdict(mode, mask)
+    check(f"{label} is still accepted", accepted, detail)
+
+vb.close()
+
 section("~n: one person's name held still")
 
 nk = Client(f"nk{RUN_ID}")
