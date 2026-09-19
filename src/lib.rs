@@ -59,6 +59,23 @@ pub async fn run_server(mut cfg: Config, config_path: &Path) -> anyhow::Result<(
         })?;
     persist::init_schema(&pool).await?;
 
+    if let Some(ref webirc) = cfg.webirc {
+        if webirc.hosts.is_empty() {
+            tracing::warn!(
+                "[webirc] is configured with no `hosts`, so WEBIRC is refused from \
+                 everywhere. Whoever may send it decides what address a connection \
+                 came from, and that is what the bans, the cloak and the login budget \
+                 are judged on — so it is believed only from an address named here. \
+                 Add the gateway's address: hosts = [\"203.0.113.5\"]"
+            );
+        } else {
+            tracing::info!(
+                "WEBIRC accepted from {}",
+                webirc.hosts.join(", ")
+            );
+        }
+    }
+
     if let Some(ref email) = cfg.email {
         tracing::info!(
             "Email verification enabled: REGISTER requires a valid address, \

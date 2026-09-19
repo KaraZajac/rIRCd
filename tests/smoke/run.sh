@@ -242,6 +242,10 @@ name = "SmokeNet"
 
 [webirc]
 password = "smoke-gateway-secret"
+# Only a gateway at this address may say where a connection really came from.
+# 127.0.0.1 is where the suites connect from; 127.0.0.9 is not, which is what
+# makes "the right password from the wrong place" a thing the suite can check.
+hosts = ["127.0.0.1"]
 
 [database]
 host = "127.0.0.1"

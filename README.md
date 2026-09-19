@@ -528,12 +528,32 @@ everybody's. A listed address is turned away before its first line with
 
 ### `[webirc]`
 
-Optional. Enables WEBIRC gateway support so reverse proxies can pass the real client IP.
+Optional. Lets a gateway — a web client, a bouncer, a Tor front end — say what
+address a connection really came from, so the person behind it is judged on
+their own address rather than the gateway's.
 
 ```toml
 [webirc]
 password = "gateway-secret"
+hosts = ["203.0.113.5", "10.0.0.0/8"]   # only these may say it
 ```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `password` | _(required)_ | What the gateway sends as the first parameter of `WEBIRC`. Compared in constant time |
+| `hosts` | `[]` (nobody) | The addresses allowed to use it, exactly or as a network in CIDR form. **Empty means nobody**, and the server says so at startup |
+
+That address is the one fact everything else rests on: the K-lines and D-lines,
+a channel ban on a host, the blocklist, the cloak, and the budget a failed login
+spends. A password on its own guarded it, and a password is handed to whoever
+runs the gateway, written into their configuration, and read by somebody else
+eventually — so it is guarded the way `trusted_proxies` guards
+`X-Forwarded-For`: believed only from an address you named.
+
+Empty means nobody rather than everybody, because a list that means everybody
+when left blank is a list nobody fills in. A connection from anywhere else is
+refused with the same answer a wrong password gets, and told nothing about
+whether it guessed right.
 
 ### Full example config
 

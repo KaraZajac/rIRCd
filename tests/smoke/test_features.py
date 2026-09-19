@@ -176,6 +176,29 @@ check("a wrong WEBIRC password is refused",
       bad_gw.lines[-3:])
 bad_gw.close()
 
+# WEBIRC decides what address a connection came from, and that is what the
+# K-lines, the D-lines, a channel ban on a host, the cloak and the failed-login
+# budget are all judged on. A password alone guarded it — and a password is
+# handed to whoever runs a gateway, written into their configuration, and read
+# by somebody else eventually. It is believed only from an address named in
+# `[webirc] hosts`, the way `X-Forwarded-For` is believed only from a proxy.
+elsewhere = Client(source="127.0.0.9")
+elsewhere.send("WEBIRC smoke-gateway-secret sneak gateway.example 203.0.113.77")
+elsewhere.read(1.2)
+elsewhere.send("NICK sneak" + RUN_ID)
+elsewhere.send("USER sneak 0 * :sneaking in")
+elsewhere.wait_for(" 376 ", " 422 ", " 001 ", "ERROR", seconds=6)
+check("the right password from an address no gateway is at is refused",
+      bool(elsewhere.find("ERROR")) or not elsewhere.find(" 001 "),
+      elsewhere.lines[-3:])
+if elsewhere.find(" 001 "):
+    elsewhere.send("WHOIS sneak" + RUN_ID)
+    elsewhere.read(1.5)
+    shown = " ".join(elsewhere.find(" 311 "))
+    check("and if it is let in at all, it does not wear the address it asked for",
+          "203.0.113.77" not in shown, shown)
+elsewhere.close()
+
 section("CHATHISTORY cursors")
 op = Client("histop", caps=TAGS + ["draft/chathistory", "draft/event-playback"])
 op.join(HISTORY)

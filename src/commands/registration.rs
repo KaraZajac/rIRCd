@@ -941,6 +941,32 @@ pub async fn handle_webirc(
     let password = msg.params.first().map(|s| s.as_str());
     let ip = msg.params.get(3).map(|s| s.as_str()).unwrap_or("");
     drop(state_guard);
+
+    // Where it is coming from, before what it knows. WEBIRC says what address
+    // a connection really came from, and that address is what every other
+    // judgement rests on — the bans, a channel ban on a host, the cloak, the
+    // budget a failed login spends. A password is the only thing that stood in
+    // front of it, and a password is handed to whoever runs a gateway, written
+    // into their configuration, and read by somebody else eventually.
+    //
+    // Asked before the password is looked at: somebody who may not use this at
+    // all should not be told whether they guessed it.
+    let from_a_gateway = cfg.webirc.as_ref().is_some_and(|w| w.allows(host));
+    if !from_a_gateway {
+        tracing::warn!(
+            client_id,
+            from = %host,
+            "WEBIRC refused: not from an address [webirc] hosts names"
+        );
+        let tx = senders.read().await.get(client_id).cloned();
+        if let Some(tx) = tx {
+            tx.send(
+                Message::new("ERROR", vec!["Invalid WebIRC password".into()])
+                    .with_prefix(&cfg.server.name),
+            );
+        }
+        return Ok(());
+    }
     // Constant-time comparison for WEBIRC password to prevent timing attacks.
     //
     // A server with no `[webirc]` block has no gateway to believe, so there is

@@ -452,6 +452,81 @@ fn default_max_failures() -> u32 {
 pub struct WebircConfig {
     /// Password gateways must send to use WEBIRC.
     pub password: String,
+    /// The addresses allowed to use it, exactly or as a network in CIDR form.
+    ///
+    /// WEBIRC lets whoever sends it say what address a connection really came
+    /// from, which is the one fact everything else is judged on: the K-lines,
+    /// the D-lines, a channel ban on a host, the cloak, and the budget a failed
+    /// login spends. A password alone guards it, and a password is the kind of
+    /// secret that is handed to whoever runs a gateway, written into their
+    /// configuration, and eventually read by somebody else.
+    ///
+    /// So it is guarded the way `trusted_proxies` guards `X-Forwarded-For`:
+    /// believed only from an address the operator named. Empty means nobody,
+    /// because a list that means everybody when left blank is a list nobody
+    /// fills in.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+#[cfg(test)]
+mod webirc_tests {
+    use super::*;
+
+    fn with(hosts: &[&str]) -> WebircConfig {
+        WebircConfig {
+            password: "secret".into(),
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+        }
+    }
+
+    /// Empty means nobody. A list that means everybody when left blank is a
+    /// list nobody fills in, and WEBIRC decides what address every other
+    /// judgement is made on.
+    #[test]
+    fn no_hosts_named_means_no_gateway_is_believed() {
+        let w = with(&[]);
+        assert!(!w.allows("203.0.113.5"));
+        assert!(!w.allows("127.0.0.1"));
+        assert!(!w.allows(""));
+    }
+
+    #[test]
+    fn a_named_address_is_believed_and_others_are_not() {
+        let w = with(&["203.0.113.5", "127.0.0.1"]);
+        assert!(w.allows("203.0.113.5"));
+        assert!(w.allows("127.0.0.1"));
+        assert!(!w.allows("203.0.113.6"));
+        assert!(!w.allows("198.51.100.1"));
+    }
+
+    /// A gateway farm is a network, not an address.
+    #[test]
+    fn a_network_may_be_named_instead_of_an_address() {
+        let w = with(&["10.0.0.0/8", "2001:db8::/32"]);
+        assert!(w.allows("10.1.2.3"));
+        assert!(w.allows("10.255.255.255"));
+        assert!(!w.allows("11.0.0.1"));
+        assert!(w.allows("2001:db8::1"));
+        assert!(!w.allows("2001:db9::1"));
+    }
+
+    /// Something that is not an address matches no address, rather than all.
+    #[test]
+    fn a_host_entry_that_is_not_an_address_matches_nothing() {
+        let w = with(&["not.an.address"]);
+        assert!(!w.allows("203.0.113.5"));
+        assert!(w.allows("not.an.address"), "except itself, spelled exactly");
+    }
+}
+
+impl WebircConfig {
+    /// Whether a connection from this address may speak for somebody else.
+    pub fn allows(&self, addr: &str) -> bool {
+        self.hosts.iter().any(|h| {
+            h == addr || crate::persist::address_in(h, addr).unwrap_or(false)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
